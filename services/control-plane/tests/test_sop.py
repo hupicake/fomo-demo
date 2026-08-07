@@ -246,6 +246,20 @@ def _architect_response_with_system_managed_path(path: str) -> dict[str, Any]:
     return response
 
 
+def test_artifact_contract_violation_uses_a_closed_repair_instruction_map() -> None:
+    violation = ArtifactContractViolation(code="technical_spec.file_plan.system_managed")
+
+    assert violation.repair_instruction == "Remove system-managed files from TechnicalSpec.filePlan."
+    with pytest.raises(ValueError, match="unknown artifact contract violation code") as unknown_code:
+        ArtifactContractViolation(code="untrusted.contract.code")
+    assert "untrusted.contract.code" not in str(unknown_code.value)
+    with pytest.raises(TypeError):
+        ArtifactContractViolation(
+            code="technical_spec.file_plan.system_managed",
+            repair_instruction="untrusted instruction",  # type: ignore[call-arg]
+        )
+
+
 def _repair_responses() -> dict[str, Any]:
     responses = _responses()
     responses["engineer"] = [*responses["engineer"], *_single_file_repair_engineer_cycle()]
@@ -434,6 +448,7 @@ async def test_four_role_sop_creates_version_and_trace(repository, settings) -> 
     assert "not a component inventory" in architect_system_prompt
     assert "without requiring a same-name decision" in architect_system_prompt
     assert "Avoid per-control Button/Card/Input decisions" in architect_system_prompt
+    assert "only for actual cross-file public symbols" in architect_system_prompt
     assert "publicApiContracts" in architect_system_prompt
     engineer_plan_request = next(request for request in model.requests if request[2] == "ImplementationPlan")
     engineer_plan_system_prompt = engineer_plan_request[1][0]["content"]
@@ -639,13 +654,13 @@ async def test_architect_contracts_bind_component_decisions_and_public_api_files
                 update={"component_decisions": [technical.component_decisions[0], technical.component_decisions[0]]}
             )
         )
-    assert duplicate_decisions.value.code == "architect.component_decision.duplicate"
+    assert duplicate_decisions.value.code == "technical_spec.component_decisions.duplicate"
     invalid_contract = technical.public_api_contracts[0].model_copy(update={"file_path": "missing.ts"})
     with pytest.raises(ArtifactContractViolation) as unplanned_contract:
         runner._validate_technical_file_plan(
             technical.model_copy(update={"public_api_contracts": [invalid_contract]})
         )
-    assert unplanned_contract.value.code == "architect.public_api.file_unplanned"
+    assert unplanned_contract.value.code == "technical_spec.public_api_contracts.file_unplanned"
     no_contract_response = dict(_responses()["architect"])
     no_contract_response.pop("publicApiContracts")
     no_contract_technical = TechnicalSpec.model_validate(no_contract_response)
@@ -659,7 +674,7 @@ async def test_architect_contracts_bind_component_decisions_and_public_api_files
         runner._validate_technical_file_plan(
             technical.model_copy(update={"file_plan": deleted_file_plan})
         )
-    assert deleted_contract.value.code == "architect.public_api.file_deleted"
+    assert deleted_contract.value.code == "technical_spec.public_api_contracts.file_deleted"
 
 
 @pytest.mark.asyncio
@@ -778,7 +793,7 @@ async def test_architect_file_plan_rejects_system_managed_paths(repository, sett
 
     with pytest.raises(ArtifactContractViolation) as violation:
         runner._validate_technical_file_plan(technical)
-    assert violation.value.code == "architect.file_plan.system_managed"
+    assert violation.value.code == "technical_spec.file_plan.system_managed"
     assert violation.value.repair_instruction == "Remove system-managed files from TechnicalSpec.filePlan."
 
 
@@ -827,7 +842,11 @@ async def test_system_managed_file_plan_retries_before_sandbox_creation(reposito
         and event.role == "architect"
         and event.payload.get("action") == "structured_retry"
     )
-    assert retry_event.payload["reasonCode"] == "architect.file_plan.system_managed"
+    assert retry_event.payload == {
+        "action": "structured_retry",
+        "summary": "The structured hand-off was invalid; requesting a schema-correct response.",
+        "reasonCode": "technical_spec.file_plan.system_managed",
+    }
     repair_instruction = "Remove system-managed files from TechnicalSpec.filePlan."
     assert repair_instruction not in json.dumps([event.payload for event in events])
     architect_requests = [request for request in model.requests if request[0] == "architect"]
@@ -840,6 +859,61 @@ async def test_system_managed_file_plan_retries_before_sandbox_creation(reposito
         "Return only a valid TechnicalSpec JSON object matching the declared schema.\n"
         + repair_instruction
     )
+
+
+@pytest.mark.asyncio
+async def test_non_architect_contract_violation_uses_generic_schema_correction(repository, settings) -> None:
+    session = await repository.create_guest_session()
+    project = await repository.create_project(session.id, "Library")
+    _message, run, _created = await repository.create_message_and_run(
+        project.id, session.id, "message-non-architect-contract", "Create a book management system"
+    )
+    assert await repository.claim_next_run("test-worker", 60)
+    context = SimpleNamespace(
+        run_id=run.id,
+        lease_token=await repository.get_active_lease_token(run.id),
+    )
+    model = ScriptedModelClient(
+        {"engineer": [_responses()["architect"], _responses()["architect"]]}
+    )
+    validation_attempts = 0
+
+    def reject_once(_artifact: TechnicalSpec) -> None:
+        nonlocal validation_attempts
+        validation_attempts += 1
+        if validation_attempts == 1:
+            raise ArtifactContractViolation(code="technical_spec.file_plan.system_managed")
+
+    artifact = await SOPRunner(
+        repository,
+        model,
+        FakeSandboxProvider(),
+        replace(settings, structured_output_retries=1),
+    )._role(
+        context,
+        role="engineer",
+        model_alias="engineer",
+        schema=TechnicalSpec,
+        messages=[{"role": "system", "content": "test generic correction"}],
+        validate_artifact=reject_once,
+    )
+
+    assert isinstance(artifact, TechnicalSpec)
+    retry_event = next(
+        event
+        for event in await repository.list_events(run.id)
+        if event.kind == "agent.activity" and event.payload.get("action") == "structured_retry"
+    )
+    assert retry_event.payload == {
+        "action": "structured_retry",
+        "summary": "The structured hand-off was invalid; requesting a schema-correct response.",
+    }
+    correction_message = next(
+        message["content"]
+        for message in model.requests[1][1]
+        if message["content"].startswith("Return only a valid TechnicalSpec JSON object")
+    )
+    assert correction_message == "Return only a valid TechnicalSpec JSON object matching the declared schema."
 
 
 @pytest.mark.asyncio

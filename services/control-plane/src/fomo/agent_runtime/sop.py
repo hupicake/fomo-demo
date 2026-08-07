@@ -8,6 +8,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, TypeVar
 
 import httpx
@@ -98,6 +99,32 @@ _PLAYWRIGHT_NETWORK_CONTRACT = (
     "http://127.0.0.1:<port>. Never use a container hostname, os.hostname(), process.env.HOSTNAME, "
     "or any other dynamic hostname."
 )
+_TECHNICAL_SPEC_REPAIR_INSTRUCTIONS = MappingProxyType(
+    {
+        "technical_spec.component_decisions.duplicate": "Use each componentDecisions.component value at most once.",
+        "technical_spec.public_api_contracts.path_invalid": (
+            "Set every publicApiContracts.filePath to a valid relative workspace file path."
+        ),
+        "technical_spec.public_api_contracts.file_unplanned": (
+            "Reference a file that exists in TechnicalSpec.filePlan."
+        ),
+        "technical_spec.public_api_contracts.file_deleted": (
+            "Remove public API contracts for filePlan entries scheduled for deletion."
+        ),
+        "technical_spec.public_api_contracts.symbol_duplicate": (
+            "Use each public API filePath and symbol pair at most once."
+        ),
+        "technical_spec.file_plan.empty": "Provide at least one model-writable TechnicalSpec.filePlan entry.",
+        "technical_spec.file_plan.path_invalid": (
+            "Use only valid relative workspace paths in TechnicalSpec.filePlan."
+        ),
+        "technical_spec.file_plan.system_managed": "Remove system-managed files from TechnicalSpec.filePlan.",
+        "technical_spec.file_plan.path_duplicate": "Use each TechnicalSpec.filePlan path at most once.",
+        "technical_spec.file_plan.capacity_exceeded": (
+            "Reduce TechnicalSpec.filePlan to the configured Engineer capacity."
+        ),
+    }
+)
 
 
 class RunCancelled(RuntimeError):
@@ -113,7 +140,11 @@ class ArtifactContractViolation(ValueError):
 
     __slots__ = ("code", "repair_instruction")
 
-    def __init__(self, *, code: str, repair_instruction: str) -> None:
+    def __init__(self, *, code: str) -> None:
+        try:
+            repair_instruction = _TECHNICAL_SPEC_REPAIR_INSTRUCTIONS[code]
+        except KeyError:
+            raise ValueError("unknown artifact contract violation code") from None
         super().__init__(code)
         self.code = code
         self.repair_instruction = repair_instruction
@@ -351,8 +382,8 @@ class SOPRunner:
                         "components in components, filePlan, and publicApiContracts without requiring a same-name decision. "
                         "A reuse decision may group maintained building blocks; a custom decision must identify a concrete "
                         "capability gap. Avoid per-control Button/Card/Input decisions; include source and rationale. "
-                        "Return publicApiContracts for every cross-file API with its file path, export style, symbol, props, "
-                        "and type. "
+                        "Return publicApiContracts only for actual cross-file public symbols, not an inventory of internal "
+                        "or same-file symbols; include file path, export style, symbol, props, and type. "
                         "Strictly use the JSON Schema's literal enum values (never descriptive "
                         f"variants), fit TechnicalSpec.filePlan within {max_batches} Engineer batches of at most "
                         f"{max_files_per_batch} unique valid relative workspace {path_label} each (no more than "
@@ -711,8 +742,7 @@ class SOPRunner:
         decision_names = [decision.component for decision in technical.component_decisions]
         if len(decision_names) != len(set(decision_names)):
             raise ArtifactContractViolation(
-                code="architect.component_decision.duplicate",
-                repair_instruction="Use each componentDecisions.component value at most once.",
+                code="technical_spec.component_decisions.duplicate",
             )
         planned_files = {
             str(validate_workspace_path(item.path)): item for item in technical.file_plan
@@ -723,35 +753,28 @@ class SOPRunner:
                 contract_path = str(validate_workspace_path(contract.file_path))
             except ValueError:
                 raise ArtifactContractViolation(
-                    code="architect.public_api.path_invalid",
-                    repair_instruction=(
-                        "Set every publicApiContracts.filePath to a valid relative workspace file path."
-                    ),
+                    code="technical_spec.public_api_contracts.path_invalid",
                 ) from None
             planned_file = planned_files.get(contract_path)
             if planned_file is None:
                 raise ArtifactContractViolation(
-                    code="architect.public_api.file_unplanned",
-                    repair_instruction="Reference a file that exists in TechnicalSpec.filePlan.",
+                    code="technical_spec.public_api_contracts.file_unplanned",
                 )
             if planned_file.operation == "delete":
                 raise ArtifactContractViolation(
-                    code="architect.public_api.file_deleted",
-                    repair_instruction="Remove public API contracts for filePlan entries scheduled for deletion.",
+                    code="technical_spec.public_api_contracts.file_deleted",
                 )
             contract_keys.append((contract_path, contract.symbol))
         if len(contract_keys) != len(set(contract_keys)):
             raise ArtifactContractViolation(
-                code="architect.public_api.symbol_duplicate",
-                repair_instruction="Use each public API filePath and symbol pair at most once.",
+                code="technical_spec.public_api_contracts.symbol_duplicate",
             )
 
     def _technical_file_plan_paths(self, technical: TechnicalSpec) -> list[str]:
         paths = [item.path for item in technical.file_plan]
         if not paths:
             raise ArtifactContractViolation(
-                code="architect.file_plan.empty",
-                repair_instruction="Provide at least one model-writable TechnicalSpec.filePlan entry.",
+                code="technical_spec.file_plan.empty",
             )
         workspace_paths = []
         try:
@@ -759,23 +782,19 @@ class SOPRunner:
                 workspace_paths.append(validate_workspace_path(path))
         except ValueError:
             raise ArtifactContractViolation(
-                code="architect.file_plan.path_invalid",
-                repair_instruction="Use only valid relative workspace paths in TechnicalSpec.filePlan.",
+                code="technical_spec.file_plan.path_invalid",
             ) from None
         if any(path.name in _SYSTEM_MANAGED_FILE_PLAN_NAMES for path in workspace_paths):
             raise ArtifactContractViolation(
-                code="architect.file_plan.system_managed",
-                repair_instruction="Remove system-managed files from TechnicalSpec.filePlan.",
+                code="technical_spec.file_plan.system_managed",
             )
         if len(paths) != len(set(paths)):
             raise ArtifactContractViolation(
-                code="architect.file_plan.path_duplicate",
-                repair_instruction="Use each TechnicalSpec.filePlan path at most once.",
+                code="technical_spec.file_plan.path_duplicate",
             )
         if len(paths) > self._engineer_max_planned_files():
             raise ArtifactContractViolation(
-                code="architect.file_plan.capacity_exceeded",
-                repair_instruction="Reduce TechnicalSpec.filePlan to the configured Engineer capacity.",
+                code="technical_spec.file_plan.capacity_exceeded",
             )
         return paths
 
@@ -1449,9 +1468,22 @@ class SOPRunner:
                 )
                 raise SOPExecutionError(f"{role} model request failed") from None
             except (ModelError, ValidationError, ValueError, TypeError) as exc:
-                reason_code = exc.code if isinstance(exc, ArtifactContractViolation) else None
+                trusted_contract_violation: ArtifactContractViolation | None = (
+                    exc
+                    if role == "architect"
+                    and schema is TechnicalSpec
+                    and isinstance(exc, ArtifactContractViolation)
+                    else None
+                )
+                reason_code = (
+                    trusted_contract_violation.code
+                    if trusted_contract_violation is not None
+                    else None
+                )
                 repair_instruction = (
-                    exc.repair_instruction if isinstance(exc, ArtifactContractViolation) else None
+                    trusted_contract_violation.repair_instruction
+                    if trusted_contract_violation is not None
+                    else None
                 )
                 if attempt + 1 < attempts:
                     retry_payload: dict[str, Any] = {
