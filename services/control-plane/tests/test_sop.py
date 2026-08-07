@@ -510,7 +510,7 @@ def test_default_starter_manifest_is_digest_pinned_and_exposes_approved_primitiv
 
     assert manifest.id == "fomo-next-radix-v1"
     assert manifest.version == "1.0.0"
-    assert manifest.tree_sha256 == "bcd9f47b393a0314992a4e17a77476c5731a47ed10818df9059845348f42cbf9"
+    assert manifest.tree_sha256 == "07cd7372813569fd270f04a11a219ad4fc200d3a21274ac677fd85b3da1d32d1"
     assert "@/components/ui/button" in manifest.available_imports
     assert "@/components/ui/card" in manifest.available_imports
     assert "package.json" in manifest.protected_paths

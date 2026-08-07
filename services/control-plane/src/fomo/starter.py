@@ -18,7 +18,7 @@ from fomo.sandbox.base import FileChange
 
 STARTER_ID = "fomo-next-radix-v1"
 STARTER_VERSION = "1.0.0"
-_EXPECTED_TREE_SHA256 = "bcd9f47b393a0314992a4e17a77476c5731a47ed10818df9059845348f42cbf9"
+_EXPECTED_TREE_SHA256 = "07cd7372813569fd270f04a11a219ad4fc200d3a21274ac677fd85b3da1d32d1"
 
 # These paths are maintained by the runner rather than an Architect or an
 # Engineer. They remain present in the public manifest so the Architect has a
