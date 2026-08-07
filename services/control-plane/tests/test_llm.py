@@ -624,6 +624,8 @@ def test_default_engineer_batch_budget_is_twenty_four_by_one() -> None:
     assert settings.engineer_max_batches == 24
     assert settings.engineer_max_files_per_batch == 1
     assert settings.engineer_max_batches * settings.engineer_max_files_per_batch == 24
+    assert settings.engineer_target_file_characters == 12_000
+    assert settings.engineer_max_file_characters == 20_000
 
 
 def test_settings_reads_network_retry_environment(monkeypatch) -> None:
@@ -634,6 +636,7 @@ def test_settings_reads_network_retry_environment(monkeypatch) -> None:
     monkeypatch.setenv("MODEL_RETRY_AFTER_MAX_SECONDS", "15")
     monkeypatch.setenv("ENGINEER_MAX_BATCHES", "6")
     monkeypatch.setenv("ENGINEER_MAX_FILES_PER_BATCH", "2")
+    monkeypatch.setenv("ENGINEER_TARGET_FILE_CHARACTERS", "6000")
     monkeypatch.setenv("ENGINEER_MAX_FILE_CHARACTERS", "8000")
 
     settings = Settings.from_env()
@@ -645,7 +648,53 @@ def test_settings_reads_network_retry_environment(monkeypatch) -> None:
     assert settings.model_retry_after_max_seconds == 15.0
     assert settings.engineer_max_batches == 6
     assert settings.engineer_max_files_per_batch == 2
+    assert settings.engineer_target_file_characters == 6000
     assert settings.engineer_max_file_characters == 8000
+
+
+@pytest.mark.parametrize(
+    ("target", "hard", "message"),
+    [
+        pytest.param(
+            "20001",
+            "20000",
+            "ENGINEER_TARGET_FILE_CHARACTERS must be less than or equal to ENGINEER_MAX_FILE_CHARACTERS",
+            id="target-exceeds-hard",
+        ),
+        pytest.param(
+            "12000",
+            "24001",
+            "ENGINEER_MAX_FILE_CHARACTERS must be at most 24000",
+            id="hard-exceeds-maximum",
+        ),
+        pytest.param(
+            "0",
+            "20000",
+            "ENGINEER_TARGET_FILE_CHARACTERS must be greater than 0",
+            id="target-is-not-positive",
+        ),
+        pytest.param(
+            "12000",
+            "0",
+            "ENGINEER_MAX_FILE_CHARACTERS must be greater than 0",
+            id="hard-is-not-positive",
+        ),
+        pytest.param(
+            "not-an-integer",
+            "20000",
+            "ENGINEER_TARGET_FILE_CHARACTERS must be an integer",
+            id="target-is-not-an-integer",
+        ),
+    ],
+)
+def test_settings_rejects_invalid_engineer_file_character_limits(
+    monkeypatch, target: str, hard: str, message: str
+) -> None:
+    monkeypatch.setenv("ENGINEER_TARGET_FILE_CHARACTERS", target)
+    monkeypatch.setenv("ENGINEER_MAX_FILE_CHARACTERS", hard)
+
+    with pytest.raises(ValueError, match=re.escape(message)):
+        Settings.from_env()
 
 
 def test_gpt55_role_routes_use_high_reasoning_effort_without_pro_models() -> None:

@@ -41,6 +41,15 @@ Use `docker compose --env-file .env.local logs -f api worker web` for runtime
 logs, and `docker compose --env-file .env.local down` to stop the stack without
 deleting persistent volumes.
 
+### Engineer file-size policy
+
+Engineer source files use a 12,000-character split target and a 20,000-character
+hard rejection limit, configurable with `ENGINEER_TARGET_FILE_CHARACTERS` and
+`ENGINEER_MAX_FILE_CHARACTERS`. Both must be positive, target must not exceed
+hard, and hard must not exceed 24,000. Content over the target through the hard
+limit succeeds and emits one aggregate, source-free `file_batch_over_target`
+activity; only content over the hard limit is rejected.
+
 ### Optional desktop proxy
 
 Proxying is disabled by default. If an opt-in local proxy listens at

@@ -37,11 +37,15 @@ run in the worker through a `SandboxProvider`.
 - Engineer implementation is deliberately bounded: a real Engineer
   `Role`/`Action` first produces an `ImplementationPlan`, then emits complete
   files in `implementation_batch` artifacts (defaults: at most 24 batches, 1
-  file and 12,000 characters per file). Each batch is applied and traced
-  before the next request; a final, compact real Engineer `ImplementationReport`
-  references those batch artifacts and becomes the only Engineer hand-off
-  after candidate commit. Tune the limits with `ENGINEER_MAX_BATCHES`,
-  `ENGINEER_MAX_FILES_PER_BATCH`, and `ENGINEER_MAX_FILE_CHARACTERS`.
+  file, a 12,000-character split target, and a 20,000-character hard limit per
+  create/modify file). Architect and Engineer prompts favor splitting at the
+  target; only content above the hard limit is rejected. A successfully
+  persisted batch over the target but within the hard limit emits one safe
+  `file_batch_over_target` activity with aggregate counts only. Tune the
+  limits with `ENGINEER_MAX_BATCHES`, `ENGINEER_MAX_FILES_PER_BATCH`,
+  `ENGINEER_TARGET_FILE_CHARACTERS`, and `ENGINEER_MAX_FILE_CHARACTERS`; both
+  file-character values must be positive, target must not exceed hard, and hard
+  must not exceed 24,000.
   Batches are durable evidence within the current run, not cross-run resume
   checkpoints: terminal failure/cancellation still safely destroys the sandbox.
 - `AGENT_FRAMEWORK=metagpt` is the default production coordination layer and

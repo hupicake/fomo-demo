@@ -507,11 +507,21 @@ def test_artifact_contract_violation_uses_a_closed_repair_instruction_map() -> N
 
 
 def test_file_batch_contract_violation_uses_a_closed_repair_instruction_map() -> None:
-    violation = FileBatchContractViolation(code="file_batch_report.file_size_exceeded")
+    violation = FileBatchContractViolation(
+        code="file_batch_report.file_size_exceeded",
+        hard_limit_characters=20_000,
+        max_observed_characters=20_001,
+        oversized_file_count=1,
+    )
 
     assert violation.repair_instruction == (
-        "Keep every create or modify fileChanges content within the configured character limit stated in the prompt."
+        "Keep every create or modify fileChanges content at or below the hard character limit stated in the prompt."
     )
+    assert violation.hard_limit_characters == 20_000
+    assert violation.max_observed_characters == 20_001
+    assert violation.oversized_file_count == 1
+    with pytest.raises(AttributeError):
+        violation.hard_limit_characters = 1  # type: ignore[misc]
     with pytest.raises(ValueError, match="unknown file batch contract violation code") as unknown_code:
         FileBatchContractViolation(code="untrusted.contract.code")
     assert "untrusted.contract.code" not in str(unknown_code.value)
@@ -519,6 +529,14 @@ def test_file_batch_contract_violation_uses_a_closed_repair_instruction_map() ->
         FileBatchContractViolation(
             code="file_batch_report.file_size_exceeded",
             repair_instruction="untrusted instruction",  # type: ignore[call-arg]
+        )
+    with pytest.raises(TypeError):
+        FileBatchContractViolation(
+            code="file_batch_report.file_size_exceeded",
+            hard_limit_characters=20_000,
+            max_observed_characters=20_001,
+            oversized_file_count=1,
+            details={"untrusted": "metadata"},  # type: ignore[call-arg]
         )
 
 
@@ -664,6 +682,47 @@ async def test_file_batch_contract_validation_uses_stable_codes(
     with pytest.raises(FileBatchContractViolation) as violation:
         runner._validate_file_batch_report(report, expected)
     assert violation.value.code == code
+
+
+@pytest.mark.asyncio
+async def test_file_batch_character_limit_accepts_hard_limit_and_rejects_only_larger_content(
+    repository, settings
+) -> None:
+    runner = SOPRunner(
+        repository,
+        ScriptedModelClient({}),
+        FakeSandboxProvider(),
+        replace(
+            settings,
+            engineer_target_file_characters=12_000,
+            engineer_max_file_characters=20_000,
+        ),
+    )
+    expected = ImplementationBatchPlan.model_validate(
+        {"id": "requested-batch", "purpose": "test", "paths": ["components/features/book.tsx"]}
+    )
+    at_hard_limit = FileBatchReport.model_validate(
+        {
+            "batchId": "requested-batch",
+            "fileChanges": [{"path": "components/features/book.tsx", "content": "x" * 20_000}],
+        }
+    )
+
+    runner._validate_file_batch_report(at_hard_limit, expected)
+
+    over_hard_limit = FileBatchReport.model_validate(
+        {
+            "batchId": "requested-batch",
+            "fileChanges": [{"path": "components/features/book.tsx", "content": "x" * 20_001}],
+        }
+    )
+    with pytest.raises(FileBatchContractViolation) as violation:
+        runner._validate_file_batch_report(over_hard_limit, expected)
+
+    assert violation.value.code == "file_batch_report.file_size_exceeded"
+    assert violation.value.hard_limit_characters == 20_000
+    assert violation.value.max_observed_characters == 20_001
+    assert violation.value.oversized_file_count == 1
 
 
 def _repair_responses() -> dict[str, Any]:
@@ -870,8 +929,10 @@ async def test_four_role_sop_creates_version_and_trace(repository, settings) -> 
     assert "without requiring a same-name decision" in architect_system_prompt
     assert "Avoid per-control Button/Card/Input decisions" in architect_system_prompt
     assert "only for actual cross-file public symbols" in architect_system_prompt
-    assert "Engineer 12000-character source limit" in architect_system_prompt
-    assert "split complex state or features across files" in architect_system_prompt
+    assert "12000-character target" in architect_system_prompt
+    assert "20000-character hard limit" in architect_system_prompt
+    assert "only rejection threshold" in architect_system_prompt
+    assert "split complex features across files" in architect_system_prompt
     assert "publicApiContracts" in architect_system_prompt
     assert "interactionResponsibilities" in architect_system_prompt
     assert "featureSurfaces" in architect_system_prompt
@@ -900,6 +961,9 @@ async def test_four_role_sop_creates_version_and_trace(repository, settings) -> 
     assert "React + TypeScript + Tailwind CSS + shadcn/ui + Lucide React" in engineer_plan_system_prompt
     assert "publicApiContracts" in engineer_plan_system_prompt
     assert "immutable starter already provides package configuration" in engineer_plan_system_prompt
+    assert "12000-character target" in engineer_plan_system_prompt
+    assert "20000-character hard limit" in engineer_plan_system_prompt
+    assert "only rejection threshold" in engineer_plan_system_prompt
     engineer_batch_requests = [request for request in model.requests if request[2] == "FileBatchReport"]
     assert len(engineer_batch_requests) == 2
     engineer_batch_system_prompt = engineer_batch_requests[0][1][0]["content"]
@@ -908,6 +972,9 @@ async def test_four_role_sop_creates_version_and_trace(repository, settings) -> 
     assert "dynamic hostname" in engineer_batch_system_prompt
     assert "React + TypeScript + Tailwind CSS + shadcn/ui + Lucide React" in engineer_batch_system_prompt
     assert "Write only StarterManifest modelOwnedRoots" in engineer_batch_system_prompt
+    assert "12000-character target" in engineer_batch_system_prompt
+    assert "20000-character hard limit" in engineer_batch_system_prompt
+    assert "only rejection threshold" in engineer_batch_system_prompt
     for engineer_batch_request in engineer_batch_requests:
         assert "Shared public API contracts" in engineer_batch_request[1][1]["content"]
         assert "StarterManifest:" in engineer_batch_request[1][1]["content"]
@@ -926,7 +993,7 @@ async def test_four_role_sop_creates_version_and_trace(repository, settings) -> 
 
 
 @pytest.mark.asyncio
-async def test_architect_prompt_uses_configured_file_character_limit(repository, settings) -> None:
+async def test_architect_prompt_uses_configured_file_character_thresholds(repository, settings) -> None:
     session = await repository.create_guest_session()
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
@@ -939,11 +1006,17 @@ async def test_architect_prompt_uses_configured_file_character_limit(repository,
         repository,
         model,
         FakeSandboxProvider(),
-        replace(settings, engineer_max_file_characters=4321),
+        replace(
+            settings,
+            engineer_target_file_characters=1234,
+            engineer_max_file_characters=4321,
+        ),
     ).run(run.id)
 
     architect_request = next(request for request in model.requests if request[0] == "architect")
-    assert "Engineer 4321-character source limit" in architect_request[1][0]["content"]
+    architect_system_prompt = architect_request[1][0]["content"]
+    assert "1234-character target" in architect_system_prompt
+    assert "4321-character hard limit" in architect_system_prompt
 
 
 @pytest.mark.asyncio
@@ -1848,6 +1921,141 @@ async def test_file_batch_contract_violation_adds_targeted_schema_correction(rep
         "Return only a valid FileBatchReport JSON object matching the declared schema.\n"
         + repair_instruction
     )
+
+
+@pytest.mark.asyncio
+async def test_file_batch_size_retry_and_failure_include_only_safe_metrics(repository, settings) -> None:
+    session = await repository.create_guest_session()
+    project = await repository.create_project(session.id, "Library")
+    _message, run, _created = await repository.create_message_and_run(
+        project.id, session.id, "message-file-batch-size-contract", "Create a book management system"
+    )
+    assert await repository.claim_next_run("test-worker", 60)
+    context = SimpleNamespace(
+        run_id=run.id,
+        lease_token=await repository.get_active_lease_token(run.id),
+    )
+    expected = ImplementationBatchPlan.model_validate(
+        {"id": "requested-batch", "purpose": "test", "paths": ["components/features/book.tsx"]}
+    )
+    source_marker = "oversized-source-never-leak"
+    prompt_marker = "oversized-prompt-never-leak"
+    oversized_content = source_marker + "x" * (20_001 - len(source_marker))
+    model = ScriptedModelClient(
+        {
+            "engineer": [
+                {
+                    "batchId": "requested-batch",
+                    "fileChanges": [
+                        {"path": "components/features/book.tsx", "content": oversized_content}
+                    ],
+                },
+                {
+                    "batchId": "requested-batch",
+                    "fileChanges": [
+                        {"path": "components/features/book.tsx", "content": oversized_content}
+                    ],
+                },
+            ]
+        }
+    )
+    runner = SOPRunner(
+        repository,
+        model,
+        FakeSandboxProvider(),
+        replace(
+            settings,
+            engineer_target_file_characters=12_000,
+            engineer_max_file_characters=20_000,
+            structured_output_retries=1,
+        ),
+    )
+
+    with pytest.raises(SOPExecutionError, match="engineer failed to produce a valid FileBatchReport"):
+        await runner._role(
+            context,
+            role="engineer",
+            model_alias="engineer",
+            schema=FileBatchReport,
+            messages=[{"role": "system", "content": prompt_marker}],
+            validate_artifact=lambda report: runner._validate_file_batch_report(report, expected),
+        )
+
+    events = await repository.list_events(run.id)
+    retry_event = next(
+        event
+        for event in events
+        if event.kind == "agent.activity" and event.payload.get("action") == "structured_retry"
+    )
+    failed_event = next(
+        event for event in events if event.kind == "agent.failed" and event.role == "engineer"
+    )
+    safe_metrics = {
+        "hardLimitCharacters": 20_000,
+        "maxObservedCharacters": 20_001,
+        "oversizedFileCount": 1,
+    }
+    assert retry_event.payload == {
+        "action": "structured_retry",
+        "summary": "The structured hand-off was invalid; requesting a schema-correct response.",
+        "reasonCode": "file_batch_report.file_size_exceeded",
+        **safe_metrics,
+    }
+    assert failed_event.payload == {
+        "role": "engineer",
+        "errorType": "FileBatchContractViolation",
+        "reasonCode": "file_batch_report.file_size_exceeded",
+        **safe_metrics,
+    }
+    event_payloads = json.dumps([event.payload for event in events])
+    assert source_marker not in event_payloads
+    assert prompt_marker not in event_payloads
+    correction_message = next(
+        message["content"]
+        for message in model.requests[1][1]
+        if message["content"].startswith("Return only a valid FileBatchReport JSON object")
+    )
+    assert source_marker not in correction_message
+    assert prompt_marker not in correction_message
+
+
+@pytest.mark.asyncio
+async def test_over_target_file_batch_persists_then_emits_one_safe_warning(repository, settings) -> None:
+    session = await repository.create_guest_session()
+    project = await repository.create_project(session.id, "Library")
+    _message, run, _created = await repository.create_message_and_run(
+        project.id, session.id, "message-file-batch-over-target", "Create a book management system"
+    )
+    assert await repository.claim_next_run("test-worker", 60)
+    source_marker = "over-target-source-never-leak"
+    responses = _responses()
+    engineer_cycle = _two_batch_engineer_cycle()
+    engineer_cycle[1]["fileChanges"][0]["content"] = source_marker + "x" * (
+        12_001 - len(source_marker)
+    )
+    responses["engineer"] = engineer_cycle
+
+    await SOPRunner(repository, ScriptedModelClient(responses), FakeSandboxProvider(), settings).run(run.id)
+
+    final = await repository.get_run(run.id)
+    assert final.status.value == "succeeded"
+    events = await repository.list_events(run.id)
+    warnings = [
+        event
+        for event in events
+        if event.kind == "agent.activity" and event.payload.get("action") == "file_batch_over_target"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].payload == {
+        "action": "file_batch_over_target",
+        "targetCharacters": 12_000,
+        "maxObservedCharacters": 12_001,
+        "overTargetFileCount": 1,
+    }
+    warning_index = events.index(warnings[0])
+    assert events[warning_index - 1].kind == "agent.activity"
+    assert events[warning_index - 1].payload.get("action") == "implementation_batch_persisted"
+    assert source_marker not in json.dumps([event.payload for event in events])
 
 
 @pytest.mark.asyncio
