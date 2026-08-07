@@ -399,6 +399,11 @@ Engineer 只能通过以下应用工具操作，所有实现最终落到沙箱�
   TechnicalSpec 与 Engineer 写入前都拒绝 starter/system 路径。常规路由、业务组合、领域状态和 smoke tests
   分别位于 `app/(generated)/**`、`components/features/**`、`lib/domain/**` 与 `tests/**`。
 - 小改动优先 unified diff；新文件或大范围重构允许整文件写入。
+- Engineer 单个 create/modify 文件默认以 12,000 字符为拆分目标，20,000 字符为唯一硬拒收线；
+  通过 `ENGINEER_TARGET_FILE_CHARACTERS` 与 `ENGINEER_MAX_FILE_CHARACTERS` 配置，二者必须为正数、
+  target 不得超过 hard，且 hard 不得超过 24,000。`len(content)` 超过硬线才拒绝。介于两者之间且
+  batch 已持久化时，仅追加一次不含路径或源码的 `file_batch_over_target` 活动，记录目标、最大观测长度和
+  超目标文件数。
 - 禁止“修改第 N 行”式脆弱指令。
 - 每次工具调用带 `operationId`，worker 重试时先检查是否已执行。
 - 依赖安装只发生在沙箱；V1 不允许模型修改固定 starter 的 `package.json` 或锁文件，缺少能力必须记录为风险，

@@ -248,7 +248,7 @@ _FILE_BATCH_REPAIR_INSTRUCTIONS = MappingProxyType(
             "Write fileChanges only inside the StarterManifest modelOwnedRoots."
         ),
         "file_batch_report.file_size_exceeded": (
-            "Keep every create or modify fileChanges content within the configured character limit stated in the prompt."
+            "Keep every create or modify fileChanges content at or below the hard character limit stated in the prompt."
         ),
     }
 )
@@ -280,16 +280,61 @@ class ArtifactContractViolation(ValueError):
 class FileBatchContractViolation(ValueError):
     """A trusted, safe-to-return correction for a FileBatchReport contract."""
 
-    __slots__ = ("code", "repair_instruction")
+    __slots__ = (
+        "code",
+        "repair_instruction",
+        "_hard_limit_characters",
+        "_max_observed_characters",
+        "_oversized_file_count",
+    )
 
-    def __init__(self, *, code: str) -> None:
+    def __init__(
+        self,
+        *,
+        code: str,
+        hard_limit_characters: int | None = None,
+        max_observed_characters: int | None = None,
+        oversized_file_count: int | None = None,
+    ) -> None:
         try:
             repair_instruction = _FILE_BATCH_REPAIR_INSTRUCTIONS[code]
         except KeyError:
             raise ValueError("unknown file batch contract violation code") from None
+        metrics = (hard_limit_characters, max_observed_characters, oversized_file_count)
+        if code == "file_batch_report.file_size_exceeded":
+            if any(value is None for value in metrics):
+                raise ValueError("file size violations require explicit size metrics")
+            if any(type(value) is not int for value in metrics):
+                raise ValueError("file size violation metrics must be integers")
+            assert hard_limit_characters is not None
+            assert max_observed_characters is not None
+            assert oversized_file_count is not None
+            if (
+                hard_limit_characters <= 0
+                or max_observed_characters <= hard_limit_characters
+                or oversized_file_count <= 0
+            ):
+                raise ValueError("file size violation metrics must describe an oversized file")
+        elif any(value is not None for value in metrics):
+            raise ValueError("only file size violations may include size metrics")
         super().__init__(code)
         self.code = code
         self.repair_instruction = repair_instruction
+        self._hard_limit_characters = hard_limit_characters
+        self._max_observed_characters = max_observed_characters
+        self._oversized_file_count = oversized_file_count
+
+    @property
+    def hard_limit_characters(self) -> int | None:
+        return self._hard_limit_characters
+
+    @property
+    def max_observed_characters(self) -> int | None:
+        return self._max_observed_characters
+
+    @property
+    def oversized_file_count(self) -> int | None:
+        return self._oversized_file_count
 
 
 class EngineerPlanCapacityError(SOPExecutionError):
@@ -507,7 +552,6 @@ class SOPRunner:
         max_batches = self._engineer_max_batches()
         max_files_per_batch = self._engineer_max_files_per_batch()
         max_planned_files = max_batches * max_files_per_batch
-        max_file_characters = self._engineer_max_file_characters()
         path_label = "path" if max_files_per_batch == 1 else "paths"
         technical = await self._role(
             context,
@@ -563,9 +607,8 @@ class SOPRunner:
                         "Strictly use the JSON Schema's literal enum values (never descriptive "
                         f"variants), fit TechnicalSpec.filePlan within {max_batches} Engineer batches of at most "
                         f"{max_files_per_batch} unique valid relative workspace {path_label} each (no more than "
-                        f"{max_planned_files} paths total). Each create/modify file must be completable within the "
-                        f"Engineer {max_file_characters}-character source limit; split complex state or features across "
-                        "files. Keep every list and description concise, and do not include "
+                        f"{max_planned_files} paths total). {self._engineer_file_character_prompt()} "
+                        "Keep every list and description concise, and do not include "
                         "chain-of-thought, secrets, or fields outside the schema."
                     ),
                 },
@@ -741,6 +784,7 @@ class SOPRunner:
                         "without source code. Split the working Next.js TypeScript app into ordered, independently "
                         f"writable batches of at most {max_files_per_batch} relative {file_label}, with at "
                         f"most {self._engineer_max_batches()} batches and no more than {max_planned_files} files total. "
+                        f"{self._engineer_file_character_prompt()} "
                         "The immutable starter already provides package configuration, scripts, layout, globals, and "
                         "components/ui primitives. Do not plan, create, modify, or delete protected paths; plan only "
                         "model-owned business files. Every TechnicalSpec.filePlan path must appear exactly once, with no "
@@ -814,8 +858,8 @@ class SOPRunner:
                         "content": (
                             "You are FOMO's Engineer. Return only FileBatchReport JSON for the requested batch. "
                             "Generate complete source for exactly the requested relative paths and no other paths. "
-                            "Do not repeat source from earlier or later batches. Each create/modify file must be at most "
-                            f"{self._engineer_max_file_characters()} characters. {_DEFAULT_FRONTEND_STACK_CONTRACT} "
+                            "Do not repeat source from earlier or later batches. "
+                            f"{self._engineer_file_character_prompt()} {_DEFAULT_FRONTEND_STACK_CONTRACT} "
                             f"{_PLAYWRIGHT_NETWORK_CONTRACT} Honor every shared public API contract supplied below. "
                             "The immutable starter already exists. Write only StarterManifest modelOwnedRoots and never "
                             "write protected paths, package configuration, or components/ui primitives. "
@@ -915,6 +959,20 @@ class SOPRunner:
                 },
                 lease_token=context.lease_token,
             )
+            over_target_sizes = self._over_target_file_sizes(batch_report)
+            if over_target_sizes:
+                await self.repository.append_event(
+                    context.run_id,
+                    "agent.activity",
+                    role="engineer",
+                    payload={
+                        "action": "file_batch_over_target",
+                        "targetCharacters": self._engineer_target_file_characters(),
+                        "maxObservedCharacters": max(over_target_sizes),
+                        "overTargetFileCount": len(over_target_sizes),
+                    },
+                    lease_token=context.lease_token,
+                )
 
         # This final compact report is still produced by a real Engineer
         # Role/Action. It carries only the manifest of already persisted files,
@@ -961,8 +1019,31 @@ class SOPRunner:
     def _engineer_max_planned_files(self) -> int:
         return self._engineer_max_batches() * self._engineer_max_files_per_batch()
 
+    def _engineer_target_file_characters(self) -> int:
+        return self.settings.engineer_target_file_characters
+
     def _engineer_max_file_characters(self) -> int:
-        return max(1, self.settings.engineer_max_file_characters)
+        return self.settings.engineer_max_file_characters
+
+    def _engineer_file_character_prompt(self) -> str:
+        target = self._engineer_target_file_characters()
+        hard = self._engineer_max_file_characters()
+        return (
+            f"Aim to keep each create or modify file at or below the {target}-character target and split "
+            "complex features across files when practical. "
+            f"The {hard}-character hard limit is the only rejection threshold: reject a create or modify file "
+            f"only when its content exceeds {hard} characters; files over the target and at or below the hard "
+            "limit remain valid."
+        )
+
+    def _over_target_file_sizes(self, report: FileBatchReport) -> list[int]:
+        target = self._engineer_target_file_characters()
+        hard = self._engineer_max_file_characters()
+        return [
+            len(change.content)
+            for change in report.file_changes
+            if change.operation != "delete" and target < len(change.content) <= hard
+        ]
 
     def _validate_technical_file_plan(self, technical: TechnicalSpec) -> None:
         if technical.dependencies:
@@ -1372,9 +1453,19 @@ class SOPRunner:
             raise FileBatchContractViolation(code="file_batch_report.paths_duplicate")
         if set(paths) != set(expected.paths):
             raise FileBatchContractViolation(code="file_batch_report.paths_mismatch")
-        for change in report.file_changes:
-            if change.operation != "delete" and len(change.content) > self._engineer_max_file_characters():
-                raise FileBatchContractViolation(code="file_batch_report.file_size_exceeded")
+        hard_limit_characters = self._engineer_max_file_characters()
+        oversized_sizes = [
+            len(change.content)
+            for change in report.file_changes
+            if change.operation != "delete" and len(change.content) > hard_limit_characters
+        ]
+        if oversized_sizes:
+            raise FileBatchContractViolation(
+                code="file_batch_report.file_size_exceeded",
+                hard_limit_characters=hard_limit_characters,
+                max_observed_characters=max(oversized_sizes),
+                oversized_file_count=len(oversized_sizes),
+            )
 
     def _validate_final_implementation_report(
         self,
@@ -1988,6 +2079,13 @@ class SOPRunner:
                     if trusted_contract_violation is not None
                     else None
                 )
+                hard_limit_characters: int | None = None
+                max_observed_characters: int | None = None
+                oversized_file_count: int | None = None
+                if isinstance(trusted_contract_violation, FileBatchContractViolation):
+                    hard_limit_characters = trusted_contract_violation.hard_limit_characters
+                    max_observed_characters = trusted_contract_violation.max_observed_characters
+                    oversized_file_count = trusted_contract_violation.oversized_file_count
                 if attempt + 1 < attempts:
                     retry_payload: dict[str, Any] = {
                         "action": "structured_retry",
@@ -1995,6 +2093,12 @@ class SOPRunner:
                     }
                     if reason_code is not None:
                         retry_payload["reasonCode"] = reason_code
+                    if hard_limit_characters is not None:
+                        assert max_observed_characters is not None
+                        assert oversized_file_count is not None
+                        retry_payload["hardLimitCharacters"] = hard_limit_characters
+                        retry_payload["maxObservedCharacters"] = max_observed_characters
+                        retry_payload["oversizedFileCount"] = oversized_file_count
                     await self.repository.append_event(
                         context.run_id,
                         "agent.activity",
@@ -2018,6 +2122,12 @@ class SOPRunner:
                 failure_payload: dict[str, Any] = {"role": role, "errorType": type(exc).__name__}
                 if reason_code is not None:
                     failure_payload["reasonCode"] = reason_code
+                if hard_limit_characters is not None:
+                    assert max_observed_characters is not None
+                    assert oversized_file_count is not None
+                    failure_payload["hardLimitCharacters"] = hard_limit_characters
+                    failure_payload["maxObservedCharacters"] = max_observed_characters
+                    failure_payload["oversizedFileCount"] = oversized_file_count
                 await self.repository.append_event(
                     context.run_id,
                     "agent.failed",

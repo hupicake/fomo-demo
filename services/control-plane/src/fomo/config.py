@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 
 DEFAULT_OPENSANDBOX_IMAGE = "fomo-sandbox-node:2026-08-08"
 DEFAULT_OPENSANDBOX_LIFETIME_SECONDS = 21_600
+MAX_ENGINEER_FILE_CHARACTERS = 24_000
 
 
 def _bool(name: str, default: bool = False) -> bool:
@@ -24,6 +25,32 @@ def _opensandbox_lifetime_seconds(default: int) -> int:
     if not 0 < value <= DEFAULT_OPENSANDBOX_LIFETIME_SECONDS:
         raise ValueError("OPENSANDBOX_LIFETIME_SECONDS must be between 1 and 21600 seconds")
     return value
+
+
+def _positive_int_environment_value(name: str, default: int) -> int:
+    raw_value = os.getenv(name, str(default))
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be an integer") from None
+    if value <= 0:
+        raise ValueError(f"{name} must be greater than 0")
+    return value
+
+
+def _engineer_file_character_limits(default_target: int, default_hard: int) -> tuple[int, int]:
+    target = _positive_int_environment_value("ENGINEER_TARGET_FILE_CHARACTERS", default_target)
+    hard = _positive_int_environment_value("ENGINEER_MAX_FILE_CHARACTERS", default_hard)
+    if hard > MAX_ENGINEER_FILE_CHARACTERS:
+        raise ValueError(
+            f"ENGINEER_MAX_FILE_CHARACTERS must be at most {MAX_ENGINEER_FILE_CHARACTERS}"
+        )
+    if target > hard:
+        raise ValueError(
+            "ENGINEER_TARGET_FILE_CHARACTERS must be less than or equal to "
+            "ENGINEER_MAX_FILE_CHARACTERS"
+        )
+    return target, hard
 
 
 def _sandbox_proxy_url(name: str) -> str | None:
@@ -85,7 +112,8 @@ class Settings:
     # so a full project is never one unbounded model response.
     engineer_max_batches: int = 24
     engineer_max_files_per_batch: int = 1
-    engineer_max_file_characters: int = 12_000
+    engineer_target_file_characters: int = 12_000
+    engineer_max_file_characters: int = 20_000
     # MetaGPT is the production coordination layer. `native` is intentionally
     # reserved for explicit test and diagnostic runs.
     agent_framework: str = "metagpt"
@@ -130,6 +158,12 @@ class Settings:
     def from_env(cls) -> Settings:
         defaults = cls()
         database_url = os.getenv("DATABASE_URL", defaults.database_url)
+        engineer_target_file_characters, engineer_max_file_characters = (
+            _engineer_file_character_limits(
+                defaults.engineer_target_file_characters,
+                defaults.engineer_max_file_characters,
+            )
+        )
         # SQLAlchemy's PostgreSQL async driver is selected by the supplied URL.
         return cls(
             app_env=os.getenv("APP_ENV", defaults.app_env),
@@ -175,9 +209,8 @@ class Settings:
             engineer_max_files_per_batch=int(
                 os.getenv("ENGINEER_MAX_FILES_PER_BATCH", str(defaults.engineer_max_files_per_batch))
             ),
-            engineer_max_file_characters=int(
-                os.getenv("ENGINEER_MAX_FILE_CHARACTERS", str(defaults.engineer_max_file_characters))
-            ),
+            engineer_target_file_characters=engineer_target_file_characters,
+            engineer_max_file_characters=engineer_max_file_characters,
             agent_framework=os.getenv("AGENT_FRAMEWORK", defaults.agent_framework).strip().lower(),
             sandbox_provider=os.getenv("SANDBOX_PROVIDER", defaults.sandbox_provider).lower(),
             opensandbox_base_url=os.getenv("OPENSANDBOX_BASE_URL", defaults.opensandbox_base_url),
