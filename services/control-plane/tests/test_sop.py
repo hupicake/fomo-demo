@@ -355,7 +355,7 @@ def _architect_response_with_feature_surface_slices() -> dict[str, Any]:
             "name": "CatalogSurface",
             "responsibility": "compose a complex catalog management surface",
             "children": ["CatalogSearch", "CatalogFilters", "CatalogTable"],
-            "interactionResponsibilities": ["search", "filter", "data_table"],
+            "interactionResponsibilities": ["search", "filter"],
         },
         {
             "name": "CatalogSearch",
@@ -397,11 +397,6 @@ def _architect_response_with_feature_surface_slices() -> dict[str, Any]:
                     "role": "filter",
                     "filePath": "components/features/catalog/catalog-filters.tsx",
                     "publicSymbol": "CatalogFilters",
-                },
-                {
-                    "role": "data_table",
-                    "filePath": "components/features/catalog/catalog-table.tsx",
-                    "publicSymbol": "CatalogTable",
                 },
             ],
         }
@@ -858,6 +853,7 @@ async def test_four_role_sop_creates_version_and_trace(repository, settings) -> 
     assert "publicApiContracts" in architect_system_prompt
     assert "interactionResponsibilities" in architect_system_prompt
     assert "featureSurfaces" in architect_system_prompt
+    assert "two or more declared concerns" in architect_system_prompt
     assert "separate controller module" in architect_system_prompt
     assert "Do not infer or merge UI responsibilities from product-domain names" in architect_system_prompt
     assert "persistent_business, transient, or derived" in architect_system_prompt
@@ -1177,7 +1173,7 @@ async def test_architect_persistent_domain_slices_use_explicit_state_declaration
 
 
 @pytest.mark.asyncio
-async def test_architect_feature_surface_slices_bind_explicit_concerns(repository, settings) -> None:
+async def test_architect_two_concern_feature_surface_slices_bind_explicit_concerns(repository, settings) -> None:
     runner = SOPRunner(repository, ScriptedModelClient({}), FakeSandboxProvider(), settings)
     technical = TechnicalSpec.model_validate(_architect_response_with_feature_surface_slices())
 
@@ -1191,7 +1187,7 @@ async def test_architect_feature_surface_slices_bind_explicit_concerns(repositor
     surface = technical.feature_surfaces[0]
     shared_module = surface.modules[2].model_copy(update={"file_path": surface.modules[1].file_path})
     shared_surface = surface.model_copy(
-        update={"modules": [surface.modules[0], surface.modules[1], shared_module, surface.modules[3]]}
+        update={"modules": [surface.modules[0], surface.modules[1], shared_module]}
     )
     with pytest.raises(ArtifactContractViolation) as shared_file_violation:
         runner._validate_technical_file_plan(
@@ -1533,7 +1529,9 @@ async def test_architect_domain_slice_retry_uses_closed_code_without_event_leak(
 
 
 @pytest.mark.asyncio
-async def test_architect_feature_surface_retry_uses_closed_code_without_event_leak(repository, settings) -> None:
+async def test_architect_feature_surface_retry_uses_closed_component_mapping_code_without_event_leak(
+    repository, settings
+) -> None:
     session = await repository.create_guest_session()
     project = await repository.create_project(session.id, "Catalog")
     _message, run, _created = await repository.create_message_and_run(
@@ -1547,9 +1545,7 @@ async def test_architect_feature_surface_retry_uses_closed_code_without_event_le
     source_marker = "model-body-never-leak"
     invalid_response = _architect_response_with_feature_surface_slices()
     invalid_response["components"][0]["responsibility"] = source_marker
-    invalid_response["featureSurfaces"][0]["modules"][2]["filePath"] = invalid_response[
-        "featureSurfaces"
-    ][0]["modules"][1]["filePath"]
+    invalid_response["featureSurfaces"] = []
     model = ScriptedModelClient(
         {
             "architect": [
@@ -1586,11 +1582,11 @@ async def test_architect_feature_surface_retry_uses_closed_code_without_event_le
     assert retry_event.payload == {
         "action": "structured_retry",
         "summary": "The structured hand-off was invalid; requesting a schema-correct response.",
-        "reasonCode": "technical_spec.feature_surfaces.file_conflict",
+        "reasonCode": "technical_spec.feature_surfaces.component_mapping_invalid",
     }
     repair_instruction = (
-        "Use different model-owned create or modify TechnicalSpec.filePlan files for every feature surface "
-        "composition and module."
+        "Give every ComponentSpec an explicit interactionResponsibilities list and declare exactly one "
+        "featureSurfaces entry for each component with two or more concerns."
     )
     serialized_events = json.dumps([event.payload for event in events])
     assert repair_instruction not in serialized_events
