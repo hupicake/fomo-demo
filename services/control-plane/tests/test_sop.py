@@ -332,8 +332,25 @@ def _architect_response_with_domain_state_slices() -> dict[str, Any]:
     ]
     response["stateAggregation"] = {
         "filePath": "lib/domain/use-library-store.ts",
-        "responsibilities": ["compose", "persist", "re_export"],
+        "responsibilities": ["compose", "re_export"],
+        "persistenceAdapter": {
+            "filePath": "lib/domain/state/library-persistence-adapter.ts",
+            "publicSymbol": "libraryPersistenceAdapter",
+            "storageKey": "fomo.library",
+            "schemaVersion": 1,
+            "responsibilities": ["load", "save", "migrate"],
+        },
     }
+    response["publicApiContracts"] = [
+        *response["publicApiContracts"],
+        {
+            "filePath": "lib/domain/state/library-persistence-adapter.ts",
+            "exportStyle": "named",
+            "symbol": "libraryPersistenceAdapter",
+            "props": [],
+            "type": "StatePersistenceAdapter",
+        },
+    ]
     response["filePlan"] = [
         *response["filePlan"],
         {"path": "lib/domain/state/books-store.ts", "operation": "create", "reason": "book mutations"},
@@ -342,7 +359,12 @@ def _architect_response_with_domain_state_slices() -> dict[str, Any]:
         {
             "path": "lib/domain/use-library-store.ts",
             "operation": "create",
-            "reason": "state composition, persistence, and re-exports only",
+            "reason": "state composition and re-exports only",
+        },
+        {
+            "path": "lib/domain/state/library-persistence-adapter.ts",
+            "operation": "create",
+            "reason": "durable storage loading, saving, and migration",
         },
     ]
     return response
@@ -861,7 +883,12 @@ async def test_four_role_sop_creates_version_and_trace(repository, settings) -> 
     assert "persistentStateDomains" in architect_system_prompt
     assert "independent CRUD lifecycle" in architect_system_prompt
     assert "other umbrella domain" in architect_system_prompt
-    assert "cross-domain CRUD" in architect_system_prompt
+    assert "exactly compose and re_export" in architect_system_prompt
+    assert "storage I/O" in architect_system_prompt
+    assert "persistenceAdapter" in architect_system_prompt
+    assert "load, save, and migrate" in architect_system_prompt
+    assert "must not perform CRUD or UI work" in architect_system_prompt
+    assert "pairwise different" in architect_system_prompt
     engineer_plan_request = next(request for request in model.requests if request[2] == "ImplementationPlan")
     engineer_plan_system_prompt = engineer_plan_request[1][0]["content"]
     assert "at most 1 relative file, with at most 24 batches" in engineer_plan_system_prompt
@@ -1154,6 +1181,86 @@ async def test_architect_persistent_domain_slices_use_explicit_state_declaration
     assert missing_mapping_violation.value.code == "technical_spec.persistent_state_domains.mapping_invalid"
 
     assert technical.state_aggregation is not None
+    aggregation = technical.state_aggregation
+    assert aggregation.persistence_adapter is not None
+    adapter = aggregation.persistence_adapter
+
+    missing_adapter = aggregation.model_copy(update={"persistence_adapter": None})
+    with pytest.raises(ArtifactContractViolation) as missing_adapter_violation:
+        runner._validate_technical_file_plan(
+            technical.model_copy(update={"state_aggregation": missing_adapter})
+        )
+    assert (
+        missing_adapter_violation.value.code
+        == "technical_spec.persistent_state_domains.persistence_adapter_missing"
+    )
+
+    invalid_adapter_responsibilities = adapter.model_copy(
+        update={"responsibilities": ["load", "save", "migrate", "load"]}
+    )
+    with pytest.raises(ArtifactContractViolation) as adapter_responsibilities_violation:
+        runner._validate_technical_file_plan(
+            technical.model_copy(
+                update={
+                    "state_aggregation": aggregation.model_copy(
+                        update={"persistence_adapter": invalid_adapter_responsibilities}
+                    )
+                }
+            )
+        )
+    assert (
+        adapter_responsibilities_violation.value.code
+        == "technical_spec.persistent_state_domains.persistence_adapter_responsibilities_invalid"
+    )
+
+    unplanned_adapter = adapter.model_copy(update={"file_path": "lib/domain/state/missing-adapter.ts"})
+    with pytest.raises(ArtifactContractViolation) as unplanned_adapter_violation:
+        runner._validate_technical_file_plan(
+            technical.model_copy(
+                update={
+                    "state_aggregation": aggregation.model_copy(
+                        update={"persistence_adapter": unplanned_adapter}
+                    )
+                }
+            )
+        )
+    assert (
+        unplanned_adapter_violation.value.code
+        == "technical_spec.persistent_state_domains.persistence_adapter_file_unplanned"
+    )
+
+    conflicting_adapter = adapter.model_copy(update={"file_path": aggregation.file_path})
+    with pytest.raises(ArtifactContractViolation) as adapter_conflict_violation:
+        runner._validate_technical_file_plan(
+            technical.model_copy(
+                update={
+                    "state_aggregation": aggregation.model_copy(
+                        update={"persistence_adapter": conflicting_adapter}
+                    )
+                }
+            )
+        )
+    assert (
+        adapter_conflict_violation.value.code
+        == "technical_spec.persistent_state_domains.persistence_adapter_file_conflict"
+    )
+
+    unbound_adapter = adapter.model_copy(update={"public_symbol": "missingPersistenceAdapter"})
+    with pytest.raises(ArtifactContractViolation) as adapter_unbound_violation:
+        runner._validate_technical_file_plan(
+            technical.model_copy(
+                update={
+                    "state_aggregation": aggregation.model_copy(
+                        update={"persistence_adapter": unbound_adapter}
+                    )
+                }
+            )
+        )
+    assert (
+        adapter_unbound_violation.value.code
+        == "technical_spec.persistent_state_domains.persistence_adapter_public_api_unbound"
+    )
+
     invalid_aggregation = technical.state_aggregation.model_copy(
         update={"responsibilities": ["compose", "cross_domain_crud"]}
     )
@@ -1164,6 +1271,18 @@ async def test_architect_persistent_domain_slices_use_explicit_state_declaration
     assert (
         aggregation_violation.value.code
         == "technical_spec.persistent_state_domains.aggregation_responsibilities_invalid"
+    )
+
+    persist_aggregation = aggregation.model_copy(
+        update={"responsibilities": ["compose", "persist", "re_export"]}
+    )
+    with pytest.raises(ArtifactContractViolation) as persist_rejected_violation:
+        runner._validate_technical_file_plan(
+            technical.model_copy(update={"state_aggregation": persist_aggregation})
+        )
+    assert (
+        persist_rejected_violation.value.code
+        == "technical_spec.persistent_state_domains.aggregation_persist_rejected"
     )
 
     invalid_state_class = _architect_response_with_domain_state_slices()
@@ -1458,7 +1577,9 @@ async def test_system_managed_file_plan_retries_before_sandbox_creation(reposito
 
 
 @pytest.mark.asyncio
-async def test_architect_domain_slice_retry_uses_closed_code_without_event_leak(repository, settings) -> None:
+async def test_architect_persistence_adapter_retry_uses_closed_code_without_event_leak(
+    repository, settings
+) -> None:
     session = await repository.create_guest_session()
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
@@ -1472,9 +1593,7 @@ async def test_architect_domain_slice_retry_uses_closed_code_without_event_leak(
     source_marker = "model-body-never-leak"
     invalid_response = _architect_response_with_domain_state_slices()
     invalid_response["stateModel"][0]["owner"] = source_marker
-    invalid_response["persistentStateDomains"][1]["actionsStoreFile"] = invalid_response[
-        "persistentStateDomains"
-    ][0]["actionsStoreFile"]
+    invalid_response["stateAggregation"]["persistenceAdapter"]["schemaVersion"] = 0
     model = ScriptedModelClient(
         {
             "architect": [
@@ -1511,9 +1630,9 @@ async def test_architect_domain_slice_retry_uses_closed_code_without_event_leak(
     assert retry_event.payload == {
         "action": "structured_retry",
         "summary": "The structured hand-off was invalid; requesting a schema-correct response.",
-        "reasonCode": "technical_spec.persistent_state_domains.file_shared",
+        "reasonCode": "technical_spec.persistent_state_domains.persistence_adapter_schema_version_invalid",
     }
-    repair_instruction = "For three or more persistentStateDomains, give every domain a different actionsStoreFile."
+    repair_instruction = "Set persistenceAdapter.schemaVersion to an integer greater than or equal to 1."
     serialized_events = json.dumps([event.payload for event in events])
     assert repair_instruction not in serialized_events
     assert source_marker not in serialized_events

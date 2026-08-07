@@ -349,13 +349,31 @@ SOPRunner
   "framework": "nextjs",
   "routes": [{ "path": "/", "rendering": "client", "description": "" }],
   "components": [{ "name": "", "responsibility": "", "children": [] }],
-  "stateModel": [{ "name": "", "owner": "", "persistence": "" }],
+  "stateModel": [{ "name": "", "owner": "", "persistence": "", "stateClass": "persistent_business", "mutableDomains": [""] }],
+  "persistentStateDomains": [{ "domain": "", "stateModelName": "", "actionsStoreFile": "" }],
+  "stateAggregation": {
+    "filePath": "",
+    "responsibilities": ["compose", "re_export"],
+    "persistenceAdapter": {
+      "filePath": "",
+      "publicSymbol": "",
+      "storageKey": "",
+      "schemaVersion": 1,
+      "responsibilities": ["load", "save", "migrate"]
+    }
+  },
   "dependencies": [{ "name": "", "reason": "" }],
   "filePlan": [{ "path": "", "operation": "create|modify|delete", "reason": "" }],
   "testPlan": [{ "acceptanceId": "AC-1", "method": "playwright", "steps": [] }],
   "risks": []
 }
 ```
+
+当显式声明的持久业务域达到三个及以上时，`persistentStateDomains.actionsStoreFile`、
+`stateAggregation.filePath` 与 `StatePersistenceAdapterSpec.filePath` 必须是彼此不同、已在
+`filePlan` 中声明且可由模型写入的非删除文件；adapter 的 `(filePath, publicSymbol)` 必须绑定
+到 `publicApiContracts`。aggregation 仅组合和 re-export，禁止 storage I/O 或 migrate；adapter
+仅负责 load/save/migrate，禁止 CRUD 或 UI。
 
 **ImplementationReport** 至少包含基准版本、已实现 AC ID、设计决策 ID、变更文件、执行命令、已知限制和候选 commit；**DiagnosticReport** 至少包含每个 gate 的状态、关联 AC ID、问题 fingerprint、责任角色、阻断问题、证据、定位文件、建议修复和截图引用。
 
