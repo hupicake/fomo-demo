@@ -433,7 +433,7 @@ V1 只实现 `OpenSandboxProvider`：
 
 ### 7.2 OpenSandbox runtime 和基础镜像
 
-自定义基础镜像预装 Node.js 22、pnpm、Git、Playwright Chromium、常用构建工具、OpenSandbox `execd` 和受控 Next.js starter。镜像使用不可变 tag + digest 锁定，其中不放任何长期密钥。
+自定义基础镜像预装 Node.js 22、pnpm、Git、Playwright Chromium、常用构建工具和受控 Next.js starter；OpenSandbox 在创建沙箱时注入 `execd`。镜像使用不可变 tag + digest 锁定，其中不放任何长期密钥。
 
 安全配置：
 

@@ -74,9 +74,11 @@ worker call `http://opensandbox:8080` over the Compose network and never mount
 `sandbox-image` Compose service is in the `build` profile and cannot start in a
 normal `docker compose up`; it exists only as a reproducible image build target.
 The image uses the non-root `node` user with a writable `/workspace`, Node 22,
-pnpm pinned through Corepack, Git, curl, and native Node build tools. Do not add
-OpenSandbox `execd` to it: the OpenSandbox server injects that runtime component
-when it creates a sandbox.
+pnpm pinned through Corepack, Git, Playwright Chromium, native Node build tools,
+and the read-only `fomo-next-radix-v1` source seed. Every workspace copies and
+verifies that seed before its first Git commit. Do not add OpenSandbox `execd`
+to it: the OpenSandbox server injects that runtime component when it creates a
+sandbox.
 
 The API and worker share a Python 3.11 image. Its build installs the locked
 `metagpt` extra because `AGENT_FRAMEWORK=metagpt` is the default; provider keys
