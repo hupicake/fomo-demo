@@ -1,0 +1,238 @@
+name: fomo-dev
+
+x-control-plane-environment: &control-plane-environment
+  APP_ENV: ${APP_ENV:-development}
+  WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost:3000}
+  DATABASE_URL: ${DATABASE_URL_DOCKER:-postgresql+asyncpg://fomo:fomo-local-only@postgres:5432/fomo}
+  REDIS_URL: ${REDIS_URL_DOCKER:-redis://redis:6379/0}
+  S3_ENDPOINT_URL: ${S3_ENDPOINT_URL_DOCKER:-http://minio:9000}
+  S3_REGION: ${S3_REGION:-us-east-1}
+  S3_BUCKET: ${S3_BUCKET:-fomo-artifacts}
+  S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-fomo}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-fomo-minio-local-only-0123456789}
+  LITELLM_BASE_URL: ${LITELLM_BASE_URL_DOCKER:-http://litellm:4000}
+  LITELLM_API_KEY: ${LITELLM_MASTER_KEY:-sk-local-fomo-development-only}
+  MODEL_PM: ${MODEL_PM:-pm}
+  MODEL_ARCHITECT: ${MODEL_ARCHITECT:-architect}
+  MODEL_ENGINEER: ${MODEL_ENGINEER:-engineer}
+  MODEL_REVIEWER: ${MODEL_REVIEWER:-reviewer}
+  AGENT_FRAMEWORK: ${AGENT_FRAMEWORK:-metagpt}
+  SANDBOX_PROVIDER: ${SANDBOX_PROVIDER:-opensandbox}
+  OPENSANDBOX_BASE_URL: ${OPENSANDBOX_BASE_URL_DOCKER:-http://opensandbox:8080}
+  OPENSANDBOX_API_KEY: ${OPENSANDBOX_API_KEY:-fomo-opensandbox-local-development-only}
+  OPENSANDBOX_IMAGE: ${OPENSANDBOX_IMAGE:-fomo-sandbox-node:2026-08-07}
+  OPENSANDBOX_LIFETIME_SECONDS: ${OPENSANDBOX_LIFETIME_SECONDS:-21600}
+  # Generated-code sandboxes never inherit generic container proxy variables.
+  # These are the only explicit, non-secret egress values passed to
+  # OpenSandbox's Sandbox.create(env=...).
+  SANDBOX_HTTP_PROXY: ${SANDBOX_HTTP_PROXY:-}
+  SANDBOX_HTTPS_PROXY: ${SANDBOX_HTTPS_PROXY:-}
+  SANDBOX_NO_PROXY: ${SANDBOX_NO_PROXY:-}
+
+x-control-plane-depends-on: &control-plane-depends-on
+  postgres:
+    condition: service_healthy
+  redis:
+    condition: service_healthy
+  minio-init:
+    condition: service_completed_successfully
+  litellm:
+    condition: service_healthy
+  opensandbox:
+    condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-fomo}
+      POSTGRES_USER: ${POSTGRES_USER:-fomo}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fomo-local-only}
+    ports:
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_HOST_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z-cpuv1
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-fomo}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-fomo-minio-local-only-0123456789}
+    ports:
+      - "${MINIO_API_HOST_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_HOST_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "mc alias set health http://127.0.0.1:9000 \"$${MINIO_ROOT_USER}\" \"$${MINIO_ROOT_PASSWORD}\" >/dev/null && mc ready health >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  minio-init:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z-cpuv1
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-fomo}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-fomo-minio-local-only-0123456789}
+      S3_BUCKET: ${S3_BUCKET:-fomo-artifacts}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}" &&
+        mc mb --ignore-existing "local/$${S3_BUCKET}"
+    restart: "no"
+
+  litellm:
+    image: ghcr.io/berriai/litellm:v1.95.0
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-local-fomo-development-only}
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:-local-litellm-salt-change-before-production-0123456789}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_BASE: ${OPENAI_API_BASE:-https://api.openai.com/v1}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      # Optional only. A macOS host proxy such as 127.0.0.1:7890 is reached
+      # from Docker containers through host.docker.internal:7890.
+      HTTP_PROXY: ${DOCKER_HTTP_PROXY:-}
+      HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-}
+      NO_PROXY: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,::1,postgres,redis,minio,minio-init,litellm,opensandbox,api,worker,web}
+      http_proxy: ${DOCKER_HTTP_PROXY:-}
+      https_proxy: ${DOCKER_HTTPS_PROXY:-}
+      no_proxy: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,::1,postgres,redis,minio,minio-init,litellm,opensandbox,api,worker,web}
+    ports:
+      - "${LITELLM_HOST_PORT:-4000}:4000"
+    volumes:
+      - ./infra/litellm/config.yaml:/app/config.yaml:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness', timeout=3).read()"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  # This is the only service allowed to manage Docker sandboxes. Future API and
+  # worker services call its HTTP API over the Compose network; they must never
+  # receive the Docker socket.
+  opensandbox:
+    image: opensandbox/server:v0.2.2
+    environment:
+      SANDBOX_CONFIG_PATH: /etc/opensandbox/config.toml
+      OPENSANDBOX_SERVER_API_KEY: ${OPENSANDBOX_API_KEY:-fomo-opensandbox-local-development-only}
+    ports:
+      # The lifecycle API is useful to a host-run control plane during local
+      # development, but must not be reachable from the LAN.
+      - "127.0.0.1:${OPENSANDBOX_HOST_PORT:-8080}:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./infra/opensandbox/config.toml:/etc/opensandbox/config.toml:ro
+      - opensandbox-metadata:/var/lib/opensandbox
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).read()"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  # Build-only target for the image used by generated applications. The profile
+  # keeps it out of normal `docker compose up` runs; OpenSandbox creates the
+  # actual short-lived sandbox containers through its own Docker API access.
+  sandbox-image:
+    profiles: ["build"]
+    build:
+      context: ./infra/opensandbox
+      dockerfile: Dockerfile
+      args:
+        HTTP_PROXY: ${DOCKER_HTTP_PROXY:-}
+        HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-}
+        NO_PROXY: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,::1,postgres,redis,minio,minio-init,litellm,opensandbox,api,worker,web}
+    image: fomo-sandbox-node:2026-08-07
+    entrypoint: ["/bin/true"]
+    restart: "no"
+
+  api:
+    build:
+      context: ./services/control-plane
+      dockerfile: Dockerfile
+      args:
+        HTTP_PROXY: ${DOCKER_HTTP_PROXY:-}
+        HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-}
+        NO_PROXY: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,::1,postgres,redis,minio,minio-init,litellm,opensandbox,api,worker,web}
+    image: fomo-control-plane:local
+    command: ["fomo-api"]
+    environment: *control-plane-environment
+    depends_on: *control-plane-depends-on
+    ports:
+      - "127.0.0.1:${API_HOST_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  worker:
+    image: fomo-control-plane:local
+    command: ["fomo-worker"]
+    environment: *control-plane-environment
+    depends_on: *control-plane-depends-on
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+        HTTP_PROXY: ${DOCKER_HTTP_PROXY:-}
+        HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-}
+        NO_PROXY: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,::1,postgres,redis,minio,minio-init,litellm,opensandbox,api,worker,web}
+    image: fomo-web:local
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      HOSTNAME: 0.0.0.0
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${WEB_HOST_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:
+  opensandbox-metadata:

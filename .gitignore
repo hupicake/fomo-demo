@@ -1,0 +1,26 @@
+# Local secrets and overrides
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# JavaScript
+node_modules/
+.next/
+.turbo/
+coverage/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+
+# Local tooling
+.DS_Store
+.idea/
+.vscode/
+logs/
