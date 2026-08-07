@@ -16,7 +16,7 @@ from fomo.agent_runtime.metagpt_adapter import (
     MetaGPTAvailability,
     MetaGPTUnavailable,
 )
-from fomo.agent_runtime.sop import SOPExecutionError, SOPRunner
+from fomo.agent_runtime.sop import ArtifactContractViolation, SOPExecutionError, SOPRunner
 from fomo.agent_runtime.state import FailureRouter, SOPStateMachine
 from fomo.sandbox.base import ExecResult
 from fomo.sandbox.fake import FakeSandboxProvider
@@ -430,6 +430,10 @@ async def test_four_role_sop_creates_version_and_trace(repository, settings) -> 
     assert "dynamic hostname" in architect_system_prompt
     assert "React + TypeScript + Tailwind CSS + shadcn/ui + Lucide React" in architect_system_prompt
     assert "componentDecisions" in architect_system_prompt
+    assert "decision-bearing UI primitives" in architect_system_prompt
+    assert "not a component inventory" in architect_system_prompt
+    assert "without requiring a same-name decision" in architect_system_prompt
+    assert "Avoid per-control Button/Card/Input decisions" in architect_system_prompt
     assert "publicApiContracts" in architect_system_prompt
     engineer_plan_request = next(request for request in model.requests if request[2] == "ImplementationPlan")
     engineer_plan_system_prompt = engineer_plan_request[1][0]["content"]
@@ -620,13 +624,28 @@ async def test_architect_contracts_bind_component_decisions_and_public_api_files
     technical = TechnicalSpec.model_validate(_responses()["architect"])
 
     runner._validate_technical_file_plan(technical)
-    with pytest.raises(ValueError, match="explain every planned component decision"):
-        runner._validate_technical_file_plan(technical.model_copy(update={"component_decisions": []}))
+    empty_decisions_response = dict(_responses()["architect"])
+    empty_decisions_response["componentDecisions"] = []
+    with pytest.raises(ValueError):
+        TechnicalSpec.model_validate(empty_decisions_response)
+    unmatched_component_response = dict(_responses()["architect"])
+    unmatched_component_response["components"] = [
+        {"name": "BookRow", "responsibility": "render a book", "children": []}
+    ]
+    runner._validate_technical_file_plan(TechnicalSpec.model_validate(unmatched_component_response))
+    with pytest.raises(ArtifactContractViolation) as duplicate_decisions:
+        runner._validate_technical_file_plan(
+            technical.model_copy(
+                update={"component_decisions": [technical.component_decisions[0], technical.component_decisions[0]]}
+            )
+        )
+    assert duplicate_decisions.value.code == "architect.component_decision.duplicate"
     invalid_contract = technical.public_api_contracts[0].model_copy(update={"file_path": "missing.ts"})
-    with pytest.raises(ValueError, match="must reference an Architect-planned file"):
+    with pytest.raises(ArtifactContractViolation) as unplanned_contract:
         runner._validate_technical_file_plan(
             technical.model_copy(update={"public_api_contracts": [invalid_contract]})
         )
+    assert unplanned_contract.value.code == "architect.public_api.file_unplanned"
     no_contract_response = dict(_responses()["architect"])
     no_contract_response.pop("publicApiContracts")
     no_contract_technical = TechnicalSpec.model_validate(no_contract_response)
@@ -636,10 +655,11 @@ async def test_architect_contracts_bind_component_decisions_and_public_api_files
         item.model_copy(update={"operation": "delete"}) if item.path == "app.js" else item
         for item in technical.file_plan
     ]
-    with pytest.raises(ValueError, match="must not reference a file scheduled for deletion"):
+    with pytest.raises(ArtifactContractViolation) as deleted_contract:
         runner._validate_technical_file_plan(
             technical.model_copy(update={"file_plan": deleted_file_plan})
         )
+    assert deleted_contract.value.code == "architect.public_api.file_deleted"
 
 
 @pytest.mark.asyncio
@@ -756,8 +776,10 @@ async def test_architect_file_plan_rejects_system_managed_paths(repository, sett
     runner = SOPRunner(repository, ScriptedModelClient({}), FakeSandboxProvider(), settings)
     technical = TechnicalSpec.model_validate(_architect_response_with_system_managed_path(path))
 
-    with pytest.raises(ValueError, match="system-managed path"):
+    with pytest.raises(ArtifactContractViolation) as violation:
         runner._validate_technical_file_plan(technical)
+    assert violation.value.code == "architect.file_plan.system_managed"
+    assert violation.value.repair_instruction == "Remove system-managed files from TechnicalSpec.filePlan."
 
 
 @pytest.mark.asyncio
@@ -798,11 +820,25 @@ async def test_system_managed_file_plan_retries_before_sandbox_creation(reposito
     assert technical is not None
     assert {item["path"] for item in technical["filePlan"]} == {"package.json", "app.js"}
     events = await repository.list_events(run.id)
-    assert any(
-        event.kind == "agent.activity"
+    retry_event = next(
+        event
+        for event in events
+        if event.kind == "agent.activity"
         and event.role == "architect"
         and event.payload.get("action") == "structured_retry"
-        for event in events
+    )
+    assert retry_event.payload["reasonCode"] == "architect.file_plan.system_managed"
+    repair_instruction = "Remove system-managed files from TechnicalSpec.filePlan."
+    assert repair_instruction not in json.dumps([event.payload for event in events])
+    architect_requests = [request for request in model.requests if request[0] == "architect"]
+    correction_message = next(
+        message["content"]
+        for message in architect_requests[1][1]
+        if message["content"].startswith("Return only a valid TechnicalSpec JSON object")
+    )
+    assert correction_message == (
+        "Return only a valid TechnicalSpec JSON object matching the declared schema.\n"
+        + repair_instruction
     )
 
 
@@ -1004,10 +1040,20 @@ async def test_metagpt_model_failure_uses_controlled_message_and_fomo_retry(
     assert secret_marker not in controlled_failure.content
     assert secret_marker not in controlled_failure.model_dump_json()
     events = await repository.list_events(run.id)
-    assert any(
-        event.kind == "agent.activity" and event.payload.get("action") == "structured_retry"
+    retry_event = next(
+        event
         for event in events
+        if event.kind == "agent.activity" and event.payload.get("action") == "structured_retry"
     )
+    assert "reasonCode" not in retry_event.payload
+    pm_retry_request = [request for request in model.requests if request[0] == "pm"][1]
+    correction_message = next(
+        message["content"]
+        for message in pm_retry_request[1]
+        if message["content"].startswith("Return only a valid ProductSpec JSON object")
+    )
+    assert correction_message == "Return only a valid ProductSpec JSON object matching the declared schema."
+    assert secret_marker not in correction_message
     assert secret_marker not in json.dumps([event.payload for event in events])
 
 
