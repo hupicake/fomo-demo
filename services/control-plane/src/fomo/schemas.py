@@ -167,11 +167,24 @@ class PersistentStateDomainSpec(SchemaModel):
     actions_store_file: str = Field(min_length=1)
 
 
+class StatePersistenceAdapterSpec(SchemaModel):
+    """The sole storage boundary shared by composed persistent state slices."""
+
+    file_path: str = Field(min_length=1)
+    public_symbol: str = Field(min_length=1)
+    storage_key: str = Field(min_length=1)
+    # The SOP enforces >= 1 so an invalid structured hand-off gets its closed
+    # repair code instead of a generic Pydantic validation failure.
+    schema_version: int
+    responsibilities: list[str] = Field(min_length=1)
+
+
 class StateAggregationSpec(SchemaModel):
     """The deliberately narrow composition boundary for domain state slices."""
 
     file_path: str = Field(min_length=1)
     responsibilities: list[str] = Field(min_length=1)
+    persistence_adapter: StatePersistenceAdapterSpec | None = None
 
 
 class DependencySpec(SchemaModel):

@@ -86,7 +86,8 @@ _SYSTEM_MANAGED_FILE_PLAN_NAMES = frozenset(
     }
 )
 _MAX_REPAIR_SCOPE_FILES = 8
-_STATE_AGGREGATION_RESPONSIBILITIES = frozenset({"compose", "persist", "re_export"})
+_STATE_AGGREGATION_RESPONSIBILITIES = frozenset({"compose", "re_export"})
+_STATE_PERSISTENCE_ADAPTER_RESPONSIBILITIES = frozenset({"load", "save", "migrate"})
 _FEATURE_SURFACE_COMPOSITION_RESPONSIBILITIES = frozenset({"compose", "layout", "props"})
 _DEFAULT_FRONTEND_STACK_CONTRACT = (
     "Use FOMO's default Next.js + React + TypeScript + Tailwind CSS + shadcn/ui + Lucide React "
@@ -195,8 +196,35 @@ _TECHNICAL_SPEC_REPAIR_INSTRUCTIONS = MappingProxyType(
             "Use a stateAggregation.filePath different from every persistentStateDomains.actionsStoreFile."
         ),
         "technical_spec.persistent_state_domains.aggregation_responsibilities_invalid": (
-            "Limit stateAggregation.responsibilities to compose, persist, and re_export; do not put cross-domain "
-            "CRUD there."
+            "Set stateAggregation.responsibilities to exactly compose and re_export without duplicates."
+        ),
+        "technical_spec.persistent_state_domains.aggregation_persist_rejected": (
+            "Remove persist from stateAggregation.responsibilities; only the persistenceAdapter may load, save, or "
+            "migrate storage."
+        ),
+        "technical_spec.persistent_state_domains.persistence_adapter_missing": (
+            "For three or more persistentStateDomains, declare stateAggregation.persistenceAdapter with its filePath, "
+            "publicSymbol, storageKey, schemaVersion, and load/save/migrate responsibilities."
+        ),
+        "technical_spec.persistent_state_domains.persistence_adapter_file_invalid": (
+            "Use a valid relative workspace path for stateAggregation.persistenceAdapter.filePath."
+        ),
+        "technical_spec.persistent_state_domains.persistence_adapter_file_unplanned": (
+            "Reference a model-owned create or modify TechnicalSpec.filePlan file from "
+            "stateAggregation.persistenceAdapter.filePath."
+        ),
+        "technical_spec.persistent_state_domains.persistence_adapter_file_conflict": (
+            "Use a persistenceAdapter.filePath different from every persistentStateDomains.actionsStoreFile and "
+            "stateAggregation.filePath."
+        ),
+        "technical_spec.persistent_state_domains.persistence_adapter_public_api_unbound": (
+            "Bind stateAggregation.persistenceAdapter.filePath and publicSymbol to publicApiContracts."
+        ),
+        "technical_spec.persistent_state_domains.persistence_adapter_responsibilities_invalid": (
+            "Set persistenceAdapter.responsibilities to exactly load, save, and migrate without duplicates."
+        ),
+        "technical_spec.persistent_state_domains.persistence_adapter_schema_version_invalid": (
+            "Set persistenceAdapter.schemaVersion to an integer greater than or equal to 1."
         ),
     }
 )
@@ -524,9 +552,14 @@ class SOPRunner:
                         "persistent business mutableDomains reaches three or more, map each domain exactly once in "
                         "persistentStateDomains with stateModelName and a model-owned actionsStoreFile. Every such "
                         "actionsStoreFile must be a different create or modify filePlan file. Declare a separate "
-                        "stateAggregation filePlan entry whose "
-                        "responsibilities are limited to compose, persist, and re_export; it must not contain cross-domain "
-                        "CRUD or share a file with a domain actionsStoreFile. "
+                        "stateAggregation filePlan entry whose responsibilities are exactly compose and re_export. "
+                        "stateAggregation may only compose and re-export domain state: it must not perform CRUD, UI work, "
+                        "storage I/O, or migration. Its required persistenceAdapter must be a separate model-owned create "
+                        "or modify filePlan file with filePath, publicSymbol, storageKey, schemaVersion >= 1, and exactly "
+                        "load, save, and migrate responsibilities. Bind that adapter filePath/publicSymbol pair in "
+                        "publicApiContracts. The persistenceAdapter alone owns load/save/migrate storage work and must not "
+                        "perform CRUD or UI work. Keep actionsStoreFile, stateAggregation.filePath, and "
+                        "persistenceAdapter.filePath pairwise different. "
                         "Strictly use the JSON Schema's literal enum values (never descriptive "
                         f"variants), fit TechnicalSpec.filePlan within {max_batches} Engineer batches of at most "
                         f"{max_files_per_batch} unique valid relative workspace {path_label} each (no more than "
@@ -943,7 +976,6 @@ class SOPRunner:
         planned_files = {
             str(validate_workspace_path(item.path)): item for item in technical.file_plan
         }
-        self._validate_persistent_state_domain_slices(technical, planned_files)
         contract_keys: list[tuple[str, str]] = []
         for contract in technical.public_api_contracts:
             try:
@@ -966,12 +998,15 @@ class SOPRunner:
             raise ArtifactContractViolation(
                 code="technical_spec.public_api_contracts.symbol_duplicate",
             )
-        self._validate_feature_surface_slices(technical, planned_files, set(contract_keys))
+        public_api_keys = set(contract_keys)
+        self._validate_persistent_state_domain_slices(technical, planned_files, public_api_keys)
+        self._validate_feature_surface_slices(technical, planned_files, public_api_keys)
 
     def _validate_persistent_state_domain_slices(
         self,
         technical: TechnicalSpec,
         planned_files: dict[str, Any],
+        public_api_keys: set[tuple[str, str]],
     ) -> None:
         """Bind durable domain state to independently writable model-owned files."""
         state_model_names = [state.name for state in technical.state_model]
@@ -1056,12 +1091,53 @@ class SOPRunner:
                 code="technical_spec.persistent_state_domains.aggregation_file_conflict",
             )
         responsibilities = aggregation.responsibilities
+        if "persist" in responsibilities:
+            raise ArtifactContractViolation(
+                code="technical_spec.persistent_state_domains.aggregation_persist_rejected",
+            )
         if (
             len(responsibilities) != len(set(responsibilities))
-            or not set(responsibilities).issubset(_STATE_AGGREGATION_RESPONSIBILITIES)
+            or set(responsibilities) != _STATE_AGGREGATION_RESPONSIBILITIES
         ):
             raise ArtifactContractViolation(
                 code="technical_spec.persistent_state_domains.aggregation_responsibilities_invalid",
+            )
+
+        adapter = aggregation.persistence_adapter
+        if adapter is None:
+            raise ArtifactContractViolation(
+                code="technical_spec.persistent_state_domains.persistence_adapter_missing",
+            )
+        try:
+            adapter_path = str(validate_workspace_path(adapter.file_path))
+        except ValueError:
+            raise ArtifactContractViolation(
+                code="technical_spec.persistent_state_domains.persistence_adapter_file_invalid",
+            ) from None
+        planned_adapter_file = planned_files.get(adapter_path)
+        if planned_adapter_file is None or planned_adapter_file.operation == "delete":
+            raise ArtifactContractViolation(
+                code="technical_spec.persistent_state_domains.persistence_adapter_file_unplanned",
+            )
+        if adapter_path in {*actions_store_paths, aggregation_path}:
+            raise ArtifactContractViolation(
+                code="technical_spec.persistent_state_domains.persistence_adapter_file_conflict",
+            )
+        adapter_responsibilities = adapter.responsibilities
+        if (
+            len(adapter_responsibilities) != len(set(adapter_responsibilities))
+            or set(adapter_responsibilities) != _STATE_PERSISTENCE_ADAPTER_RESPONSIBILITIES
+        ):
+            raise ArtifactContractViolation(
+                code="technical_spec.persistent_state_domains.persistence_adapter_responsibilities_invalid",
+            )
+        if adapter.schema_version < 1:
+            raise ArtifactContractViolation(
+                code="technical_spec.persistent_state_domains.persistence_adapter_schema_version_invalid",
+            )
+        if (adapter_path, adapter.public_symbol) not in public_api_keys:
+            raise ArtifactContractViolation(
+                code="technical_spec.persistent_state_domains.persistence_adapter_public_api_unbound",
             )
 
     def _validate_feature_surface_slices(
