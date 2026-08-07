@@ -292,6 +292,9 @@ class GateResult(SchemaModel):
     status: GateStatus
     summary: str
     evidence: list[str] = Field(default_factory=list)
+    # Deterministic QA may expose only normalized workspace paths, never the
+    # command output used to derive them.
+    affected_files: list[str] = Field(default_factory=list)
 
 
 class DiagnosticFinding(SchemaModel):
