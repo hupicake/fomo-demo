@@ -597,6 +597,27 @@ async def test_four_role_sop_creates_version_and_trace(repository, settings) -> 
 
 
 @pytest.mark.asyncio
+async def test_architect_prompt_uses_configured_file_character_limit(repository, settings) -> None:
+    session = await repository.create_guest_session()
+    project = await repository.create_project(session.id, "Library")
+    _message, run, _created = await repository.create_message_and_run(
+        project.id, session.id, "message-file-character-limit", "Create a book management system"
+    )
+    assert await repository.claim_next_run("test-worker", 60)
+    model = ScriptedModelClient(_responses())
+
+    await SOPRunner(
+        repository,
+        model,
+        FakeSandboxProvider(),
+        replace(settings, engineer_max_file_characters=4321),
+    ).run(run.id)
+
+    architect_request = next(request for request in model.requests if request[0] == "architect")
+    assert "Engineer 4321-character source limit" in architect_request[1][0]["content"]
+
+
+@pytest.mark.asyncio
 async def test_system_gitignore_is_idempotent_and_recovers_a_permission_protected_tamper(
     repository, settings
 ) -> None:
