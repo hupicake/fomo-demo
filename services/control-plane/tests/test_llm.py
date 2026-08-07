@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import re
+from datetime import UTC, datetime, timedelta
+from email.utils import format_datetime
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -129,6 +133,7 @@ async def test_retryable_gateway_responses_follow_retry_after_without_using_sop_
         network_retry_base_delay_seconds=0.1,
         network_retry_max_delay_seconds=0.2,
         retry_after_max_seconds=1.0,
+        random_source=lambda: 1.0,
     )
 
     result = await client.complete_json("architect", [], "TechnicalSpec", on_retry=record_retry)
@@ -141,6 +146,98 @@ async def test_retryable_gateway_responses_follow_retry_after_without_using_sop_
         (2, 504, 0.2),
     ]
     assert all(event.failure_kind == "gateway_status" for event in retry_events)
+
+
+@pytest.mark.asyncio
+async def test_429_honors_numeric_retry_after_with_a_bounded_cap(monkeypatch) -> None:
+    captured: list[dict[str, Any]] = []
+    sequence = [_Response(429, {"Retry-After": "9"}), _Response()]
+    sleeps: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(
+        llm_module.httpx,
+        "AsyncClient",
+        lambda **kwargs: _SequencedAsyncClient(sequence, captured, **kwargs),
+    )
+    monkeypatch.setattr(llm_module.asyncio, "sleep", record_sleep)
+
+    assert await OpenAICompatibleClient(
+        "http://localhost:4000/v1",
+        network_retries=1,
+        network_retry_base_delay_seconds=0.1,
+        network_retry_max_delay_seconds=0.2,
+        retry_after_max_seconds=1.5,
+        random_source=lambda: 1.0,
+    ).complete_json("engineer", [], "ImplementationPlan") == {"status": "ok"}
+
+    assert len(captured) == 2
+    assert sleeps == [1.5]
+
+
+@pytest.mark.asyncio
+async def test_429_honors_http_date_retry_after_with_an_injected_clock(monkeypatch) -> None:
+    captured: list[dict[str, Any]] = []
+    fixed_now = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
+    sequence = [
+        _Response(429, {"Retry-After": format_datetime(fixed_now + timedelta(seconds=3), usegmt=True)}),
+        _Response(),
+    ]
+    sleeps: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(
+        llm_module.httpx,
+        "AsyncClient",
+        lambda **kwargs: _SequencedAsyncClient(sequence, captured, **kwargs),
+    )
+    monkeypatch.setattr(llm_module.asyncio, "sleep", record_sleep)
+
+    assert await OpenAICompatibleClient(
+        "http://localhost:4000/v1",
+        network_retries=1,
+        network_retry_base_delay_seconds=0.1,
+        network_retry_max_delay_seconds=0.2,
+        retry_after_max_seconds=5.0,
+        random_source=lambda: 1.0,
+        now=lambda: fixed_now,
+    ).complete_json("reviewer", [], "DiagnosticReport") == {"status": "ok"}
+
+    assert len(captured) == 2
+    assert sleeps == [3.0]
+
+
+@pytest.mark.asyncio
+async def test_retry_backoff_uses_injected_bounded_jitter(monkeypatch) -> None:
+    captured: list[dict[str, Any]] = []
+    sequence = [_Response(504), _Response(504), _Response()]
+    samples = iter((0.0, 1.0))
+    sleeps: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(
+        llm_module.httpx,
+        "AsyncClient",
+        lambda **kwargs: _SequencedAsyncClient(sequence, captured, **kwargs),
+    )
+    monkeypatch.setattr(llm_module.asyncio, "sleep", record_sleep)
+
+    assert await OpenAICompatibleClient(
+        "http://localhost:4000/v1",
+        network_retries=2,
+        network_retry_base_delay_seconds=0.2,
+        network_retry_max_delay_seconds=0.3,
+        random_source=lambda: next(samples),
+    ).complete_json("architect", [], "TechnicalSpec") == {"status": "ok"}
+
+    assert len(captured) == 3
+    assert sleeps == [0.1, 0.3]
 
 
 @pytest.mark.asyncio
@@ -176,6 +273,7 @@ async def test_retryable_transport_errors_get_an_independent_retry_budget(monkey
         network_retries=2,
         network_retry_base_delay_seconds=0.1,
         network_retry_max_delay_seconds=0.2,
+        random_source=lambda: 1.0,
     )
 
     assert await client.complete_json("architect", [], "TechnicalSpec", on_retry=record_retry) == {
@@ -241,6 +339,7 @@ async def test_exhausted_gateway_retries_return_a_safe_error(monkeypatch) -> Non
         network_retries=2,
         network_retry_base_delay_seconds=0.1,
         network_retry_max_delay_seconds=0.2,
+        random_source=lambda: 1.0,
     )
 
     with pytest.raises(ModelRequestError) as raised:
@@ -304,3 +403,19 @@ def test_settings_reads_network_retry_environment(monkeypatch) -> None:
     assert settings.engineer_max_batches == 6
     assert settings.engineer_max_files_per_batch == 2
     assert settings.engineer_max_file_characters == 8000
+
+
+def test_gpt55_role_routes_use_high_reasoning_effort_without_pro_models() -> None:
+    config = (Path(__file__).resolve().parents[3] / "infra" / "litellm" / "config.yaml").read_text(
+        encoding="utf-8"
+    )
+    for alias in ("pm-fallback", "architect-fallback", "engineer", "reviewer-fallback"):
+        match = re.search(
+            rf"(?ms)^  - model_name: {re.escape(alias)}\n(?P<body>.*?)(?=^  - model_name:|\Z)",
+            config,
+        )
+        assert match is not None
+        assert "model: openai/gpt-5.5" in match.group("body")
+        assert "reasoning_effort: high" in match.group("body")
+
+    assert all("pro" not in model.lower() for model in re.findall(r"^      model: (.+)$", config, re.M))

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
+import random
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -90,6 +91,8 @@ class OpenAICompatibleClient:
         network_retry_base_delay_seconds: float = 0.5,
         network_retry_max_delay_seconds: float = 4.0,
         retry_after_max_seconds: float = 30.0,
+        random_source: Callable[[], float] | None = None,
+        now: Callable[[], datetime] | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self._api_key = api_key
@@ -103,6 +106,10 @@ class OpenAICompatibleClient:
             network_retry_max_delay_seconds,
         )
         self.retry_after_max_seconds = max(0.0, retry_after_max_seconds)
+        # Both sources are injectable so retry timing stays deterministic in
+        # tests without weakening production's jittered recovery behavior.
+        self._random_source = random_source or random.random
+        self._now = now or (lambda: datetime.now(UTC))
 
     async def complete_json(
         self,
@@ -229,13 +236,20 @@ class OpenAICompatibleClient:
             await observer(retry)
 
     def _retry_delay(self, retry_index: int, retry_after: str | None = None) -> float:
-        retry_after_delay = _parse_retry_after(retry_after)
-        if retry_after_delay is not None and retry_after_delay <= self.retry_after_max_seconds:
-            return retry_after_delay
-        return min(
+        exponential_delay = min(
             self.network_retry_max_delay_seconds,
             self.network_retry_base_delay_seconds * (2**retry_index),
         )
+        # Equal jitter keeps retries from synchronizing while preserving at
+        # least half of the bounded exponential delay.
+        jitter = min(1.0, max(0.0, float(self._random_source())))
+        backoff_delay = exponential_delay * (0.5 + 0.5 * jitter)
+        retry_after_delay = _parse_retry_after(retry_after, now=self._now)
+        if retry_after_delay is None:
+            return backoff_delay
+        # A valid gateway hint is a lower bound for the retry. Cap it so a
+        # malformed or excessive date cannot hold a worker indefinitely.
+        return max(backoff_delay, min(retry_after_delay, self.retry_after_max_seconds))
 
 
 def _is_loopback_url(url: str) -> bool:
@@ -250,7 +264,11 @@ def _is_loopback_url(url: str) -> bool:
         return False
 
 
-def _parse_retry_after(value: str | None) -> float | None:
+def _parse_retry_after(
+    value: str | None,
+    *,
+    now: Callable[[], datetime] | None = None,
+) -> float | None:
     if value is None:
         return None
     try:
@@ -262,7 +280,10 @@ def _parse_retry_after(value: str | None) -> float | None:
             return None
         if retry_at.tzinfo is None:
             retry_at = retry_at.replace(tzinfo=UTC)
-        seconds = (retry_at - datetime.now(UTC)).total_seconds()
+        current = (now or (lambda: datetime.now(UTC)))()
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=UTC)
+        seconds = (retry_at - current).total_seconds()
     return seconds if seconds >= 0 else None
 
 

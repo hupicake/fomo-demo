@@ -20,7 +20,14 @@ from fomo.agent_runtime.sop import SOPExecutionError, SOPRunner
 from fomo.agent_runtime.state import FailureRouter, SOPStateMachine
 from fomo.sandbox.base import ExecResult
 from fomo.sandbox.fake import FakeSandboxProvider
-from fomo.schemas import DiagnosticReport, ImplementationPlan, RunPhase, TechnicalSpec
+from fomo.schemas import (
+    DiagnosticReport,
+    GateResult,
+    GateStatus,
+    ImplementationPlan,
+    RunPhase,
+    TechnicalSpec,
+)
 from fomo.worker.runner import WorkerRunner
 
 
@@ -101,6 +108,35 @@ def _two_batch_engineer_cycle() -> list[dict[str, Any] | object]:
     ]
 
 
+def _single_file_repair_engineer_cycle() -> list[dict[str, Any] | object]:
+    return [
+        {
+            "baselineVersionId": None,
+            "batches": [
+                {
+                    "id": "library-ui-repair",
+                    "purpose": "repair the diagnosed library UI file",
+                    "paths": ["app.js"],
+                    "acceptanceIds": ["AC-1"],
+                }
+            ],
+            "designDecisionIds": ["DD-1"],
+            "knownLimitations": [],
+        },
+        {
+            "batchId": "library-ui-repair",
+            "implementedAcceptanceIds": ["AC-1"],
+            "designDecisionIds": ["DD-1"],
+            "changedFiles": ["app.js"],
+            "knownLimitations": [],
+            "fileChanges": [
+                {"path": "app.js", "operation": "modify", "content": "console.log('library repair')"}
+            ],
+        },
+        _final_implementation_response,
+    ]
+
+
 def _responses() -> dict[str, Any]:
     return {
         "pm": {
@@ -120,6 +156,29 @@ def _responses() -> dict[str, Any]:
             "framework": "nextjs",
             "routes": [{"path": "/", "rendering": "client", "description": "library"}],
             "components": [{"name": "Library", "responsibility": "books", "children": []}],
+            "componentDecisions": [
+                {
+                    "component": "Button",
+                    "strategy": "reuse",
+                    "source": "shadcn/ui",
+                    "rationale": "Use the maintained accessible primitive for common actions.",
+                },
+                {
+                    "component": "Library",
+                    "strategy": "custom",
+                    "source": "application",
+                    "rationale": "Its book-domain composition is specific to this product.",
+                },
+            ],
+            "publicApiContracts": [
+                {
+                    "filePath": "app.js",
+                    "exportStyle": "named",
+                    "symbol": "Library",
+                    "props": [],
+                    "type": "React.ComponentType",
+                }
+            ],
             "stateModel": [{"name": "books", "owner": "client", "persistence": "local"}],
             "dependencies": [],
             "filePlan": [
@@ -154,6 +213,15 @@ def _architect_response_with_file_plan_count(count: int) -> dict[str, Any]:
         }
         for index in range(count)
     ]
+    response["publicApiContracts"] = [
+        {
+            "filePath": "src/generated/file-0.ts",
+            "exportStyle": "named",
+            "symbol": "GeneratedFile",
+            "props": [],
+            "type": "unknown",
+        }
+    ]
     return response
 
 
@@ -166,13 +234,24 @@ def _architect_response_with_system_managed_path(path: str) -> dict[str, Any]:
             "reason": "test-only invalid system-managed file-plan fixture",
         }
     ]
+    response["publicApiContracts"] = [
+        {
+            "filePath": path,
+            "exportStyle": "named",
+            "symbol": "SystemManagedFixture",
+            "props": [],
+            "type": "unknown",
+        }
+    ]
     return response
 
 
 def _repair_responses() -> dict[str, Any]:
     responses = _responses()
-    responses["engineer"] = [*responses["engineer"], *_engineer_cycle()]
-    responses["reviewer"] = [responses["reviewer"], responses["reviewer"]]
+    responses["engineer"] = [*responses["engineer"], *_single_file_repair_engineer_cycle()]
+    initial_reviewer = dict(responses["reviewer"])
+    initial_reviewer["locationFiles"] = ["app.js"]
+    responses["reviewer"] = [initial_reviewer, responses["reviewer"]]
     return responses
 
 
@@ -349,6 +428,9 @@ async def test_four_role_sop_creates_version_and_trace(repository, settings) -> 
     assert "0.0.0.0" in architect_system_prompt
     assert "http://127.0.0.1:<port>" in architect_system_prompt
     assert "dynamic hostname" in architect_system_prompt
+    assert "React + TypeScript + Tailwind CSS + shadcn/ui + Lucide React" in architect_system_prompt
+    assert "componentDecisions" in architect_system_prompt
+    assert "publicApiContracts" in architect_system_prompt
     engineer_plan_request = next(request for request in model.requests if request[2] == "ImplementationPlan")
     engineer_plan_system_prompt = engineer_plan_request[1][0]["content"]
     assert "at most 1 relative file, with at most 24 batches" in engineer_plan_system_prompt
@@ -357,11 +439,18 @@ async def test_four_role_sop_creates_version_and_trace(repository, settings) -> 
     assert "0.0.0.0" in engineer_plan_system_prompt
     assert "http://127.0.0.1:<port>" in engineer_plan_system_prompt
     assert "dynamic hostname" in engineer_plan_system_prompt
-    engineer_batch_request = next(request for request in model.requests if request[2] == "FileBatchReport")
-    engineer_batch_system_prompt = engineer_batch_request[1][0]["content"]
+    assert "React + TypeScript + Tailwind CSS + shadcn/ui + Lucide React" in engineer_plan_system_prompt
+    assert "publicApiContracts" in engineer_plan_system_prompt
+    engineer_batch_requests = [request for request in model.requests if request[2] == "FileBatchReport"]
+    assert len(engineer_batch_requests) == 2
+    engineer_batch_system_prompt = engineer_batch_requests[0][1][0]["content"]
     assert "0.0.0.0" in engineer_batch_system_prompt
     assert "http://127.0.0.1:<port>" in engineer_batch_system_prompt
     assert "dynamic hostname" in engineer_batch_system_prompt
+    assert "React + TypeScript + Tailwind CSS + shadcn/ui + Lucide React" in engineer_batch_system_prompt
+    for engineer_batch_request in engineer_batch_requests:
+        assert "Shared public API contracts" in engineer_batch_request[1][1]["content"]
+        assert '"symbol":"Library"' in engineer_batch_request[1][1]["content"]
 
     # On refresh a finished run remains non-active, but its whole visible
     # workbench trace is still available for the client to reconstruct.
@@ -467,6 +556,52 @@ async def test_engineer_plan_must_exactly_cover_architect_file_plan(repository, 
     )
     with pytest.raises(ValueError, match="exactly match the architect TechnicalSpec file plan"):
         runner._validate_implementation_plan(extra_path_plan, technical)
+
+
+@pytest.mark.asyncio
+async def test_repair_scope_rejects_an_unrelated_full_rewrite(repository, settings) -> None:
+    runner = SOPRunner(repository, ScriptedModelClient({}), FakeSandboxProvider(), settings)
+    technical = TechnicalSpec.model_validate(_responses()["architect"])
+    diagnostic = DiagnosticReport(location_files=["app.js"])
+
+    scoped_technical = runner._repair_technical(technical, diagnostic)
+
+    assert [item.path for item in scoped_technical.file_plan] == ["app.js"]
+    with pytest.raises(ValueError, match="exactly match the architect TechnicalSpec file plan"):
+        runner._validate_implementation_plan(
+            ImplementationPlan.model_validate(_two_batch_engineer_cycle()[0]),
+            scoped_technical,
+        )
+    with pytest.raises(SOPExecutionError, match="did not identify an approved file scope"):
+        runner._repair_technical(technical, DiagnosticReport())
+
+
+@pytest.mark.asyncio
+async def test_repair_scope_includes_only_the_package_manifest_for_dependency_gates(repository, settings) -> None:
+    runner = SOPRunner(repository, ScriptedModelClient({}), FakeSandboxProvider(), settings)
+    technical = TechnicalSpec.model_validate(_responses()["architect"])
+    diagnostic = DiagnosticReport(
+        gates=[GateResult(gate="dependencies", status=GateStatus.failed, summary="lockfile mismatch")]
+    )
+
+    scoped_technical = runner._repair_technical(technical, diagnostic)
+
+    assert [item.path for item in scoped_technical.file_plan] == ["package.json"]
+
+
+@pytest.mark.asyncio
+async def test_architect_contracts_bind_component_decisions_and_public_api_files(repository, settings) -> None:
+    runner = SOPRunner(repository, ScriptedModelClient({}), FakeSandboxProvider(), settings)
+    technical = TechnicalSpec.model_validate(_responses()["architect"])
+
+    runner._validate_technical_file_plan(technical)
+    with pytest.raises(ValueError, match="explain every planned component decision"):
+        runner._validate_technical_file_plan(technical.model_copy(update={"component_decisions": []}))
+    invalid_contract = technical.public_api_contracts[0].model_copy(update={"file_path": "missing.ts"})
+    with pytest.raises(ValueError, match="must reference an Architect-planned file"):
+        runner._validate_technical_file_plan(
+            technical.model_copy(update={"public_api_contracts": [invalid_contract]})
+        )
 
 
 @pytest.mark.asyncio
@@ -984,7 +1119,6 @@ async def test_blocking_typecheck_routes_one_repair_to_engineer(repository, sett
         "engineer",
         "engineer",
         "reviewer",
-        "engineer",
         "engineer",
         "engineer",
         "engineer",

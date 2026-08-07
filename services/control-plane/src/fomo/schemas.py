@@ -79,6 +79,31 @@ class ComponentSpec(SchemaModel):
     children: list[str] = Field(default_factory=list)
 
 
+class ComponentDecision(SchemaModel):
+    """Why a UI component reuses a mature primitive or is built in-app."""
+
+    component: str = Field(min_length=1)
+    strategy: Literal["reuse", "custom"]
+    source: str = Field(min_length=1)
+    rationale: str = Field(min_length=1)
+
+
+class PublicApiProp(SchemaModel):
+    name: str = Field(min_length=1)
+    type: str = Field(min_length=1)
+    required: bool = True
+
+
+class PublicApiContract(SchemaModel):
+    """A cross-file symbol contract that every Engineer batch must preserve."""
+
+    file_path: str = Field(min_length=1)
+    export_style: Literal["default", "named"]
+    symbol: str = Field(min_length=1)
+    props: list[PublicApiProp] = Field(default_factory=list)
+    type: str = Field(min_length=1)
+
+
 class StateModelSpec(SchemaModel):
     name: str
     owner: str
@@ -106,6 +131,8 @@ class TechnicalSpec(SchemaModel):
     framework: str
     routes: list[RouteSpec] = Field(default_factory=list)
     components: list[ComponentSpec] = Field(default_factory=list)
+    component_decisions: list[ComponentDecision] = Field(min_length=1)
+    public_api_contracts: list[PublicApiContract] = Field(min_length=1)
     state_model: list[StateModelSpec] = Field(default_factory=list)
     dependencies: list[DependencySpec] = Field(default_factory=list)
     file_plan: list[FilePlanItem] = Field(default_factory=list)

@@ -83,6 +83,15 @@ _SYSTEM_MANAGED_FILE_PLAN_NAMES = frozenset(
         "bun.lockb",
     }
 )
+_DEFAULT_FRONTEND_STACK_CONTRACT = (
+    "Use FOMO's default Next.js + React + TypeScript + Tailwind CSS + shadcn/ui + Lucide React "
+    "frontend stack. Reuse mature shadcn/ui primitives and Lucide icons before bespoke equivalents."
+)
+_PLAYWRIGHT_NETWORK_CONTRACT = (
+    "Any Playwright webServer command must bind to 0.0.0.0; its baseURL and readiness probe must use "
+    "http://127.0.0.1:<port>. Never use a container hostname, os.hostname(), process.env.HOSTNAME, "
+    "or any other dynamic hostname."
+)
 
 
 class RunCancelled(RuntimeError):
@@ -318,10 +327,11 @@ class SOPRunner:
                     "role": "system",
                     "content": (
                         "You are FOMO's Architect. Consume the supplied ProductSpec and produce only TechnicalSpec JSON. "
-                        "Use a controlled Next.js + TypeScript + pnpm design. Include typecheck/build/dev in the "
-                        "file and test plan. Any Playwright webServer command must bind to 0.0.0.0; its baseURL and "
-                        "readiness probe must use http://127.0.0.1:<port>. Never use a container hostname, os.hostname(), "
-                        "process.env.HOSTNAME, or any other dynamic hostname. "
+                        f"{_DEFAULT_FRONTEND_STACK_CONTRACT} Include typecheck/build/dev in the file and test plan. "
+                        f"{_PLAYWRIGHT_NETWORK_CONTRACT} "
+                        "Return componentDecisions for every mature-component reuse or custom implementation choice, "
+                        "including source and rationale. Return publicApiContracts for every cross-file API with its "
+                        "file path, export style, symbol, props, and type. "
                         "Strictly use the JSON Schema's literal enum values (never descriptive "
                         f"variants), fit TechnicalSpec.filePlan within {max_batches} Engineer batches of at most "
                         f"{max_files_per_batch} unique valid relative workspace {path_label} each (no more than "
@@ -405,8 +415,20 @@ class SOPRunner:
         await self._transition(context, RunPhase.implementation)
         if context.sandbox is None:
             raise SOPExecutionError("engineer was invoked without a sandbox")
+        run = await self.repository.get_run(context.run_id)
+        if run.repair_round > 0:
+            if diagnostic is None:
+                raise SOPExecutionError("repair implementation requires a diagnostic scope")
+            implementation_technical = self._repair_technical(technical, diagnostic)
+            repair_scope_instruction = (
+                "This is a repair. TechnicalSpec.filePlan is the complete diagnosis-derived repair scope: plan "
+                "exactly those files and never rewrite unrelated files. "
+            )
+        else:
+            implementation_technical = technical
+            repair_scope_instruction = ""
         try:
-            technical_file_paths = self._technical_file_plan_paths(technical)
+            technical_file_paths = self._technical_file_plan_paths(implementation_technical)
         except ValueError:
             # Architect output normally cannot reach this point without first
             # passing its own structured validator. Retain a safe defense for
@@ -448,21 +470,25 @@ class SOPRunner:
                         "Put package/configuration scaffolding first; then UI and supporting files. Every "
                         "TechnicalSpec.filePlan path must appear exactly once, with no additional paths. Use pnpm scripts named "
                         "typecheck, build and dev; the dev script must support `pnpm dev --hostname 0.0.0.0 --port 8080`. "
-                        "Any Playwright webServer command must bind to 0.0.0.0; its baseURL and readiness probe must use "
-                        "http://127.0.0.1:<port>. Never use a container hostname, os.hostname(), process.env.HOSTNAME, "
-                        "or any other dynamic hostname. "
+                        f"{_DEFAULT_FRONTEND_STACK_CONTRACT} {_PLAYWRIGHT_NETWORK_CONTRACT} "
+                        "Honor TechnicalSpec.componentDecisions and TechnicalSpec.publicApiContracts. "
+                        f"{repair_scope_instruction}"
                         "Never plan .env files, Git hooks, or files outside the workspace. Do not include chain-of-thought."
                     ),
                 },
                 {
                     "role": "user",
                     "content": (
-                        f"ProductSpec:\n{self._json(product)}\nTechnicalSpec:\n{self._json(technical)}\n"
+                        f"ProductSpec:\n{self._json(product)}\nTechnicalSpec:\n{self._json(implementation_technical)}\n"
+                        "Shared public API contracts (preserve across every batch):\n"
+                        f"{self._json(technical.public_api_contracts)}\n"
                         f"DiagnosticReport for repair (if any):\n{repair_context}"
                     ),
                 },
             ],
-            validate_artifact=lambda candidate: self._validate_implementation_plan(candidate, technical),
+            validate_artifact=lambda candidate: self._validate_implementation_plan(
+                candidate, implementation_technical
+            ),
             persist_handoff=False,
         )
         context.implementation_plan_artifact_id = await self.repository.store_artifact(
@@ -513,17 +539,18 @@ class SOPRunner:
                             "You are FOMO's Engineer. Return only FileBatchReport JSON for the requested batch. "
                             "Generate complete source for exactly the requested relative paths and no other paths. "
                             "Do not repeat source from earlier or later batches. Each create/modify file must be at most "
-                            f"{self._engineer_max_file_characters()} characters. "
-                            "Any Playwright webServer command must bind to 0.0.0.0; its baseURL and readiness probe "
-                            "must use http://127.0.0.1:<port>. Never use a container hostname, os.hostname(), "
-                            "process.env.HOSTNAME, or any other dynamic hostname. Never write .env files, Git hooks, "
+                            f"{self._engineer_max_file_characters()} characters. {_DEFAULT_FRONTEND_STACK_CONTRACT} "
+                            f"{_PLAYWRIGHT_NETWORK_CONTRACT} Honor every shared public API contract supplied below. "
+                            "Never write .env files, Git hooks, "
                             "or files outside the workspace. Do not include chain-of-thought."
                         ),
                     },
                     {
                         "role": "user",
                         "content": (
-                            f"ProductSpec:\n{self._json(product)}\nTechnicalSpec:\n{self._json(technical)}\n"
+                            f"ProductSpec:\n{self._json(product)}\nTechnicalSpec:\n{self._json(implementation_technical)}\n"
+                            "Shared public API contracts (preserve across every batch):\n"
+                            f"{self._json(technical.public_api_contracts)}\n"
                             f"ImplementationPlan:\n{self._json(plan)}\n"
                             f"Requested batch {index} of {len(plan.batches)}:\n{self._json(batch)}\n"
                             f"DiagnosticReport for repair (if any):\n{repair_context}"
@@ -659,7 +686,25 @@ class SOPRunner:
         return max(1, self.settings.engineer_max_file_characters)
 
     def _validate_technical_file_plan(self, technical: TechnicalSpec) -> None:
-        self._technical_file_plan_paths(technical)
+        file_paths = self._technical_file_plan_paths(technical)
+        decision_names = [decision.component for decision in technical.component_decisions]
+        if len(decision_names) != len(set(decision_names)):
+            raise ValueError("architect TechnicalSpec component decisions must not repeat a component")
+        missing_decisions = {component.name for component in technical.components}.difference(decision_names)
+        if missing_decisions:
+            raise ValueError("architect TechnicalSpec must explain every planned component decision")
+        normalized_file_paths = {str(validate_workspace_path(path)) for path in file_paths}
+        contract_keys: list[tuple[str, str]] = []
+        for contract in technical.public_api_contracts:
+            try:
+                contract_path = str(validate_workspace_path(contract.file_path))
+            except ValueError:
+                raise ValueError("architect TechnicalSpec contains an invalid public API contract") from None
+            if contract_path not in normalized_file_paths:
+                raise ValueError("public API contract must reference an Architect-planned file")
+            contract_keys.append((contract_path, contract.symbol))
+        if len(contract_keys) != len(set(contract_keys)):
+            raise ValueError("architect TechnicalSpec public API contracts must not repeat a symbol")
 
     def _technical_file_plan_paths(self, technical: TechnicalSpec) -> list[str]:
         paths = [item.path for item in technical.file_plan]
@@ -678,6 +723,43 @@ class SOPRunner:
         if len(paths) > self._engineer_max_planned_files():
             raise ValueError("architect TechnicalSpec file plan exceeds the configured Engineer capacity")
         return paths
+
+    def _repair_technical(self, technical: TechnicalSpec, diagnostic: DiagnosticReport) -> TechnicalSpec:
+        """Restrict repair plans to structured diagnostic evidence, never a full rewrite."""
+        self._technical_file_plan_paths(technical)
+        planned_paths = {
+            str(validate_workspace_path(item.path)): item for item in technical.file_plan
+        }
+        scope_candidates = set(diagnostic.location_files)
+        scope_candidates.update(finding.file for finding in diagnostic.findings if finding.file)
+        if any(
+            gate.status == GateStatus.failed and gate.gate in {"dependencies", "package_manifest"}
+            for gate in diagnostic.gates
+        ):
+            # Dependency installation owns the lockfile; package.json is the
+            # only model-writable dependency manifest that may be required.
+            scope_candidates.add("package.json")
+
+        scoped_paths: set[str] = set()
+        for candidate in scope_candidates:
+            try:
+                normalized = str(validate_workspace_path(candidate))
+            except ValueError:
+                continue
+            if normalized in planned_paths:
+                scoped_paths.add(normalized)
+        if not scoped_paths:
+            raise SOPExecutionError("repair diagnostic did not identify an approved file scope")
+
+        return technical.model_copy(
+            update={
+                "file_plan": [
+                    item
+                    for item in technical.file_plan
+                    if str(validate_workspace_path(item.path)) in scoped_paths
+                ]
+            }
+        )
 
     def _validate_implementation_plan(self, plan: ImplementationPlan, technical: TechnicalSpec) -> None:
         technical_file_paths = self._technical_file_plan_paths(technical)
@@ -797,7 +879,9 @@ class SOPRunner:
                     "content": (
                         "You are FOMO's independent Reviewer. Consume ProductSpec, TechnicalSpec, and actual "
                         "deterministic command results. Return only DiagnosticReport JSON. Never claim an artifact, "
-                        "test, screenshot, or gate that is absent from the supplied evidence. Do not include chain-of-thought."
+                        "test, screenshot, or gate that is absent from the supplied evidence. When blockers remain, "
+                        "populate locationFiles with affected workspace files and only direct dependency files necessary "
+                        "for repair; FOMO will reject an unscoped rewrite. Do not include chain-of-thought."
                     ),
                 },
                 {
