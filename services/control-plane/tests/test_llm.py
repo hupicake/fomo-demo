@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
@@ -20,10 +21,12 @@ class _Response:
         status_code: int = 200,
         headers: dict[str, str] | None = None,
         payload: dict[str, Any] | None = None,
+        lines: list[str | Exception] | None = None,
     ) -> None:
         self.status_code = status_code
         self.headers = headers or {}
-        self._payload = payload or {"choices": [{"message": {"content": '{"status":"ok"}'}}]}
+        self._payload = payload or {"choices": [{"delta": {"content": '{"status":"ok"}'}}]}
+        self._lines = lines
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
@@ -34,10 +37,39 @@ class _Response:
     def json(self) -> dict[str, Any]:
         return self._payload
 
+    async def aiter_lines(self):
+        lines = self._lines
+        if lines is None:
+            lines = [f"data: {json.dumps(self._payload)}", "", "data: [DONE]", ""]
+        for item in lines:
+            if isinstance(item, Exception):
+                raise item
+            yield item
+
+
+class _StreamContext:
+    def __init__(self, item: _Response | Exception) -> None:
+        self._item = item
+
+    async def __aenter__(self) -> _Response:
+        if isinstance(self._item, Exception):
+            raise self._item
+        return self._item
+
+    async def __aexit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        return None
+
 
 class _CapturingAsyncClient:
-    def __init__(self, captured: list[dict[str, Any]], **kwargs: Any) -> None:
+    def __init__(
+        self,
+        captured: list[dict[str, Any]],
+        *,
+        requests: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> None:
         captured.append(kwargs)
+        self._requests = requests
 
     async def __aenter__(self) -> _CapturingAsyncClient:
         return self
@@ -45,8 +77,10 @@ class _CapturingAsyncClient:
     async def __aexit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
         return None
 
-    async def post(self, *args: Any, **kwargs: Any) -> _Response:
-        return _Response()
+    def stream(self, method: str, endpoint: str, **kwargs: Any) -> _StreamContext:
+        if self._requests is not None:
+            self._requests.append({"method": method, "endpoint": endpoint, **kwargs})
+        return _StreamContext(_Response())
 
 
 class _SequencedAsyncClient:
@@ -54,10 +88,13 @@ class _SequencedAsyncClient:
         self,
         sequence: list[_Response | Exception],
         captured: list[dict[str, Any]],
+        *,
+        requests: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> None:
         self.sequence = sequence
         captured.append(kwargs)
+        self._requests = requests
 
     async def __aenter__(self) -> _SequencedAsyncClient:
         return self
@@ -65,11 +102,15 @@ class _SequencedAsyncClient:
     async def __aexit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
         return None
 
-    async def post(self, *args: Any, **kwargs: Any) -> _Response:
+    def stream(self, method: str, endpoint: str, **kwargs: Any) -> _StreamContext:
         item = self.sequence.pop(0)
-        if isinstance(item, Exception):
-            raise item
-        return item
+        if self._requests is not None:
+            self._requests.append({"method": method, "endpoint": endpoint, **kwargs})
+        return _StreamContext(item)
+
+
+def _sse_data(payload: dict[str, Any]) -> str:
+    return f"data: {json.dumps(payload)}"
 
 
 @pytest.mark.asyncio
@@ -102,6 +143,155 @@ async def test_model_client_bypasses_environment_proxy_only_for_loopback(
 
     assert result == {"status": "ok"}
     assert captured[0]["trust_env"] is expected_trust_env
+
+
+@pytest.mark.asyncio
+async def test_structured_chat_completion_requests_streaming_json(monkeypatch) -> None:
+    captured: list[dict[str, Any]] = []
+    requests: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        llm_module.httpx,
+        "AsyncClient",
+        lambda **kwargs: _CapturingAsyncClient(captured, requests=requests, **kwargs),
+    )
+
+    result = await OpenAICompatibleClient("http://localhost:4000/v1").complete_json(
+        "any-logical-model-alias",
+        [{"role": "user", "content": "return JSON"}],
+        "TechnicalSpec",
+    )
+
+    assert result == {"status": "ok"}
+    assert requests == [
+        {
+            "method": "POST",
+            "endpoint": "http://localhost:4000/v1/chat/completions",
+            "headers": {"Content-Type": "application/json", "Accept": "text/event-stream"},
+            "json": {
+                "model": "any-logical-model-alias",
+                "messages": [{"role": "user", "content": "return JSON"}],
+                "temperature": 0.2,
+                "stream": True,
+                "response_format": {"type": "json_object"},
+            },
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_streamed_delta_content_is_assembled_after_a_single_done_marker(monkeypatch) -> None:
+    captured: list[dict[str, Any]] = []
+    sequence = [
+        _Response(
+            lines=[
+                "event: message",
+                _sse_data({"choices": [{"delta": {"role": "assistant"}}]}),
+                _sse_data({"choices": [{"delta": {"content": '{"status":'}}]}),
+                _sse_data({"choices": [{"delta": {"content": '"streamed"}'}}]}),
+                _sse_data({"choices": [{"delta": {}}]}),
+                "data: [DONE]",
+                "",
+            ]
+        )
+    ]
+    monkeypatch.setattr(
+        llm_module.httpx,
+        "AsyncClient",
+        lambda **kwargs: _SequencedAsyncClient(sequence, captured, **kwargs),
+    )
+
+    assert await OpenAICompatibleClient("http://localhost:4000/v1").complete_json(
+        "engineer", [], "ImplementationPlan"
+    ) == {"status": "streamed"}
+
+
+@pytest.mark.asyncio
+async def test_missing_done_retries_stream_and_discards_partial_content(monkeypatch) -> None:
+    captured: list[dict[str, Any]] = []
+    sequence = [
+        _Response(lines=[_sse_data({"choices": [{"delta": {"content": '{"discarded":'}}]})]),
+        _Response(
+            lines=[
+                _sse_data({"choices": [{"delta": {"content": '{"status":"recovered"}'}}]}),
+                "data: [DONE]",
+            ]
+        ),
+    ]
+    sleeps: list[float] = []
+    retry_events = []
+
+    async def record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    async def record_retry(retry) -> None:
+        retry_events.append(retry)
+
+    monkeypatch.setattr(
+        llm_module.httpx,
+        "AsyncClient",
+        lambda **kwargs: _SequencedAsyncClient(sequence, captured, **kwargs),
+    )
+    monkeypatch.setattr(llm_module.asyncio, "sleep", record_sleep)
+
+    assert await OpenAICompatibleClient(
+        "http://localhost:4000/v1",
+        network_retries=1,
+        network_retry_base_delay_seconds=0.1,
+        network_retry_max_delay_seconds=0.2,
+        random_source=lambda: 1.0,
+    ).complete_json("architect", [], "TechnicalSpec", on_retry=record_retry) == {"status": "recovered"}
+
+    assert len(captured) == 2
+    assert sleeps == [0.1]
+    assert retry_events[0].failure_kind == "stream"
+    assert retry_events[0].transport_error == "_SSEStreamIncompleteError"
+
+
+@pytest.mark.asyncio
+async def test_midstream_read_timeout_retries_and_discards_partial_content(monkeypatch) -> None:
+    captured: list[dict[str, Any]] = []
+    sequence = [
+        _Response(
+            lines=[
+                _sse_data({"choices": [{"delta": {"content": '{"discarded":'}}]}),
+                httpx.ReadTimeout("read timed out"),
+            ]
+        ),
+        _Response(
+            lines=[
+                _sse_data({"choices": [{"delta": {"content": '{"status":"recovered"}'}}]}),
+                "data: [DONE]",
+            ]
+        ),
+    ]
+    sleeps: list[float] = []
+    retry_events = []
+
+    async def record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    async def record_retry(retry) -> None:
+        retry_events.append(retry)
+
+    monkeypatch.setattr(
+        llm_module.httpx,
+        "AsyncClient",
+        lambda **kwargs: _SequencedAsyncClient(sequence, captured, **kwargs),
+    )
+    monkeypatch.setattr(llm_module.asyncio, "sleep", record_sleep)
+
+    assert await OpenAICompatibleClient(
+        "http://localhost:4000/v1",
+        network_retries=1,
+        network_retry_base_delay_seconds=0.1,
+        network_retry_max_delay_seconds=0.2,
+        random_source=lambda: 1.0,
+    ).complete_json("architect", [], "TechnicalSpec", on_retry=record_retry) == {"status": "recovered"}
+
+    assert len(captured) == 2
+    assert sleeps == [0.1]
+    assert retry_events[0].failure_kind == "transport"
+    assert retry_events[0].transport_error == "ReadTimeout"
 
 
 @pytest.mark.asyncio
@@ -382,7 +572,14 @@ async def test_exhausted_gateway_retries_return_a_safe_error(monkeypatch) -> Non
 async def test_malformed_response_body_is_not_kept_as_an_exception_cause(monkeypatch) -> None:
     captured: list[dict[str, Any]] = []
     response_body_marker = "response-body-never-leak"
-    sequence = [_Response(payload={"choices": [{"message": {"content": response_body_marker}}]})]
+    sequence = [
+        _Response(
+            lines=[
+                _sse_data({"choices": [{"delta": {"content": response_body_marker}}]}),
+                "data: [DONE]",
+            ]
+        )
+    ]
     monkeypatch.setattr(
         llm_module.httpx,
         "AsyncClient",
@@ -397,6 +594,28 @@ async def test_malformed_response_body_is_not_kept_as_an_exception_cause(monkeyp
     assert str(raised.value) == "model did not return a TechnicalSpec JSON object"
     assert response_body_marker not in str(raised.value)
     assert raised.value.__cause__ is None
+
+
+@pytest.mark.asyncio
+async def test_malformed_sse_does_not_leak_response_body(monkeypatch) -> None:
+    captured: list[dict[str, Any]] = []
+    response_body_marker = "malformed-sse-body-never-leak"
+    sequence = [_Response(lines=[f"data: {response_body_marker}", "data: [DONE]"])]
+    monkeypatch.setattr(
+        llm_module.httpx,
+        "AsyncClient",
+        lambda **kwargs: _SequencedAsyncClient(sequence, captured, **kwargs),
+    )
+
+    with pytest.raises(ModelRequestError) as raised:
+        await OpenAICompatibleClient(
+            "http://localhost:4000/v1", network_retries=0
+        ).complete_json("architect", [], "TechnicalSpec")
+
+    assert str(raised.value) == "model request failed after 1 attempts (_SSEStreamProtocolError)"
+    assert response_body_marker not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.failure_kind == "stream"
 
 
 def test_default_engineer_batch_budget_is_twenty_four_by_one() -> None:

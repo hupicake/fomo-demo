@@ -58,6 +58,18 @@ class ModelRetry:
 RetryObserver = Callable[[ModelRetry], Awaitable[None]]
 
 
+class _SSEStreamError(ValueError):
+    """A streamed completion ended before it became a trustworthy response."""
+
+
+class _SSEStreamIncompleteError(_SSEStreamError):
+    pass
+
+
+class _SSEStreamProtocolError(_SSEStreamError):
+    pass
+
+
 _RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
 _RETRYABLE_TRANSPORT_ERRORS = (
     httpx.ConnectError,
@@ -65,6 +77,8 @@ _RETRYABLE_TRANSPORT_ERRORS = (
     httpx.ReadTimeout,
     httpx.RemoteProtocolError,
 )
+_RETRYABLE_STREAM_ERRORS = (_SSEStreamIncompleteError, _SSEStreamProtocolError)
+_RETRYABLE_REQUEST_ERRORS = _RETRYABLE_TRANSPORT_ERRORS + _RETRYABLE_STREAM_ERRORS
 
 
 class ModelClient(Protocol):
@@ -125,39 +139,33 @@ class OpenAICompatibleClient:
             endpoint = f"{self.base_url}/chat/completions"
         else:
             endpoint = f"{self.base_url}/v1/chat/completions"
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
         body = {
             "model": model_alias,
             "messages": list(messages),
             "temperature": 0.2,
+            "stream": True,
             "response_format": {"type": "json_object"},
         }
-        payload = await self._request_json(endpoint, headers, body, on_retry=on_retry)
+        content = await self._request_streamed_content(endpoint, headers, body, on_retry=on_retry)
         try:
-            content = payload["choices"][0]["message"]["content"]
-            if isinstance(content, list):
-                content = "".join(
-                    part.get("text", "") if isinstance(part, dict) else str(part) for part in content
-                )
-            if not isinstance(content, str):
-                raise TypeError("model content was not text")
             return _parse_json_object(content)
-        except (KeyError, IndexError, TypeError, json.JSONDecodeError):
+        except (TypeError, json.JSONDecodeError):
             # The response content can be included in a JSONDecodeError's
             # diagnostic context. Keep the worker's exception path free of
             # response-body data as well as request credentials.
             raise ModelError(f"model did not return a {schema_name} JSON object") from None
 
-    async def _request_json(
+    async def _request_streamed_content(
         self,
         endpoint: str,
         headers: dict[str, str],
         body: dict[str, Any],
         *,
         on_retry: RetryObserver | None,
-    ) -> dict[str, Any]:
+    ) -> str:
         for attempt in range(self.network_retries + 1):
             try:
                 # A sourced local dotenv may set HTTP_PROXY for external traffic.
@@ -167,35 +175,35 @@ class OpenAICompatibleClient:
                     timeout=self.timeout_seconds,
                     trust_env=not _is_loopback_url(endpoint),
                 ) as client:
-                    response = await client.post(endpoint, headers=headers, json=body)
-                if response.status_code in _RETRYABLE_STATUS_CODES:
-                    if attempt < self.network_retries:
-                        delay_seconds = self._retry_delay(attempt, response.headers.get("Retry-After"))
-                        await self._notify_retry(
-                            on_retry,
-                            ModelRetry(
-                                attempt=attempt + 1,
-                                max_attempts=self.network_retries + 1,
-                                delay_seconds=delay_seconds,
+                    async with client.stream("POST", endpoint, headers=headers, json=body) as response:
+                        if response.status_code in _RETRYABLE_STATUS_CODES:
+                            if attempt < self.network_retries:
+                                delay_seconds = self._retry_delay(
+                                    attempt, response.headers.get("Retry-After")
+                                )
+                                await self._notify_retry(
+                                    on_retry,
+                                    ModelRetry(
+                                        attempt=attempt + 1,
+                                        max_attempts=self.network_retries + 1,
+                                        delay_seconds=delay_seconds,
+                                        failure_kind="gateway_status",
+                                        status_code=response.status_code,
+                                    ),
+                                )
+                                await asyncio.sleep(delay_seconds)
+                                continue
+                            raise ModelRequestError(
+                                "model request failed after "
+                                f"{attempt + 1} attempts (retryable gateway response)",
+                                attempts=attempt + 1,
                                 failure_kind="gateway_status",
                                 status_code=response.status_code,
-                            ),
-                        )
-                        await asyncio.sleep(delay_seconds)
-                        continue
-                    raise ModelRequestError(
-                        "model request failed after "
-                        f"{attempt + 1} attempts (retryable gateway response)",
-                        attempts=attempt + 1,
-                        failure_kind="gateway_status",
-                        status_code=response.status_code,
-                    )
-                response.raise_for_status()
-                payload = response.json()
-                if not isinstance(payload, dict):
-                    raise ValueError("model response was not an object")
-                return payload
-            except _RETRYABLE_TRANSPORT_ERRORS as exc:
+                            )
+                        response.raise_for_status()
+                        return await self._consume_sse_content(response)
+            except _RETRYABLE_REQUEST_ERRORS as exc:
+                failure_kind = "stream" if isinstance(exc, _SSEStreamError) else "transport"
                 if attempt < self.network_retries:
                     delay_seconds = self._retry_delay(attempt)
                     await self._notify_retry(
@@ -204,7 +212,7 @@ class OpenAICompatibleClient:
                             attempt=attempt + 1,
                             max_attempts=self.network_retries + 1,
                             delay_seconds=delay_seconds,
-                            failure_kind="transport",
+                            failure_kind=failure_kind,
                             transport_error=type(exc).__name__,
                         ),
                     )
@@ -213,7 +221,7 @@ class OpenAICompatibleClient:
                 raise ModelRequestError(
                     f"model request failed after {attempt + 1} attempts ({type(exc).__name__})",
                     attempts=attempt + 1,
-                    failure_kind="transport",
+                    failure_kind=failure_kind,
                     transport_error=type(exc).__name__,
                 ) from None
             except ModelRequestError:
@@ -229,6 +237,46 @@ class OpenAICompatibleClient:
                     status_code=status_code,
                 ) from None
         raise AssertionError("unreachable")
+
+    @staticmethod
+    async def _consume_sse_content(response: Any) -> str:
+        parts: list[str] = []
+        done_seen = False
+        async for line in response.aiter_lines():
+            if not isinstance(line, str):
+                raise _SSEStreamProtocolError("invalid SSE line")
+            if not line or line.startswith((":", "event:", "id:", "retry:")):
+                continue
+            if not line.startswith("data:"):
+                raise _SSEStreamProtocolError("invalid SSE field")
+            data = line[5:].lstrip()
+            if data == "[DONE]":
+                if done_seen:
+                    raise _SSEStreamProtocolError("duplicate SSE completion marker")
+                done_seen = True
+                continue
+            if done_seen:
+                raise _SSEStreamProtocolError("SSE data followed completion marker")
+            try:
+                event = json.loads(data)
+                if not isinstance(event, dict):
+                    raise TypeError("SSE event was not an object")
+                choices = event["choices"]
+                if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+                    raise TypeError("SSE event choices were invalid")
+                delta = choices[0]["delta"]
+                if not isinstance(delta, dict):
+                    raise TypeError("SSE event delta was invalid")
+                content = delta.get("content")
+                if content is not None and not isinstance(content, str):
+                    raise TypeError("SSE delta content was not text")
+            except (KeyError, IndexError, TypeError, json.JSONDecodeError):
+                raise _SSEStreamProtocolError("invalid SSE completion event") from None
+            if content is not None:
+                parts.append(content)
+        if not done_seen:
+            raise _SSEStreamIncompleteError("SSE completion marker was missing")
+        return "".join(parts)
 
     @staticmethod
     async def _notify_retry(observer: RetryObserver | None, retry: ModelRetry) -> None:
