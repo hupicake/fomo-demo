@@ -108,6 +108,23 @@ class StateModelSpec(SchemaModel):
     name: str
     owner: str
     persistence: str
+    state_class: Literal["persistent_business", "transient", "derived"]
+    mutable_domains: list[str] = Field(default_factory=list)
+
+
+class PersistentStateDomainSpec(SchemaModel):
+    """One durable business domain and the file that owns its mutations."""
+
+    domain: str = Field(min_length=1)
+    state_model_name: str = Field(min_length=1)
+    actions_store_file: str = Field(min_length=1)
+
+
+class StateAggregationSpec(SchemaModel):
+    """The deliberately narrow composition boundary for domain state slices."""
+
+    file_path: str = Field(min_length=1)
+    responsibilities: list[str] = Field(min_length=1)
 
 
 class DependencySpec(SchemaModel):
@@ -134,6 +151,8 @@ class TechnicalSpec(SchemaModel):
     component_decisions: list[ComponentDecision] = Field(min_length=1)
     public_api_contracts: list[PublicApiContract] = Field(default_factory=list)
     state_model: list[StateModelSpec] = Field(default_factory=list)
+    persistent_state_domains: list[PersistentStateDomainSpec] = Field(default_factory=list)
+    state_aggregation: StateAggregationSpec | None = None
     dependencies: list[DependencySpec] = Field(default_factory=list)
     file_plan: list[FilePlanItem] = Field(default_factory=list)
     test_plan: list[TestPlanItem] = Field(default_factory=list)

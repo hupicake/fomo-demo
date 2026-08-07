@@ -85,6 +85,7 @@ _SYSTEM_MANAGED_FILE_PLAN_NAMES = frozenset(
     }
 )
 _MAX_REPAIR_SCOPE_FILES = 8
+_STATE_AGGREGATION_RESPONSIBILITIES = frozenset({"compose", "persist", "re_export"})
 _DEFAULT_FRONTEND_STACK_CONTRACT = (
     "Use FOMO's default Next.js + React + TypeScript + Tailwind CSS + shadcn/ui + Lucide React "
     "frontend stack. Prefer existing components and mature shadcn/ui primitives with Lucide icons. "
@@ -122,6 +123,41 @@ _TECHNICAL_SPEC_REPAIR_INSTRUCTIONS = MappingProxyType(
         "technical_spec.file_plan.path_duplicate": "Use each TechnicalSpec.filePlan path at most once.",
         "technical_spec.file_plan.capacity_exceeded": (
             "Reduce TechnicalSpec.filePlan to the configured Engineer capacity."
+        ),
+        "technical_spec.persistent_state_domains.mapping_invalid": (
+            "For every independently mutable persistent business domain declared in stateModel.mutableDomains, "
+            "provide exactly one matching persistentStateDomains entry with stateModelName, domain, and "
+            "actionsStoreFile."
+        ),
+        "technical_spec.persistent_state_domains.mutable_domains_invalid": (
+            "Give every persistent_business stateModel a nonempty unique mutableDomains list, and leave "
+            "mutableDomains empty for transient or derived state."
+        ),
+        "technical_spec.persistent_state_domains.file_invalid": (
+            "Use valid relative workspace paths for persistentStateDomains.actionsStoreFile."
+        ),
+        "technical_spec.persistent_state_domains.file_unplanned": (
+            "Reference model-owned create or modify files from TechnicalSpec.filePlan in "
+            "persistentStateDomains.actionsStoreFile."
+        ),
+        "technical_spec.persistent_state_domains.file_shared": (
+            "For three or more persistentStateDomains, give every domain a different actionsStoreFile."
+        ),
+        "technical_spec.persistent_state_domains.aggregation_missing": (
+            "For three or more persistentStateDomains, declare a separate stateAggregation file."
+        ),
+        "technical_spec.persistent_state_domains.aggregation_file_invalid": (
+            "Use a valid relative workspace path for stateAggregation.filePath."
+        ),
+        "technical_spec.persistent_state_domains.aggregation_file_unplanned": (
+            "Reference a model-owned create or modify TechnicalSpec.filePlan file from stateAggregation.filePath."
+        ),
+        "technical_spec.persistent_state_domains.aggregation_file_conflict": (
+            "Use a stateAggregation.filePath different from every persistentStateDomains.actionsStoreFile."
+        ),
+        "technical_spec.persistent_state_domains.aggregation_responsibilities_invalid": (
+            "Limit stateAggregation.responsibilities to compose, persist, and re_export; do not put cross-domain "
+            "CRUD there."
         ),
     }
 )
@@ -418,6 +454,18 @@ class SOPRunner:
                         "capability gap. Avoid per-control Button/Card/Input decisions; include source and rationale. "
                         "Return publicApiContracts only for actual cross-file public symbols, not an inventory of internal "
                         "or same-file symbols; include file path, export style, symbol, props, and type. "
+                        "Classify every stateModel as persistent_business, transient, or derived. For each "
+                        "persistent_business stateModel, mutableDomains must enumerate every independently mutable business "
+                        "aggregate it owns; each aggregate with an independent CRUD lifecycle must use its own domain name "
+                        "and must not be collapsed into an application, library, or other umbrella domain. Do not include "
+                        "component/form/filter state or "
+                        "derived stats. When the total declared "
+                        "persistent business mutableDomains reaches three or more, map each domain exactly once in "
+                        "persistentStateDomains with stateModelName and a model-owned actionsStoreFile. Every such "
+                        "actionsStoreFile must be a different create or modify filePlan file. Declare a separate "
+                        "stateAggregation filePlan entry whose "
+                        "responsibilities are limited to compose, persist, and re_export; it must not contain cross-domain "
+                        "CRUD or share a file with a domain actionsStoreFile. "
                         "Strictly use the JSON Schema's literal enum values (never descriptive "
                         f"variants), fit TechnicalSpec.filePlan within {max_batches} Engineer batches of at most "
                         f"{max_files_per_batch} unique valid relative workspace {path_label} each (no more than "
@@ -783,6 +831,7 @@ class SOPRunner:
         planned_files = {
             str(validate_workspace_path(item.path)): item for item in technical.file_plan
         }
+        self._validate_persistent_state_domain_slices(technical, planned_files)
         contract_keys: list[tuple[str, str]] = []
         for contract in technical.public_api_contracts:
             try:
@@ -804,6 +853,102 @@ class SOPRunner:
         if len(contract_keys) != len(set(contract_keys)):
             raise ArtifactContractViolation(
                 code="technical_spec.public_api_contracts.symbol_duplicate",
+            )
+
+    def _validate_persistent_state_domain_slices(
+        self,
+        technical: TechnicalSpec,
+        planned_files: dict[str, Any],
+    ) -> None:
+        """Bind durable domain state to independently writable model-owned files."""
+        state_model_names = [state.name for state in technical.state_model]
+        if len(state_model_names) != len(set(state_model_names)):
+            raise ArtifactContractViolation(
+                code="technical_spec.persistent_state_domains.mapping_invalid",
+            )
+
+        persistent_domain_owners: list[tuple[str, str]] = []
+        for state in technical.state_model:
+            mutable_domains = state.mutable_domains
+            if state.state_class == "persistent_business":
+                if (
+                    not mutable_domains
+                    or len(mutable_domains) != len(set(mutable_domains))
+                    or any(not domain.strip() for domain in mutable_domains)
+                ):
+                    raise ArtifactContractViolation(
+                        code="technical_spec.persistent_state_domains.mutable_domains_invalid",
+                    )
+                persistent_domain_owners.extend((state.name, domain) for domain in mutable_domains)
+            elif mutable_domains:
+                raise ArtifactContractViolation(
+                    code="technical_spec.persistent_state_domains.mutable_domains_invalid",
+                )
+
+        persistent_domain_names = [domain for _state_model_name, domain in persistent_domain_owners]
+        if len(persistent_domain_names) != len(set(persistent_domain_names)):
+            raise ArtifactContractViolation(
+                code="technical_spec.persistent_state_domains.mutable_domains_invalid",
+            )
+        if len(persistent_domain_owners) < 3:
+            return
+
+        domains = technical.persistent_state_domains
+        declared_domain_owners = [(domain.state_model_name, domain.domain) for domain in domains]
+        if (
+            len(declared_domain_owners) != len(set(declared_domain_owners))
+            or set(declared_domain_owners) != set(persistent_domain_owners)
+        ):
+            raise ArtifactContractViolation(
+                code="technical_spec.persistent_state_domains.mapping_invalid",
+            )
+
+        actions_store_paths: list[str] = []
+        for domain in domains:
+            try:
+                actions_store_path = str(validate_workspace_path(domain.actions_store_file))
+            except ValueError:
+                raise ArtifactContractViolation(
+                    code="technical_spec.persistent_state_domains.file_invalid",
+                ) from None
+            planned_file = planned_files.get(actions_store_path)
+            if planned_file is None or planned_file.operation == "delete":
+                raise ArtifactContractViolation(
+                    code="technical_spec.persistent_state_domains.file_unplanned",
+                )
+            actions_store_paths.append(actions_store_path)
+
+        aggregation = technical.state_aggregation
+        if len(actions_store_paths) != len(set(actions_store_paths)):
+            raise ArtifactContractViolation(
+                code="technical_spec.persistent_state_domains.file_shared",
+            )
+        if aggregation is None:
+            raise ArtifactContractViolation(
+                code="technical_spec.persistent_state_domains.aggregation_missing",
+            )
+        try:
+            aggregation_path = str(validate_workspace_path(aggregation.file_path))
+        except ValueError:
+            raise ArtifactContractViolation(
+                code="technical_spec.persistent_state_domains.aggregation_file_invalid",
+            ) from None
+        planned_aggregation_file = planned_files.get(aggregation_path)
+        if planned_aggregation_file is None or planned_aggregation_file.operation == "delete":
+            raise ArtifactContractViolation(
+                code="technical_spec.persistent_state_domains.aggregation_file_unplanned",
+            )
+        if aggregation_path in actions_store_paths:
+            raise ArtifactContractViolation(
+                code="technical_spec.persistent_state_domains.aggregation_file_conflict",
+            )
+        responsibilities = aggregation.responsibilities
+        if (
+            len(responsibilities) != len(set(responsibilities))
+            or not set(responsibilities).issubset(_STATE_AGGREGATION_RESPONSIBILITIES)
+        ):
+            raise ArtifactContractViolation(
+                code="technical_spec.persistent_state_domains.aggregation_responsibilities_invalid",
             )
 
     def _technical_file_plan_paths(self, technical: TechnicalSpec) -> list[str]:

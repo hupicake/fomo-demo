@@ -186,7 +186,15 @@ def _responses() -> dict[str, Any]:
                     "type": "React.ComponentType",
                 }
             ],
-            "stateModel": [{"name": "books", "owner": "client", "persistence": "local"}],
+            "stateModel": [
+                {
+                    "name": "books",
+                    "owner": "client",
+                    "persistence": "local",
+                    "stateClass": "persistent_business",
+                    "mutableDomains": ["books"],
+                }
+            ],
             "dependencies": [],
             "filePlan": [
                 {"path": "package.json", "operation": "create", "reason": "scripts"},
@@ -249,6 +257,73 @@ def _architect_response_with_system_managed_path(path: str) -> dict[str, Any]:
             "props": [],
             "type": "unknown",
         }
+    ]
+    return response
+
+
+def _architect_response_with_domain_state_slices() -> dict[str, Any]:
+    response = dict(_responses()["architect"])
+    response["stateModel"] = [
+        {
+            "name": "LibraryData",
+            "owner": "useLibraryStore",
+            "persistence": "localStorage",
+            "stateClass": "persistent_business",
+            "mutableDomains": ["books", "readers", "loans"],
+        },
+        {
+            "name": "BookFilters",
+            "owner": "BookList",
+            "persistence": "component state",
+            "stateClass": "transient",
+            "mutableDomains": [],
+        },
+        {
+            "name": "LoanFormState",
+            "owner": "LoanForm",
+            "persistence": "component state",
+            "stateClass": "transient",
+            "mutableDomains": [],
+        },
+        {
+            "name": "DerivedStatsAndStatuses",
+            "owner": "selectors",
+            "persistence": "computed",
+            "stateClass": "derived",
+            "mutableDomains": [],
+        },
+    ]
+    response["persistentStateDomains"] = [
+        {
+            "domain": "books",
+            "stateModelName": "LibraryData",
+            "actionsStoreFile": "lib/state/books-store.ts",
+        },
+        {
+            "domain": "readers",
+            "stateModelName": "LibraryData",
+            "actionsStoreFile": "lib/state/readers-store.ts",
+        },
+        {
+            "domain": "loans",
+            "stateModelName": "LibraryData",
+            "actionsStoreFile": "lib/state/loans-store.ts",
+        },
+    ]
+    response["stateAggregation"] = {
+        "filePath": "lib/use-library-store.ts",
+        "responsibilities": ["compose", "persist", "re_export"],
+    }
+    response["filePlan"] = [
+        *response["filePlan"],
+        {"path": "lib/state/books-store.ts", "operation": "create", "reason": "book mutations"},
+        {"path": "lib/state/readers-store.ts", "operation": "create", "reason": "reader mutations"},
+        {"path": "lib/state/loans-store.ts", "operation": "create", "reason": "loan and return mutations"},
+        {
+            "path": "lib/use-library-store.ts",
+            "operation": "create",
+            "reason": "state composition, persistence, and re-exports only",
+        },
     ]
     return response
 
@@ -563,6 +638,12 @@ async def test_four_role_sop_creates_version_and_trace(repository, settings) -> 
     assert "Engineer 12000-character source limit" in architect_system_prompt
     assert "split complex state or features across files" in architect_system_prompt
     assert "publicApiContracts" in architect_system_prompt
+    assert "persistent_business, transient, or derived" in architect_system_prompt
+    assert "mutableDomains" in architect_system_prompt
+    assert "persistentStateDomains" in architect_system_prompt
+    assert "independent CRUD lifecycle" in architect_system_prompt
+    assert "other umbrella domain" in architect_system_prompt
+    assert "cross-domain CRUD" in architect_system_prompt
     engineer_plan_request = next(request for request in model.requests if request[2] == "ImplementationPlan")
     engineer_plan_system_prompt = engineer_plan_request[1][0]["content"]
     assert "at most 1 relative file, with at most 24 batches" in engineer_plan_system_prompt
@@ -812,6 +893,54 @@ async def test_architect_contracts_bind_component_decisions_and_public_api_files
 
 
 @pytest.mark.asyncio
+async def test_architect_persistent_domain_slices_use_explicit_state_declarations(repository, settings) -> None:
+    runner = SOPRunner(repository, ScriptedModelClient({}), FakeSandboxProvider(), settings)
+    technical = TechnicalSpec.model_validate(_architect_response_with_domain_state_slices())
+
+    runner._validate_technical_file_plan(technical)
+
+    shared_store = technical.persistent_state_domains[1].model_copy(
+        update={"actions_store_file": technical.persistent_state_domains[0].actions_store_file}
+    )
+    with pytest.raises(ArtifactContractViolation) as shared_store_violation:
+        runner._validate_technical_file_plan(
+            technical.model_copy(
+                update={
+                    "persistent_state_domains": [
+                        technical.persistent_state_domains[0],
+                        shared_store,
+                        technical.persistent_state_domains[2],
+                    ]
+                }
+            )
+        )
+    assert shared_store_violation.value.code == "technical_spec.persistent_state_domains.file_shared"
+
+    missing_domain_mapping = technical.model_copy(update={"persistent_state_domains": []})
+    with pytest.raises(ArtifactContractViolation) as missing_mapping_violation:
+        runner._validate_technical_file_plan(missing_domain_mapping)
+    assert missing_mapping_violation.value.code == "technical_spec.persistent_state_domains.mapping_invalid"
+
+    assert technical.state_aggregation is not None
+    invalid_aggregation = technical.state_aggregation.model_copy(
+        update={"responsibilities": ["compose", "cross_domain_crud"]}
+    )
+    with pytest.raises(ArtifactContractViolation) as aggregation_violation:
+        runner._validate_technical_file_plan(
+            technical.model_copy(update={"state_aggregation": invalid_aggregation})
+        )
+    assert (
+        aggregation_violation.value.code
+        == "technical_spec.persistent_state_domains.aggregation_responsibilities_invalid"
+    )
+
+    invalid_state_class = _architect_response_with_domain_state_slices()
+    invalid_state_class["stateModel"][0]["stateClass"] = "persistent"
+    with pytest.raises(ValueError):
+        TechnicalSpec.model_validate(invalid_state_class)
+
+
+@pytest.mark.asyncio
 async def test_architect_file_plan_over_capacity_retries_before_sandbox_creation(
     repository, settings
 ) -> None:
@@ -987,6 +1116,77 @@ async def test_system_managed_file_plan_retries_before_sandbox_creation(reposito
     correction_message = next(
         message["content"]
         for message in architect_requests[1][1]
+        if message["content"].startswith("Return only a valid TechnicalSpec JSON object")
+    )
+    assert correction_message == (
+        "Return only a valid TechnicalSpec JSON object matching the declared schema.\n"
+        + repair_instruction
+    )
+
+
+@pytest.mark.asyncio
+async def test_architect_domain_slice_retry_uses_closed_code_without_event_leak(repository, settings) -> None:
+    session = await repository.create_guest_session()
+    project = await repository.create_project(session.id, "Library")
+    _message, run, _created = await repository.create_message_and_run(
+        project.id, session.id, "message-domain-slice-retry", "Create a book management system"
+    )
+    assert await repository.claim_next_run("test-worker", 60)
+    context = SimpleNamespace(
+        run_id=run.id,
+        lease_token=await repository.get_active_lease_token(run.id),
+    )
+    source_marker = "model-body-never-leak"
+    invalid_response = _architect_response_with_domain_state_slices()
+    invalid_response["stateModel"][0]["owner"] = source_marker
+    invalid_response["persistentStateDomains"][1]["actionsStoreFile"] = invalid_response[
+        "persistentStateDomains"
+    ][0]["actionsStoreFile"]
+    model = ScriptedModelClient(
+        {
+            "architect": [
+                invalid_response,
+                _architect_response_with_domain_state_slices(),
+            ]
+        }
+    )
+    runner = SOPRunner(
+        repository,
+        model,
+        FakeSandboxProvider(),
+        replace(settings, structured_output_retries=1),
+    )
+
+    artifact = await runner._role(
+        context,
+        role="architect",
+        model_alias="architect",
+        schema=TechnicalSpec,
+        messages=[{"role": "system", "content": "test architect domain state correction"}],
+        validate_artifact=runner._validate_technical_file_plan,
+    )
+
+    assert isinstance(artifact, TechnicalSpec)
+    events = await repository.list_events(run.id)
+    retry_event = next(
+        event
+        for event in events
+        if event.kind == "agent.activity"
+        and event.role == "architect"
+        and event.payload.get("action") == "structured_retry"
+    )
+    assert retry_event.payload == {
+        "action": "structured_retry",
+        "summary": "The structured hand-off was invalid; requesting a schema-correct response.",
+        "reasonCode": "technical_spec.persistent_state_domains.file_shared",
+    }
+    repair_instruction = "For three or more persistentStateDomains, give every domain a different actionsStoreFile."
+    serialized_events = json.dumps([event.payload for event in events])
+    assert repair_instruction not in serialized_events
+    assert source_marker not in serialized_events
+    correction_message = next(
+        message["content"]
+        for message in model.requests[1][1]
         if message["content"].startswith("Return only a valid TechnicalSpec JSON object")
     )
     assert correction_message == (
