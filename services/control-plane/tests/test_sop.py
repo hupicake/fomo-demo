@@ -162,7 +162,14 @@ def _responses() -> dict[str, Any]:
         "architect": {
             "framework": "nextjs",
             "routes": [{"path": "/", "rendering": "client", "description": "library"}],
-            "components": [{"name": "Library", "responsibility": "books", "children": []}],
+            "components": [
+                {
+                    "name": "Library",
+                    "responsibility": "books",
+                    "children": [],
+                    "interactionResponsibilities": [],
+                }
+            ],
             "componentDecisions": [
                 {
                     "component": "Button",
@@ -323,6 +330,133 @@ def _architect_response_with_domain_state_slices() -> dict[str, Any]:
             "path": "lib/use-library-store.ts",
             "operation": "create",
             "reason": "state composition, persistence, and re-exports only",
+        },
+    ]
+    return response
+
+
+def _architect_response_with_feature_surface_slices() -> dict[str, Any]:
+    response = dict(_responses()["architect"])
+    response["components"] = [
+        {
+            "name": "CatalogSurface",
+            "responsibility": "compose a complex catalog management surface",
+            "children": ["CatalogSearch", "CatalogFilters", "CatalogTable"],
+            "interactionResponsibilities": ["search", "filter", "data_table"],
+        },
+        {
+            "name": "CatalogSearch",
+            "responsibility": "render catalog query controls",
+            "children": [],
+            "interactionResponsibilities": [],
+        },
+        {
+            "name": "CatalogFilters",
+            "responsibility": "render catalog filter controls",
+            "children": [],
+            "interactionResponsibilities": [],
+        },
+        {
+            "name": "CatalogTable",
+            "responsibility": "render catalog data rows",
+            "children": [],
+            "interactionResponsibilities": [],
+        },
+    ]
+    response["featureSurfaces"] = [
+        {
+            "componentName": "CatalogSurface",
+            "compositionFile": "components/catalog/catalog-surface.tsx",
+            "compositionSymbol": "CatalogSurface",
+            "compositionResponsibilities": ["compose", "layout", "props"],
+            "modules": [
+                {
+                    "role": "controller",
+                    "filePath": "components/catalog/use-catalog-controller.ts",
+                    "publicSymbol": "useCatalogController",
+                },
+                {
+                    "role": "search",
+                    "filePath": "components/catalog/catalog-search.tsx",
+                    "publicSymbol": "CatalogSearch",
+                },
+                {
+                    "role": "filter",
+                    "filePath": "components/catalog/catalog-filters.tsx",
+                    "publicSymbol": "CatalogFilters",
+                },
+                {
+                    "role": "data_table",
+                    "filePath": "components/catalog/catalog-table.tsx",
+                    "publicSymbol": "CatalogTable",
+                },
+            ],
+        }
+    ]
+    response["filePlan"] = [
+        *response["filePlan"],
+        {
+            "path": "components/catalog/catalog-surface.tsx",
+            "operation": "create",
+            "reason": "compose catalog surface only",
+        },
+        {
+            "path": "components/catalog/use-catalog-controller.ts",
+            "operation": "create",
+            "reason": "catalog interaction state and callbacks",
+        },
+        {
+            "path": "components/catalog/catalog-search.tsx",
+            "operation": "create",
+            "reason": "catalog query controls",
+        },
+        {
+            "path": "components/catalog/catalog-filters.tsx",
+            "operation": "create",
+            "reason": "catalog filter controls",
+        },
+        {
+            "path": "components/catalog/catalog-table.tsx",
+            "operation": "create",
+            "reason": "catalog data table",
+        },
+    ]
+    response["publicApiContracts"] = [
+        *response["publicApiContracts"],
+        {
+            "filePath": "components/catalog/catalog-surface.tsx",
+            "exportStyle": "named",
+            "symbol": "CatalogSurface",
+            "props": [],
+            "type": "React.ComponentType",
+        },
+        {
+            "filePath": "components/catalog/use-catalog-controller.ts",
+            "exportStyle": "named",
+            "symbol": "useCatalogController",
+            "props": [],
+            "type": "() => CatalogController",
+        },
+        {
+            "filePath": "components/catalog/catalog-search.tsx",
+            "exportStyle": "named",
+            "symbol": "CatalogSearch",
+            "props": [],
+            "type": "React.ComponentType",
+        },
+        {
+            "filePath": "components/catalog/catalog-filters.tsx",
+            "exportStyle": "named",
+            "symbol": "CatalogFilters",
+            "props": [],
+            "type": "React.ComponentType",
+        },
+        {
+            "filePath": "components/catalog/catalog-table.tsx",
+            "exportStyle": "named",
+            "symbol": "CatalogTable",
+            "props": [],
+            "type": "React.ComponentType",
         },
     ]
     return response
@@ -638,6 +772,10 @@ async def test_four_role_sop_creates_version_and_trace(repository, settings) -> 
     assert "Engineer 12000-character source limit" in architect_system_prompt
     assert "split complex state or features across files" in architect_system_prompt
     assert "publicApiContracts" in architect_system_prompt
+    assert "interactionResponsibilities" in architect_system_prompt
+    assert "featureSurfaces" in architect_system_prompt
+    assert "separate controller module" in architect_system_prompt
+    assert "Do not infer or merge UI responsibilities from product-domain names" in architect_system_prompt
     assert "persistent_business, transient, or derived" in architect_system_prompt
     assert "mutableDomains" in architect_system_prompt
     assert "persistentStateDomains" in architect_system_prompt
@@ -860,7 +998,12 @@ async def test_architect_contracts_bind_component_decisions_and_public_api_files
         TechnicalSpec.model_validate(empty_decisions_response)
     unmatched_component_response = dict(_responses()["architect"])
     unmatched_component_response["components"] = [
-        {"name": "BookRow", "responsibility": "render a book", "children": []}
+        {
+            "name": "BookRow",
+            "responsibility": "render a book",
+            "children": [],
+            "interactionResponsibilities": [],
+        }
     ]
     runner._validate_technical_file_plan(TechnicalSpec.model_validate(unmatched_component_response))
     with pytest.raises(ArtifactContractViolation) as duplicate_decisions:
@@ -938,6 +1081,54 @@ async def test_architect_persistent_domain_slices_use_explicit_state_declaration
     invalid_state_class["stateModel"][0]["stateClass"] = "persistent"
     with pytest.raises(ValueError):
         TechnicalSpec.model_validate(invalid_state_class)
+
+
+@pytest.mark.asyncio
+async def test_architect_feature_surface_slices_bind_explicit_concerns(repository, settings) -> None:
+    runner = SOPRunner(repository, ScriptedModelClient({}), FakeSandboxProvider(), settings)
+    technical = TechnicalSpec.model_validate(_architect_response_with_feature_surface_slices())
+
+    runner._validate_technical_file_plan(technical)
+
+    missing_surface = technical.model_copy(update={"feature_surfaces": []})
+    with pytest.raises(ArtifactContractViolation) as missing_surface_violation:
+        runner._validate_technical_file_plan(missing_surface)
+    assert missing_surface_violation.value.code == "technical_spec.feature_surfaces.component_mapping_invalid"
+
+    surface = technical.feature_surfaces[0]
+    shared_module = surface.modules[2].model_copy(update={"file_path": surface.modules[1].file_path})
+    shared_surface = surface.model_copy(
+        update={"modules": [surface.modules[0], surface.modules[1], shared_module, surface.modules[3]]}
+    )
+    with pytest.raises(ArtifactContractViolation) as shared_file_violation:
+        runner._validate_technical_file_plan(
+            technical.model_copy(update={"feature_surfaces": [shared_surface]})
+        )
+    assert shared_file_violation.value.code == "technical_spec.feature_surfaces.file_conflict"
+
+    without_controller = surface.model_copy(
+        update={"modules": [module for module in surface.modules if module.role != "controller"]}
+    )
+    with pytest.raises(ArtifactContractViolation) as controller_violation:
+        runner._validate_technical_file_plan(
+            technical.model_copy(update={"feature_surfaces": [without_controller]})
+        )
+    assert controller_violation.value.code == "technical_spec.feature_surfaces.controller_missing"
+
+    unbound_module = surface.modules[1].model_copy(update={"public_symbol": "MissingCatalogSearch"})
+    unbound_surface = surface.model_copy(
+        update={"modules": [surface.modules[0], unbound_module, *surface.modules[2:]]}
+    )
+    with pytest.raises(ArtifactContractViolation) as unbound_api_violation:
+        runner._validate_technical_file_plan(
+            technical.model_copy(update={"feature_surfaces": [unbound_surface]})
+        )
+    assert unbound_api_violation.value.code == "technical_spec.feature_surfaces.public_api_unbound"
+
+    missing_interaction_responsibilities = _architect_response_with_feature_surface_slices()
+    missing_interaction_responsibilities["components"][0].pop("interactionResponsibilities")
+    with pytest.raises(ValueError):
+        TechnicalSpec.model_validate(missing_interaction_responsibilities)
 
 
 @pytest.mark.asyncio
@@ -1181,6 +1372,80 @@ async def test_architect_domain_slice_retry_uses_closed_code_without_event_leak(
         "reasonCode": "technical_spec.persistent_state_domains.file_shared",
     }
     repair_instruction = "For three or more persistentStateDomains, give every domain a different actionsStoreFile."
+    serialized_events = json.dumps([event.payload for event in events])
+    assert repair_instruction not in serialized_events
+    assert source_marker not in serialized_events
+    correction_message = next(
+        message["content"]
+        for message in model.requests[1][1]
+        if message["content"].startswith("Return only a valid TechnicalSpec JSON object")
+    )
+    assert correction_message == (
+        "Return only a valid TechnicalSpec JSON object matching the declared schema.\n"
+        + repair_instruction
+    )
+
+
+@pytest.mark.asyncio
+async def test_architect_feature_surface_retry_uses_closed_code_without_event_leak(repository, settings) -> None:
+    session = await repository.create_guest_session()
+    project = await repository.create_project(session.id, "Catalog")
+    _message, run, _created = await repository.create_message_and_run(
+        project.id, session.id, "message-feature-surface-retry", "Create a catalog management system"
+    )
+    assert await repository.claim_next_run("test-worker", 60)
+    context = SimpleNamespace(
+        run_id=run.id,
+        lease_token=await repository.get_active_lease_token(run.id),
+    )
+    source_marker = "model-body-never-leak"
+    invalid_response = _architect_response_with_feature_surface_slices()
+    invalid_response["components"][0]["responsibility"] = source_marker
+    invalid_response["featureSurfaces"][0]["modules"][2]["filePath"] = invalid_response[
+        "featureSurfaces"
+    ][0]["modules"][1]["filePath"]
+    model = ScriptedModelClient(
+        {
+            "architect": [
+                invalid_response,
+                _architect_response_with_feature_surface_slices(),
+            ]
+        }
+    )
+    runner = SOPRunner(
+        repository,
+        model,
+        FakeSandboxProvider(),
+        replace(settings, structured_output_retries=1),
+    )
+
+    artifact = await runner._role(
+        context,
+        role="architect",
+        model_alias="architect",
+        schema=TechnicalSpec,
+        messages=[{"role": "system", "content": "test architect feature surface correction"}],
+        validate_artifact=runner._validate_technical_file_plan,
+    )
+
+    assert isinstance(artifact, TechnicalSpec)
+    events = await repository.list_events(run.id)
+    retry_event = next(
+        event
+        for event in events
+        if event.kind == "agent.activity"
+        and event.role == "architect"
+        and event.payload.get("action") == "structured_retry"
+    )
+    assert retry_event.payload == {
+        "action": "structured_retry",
+        "summary": "The structured hand-off was invalid; requesting a schema-correct response.",
+        "reasonCode": "technical_spec.feature_surfaces.file_conflict",
+    }
+    repair_instruction = (
+        "Use different model-owned create or modify TechnicalSpec.filePlan files for every feature surface "
+        "composition and module."
+    )
     serialized_events = json.dumps([event.payload for event in events])
     assert repair_instruction not in serialized_events
     assert source_marker not in serialized_events

@@ -73,10 +73,39 @@ class RouteSpec(SchemaModel):
     description: str
 
 
+InteractionResponsibility = Literal[
+    "search",
+    "filter",
+    "data_table",
+    "row_actions",
+    "confirmation",
+    "form",
+    "sort",
+    "pagination",
+    "selection",
+    "bulk_actions",
+]
+FeatureSurfaceModuleRole = Literal[
+    "controller",
+    "search",
+    "filter",
+    "data_table",
+    "row_actions",
+    "confirmation",
+    "form",
+    "sort",
+    "pagination",
+    "selection",
+    "bulk_actions",
+]
+FeatureSurfaceCompositionResponsibility = Literal["compose", "layout", "props"]
+
+
 class ComponentSpec(SchemaModel):
     name: str
     responsibility: str
     children: list[str] = Field(default_factory=list)
+    interaction_responsibilities: list[InteractionResponsibility]
 
 
 class ComponentDecision(SchemaModel):
@@ -102,6 +131,24 @@ class PublicApiContract(SchemaModel):
     symbol: str = Field(min_length=1)
     props: list[PublicApiProp] = Field(default_factory=list)
     type: str = Field(min_length=1)
+
+
+class FeatureSurfaceModuleSpec(SchemaModel):
+    """One model-owned module of a complex interactive feature surface."""
+
+    role: FeatureSurfaceModuleRole
+    file_path: str = Field(min_length=1)
+    public_symbol: str = Field(min_length=1)
+
+
+class FeatureSurfaceSpec(SchemaModel):
+    """Explicit UI ownership boundaries for a complex interactive component."""
+
+    component_name: str = Field(min_length=1)
+    composition_file: str = Field(min_length=1)
+    composition_symbol: str = Field(min_length=1)
+    composition_responsibilities: list[FeatureSurfaceCompositionResponsibility] = Field(min_length=1)
+    modules: list[FeatureSurfaceModuleSpec] = Field(min_length=1)
 
 
 class StateModelSpec(SchemaModel):
@@ -150,6 +197,7 @@ class TechnicalSpec(SchemaModel):
     components: list[ComponentSpec] = Field(default_factory=list)
     component_decisions: list[ComponentDecision] = Field(min_length=1)
     public_api_contracts: list[PublicApiContract] = Field(default_factory=list)
+    feature_surfaces: list[FeatureSurfaceSpec] = Field(default_factory=list)
     state_model: list[StateModelSpec] = Field(default_factory=list)
     persistent_state_domains: list[PersistentStateDomainSpec] = Field(default_factory=list)
     state_aggregation: StateAggregationSpec | None = None

@@ -86,6 +86,7 @@ _SYSTEM_MANAGED_FILE_PLAN_NAMES = frozenset(
 )
 _MAX_REPAIR_SCOPE_FILES = 8
 _STATE_AGGREGATION_RESPONSIBILITIES = frozenset({"compose", "persist", "re_export"})
+_FEATURE_SURFACE_COMPOSITION_RESPONSIBILITIES = frozenset({"compose", "layout", "props"})
 _DEFAULT_FRONTEND_STACK_CONTRACT = (
     "Use FOMO's default Next.js + React + TypeScript + Tailwind CSS + shadcn/ui + Lucide React "
     "frontend stack. Prefer existing components and mature shadcn/ui primitives with Lucide icons. "
@@ -123,6 +124,34 @@ _TECHNICAL_SPEC_REPAIR_INSTRUCTIONS = MappingProxyType(
         "technical_spec.file_plan.path_duplicate": "Use each TechnicalSpec.filePlan path at most once.",
         "technical_spec.file_plan.capacity_exceeded": (
             "Reduce TechnicalSpec.filePlan to the configured Engineer capacity."
+        ),
+        "technical_spec.feature_surfaces.component_mapping_invalid": (
+            "Give every ComponentSpec an explicit interactionResponsibilities list and declare exactly one "
+            "featureSurfaces entry for each component with three or more concerns."
+        ),
+        "technical_spec.feature_surfaces.module_mapping_invalid": (
+            "For each feature surface, map every declared interaction responsibility to exactly one module and "
+            "use each module role at most once."
+        ),
+        "technical_spec.feature_surfaces.controller_missing": (
+            "Give every feature surface exactly one additional controller module."
+        ),
+        "technical_spec.feature_surfaces.composition_responsibilities_invalid": (
+            "Limit feature surface compositionResponsibilities to compose, layout, and props without duplicates."
+        ),
+        "technical_spec.feature_surfaces.file_invalid": (
+            "Use valid relative workspace paths for feature surface composition and module files."
+        ),
+        "technical_spec.feature_surfaces.file_unplanned": (
+            "Reference model-owned create or modify TechnicalSpec.filePlan files for every feature surface composition "
+            "and module."
+        ),
+        "technical_spec.feature_surfaces.file_conflict": (
+            "Use different model-owned create or modify TechnicalSpec.filePlan files for every feature surface "
+            "composition and module."
+        ),
+        "technical_spec.feature_surfaces.public_api_unbound": (
+            "Bind every feature surface composition and module filePath plus publicSymbol to publicApiContracts."
         ),
         "technical_spec.persistent_state_domains.mapping_invalid": (
             "For every independently mutable persistent business domain declared in stateModel.mutableDomains, "
@@ -454,6 +483,14 @@ class SOPRunner:
                         "capability gap. Avoid per-control Button/Card/Input decisions; include source and rationale. "
                         "Return publicApiContracts only for actual cross-file public symbols, not an inventory of internal "
                         "or same-file symbols; include file path, export style, symbol, props, and type. "
+                        "Every ComponentSpec must explicitly set interactionResponsibilities from the schema; use [] for "
+                        "leaf or presentational components. For each component with three or more declared concerns, provide "
+                        "exactly one featureSurfaces entry. Give every declared concern its own module with filePath and "
+                        "publicSymbol, plus one separate controller module. The compositionFile may only compose children, "
+                        "arrange layout, and pass props. All composition and module files must be different model-owned create "
+                        "or modify filePlan files, and every compositionFile/compositionSymbol and module filePath/publicSymbol "
+                        "pair must appear in publicApiContracts. Do not infer or merge UI responsibilities from product-domain "
+                        "names. "
                         "Classify every stateModel as persistent_business, transient, or derived. For each "
                         "persistent_business stateModel, mutableDomains must enumerate every independently mutable business "
                         "aggregate it owns; each aggregate with an independent CRUD lifecycle must use its own domain name "
@@ -854,6 +891,7 @@ class SOPRunner:
             raise ArtifactContractViolation(
                 code="technical_spec.public_api_contracts.symbol_duplicate",
             )
+        self._validate_feature_surface_slices(technical, planned_files, set(contract_keys))
 
     def _validate_persistent_state_domain_slices(
         self,
@@ -950,6 +988,116 @@ class SOPRunner:
             raise ArtifactContractViolation(
                 code="technical_spec.persistent_state_domains.aggregation_responsibilities_invalid",
             )
+
+    def _validate_feature_surface_slices(
+        self,
+        technical: TechnicalSpec,
+        planned_files: dict[str, Any],
+        public_api_keys: set[tuple[str, str]],
+    ) -> None:
+        """Bind explicitly declared complex UI concerns to small public modules."""
+        component_names = [component.name for component in technical.components]
+        if len(component_names) != len(set(component_names)):
+            raise ArtifactContractViolation(
+                code="technical_spec.feature_surfaces.component_mapping_invalid",
+            )
+
+        components_by_name = {component.name: component for component in technical.components}
+        complex_component_names: set[str] = set()
+        for component in technical.components:
+            concerns = component.interaction_responsibilities
+            if len(concerns) != len(set(concerns)):
+                raise ArtifactContractViolation(
+                    code="technical_spec.feature_surfaces.component_mapping_invalid",
+                )
+            if len(concerns) >= 3:
+                complex_component_names.add(component.name)
+
+        surfaces = technical.feature_surfaces
+        surface_component_names = [surface.component_name for surface in surfaces]
+        if (
+            len(surface_component_names) != len(set(surface_component_names))
+            or set(surface_component_names) != complex_component_names
+        ):
+            raise ArtifactContractViolation(
+                code="technical_spec.feature_surfaces.component_mapping_invalid",
+            )
+
+        surface_paths: set[str] = set()
+        for surface in surfaces:
+            component = components_by_name.get(surface.component_name)
+            if component is None:
+                raise ArtifactContractViolation(
+                    code="technical_spec.feature_surfaces.component_mapping_invalid",
+                )
+
+            roles = [module.role for module in surface.modules]
+            controller_count = roles.count("controller")
+            if controller_count == 0:
+                raise ArtifactContractViolation(
+                    code="technical_spec.feature_surfaces.controller_missing",
+                )
+            concern_roles = [role for role in roles if role != "controller"]
+            if (
+                controller_count != 1
+                or len(concern_roles) != len(set(concern_roles))
+                or set(concern_roles) != set(component.interaction_responsibilities)
+            ):
+                raise ArtifactContractViolation(
+                    code="technical_spec.feature_surfaces.module_mapping_invalid",
+                )
+
+            composition_responsibilities = surface.composition_responsibilities
+            if (
+                len(composition_responsibilities) != len(set(composition_responsibilities))
+                or not set(composition_responsibilities).issubset(
+                    _FEATURE_SURFACE_COMPOSITION_RESPONSIBILITIES
+                )
+            ):
+                raise ArtifactContractViolation(
+                    code="technical_spec.feature_surfaces.composition_responsibilities_invalid",
+                )
+
+            try:
+                composition_path = str(validate_workspace_path(surface.composition_file))
+            except ValueError:
+                raise ArtifactContractViolation(
+                    code="technical_spec.feature_surfaces.file_invalid",
+                ) from None
+            module_paths: list[str] = []
+            for module in surface.modules:
+                try:
+                    module_path = str(validate_workspace_path(module.file_path))
+                except ValueError:
+                    raise ArtifactContractViolation(
+                        code="technical_spec.feature_surfaces.file_invalid",
+                    ) from None
+                module_paths.append(module_path)
+
+            owned_paths = [composition_path, *module_paths]
+            if len(owned_paths) != len(set(owned_paths)) or any(
+                path in surface_paths for path in owned_paths
+            ):
+                raise ArtifactContractViolation(
+                    code="technical_spec.feature_surfaces.file_conflict",
+                )
+            for path in owned_paths:
+                planned_file = planned_files.get(path)
+                if planned_file is None or planned_file.operation == "delete":
+                    raise ArtifactContractViolation(
+                        code="technical_spec.feature_surfaces.file_unplanned",
+                    )
+            surface_paths.update(owned_paths)
+
+            if (composition_path, surface.composition_symbol) not in public_api_keys:
+                raise ArtifactContractViolation(
+                    code="technical_spec.feature_surfaces.public_api_unbound",
+                )
+            for module, module_path in zip(surface.modules, module_paths, strict=True):
+                if (module_path, module.public_symbol) not in public_api_keys:
+                    raise ArtifactContractViolation(
+                        code="technical_spec.feature_surfaces.public_api_unbound",
+                    )
 
     def _technical_file_plan_paths(self, technical: TechnicalSpec) -> list[str]:
         paths = [item.path for item in technical.file_plan]
