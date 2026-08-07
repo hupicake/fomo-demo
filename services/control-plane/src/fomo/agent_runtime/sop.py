@@ -137,7 +137,7 @@ _TECHNICAL_SPEC_REPAIR_INSTRUCTIONS = MappingProxyType(
         ),
         "technical_spec.feature_surfaces.component_mapping_invalid": (
             "Give every ComponentSpec an explicit interactionResponsibilities list and declare exactly one "
-            "featureSurfaces entry for each component with three or more concerns."
+            "featureSurfaces entry for each component with two or more concerns."
         ),
         "technical_spec.feature_surfaces.module_mapping_invalid": (
             "For each feature surface, map every declared interaction responsibility to exactly one module and "
@@ -508,7 +508,7 @@ class SOPRunner:
                         "Return publicApiContracts only for actual cross-file public symbols, not an inventory of internal "
                         "or same-file symbols; include file path, export style, symbol, props, and type. "
                         "Every ComponentSpec must explicitly set interactionResponsibilities from the schema; use [] for "
-                        "leaf or presentational components. For each component with three or more declared concerns, provide "
+                        "leaf or presentational components. For each component with two or more declared concerns, provide "
                         "exactly one featureSurfaces entry. Give every declared concern its own module with filePath and "
                         "publicSymbol, plus one separate controller module. The compositionFile may only compose children, "
                         "arrange layout, and pass props. All composition and module files must be different model-owned create "
@@ -1085,7 +1085,7 @@ class SOPRunner:
                 raise ArtifactContractViolation(
                     code="technical_spec.feature_surfaces.component_mapping_invalid",
                 )
-            if len(concerns) >= 3:
+            if len(concerns) >= 2:
                 complex_component_names.add(component.name)
 
         surfaces = technical.feature_surfaces
