@@ -1298,7 +1298,9 @@ async def test_reviewer_scope_capacity_retries_to_an_engineer_eligible_subset_wi
 
 
 @pytest.mark.asyncio
-async def test_verify_reviewer_scope_contract_retries_without_detail_leak(repository, settings) -> None:
+async def test_verify_reviewer_scope_contract_retries_without_detail_leak(
+    repository, settings, monkeypatch
+) -> None:
     session = await repository.create_guest_session()
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
@@ -1329,7 +1331,7 @@ async def test_verify_reviewer_scope_contract_retries_without_detail_leak(reposi
     corrected_report = dict(_responses()["reviewer"])
     corrected_report.update(
         {
-            "blockingIssues": ["package manifest failed"],
+            "blockingIssues": ["typecheck failed"],
             "locationFiles": [planned_paths[0]],
         }
     )
@@ -1341,6 +1343,18 @@ async def test_verify_reviewer_scope_contract_retries_without_detail_leak(reposi
         replace(settings, structured_output_retries=1),
     )
 
+    async def failed_quality_gates(_context) -> list[GateResult]:
+        return [
+            GateResult(
+                gate="typecheck",
+                status=GateStatus.failed,
+                summary="failed",
+                affected_files=[planned_paths[0]],
+            )
+        ]
+
+    monkeypatch.setattr(runner, "_run_quality_gates", failed_quality_gates)
+
     report = await runner._verify(
         context,
         ProductSpec.model_validate(_responses()["pm"]),
@@ -1348,7 +1362,7 @@ async def test_verify_reviewer_scope_contract_retries_without_detail_leak(reposi
     )
 
     assert report.location_files == [planned_paths[0]]
-    assert [gate.gate for gate in report.gates] == ["package_manifest"]
+    assert [gate.gate for gate in report.gates] == ["typecheck"]
     retry_event = next(
         event
         for event in await repository.list_events(run.id)
@@ -1410,7 +1424,12 @@ async def test_reviewer_scope_contract_variants_retry_closed_without_detail_leak
             "diagnostic_report.location_files.file_unplanned",
         ),
     ]
-    failed_gate = GateResult(gate="typecheck", status=GateStatus.failed, summary="failed")
+    failed_gate = GateResult(
+        gate="typecheck",
+        status=GateStatus.failed,
+        summary="failed",
+        affected_files=planned_paths,
+    )
 
     for case, invalid_update, expected_code in invalid_cases:
         session = await repository.create_guest_session()
@@ -1471,6 +1490,80 @@ async def test_reviewer_scope_contract_variants_retry_closed_without_detail_leak
         )
         assert source_marker not in correction
         assert source_marker not in json.dumps([event.payload for event in events])
+
+
+@pytest.mark.asyncio
+async def test_reviewer_scope_rejects_planned_guess_without_affected_file_evidence(
+    repository, settings
+) -> None:
+    session = await repository.create_guest_session()
+    project = await repository.create_project(session.id, "Library")
+    _message, run, _created = await repository.create_message_and_run(
+        project.id, session.id, "reviewer-evidence-missing", "Create a book management system"
+    )
+    assert await repository.claim_next_run("test-worker", 60)
+    context = SimpleNamespace(
+        run_id=run.id,
+        lease_token=await repository.get_active_lease_token(run.id),
+    )
+    technical = TechnicalSpec.model_validate(_responses()["architect"])
+    planned_path = technical.file_plan[0].path
+    source_marker = "reviewer-evidence-missing-source-marker"
+    command_marker = "reviewer-evidence-missing-command-marker"
+    output_marker = "reviewer-evidence-missing-output-marker"
+    invalid_report = dict(_responses()["reviewer"])
+    invalid_report.update(
+        {
+            "blockingIssues": [source_marker],
+            "locationFiles": [planned_path],
+        }
+    )
+    model = ScriptedModelClient({"reviewer": [invalid_report, dict(invalid_report)]})
+    runner = SOPRunner(
+        repository,
+        model,
+        FakeSandboxProvider(),
+        replace(settings, structured_output_retries=1),
+    )
+    failed_gate = GateResult(
+        gate="typecheck",
+        status=GateStatus.failed,
+        summary=output_marker,
+        evidence=[f"command:{command_marker}"],
+    )
+
+    with pytest.raises(SOPExecutionError, match="reviewer failed to produce a valid DiagnosticReport"):
+        await runner._role(
+            context,
+            role="reviewer",
+            model_alias="reviewer",
+            schema=DiagnosticReport,
+            messages=[{"role": "system", "content": "test missing diagnostic evidence"}],
+            validate_artifact=lambda report: runner._validate_diagnostic_repair_scope(
+                report,
+                technical,
+                [failed_gate],
+            ),
+        )
+
+    events = await repository.list_events(run.id)
+    retry_event = next(
+        event
+        for event in events
+        if event.kind == "agent.activity" and event.payload.get("action") == "structured_retry"
+    )
+    failed_event = next(event for event in events if event.kind == "agent.failed")
+    assert retry_event.payload["reasonCode"] == "diagnostic_report.location_files.evidence_missing"
+    assert failed_event.payload["reasonCode"] == "diagnostic_report.location_files.evidence_missing"
+    correction = next(
+        message["content"]
+        for message in model.requests[1][1]
+        if message["content"].startswith("Return only a valid DiagnosticReport JSON object")
+    )
+    serialized_events = json.dumps([event.payload for event in events])
+    for marker in (planned_path, source_marker, command_marker, output_marker):
+        assert marker not in correction
+        assert marker not in serialized_events
 
 
 @pytest.mark.asyncio

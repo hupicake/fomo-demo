@@ -255,6 +255,9 @@ _DIAGNOSTIC_REPORT_REPAIR_INSTRUCTIONS = MappingProxyType(
         "diagnostic_report.location_files.not_affected": (
             "When deterministic gates identify affected files, keep locationFiles within that evidence."
         ),
+        "diagnostic_report.location_files.evidence_missing": (
+            "Do not select a repair scope without deterministic affected-file evidence."
+        ),
         "diagnostic_report.findings.file_invalid": (
             "Use only valid relative workspace paths in findings.file."
         ),
@@ -1141,6 +1144,11 @@ class SOPRunner:
                     # Gate paths are deterministic provider output, but an
                     # invalid token must never expand a model repair scope.
                     continue
+
+        if failed_gates and not affected_paths:
+            raise ArtifactContractViolation(
+                code="diagnostic_report.location_files.evidence_missing"
+            )
 
         location_files = diagnostic.location_files
         requires_scope = bool(failed_gates) or bool(diagnostic.blocking_issues) or any(
