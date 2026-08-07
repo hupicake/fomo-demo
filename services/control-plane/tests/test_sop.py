@@ -590,6 +590,31 @@ async def test_repair_scope_includes_only_the_package_manifest_for_dependency_ga
 
 
 @pytest.mark.asyncio
+async def test_repair_scope_caps_full_diagnostic_scope_and_preserves_file_plan_order(
+    repository, settings
+) -> None:
+    runner = SOPRunner(repository, ScriptedModelClient({}), FakeSandboxProvider(), settings)
+    technical = TechnicalSpec.model_validate(_architect_response_with_file_plan_count(9))
+
+    small_scope = runner._repair_technical(
+        technical,
+        DiagnosticReport(
+            location_files=["src/generated/file-7.ts", "src/generated/file-2.ts"]
+        ),
+    )
+
+    assert [item.path for item in small_scope.file_plan] == [
+        "src/generated/file-2.ts",
+        "src/generated/file-7.ts",
+    ]
+    with pytest.raises(SOPExecutionError, match="exceeds the maximum of 8 approved files"):
+        runner._repair_technical(
+            technical,
+            DiagnosticReport(location_files=[item.path for item in technical.file_plan]),
+        )
+
+
+@pytest.mark.asyncio
 async def test_architect_contracts_bind_component_decisions_and_public_api_files(repository, settings) -> None:
     runner = SOPRunner(repository, ScriptedModelClient({}), FakeSandboxProvider(), settings)
     technical = TechnicalSpec.model_validate(_responses()["architect"])
@@ -601,6 +626,19 @@ async def test_architect_contracts_bind_component_decisions_and_public_api_files
     with pytest.raises(ValueError, match="must reference an Architect-planned file"):
         runner._validate_technical_file_plan(
             technical.model_copy(update={"public_api_contracts": [invalid_contract]})
+        )
+    no_contract_response = dict(_responses()["architect"])
+    no_contract_response.pop("publicApiContracts")
+    no_contract_technical = TechnicalSpec.model_validate(no_contract_response)
+    assert no_contract_technical.public_api_contracts == []
+    runner._validate_technical_file_plan(no_contract_technical)
+    deleted_file_plan = [
+        item.model_copy(update={"operation": "delete"}) if item.path == "app.js" else item
+        for item in technical.file_plan
+    ]
+    with pytest.raises(ValueError, match="must not reference a file scheduled for deletion"):
+        runner._validate_technical_file_plan(
+            technical.model_copy(update={"file_plan": deleted_file_plan})
         )
 
 

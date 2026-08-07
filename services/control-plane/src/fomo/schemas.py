@@ -132,7 +132,7 @@ class TechnicalSpec(SchemaModel):
     routes: list[RouteSpec] = Field(default_factory=list)
     components: list[ComponentSpec] = Field(default_factory=list)
     component_decisions: list[ComponentDecision] = Field(min_length=1)
-    public_api_contracts: list[PublicApiContract] = Field(min_length=1)
+    public_api_contracts: list[PublicApiContract] = Field(default_factory=list)
     state_model: list[StateModelSpec] = Field(default_factory=list)
     dependencies: list[DependencySpec] = Field(default_factory=list)
     file_plan: list[FilePlanItem] = Field(default_factory=list)

@@ -83,6 +83,7 @@ _SYSTEM_MANAGED_FILE_PLAN_NAMES = frozenset(
         "bun.lockb",
     }
 )
+_MAX_REPAIR_SCOPE_FILES = 8
 _DEFAULT_FRONTEND_STACK_CONTRACT = (
     "Use FOMO's default Next.js + React + TypeScript + Tailwind CSS + shadcn/ui + Lucide React "
     "frontend stack. Prefer existing components and mature shadcn/ui primitives with Lucide icons. "
@@ -691,22 +692,27 @@ class SOPRunner:
         return max(1, self.settings.engineer_max_file_characters)
 
     def _validate_technical_file_plan(self, technical: TechnicalSpec) -> None:
-        file_paths = self._technical_file_plan_paths(technical)
+        self._technical_file_plan_paths(technical)
         decision_names = [decision.component for decision in technical.component_decisions]
         if len(decision_names) != len(set(decision_names)):
             raise ValueError("architect TechnicalSpec component decisions must not repeat a component")
         missing_decisions = {component.name for component in technical.components}.difference(decision_names)
         if missing_decisions:
             raise ValueError("architect TechnicalSpec must explain every planned component decision")
-        normalized_file_paths = {str(validate_workspace_path(path)) for path in file_paths}
+        planned_files = {
+            str(validate_workspace_path(item.path)): item for item in technical.file_plan
+        }
         contract_keys: list[tuple[str, str]] = []
         for contract in technical.public_api_contracts:
             try:
                 contract_path = str(validate_workspace_path(contract.file_path))
             except ValueError:
                 raise ValueError("architect TechnicalSpec contains an invalid public API contract") from None
-            if contract_path not in normalized_file_paths:
+            planned_file = planned_files.get(contract_path)
+            if planned_file is None:
                 raise ValueError("public API contract must reference an Architect-planned file")
+            if planned_file.operation == "delete":
+                raise ValueError("public API contract must not reference a file scheduled for deletion")
             contract_keys.append((contract_path, contract.symbol))
         if len(contract_keys) != len(set(contract_keys)):
             raise ValueError("architect TechnicalSpec public API contracts must not repeat a symbol")
@@ -755,6 +761,10 @@ class SOPRunner:
                 scoped_paths.add(normalized)
         if not scoped_paths:
             raise SOPExecutionError("repair diagnostic did not identify an approved file scope")
+        if len(scoped_paths) > _MAX_REPAIR_SCOPE_FILES:
+            raise SOPExecutionError(
+                f"repair diagnostic scope exceeds the maximum of {_MAX_REPAIR_SCOPE_FILES} approved files"
+            )
 
         return technical.model_copy(
             update={
