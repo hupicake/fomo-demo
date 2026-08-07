@@ -73,10 +73,10 @@ class Settings:
     model_request_timeout_seconds: int = 300
     # Independent transport budget for LiteLLM gateway transient failures; it
     # must not consume the SOP's schema/structured-output retry budget.
-    model_network_retries: int = 2
-    model_network_retry_base_delay_seconds: float = 0.5
-    model_network_retry_max_delay_seconds: float = 4.0
-    model_retry_after_max_seconds: float = 30.0
+    model_network_retries: int = 5
+    model_network_retry_base_delay_seconds: float = 1.0
+    model_network_retry_max_delay_seconds: float = 16.0
+    model_retry_after_max_seconds: float = 60.0
     model_pm: str = "pm"
     model_architect: str = "architect"
     model_engineer: str = "engineer"

@@ -85,7 +85,12 @@ _SYSTEM_MANAGED_FILE_PLAN_NAMES = frozenset(
 )
 _DEFAULT_FRONTEND_STACK_CONTRACT = (
     "Use FOMO's default Next.js + React + TypeScript + Tailwind CSS + shadcn/ui + Lucide React "
-    "frontend stack. Reuse mature shadcn/ui primitives and Lucide icons before bespoke equivalents."
+    "frontend stack. Prefer existing components and mature shadcn/ui primitives with Lucide icons. "
+    "CRUD uses Table + DropdownMenu, Sheet/Dialog editing, AlertDialog deletion, and Badge status; "
+    "forms use Label + Input/Textarea/Select/Checkbox/Switch with validation and pending submission. "
+    "When a shadcn primitive exists, do not use raw button/input/textarea/select or an unjustified custom "
+    "Dialog/Menu/Select/Tooltip; every custom decision must document the missing capability in "
+    "componentDecisions."
 )
 _PLAYWRIGHT_NETWORK_CONTRACT = (
     "Any Playwright webServer command must bind to 0.0.0.0; its baseURL and readiness probe must use "

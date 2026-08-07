@@ -149,6 +149,30 @@ async def test_retryable_gateway_responses_follow_retry_after_without_using_sop_
 
 
 @pytest.mark.asyncio
+async def test_default_retry_budget_recovers_after_five_429_responses(monkeypatch) -> None:
+    captured: list[dict[str, Any]] = []
+    sequence = [_Response(429) for _ in range(5)] + [_Response()]
+    sleeps: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(
+        llm_module.httpx,
+        "AsyncClient",
+        lambda **kwargs: _SequencedAsyncClient(sequence, captured, **kwargs),
+    )
+    monkeypatch.setattr(llm_module.asyncio, "sleep", record_sleep)
+
+    assert await OpenAICompatibleClient(
+        "http://localhost:4000/v1", random_source=lambda: 1.0
+    ).complete_json("engineer", [], "ImplementationPlan") == {"status": "ok"}
+
+    assert len(captured) == 6
+    assert sleeps == [1.0, 2.0, 4.0, 8.0, 16.0]
+
+
+@pytest.mark.asyncio
 async def test_429_honors_numeric_retry_after_with_a_bounded_cap(monkeypatch) -> None:
     captured: list[dict[str, Any]] = []
     sequence = [_Response(429, {"Retry-After": "9"}), _Response()]
