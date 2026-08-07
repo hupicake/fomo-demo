@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
-DEFAULT_OPENSANDBOX_IMAGE = "fomo-sandbox-node:2026-08-07"
+DEFAULT_OPENSANDBOX_IMAGE = "fomo-sandbox-node:2026-08-08"
 DEFAULT_OPENSANDBOX_LIFETIME_SECONDS = 21_600
 
 

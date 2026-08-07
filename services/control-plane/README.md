@@ -74,7 +74,7 @@ run in the worker through a `SandboxProvider`.
 - Production/default sandbox selection is `opensandbox`, implemented against
   **OpenSandbox Server v0.2.2** with the pinned **Python SDK v0.1.15**. It
   creates an arm64 workspace from the curated
-  `fomo-sandbox-node:2026-08-07` base image (or `OPENSANDBOX_IMAGE`), streams execd command
+  `fomo-sandbox-node:2026-08-08` base image (or `OPENSANDBOX_IMAGE`), streams execd command
   output, supports file reads/writes, lifecycle pause/kill, and maps previews
   to `get_endpoint(8080)`. Port `44772` is `execd`, is never a preview, and is
   never returned to a browser. FOMO intentionally uses Git commits plus its

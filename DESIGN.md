@@ -373,10 +373,18 @@ Engineer 只能通过以下应用工具操作，所有实现最终落到沙箱�
 策略：
 
 - 首轮从受控 Next.js starter 开始，不让模型自己选择任意脚手架。
+- V1 固定使用 `fomo-next-radix-v1`：镜像与 control plane 都持有同一份 vendored
+  Next/TypeScript/Tailwind/Radix shadcn 源码、pnpm lock 和 Playwright 配置。创建 sandbox 后先复制，
+  按逐文件 SHA-256 与 canonical tree SHA-256 校验，再创建 `chore(starter)` 初始 Git commit 并持久化
+  starter provenance。
+- Architect 只接收 compact StarterManifest（可用 imports、受保护路径、model-owned roots 和 scripts）；
+  TechnicalSpec 与 Engineer 写入前都拒绝 starter/system 路径。常规路由、业务组合、领域状态和 smoke tests
+  分别位于 `app/(generated)/**`、`components/features/**`、`lib/domain/**` 与 `tests/**`。
 - 小改动优先 unified diff；新文件或大范围重构允许整文件写入。
 - 禁止“修改第 N 行”式脆弱指令。
 - 每次工具调用带 `operationId`，worker 重试时先检查是否已执行。
-- 依赖安装只发生在沙箱；新增依赖必须进入 `package.json` 和锁文件。
+- 依赖安装只发生在沙箱；V1 不允许模型修改固定 starter 的 `package.json` 或锁文件，缺少能力必须记录为风险，
+  由后续受控 starter 版本演进处理。
 - 模型不能直接写 `.env*`、Git hooks、宿主配置或沙箱外路径。
 
 ### 6.5 QA 与自愈
@@ -730,7 +738,7 @@ AWS_SECRET_ACCESS_KEY=...
 SANDBOX_PROVIDER=opensandbox
 OPENSANDBOX_BASE_URL=http://opensandbox:8080
 OPENSANDBOX_API_KEY=...
-OPENSANDBOX_IMAGE=fomo-sandbox-node:2026-08-07
+OPENSANDBOX_IMAGE=fomo-sandbox-node:2026-08-08
 OPENSANDBOX_RUNTIME=docker
 OPENSANDBOX_PREVIEW_DOMAIN=preview.localhost
 # Optional cloud adapter; V1 local startup does not require these values.

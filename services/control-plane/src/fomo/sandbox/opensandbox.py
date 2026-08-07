@@ -43,6 +43,8 @@ from .base import (
 
 _APPLICATION_PORT = 8080
 _WORKSPACE = "/workspace"
+_STARTER_ROOT = "/opt/fomo/starters"
+_SUPPORTED_STARTER_ID = "fomo-next-radix-v1"
 # OpenSandbox serializes permission modes as octal-looking JSON integers
 # (for example, 644), not Python ``0o`` integer literals (which become 420).
 _OPENSANDBOX_DIRECTORY_WIRE_MODE = 755
@@ -303,6 +305,29 @@ class OpenSandboxProvider:
             await sandbox.files.write_files(write_entries)
         if delete_paths:
             await sandbox.files.delete_files(delete_paths)
+
+    async def copy_starter(self, ref: SandboxRef, starter_id: str) -> ExecResult:
+        """Copy the baked immutable seed into a writable generated workspace."""
+        if starter_id != _SUPPORTED_STARTER_ID:
+            raise ValueError("unsupported immutable starter")
+
+        async def discard_output(_stream: str, _text: str) -> None:
+            return None
+
+        # The starter source is image-owned and read-only. Do not preserve its
+        # mode or ownership: the copy in /workspace must be writable by the
+        # sandbox's unprivileged Node user.
+        return await self.exec(
+            ref,
+            Command(
+                command=(
+                    "cp -R --no-preserve=mode,ownership -- "
+                    f"{_STARTER_ROOT}/{_SUPPORTED_STARTER_ID}/. {_WORKSPACE}/"
+                ),
+                timeout_seconds=30,
+            ),
+            discard_output,
+        )
 
     async def expose(self, ref: SandboxRef, port: int) -> PreviewRef:
         self._validate_preview_port(port)
