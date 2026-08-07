@@ -35,6 +35,7 @@ from fomo.schemas import (
     RunPhase,
     TechnicalSpec,
 )
+from fomo.starter import default_starter_manifest
 from fomo.worker.runner import WorkerRunner
 
 
@@ -72,15 +73,15 @@ def _two_batch_engineer_cycle() -> list[dict[str, Any] | object]:
             "baselineVersionId": None,
             "batches": [
                 {
-                    "id": "package-scaffold",
-                    "purpose": "package configuration",
-                    "paths": ["package.json"],
+                    "id": "library-page",
+                    "purpose": "root route composition",
+                    "paths": ["app/page.tsx"],
                     "acceptanceIds": ["AC-1"],
                 },
                 {
-                    "id": "library-ui",
+                    "id": "library-feature",
                     "purpose": "library interaction",
-                    "paths": ["app.js"],
+                    "paths": ["components/features/library.tsx"],
                     "acceptanceIds": ["AC-1"],
                 },
             ],
@@ -88,27 +89,31 @@ def _two_batch_engineer_cycle() -> list[dict[str, Any] | object]:
             "knownLimitations": [],
         },
         {
-            "batchId": "package-scaffold",
+            "batchId": "library-page",
             "implementedAcceptanceIds": ["AC-1"],
             "designDecisionIds": ["DD-1"],
-            "changedFiles": ["package.json"],
+            "changedFiles": ["app/page.tsx"],
             "knownLimitations": [],
             "fileChanges": [
                 {
-                    "path": "package.json",
-                    "operation": "create",
-                    "content": '{"scripts":{"typecheck":"node --check app.js","build":"node --check app.js","dev":"node server.js"}}',
+                    "path": "app/page.tsx",
+                    "operation": "modify",
+                    "content": 'import { Library } from "@/components/features/library";\n\nexport default function HomePage() {\n  return <Library />;\n}\n',
                 }
             ],
         },
         {
-            "batchId": "library-ui",
+            "batchId": "library-feature",
             "implementedAcceptanceIds": ["AC-1"],
             "designDecisionIds": ["DD-1"],
-            "changedFiles": ["app.js"],
+            "changedFiles": ["components/features/library.tsx"],
             "knownLimitations": [],
             "fileChanges": [
-                {"path": "app.js", "operation": "create", "content": "console.log('library')"}
+                {
+                    "path": "components/features/library.tsx",
+                    "operation": "create",
+                    "content": 'export function Library() {\n  return <main>Library</main>;\n}\n',
+                }
             ],
         },
         _final_implementation_response,
@@ -123,7 +128,7 @@ def _single_file_repair_engineer_cycle() -> list[dict[str, Any] | object]:
                 {
                     "id": "library-ui-repair",
                     "purpose": "repair the diagnosed library UI file",
-                    "paths": ["app.js"],
+                    "paths": ["components/features/library.tsx"],
                     "acceptanceIds": ["AC-1"],
                 }
             ],
@@ -134,10 +139,14 @@ def _single_file_repair_engineer_cycle() -> list[dict[str, Any] | object]:
             "batchId": "library-ui-repair",
             "implementedAcceptanceIds": ["AC-1"],
             "designDecisionIds": ["DD-1"],
-            "changedFiles": ["app.js"],
+            "changedFiles": ["components/features/library.tsx"],
             "knownLimitations": [],
             "fileChanges": [
-                {"path": "app.js", "operation": "modify", "content": "console.log('library repair')"}
+                {
+                    "path": "components/features/library.tsx",
+                    "operation": "modify",
+                    "content": 'export function Library() {\n  return <main>Library repaired</main>;\n}\n',
+                }
             ],
         },
         _final_implementation_response,
@@ -179,7 +188,7 @@ def _responses() -> dict[str, Any]:
             ],
             "publicApiContracts": [
                 {
-                    "filePath": "app.js",
+                    "filePath": "components/features/library.tsx",
                     "exportStyle": "named",
                     "symbol": "Library",
                     "props": [],
@@ -197,8 +206,12 @@ def _responses() -> dict[str, Any]:
             ],
             "dependencies": [],
             "filePlan": [
-                {"path": "package.json", "operation": "create", "reason": "scripts"},
-                {"path": "app.js", "operation": "create", "reason": "library interaction"},
+                {"path": "app/page.tsx", "operation": "modify", "reason": "root route composition"},
+                {
+                    "path": "components/features/library.tsx",
+                    "operation": "create",
+                    "reason": "library interaction",
+                },
             ],
             "testPlan": [{"acceptanceId": "AC-1", "method": "unit", "steps": ["add book"]}],
             "risks": [],
@@ -222,7 +235,7 @@ def _architect_response_with_file_plan_count(count: int) -> dict[str, Any]:
     response = dict(_responses()["architect"])
     response["filePlan"] = [
         {
-            "path": f"src/generated/file-{index}.ts",
+            "path": f"components/features/generated/file-{index}.tsx",
             "operation": "create",
             "reason": "test-only file-plan capacity fixture",
         }
@@ -230,7 +243,7 @@ def _architect_response_with_file_plan_count(count: int) -> dict[str, Any]:
     ]
     response["publicApiContracts"] = [
         {
-            "filePath": "src/generated/file-0.ts",
+            "filePath": "components/features/generated/file-0.tsx",
             "exportStyle": "named",
             "symbol": "GeneratedFile",
             "props": [],
@@ -297,30 +310,30 @@ def _architect_response_with_domain_state_slices() -> dict[str, Any]:
         {
             "domain": "books",
             "stateModelName": "LibraryData",
-            "actionsStoreFile": "lib/state/books-store.ts",
+            "actionsStoreFile": "lib/domain/state/books-store.ts",
         },
         {
             "domain": "readers",
             "stateModelName": "LibraryData",
-            "actionsStoreFile": "lib/state/readers-store.ts",
+            "actionsStoreFile": "lib/domain/state/readers-store.ts",
         },
         {
             "domain": "loans",
             "stateModelName": "LibraryData",
-            "actionsStoreFile": "lib/state/loans-store.ts",
+            "actionsStoreFile": "lib/domain/state/loans-store.ts",
         },
     ]
     response["stateAggregation"] = {
-        "filePath": "lib/use-library-store.ts",
+        "filePath": "lib/domain/use-library-store.ts",
         "responsibilities": ["compose", "persist", "re_export"],
     }
     response["filePlan"] = [
         *response["filePlan"],
-        {"path": "lib/state/books-store.ts", "operation": "create", "reason": "book mutations"},
-        {"path": "lib/state/readers-store.ts", "operation": "create", "reason": "reader mutations"},
-        {"path": "lib/state/loans-store.ts", "operation": "create", "reason": "loan and return mutations"},
+        {"path": "lib/domain/state/books-store.ts", "operation": "create", "reason": "book mutations"},
+        {"path": "lib/domain/state/readers-store.ts", "operation": "create", "reason": "reader mutations"},
+        {"path": "lib/domain/state/loans-store.ts", "operation": "create", "reason": "loan and return mutations"},
         {
-            "path": "lib/use-library-store.ts",
+            "path": "lib/domain/use-library-store.ts",
             "operation": "create",
             "reason": "state composition, persistence, and re-exports only",
         },
@@ -358,6 +371,62 @@ def test_file_batch_contract_violation_uses_a_closed_repair_instruction_map() ->
         )
 
 
+def test_default_starter_manifest_is_digest_pinned_and_exposes_approved_primitives() -> None:
+    manifest = default_starter_manifest()
+
+    assert manifest.id == "fomo-next-radix-v1"
+    assert manifest.version == "1.0.0"
+    assert manifest.tree_sha256 == "bcd9f47b393a0314992a4e17a77476c5731a47ed10818df9059845348f42cbf9"
+    assert "@/components/ui/button" in manifest.available_imports
+    assert "@/components/ui/card" in manifest.available_imports
+    assert "package.json" in manifest.protected_paths
+    assert "playwright.config.ts" in manifest.protected_paths
+    assert "components/features/**" in manifest.model_owned_roots
+    assert manifest.base_scripts["test:smoke"] == "playwright test --project=chromium"
+    manifest.verify_tree(
+        {change.path: change.content.encode("utf-8") for change in manifest.file_changes}
+    )
+
+
+@pytest.mark.asyncio
+async def test_sandbox_bootstrap_copies_verified_starter_before_initial_commit(repository, settings) -> None:
+    session = await repository.create_guest_session()
+    project = await repository.create_project(session.id, "Starter bootstrap")
+    _message, run, _created = await repository.create_message_and_run(
+        project.id, session.id, "starter-bootstrap", "Create a book management system"
+    )
+    claimed = await repository.claim_next_run("test-worker", 60)
+    assert claimed is not None and claimed.id == run.id
+    sandbox = FakeSandboxProvider()
+    runner = SOPRunner(repository, ScriptedModelClient({}), sandbox, settings)
+    context = SimpleNamespace(
+        run_id=run.id,
+        project_id=project.id,
+        lease_token=await repository.get_active_lease_token(run.id),
+        sandbox=None,
+    )
+
+    await runner._create_sandbox(context)
+
+    assert context.sandbox is not None
+    workspace = sandbox.sandboxes[context.sandbox.id]
+    expected_files = {change.path: change.content.encode("utf-8") for change in runner.starter.file_changes}
+    assert {path: workspace.files[path] for path in expected_files} == expected_files
+    assert workspace.files[".gitignore"] == (
+        b"# FOMO system safety baseline\nnode_modules/\n.next/\ndist/\nbuild/\ncoverage/\n"
+        b"playwright-report/\ntest-results/\nblob-report/\n*.log\n.env\n.env.*\n"
+    )
+    assert workspace.commands == [
+        "git init && git config user.email fomo@local.invalid && git config user.name 'FOMO Agent'",
+        "git add -A && git commit -m 'chore(starter): fomo-next-radix-v1'",
+        "git rev-parse HEAD",
+    ]
+    provenance = await repository.get_latest_artifact(run.id, "starter_provenance")
+    assert provenance is not None
+    assert provenance["treeSha256"] == runner.starter.tree_sha256
+    assert provenance["initialCommitSha"] == "ok"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("report_payload", "expected_payload", "settings_overrides", "code"),
@@ -365,16 +434,16 @@ def test_file_batch_contract_violation_uses_a_closed_repair_instruction_map() ->
         pytest.param(
             {
                 "batchId": "wrong-batch",
-                "fileChanges": [{"path": "src/book.ts", "content": "export {}"}],
+                "fileChanges": [{"path": "components/features/book.tsx", "content": "export {}"}],
             },
-            {"id": "requested-batch", "purpose": "test", "paths": ["src/book.ts"]},
+            {"id": "requested-batch", "purpose": "test", "paths": ["components/features/book.tsx"]},
             {},
             "file_batch_report.batch_id_mismatch",
             id="batch-id-mismatch",
         ),
         pytest.param(
             {"batchId": "requested-batch", "fileChanges": []},
-            {"id": "requested-batch", "purpose": "test", "paths": ["src/book.ts"]},
+            {"id": "requested-batch", "purpose": "test", "paths": ["components/features/book.tsx"]},
             {},
             "file_batch_report.file_changes_empty",
             id="empty-file-changes",
@@ -383,11 +452,11 @@ def test_file_batch_contract_violation_uses_a_closed_repair_instruction_map() ->
             {
                 "batchId": "requested-batch",
                 "fileChanges": [
-                    {"path": "src/book.ts", "content": "first"},
-                    {"path": "src/book.ts", "content": "second"},
+                    {"path": "components/features/book.tsx", "content": "first"},
+                    {"path": "components/features/book.tsx", "content": "second"},
                 ],
             },
-            {"id": "requested-batch", "purpose": "test", "paths": ["src/book.ts"]},
+            {"id": "requested-batch", "purpose": "test", "paths": ["components/features/book.tsx"]},
             {},
             "file_batch_report.paths_duplicate",
             id="duplicate-paths",
@@ -395,9 +464,9 @@ def test_file_batch_contract_violation_uses_a_closed_repair_instruction_map() ->
         pytest.param(
             {
                 "batchId": "requested-batch",
-                "fileChanges": [{"path": "src/other.ts", "content": "export {}"}],
+                "fileChanges": [{"path": "components/features/other.tsx", "content": "export {}"}],
             },
-            {"id": "requested-batch", "purpose": "test", "paths": ["src/book.ts"]},
+            {"id": "requested-batch", "purpose": "test", "paths": ["components/features/book.tsx"]},
             {},
             "file_batch_report.paths_mismatch",
             id="paths-mismatch",
@@ -407,7 +476,7 @@ def test_file_batch_contract_violation_uses_a_closed_repair_instruction_map() ->
                 "batchId": "requested-batch",
                 "fileChanges": [{"path": "../outside.ts", "content": "export {}"}],
             },
-            {"id": "requested-batch", "purpose": "test", "paths": ["src/book.ts"]},
+            {"id": "requested-batch", "purpose": "test", "paths": ["components/features/book.tsx"]},
             {},
             "file_batch_report.workspace_path_invalid",
             id="invalid-workspace-path-before-path-mismatch",
@@ -415,9 +484,9 @@ def test_file_batch_contract_violation_uses_a_closed_repair_instruction_map() ->
         pytest.param(
             {
                 "batchId": "requested-batch",
-                "fileChanges": [{"path": "src/book.ts", "content": "too-long"}],
+                "fileChanges": [{"path": "components/features/book.tsx", "content": "too-long"}],
             },
-            {"id": "requested-batch", "purpose": "test", "paths": ["src/book.ts"]},
+            {"id": "requested-batch", "purpose": "test", "paths": ["components/features/book.tsx"]},
             {"engineer_max_file_characters": 2},
             "file_batch_report.file_size_exceeded",
             id="file-size-exceeded",
@@ -450,7 +519,7 @@ def _repair_responses() -> dict[str, Any]:
     responses = _responses()
     responses["engineer"] = [*responses["engineer"], *_single_file_repair_engineer_cycle()]
     initial_reviewer = dict(responses["reviewer"])
-    initial_reviewer["locationFiles"] = ["app.js"]
+    initial_reviewer["locationFiles"] = ["components/features/library.tsx"]
     responses["reviewer"] = [initial_reviewer, responses["reviewer"]]
     return responses
 
@@ -596,7 +665,8 @@ async def test_four_role_sop_creates_version_and_trace(repository, settings) -> 
     assert len(versions) == 1
     assert {item["path"] for item in await repository.list_version_files(project.id)} >= {
         ".gitignore",
-        "app.js",
+        "app/page.tsx",
+        "components/features/library.tsx",
     }
     _version_id, gitignore, _sha256 = await repository.get_version_file_content(project.id, ".gitignore")
     assert "node_modules/" in gitignore
@@ -608,6 +678,17 @@ async def test_four_role_sop_creates_version_and_trace(repository, settings) -> 
     assert len(implementation["batchArtifactIds"]) == 2
     assert await repository.get_latest_artifact(run.id, "implementation_plan") is not None
     assert await repository.get_latest_artifact(run.id, "implementation_batch") is not None
+    starter_provenance = await repository.get_latest_artifact(run.id, "starter_provenance")
+    assert starter_provenance is not None
+    assert starter_provenance["id"] == "fomo-next-radix-v1"
+    assert starter_provenance["version"] == "1.0.0"
+    assert starter_provenance["initialCommitSha"] == "ok"
+    assert {entry["path"] for entry in starter_provenance["files"]} >= {
+        "components/ui/button.tsx",
+        "components/ui/card.tsx",
+        "playwright.config.ts",
+        "pnpm-lock.yaml",
+    }
     trace = await repository.get_trace(project.id, run.id)
     assert trace["links"]
     events = await repository.list_events(run.id)
@@ -623,8 +704,11 @@ async def test_four_role_sop_creates_version_and_trace(repository, settings) -> 
     assert "concise" in architect_system_prompt
     assert "24 Engineer batches of at most 1 unique valid relative workspace path each" in architect_system_prompt
     assert "no more than 24 paths total" in architect_system_prompt
-    assert "Never plan system-managed .gitignore files" in architect_system_prompt
-    assert "pnpm-lock.yaml, package-lock.json, yarn.lock, bun.lock, or bun.lockb" in architect_system_prompt
+    assert "An immutable starter already exists" in architect_system_prompt
+    assert "StarterManifest protectedPaths" in architect_system_prompt
+    assert "app/(generated)/**" in architect_system_prompt
+    assert "components/features/**" in architect_system_prompt
+    assert "lib/domain/**" in architect_system_prompt
     assert "0.0.0.0" in architect_system_prompt
     assert "http://127.0.0.1:<port>" in architect_system_prompt
     assert "dynamic hostname" in architect_system_prompt
@@ -654,6 +738,7 @@ async def test_four_role_sop_creates_version_and_trace(repository, settings) -> 
     assert "dynamic hostname" in engineer_plan_system_prompt
     assert "React + TypeScript + Tailwind CSS + shadcn/ui + Lucide React" in engineer_plan_system_prompt
     assert "publicApiContracts" in engineer_plan_system_prompt
+    assert "immutable starter already provides package configuration" in engineer_plan_system_prompt
     engineer_batch_requests = [request for request in model.requests if request[2] == "FileBatchReport"]
     assert len(engineer_batch_requests) == 2
     engineer_batch_system_prompt = engineer_batch_requests[0][1][0]["content"]
@@ -661,8 +746,10 @@ async def test_four_role_sop_creates_version_and_trace(repository, settings) -> 
     assert "http://127.0.0.1:<port>" in engineer_batch_system_prompt
     assert "dynamic hostname" in engineer_batch_system_prompt
     assert "React + TypeScript + Tailwind CSS + shadcn/ui + Lucide React" in engineer_batch_system_prompt
+    assert "Write only StarterManifest modelOwnedRoots" in engineer_batch_system_prompt
     for engineer_batch_request in engineer_batch_requests:
         assert "Shared public API contracts" in engineer_batch_request[1][1]["content"]
+        assert "StarterManifest:" in engineer_batch_request[1][1]["content"]
         assert '"symbol":"Library"' in engineer_batch_request[1][1]["content"]
 
     # On refresh a finished run remains non-active, but its whole visible
@@ -743,9 +830,9 @@ async def test_engineer_plan_must_exactly_cover_architect_file_plan(repository, 
         {
             "batches": [
                 {
-                    "id": "package",
-                    "purpose": "initial package file",
-                    "paths": ["package.json"],
+                    "id": "page",
+                    "purpose": "only one planned model-owned file",
+                    "paths": ["app/page.tsx"],
                 },
             ]
         }
@@ -759,7 +846,7 @@ async def test_engineer_plan_must_exactly_cover_architect_file_plan(repository, 
                 {
                     "id": "overfull",
                     "purpose": "violates the bounded batch contract",
-                    "paths": ["package.json", "app.js"],
+                    "paths": ["app/page.tsx", "components/features/library.tsx"],
                 }
             ]
         }
@@ -771,19 +858,19 @@ async def test_engineer_plan_must_exactly_cover_architect_file_plan(repository, 
         {
             "batches": [
                 {
-                    "id": "scaffold",
+                    "id": "page",
                     "purpose": "initial files",
-                    "paths": ["package.json"],
+                    "paths": ["app/page.tsx"],
                 },
                 {
-                    "id": "app",
+                    "id": "feature",
                     "purpose": "library application",
-                    "paths": ["app.js"],
+                    "paths": ["components/features/library.tsx"],
                 },
                 {
                     "id": "extra",
                     "purpose": "not authorized by the Architect",
-                    "paths": ["server.js"],
+                    "paths": ["components/features/extra.tsx"],
                 },
             ]
         }
@@ -796,11 +883,11 @@ async def test_engineer_plan_must_exactly_cover_architect_file_plan(repository, 
 async def test_repair_scope_rejects_an_unrelated_full_rewrite(repository, settings) -> None:
     runner = SOPRunner(repository, ScriptedModelClient({}), FakeSandboxProvider(), settings)
     technical = TechnicalSpec.model_validate(_responses()["architect"])
-    diagnostic = DiagnosticReport(location_files=["app.js"])
+    diagnostic = DiagnosticReport(location_files=["components/features/library.tsx"])
 
     scoped_technical = runner._repair_technical(technical, diagnostic)
 
-    assert [item.path for item in scoped_technical.file_plan] == ["app.js"]
+    assert [item.path for item in scoped_technical.file_plan] == ["components/features/library.tsx"]
     with pytest.raises(ValueError, match="exactly match the architect TechnicalSpec file plan"):
         runner._validate_implementation_plan(
             ImplementationPlan.model_validate(_two_batch_engineer_cycle()[0]),
@@ -811,16 +898,17 @@ async def test_repair_scope_rejects_an_unrelated_full_rewrite(repository, settin
 
 
 @pytest.mark.asyncio
-async def test_repair_scope_includes_only_the_package_manifest_for_dependency_gates(repository, settings) -> None:
+async def test_repair_scope_does_not_offer_immutable_package_files_for_dependency_gates(
+    repository, settings
+) -> None:
     runner = SOPRunner(repository, ScriptedModelClient({}), FakeSandboxProvider(), settings)
     technical = TechnicalSpec.model_validate(_responses()["architect"])
     diagnostic = DiagnosticReport(
         gates=[GateResult(gate="dependencies", status=GateStatus.failed, summary="lockfile mismatch")]
     )
 
-    scoped_technical = runner._repair_technical(technical, diagnostic)
-
-    assert [item.path for item in scoped_technical.file_plan] == ["package.json"]
+    with pytest.raises(SOPExecutionError, match="did not identify an approved file scope"):
+        runner._repair_technical(technical, diagnostic)
 
 
 @pytest.mark.asyncio
@@ -833,13 +921,16 @@ async def test_repair_scope_caps_full_diagnostic_scope_and_preserves_file_plan_o
     small_scope = runner._repair_technical(
         technical,
         DiagnosticReport(
-            location_files=["src/generated/file-7.ts", "src/generated/file-2.ts"]
+            location_files=[
+                "components/features/generated/file-7.tsx",
+                "components/features/generated/file-2.tsx",
+            ]
         ),
     )
 
     assert [item.path for item in small_scope.file_plan] == [
-        "src/generated/file-2.ts",
-        "src/generated/file-7.ts",
+        "components/features/generated/file-2.tsx",
+        "components/features/generated/file-7.tsx",
     ]
     with pytest.raises(SOPExecutionError, match="exceeds the maximum of 8 approved files"):
         runner._repair_technical(
@@ -882,7 +973,9 @@ async def test_architect_contracts_bind_component_decisions_and_public_api_files
     assert no_contract_technical.public_api_contracts == []
     runner._validate_technical_file_plan(no_contract_technical)
     deleted_file_plan = [
-        item.model_copy(update={"operation": "delete"}) if item.path == "app.js" else item
+        item.model_copy(update={"operation": "delete"})
+        if item.path == "components/features/library.tsx"
+        else item
         for item in technical.file_plan
     ]
     with pytest.raises(ArtifactContractViolation) as deleted_contract:
@@ -1061,6 +1154,56 @@ async def test_architect_file_plan_rejects_system_managed_paths(repository, sett
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "code"),
+    [
+        ("package.json", "technical_spec.file_plan.starter_protected"),
+        ("components/ui/button.tsx", "technical_spec.file_plan.starter_protected"),
+        ("app/layout.tsx", "technical_spec.file_plan.starter_protected"),
+        ("playwright.config.ts", "technical_spec.file_plan.starter_protected"),
+        ("src/not-allowed.ts", "technical_spec.file_plan.model_root"),
+    ],
+)
+async def test_architect_file_plan_rejects_immutable_starter_and_non_model_roots(
+    repository, settings, path, code
+) -> None:
+    runner = SOPRunner(repository, ScriptedModelClient({}), FakeSandboxProvider(), settings)
+    technical = TechnicalSpec.model_validate(_architect_response_with_system_managed_path(path))
+
+    with pytest.raises(ArtifactContractViolation) as violation:
+        runner._validate_technical_file_plan(technical)
+    assert violation.value.code == code
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "code"),
+    [
+        ("components/ui/button.tsx", "file_batch_report.starter_protected"),
+        ("package.json", "file_batch_report.starter_protected"),
+        ("src/not-allowed.ts", "file_batch_report.model_root"),
+    ],
+)
+async def test_engineer_file_batch_rejects_immutable_starter_and_non_model_roots(
+    repository, settings, path, code
+) -> None:
+    runner = SOPRunner(repository, ScriptedModelClient({}), FakeSandboxProvider(), settings)
+    expected = ImplementationBatchPlan.model_validate(
+        {"id": "requested-batch", "purpose": "test", "paths": [path]}
+    )
+    report = FileBatchReport.model_validate(
+        {
+            "batchId": "requested-batch",
+            "fileChanges": [{"path": path, "content": "export {}"}],
+        }
+    )
+
+    with pytest.raises(FileBatchContractViolation) as violation:
+        runner._validate_file_batch_report(report, expected)
+    assert violation.value.code == code
+
+
+@pytest.mark.asyncio
 async def test_system_managed_file_plan_retries_before_sandbox_creation(repository, settings) -> None:
     session = await repository.create_guest_session()
     project = await repository.create_project(session.id, "Library")
@@ -1096,7 +1239,10 @@ async def test_system_managed_file_plan_retries_before_sandbox_creation(reposito
     assert len(sandbox.sandboxes) == 1
     technical = await repository.get_latest_artifact(run.id, "technical_spec")
     assert technical is not None
-    assert {item["path"] for item in technical["filePlan"]} == {"package.json", "app.js"}
+    assert {item["path"] for item in technical["filePlan"]} == {
+        "app/page.tsx",
+        "components/features/library.tsx",
+    }
     events = await repository.list_events(run.id)
     retry_event = next(
         event
@@ -1263,7 +1409,7 @@ async def test_file_batch_contract_violation_adds_targeted_schema_correction(rep
         lease_token=await repository.get_active_lease_token(run.id),
     )
     expected = ImplementationBatchPlan.model_validate(
-        {"id": "requested-batch", "purpose": "test", "paths": ["src/book.ts"]}
+        {"id": "requested-batch", "purpose": "test", "paths": ["components/features/book.tsx"]}
     )
     source_marker = "model-body-never-leak"
     model = ScriptedModelClient(
@@ -1271,11 +1417,11 @@ async def test_file_batch_contract_violation_adds_targeted_schema_correction(rep
             "engineer": [
                 {
                     "batchId": "wrong-batch",
-                    "fileChanges": [{"path": "src/book.ts", "content": source_marker}],
+                    "fileChanges": [{"path": "components/features/book.tsx", "content": source_marker}],
                 },
                 {
                     "batchId": "requested-batch",
-                    "fileChanges": [{"path": "src/book.ts", "content": "export {}"}],
+                    "fileChanges": [{"path": "components/features/book.tsx", "content": "export {}"}],
                 },
             ]
         }
@@ -1340,7 +1486,11 @@ async def test_engineer_non_file_batch_contract_violation_uses_generic_schema_co
     )
     plan_payload = {
         "batches": [
-            {"id": "requested-batch", "purpose": "test", "paths": ["src/book.ts"]}
+            {
+                "id": "requested-batch",
+                "purpose": "test",
+                "paths": ["components/features/book.tsx"],
+            }
         ]
     }
     model = ScriptedModelClient({"engineer": [plan_payload, plan_payload]})
@@ -1727,7 +1877,7 @@ async def test_blocking_typecheck_routes_one_repair_to_engineer(repository, sett
     sandbox = LockfileSandbox(
         {
             "pnpm typecheck": [
-                ExecResult(1, "", "Type error in app.js"),
+                ExecResult(1, "", "Type error in components/features/library.tsx"),
                 ExecResult(0, "ok\n", ""),
             ]
         }

@@ -319,10 +319,19 @@ async def test_opensandbox_provider_uses_pinned_sdk_contract_and_application_por
     assert SDK.handle.commands.runs[0][1].working_directory == "/workspace"
     assert SDK.handle.commands.runs[0][1].timeout.total_seconds() == 12
 
+    starter_copy = await provider.copy_starter(ref, "fomo-next-radix-v1")
+    assert starter_copy.exit_code == 0
+    assert SDK.handle.commands.runs[1][0] == (
+        "cp -R --no-preserve=mode,ownership -- "
+        "/opt/fomo/starters/fomo-next-radix-v1/. /workspace/"
+    )
+    with pytest.raises(ValueError, match="unsupported immutable starter"):
+        await provider.copy_starter(ref, "unapproved-starter")
+
     preview = await provider.start_preview(ref, Command("pnpm dev"), 8080, sink)
     assert preview.url == "http://preview.example.test:45678"
-    assert SDK.handle.commands.runs[1][1].background is True
-    assert SDK.handle.commands.runs[1][1].working_directory == "/workspace"
+    assert SDK.handle.commands.runs[2][1].background is True
+    assert SDK.handle.commands.runs[2][1].working_directory == "/workspace"
     manifest = await provider.list_files(ref)
     assert [item["path"] for item in manifest] == ["package.json", "src/app.ts"]
     await provider.pause(ref)

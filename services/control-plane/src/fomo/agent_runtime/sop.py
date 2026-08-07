@@ -38,6 +38,7 @@ from fomo.schemas import (
     RunStatus,
     TechnicalSpec,
 )
+from fomo.starter import StarterIntegrityError, StarterManifest, default_starter_manifest
 
 from .llm import ModelClient, ModelError, ModelRequestError, ModelRetry
 from .metagpt_adapter import MetaGPTAdapter
@@ -120,9 +121,18 @@ _TECHNICAL_SPEC_REPAIR_INSTRUCTIONS = MappingProxyType(
             "Use only valid relative workspace paths in TechnicalSpec.filePlan."
         ),
         "technical_spec.file_plan.system_managed": "Remove system-managed files from TechnicalSpec.filePlan.",
+        "technical_spec.file_plan.starter_protected": (
+            "Remove immutable starter-owned paths from TechnicalSpec.filePlan."
+        ),
+        "technical_spec.file_plan.model_root": (
+            "Plan files only inside the StarterManifest modelOwnedRoots."
+        ),
         "technical_spec.file_plan.path_duplicate": "Use each TechnicalSpec.filePlan path at most once.",
         "technical_spec.file_plan.capacity_exceeded": (
             "Reduce TechnicalSpec.filePlan to the configured Engineer capacity."
+        ),
+        "technical_spec.dependencies.starter_only": (
+            "Do not declare additional dependencies; use the immutable starter baseline or record a risk."
         ),
         "technical_spec.persistent_state_domains.mapping_invalid": (
             "For every independently mutable persistent business domain declared in stateModel.mutableDomains, "
@@ -173,6 +183,12 @@ _FILE_BATCH_REPAIR_INSTRUCTIONS = MappingProxyType(
         ),
         "file_batch_report.workspace_path_invalid": (
             "Use only valid relative workspace paths in fileChanges."
+        ),
+        "file_batch_report.starter_protected": (
+            "Do not write immutable starter-owned or system-owned paths in fileChanges."
+        ),
+        "file_batch_report.model_root": (
+            "Write fileChanges only inside the StarterManifest modelOwnedRoots."
         ),
         "file_batch_report.file_size_exceeded": (
             "Keep every create or modify fileChanges content within the configured character limit stated in the prompt."
@@ -258,6 +274,7 @@ class SOPRunner:
         self.model = model
         self.sandbox = sandbox
         self.settings = settings
+        self.starter: StarterManifest = default_starter_manifest()
         if settings.agent_framework == "metagpt":
             self.agent_adapter = agent_adapter or MetaGPTAdapter(model)
         elif settings.agent_framework == "native":
@@ -445,8 +462,15 @@ class SOPRunner:
                     "role": "system",
                     "content": (
                         "You are FOMO's Architect. Consume the supplied ProductSpec and produce only TechnicalSpec JSON. "
-                        f"{_DEFAULT_FRONTEND_STACK_CONTRACT} Include typecheck/build/dev in the file and test plan. "
+                        f"{_DEFAULT_FRONTEND_STACK_CONTRACT} Use the starter's typecheck/build/dev scripts in the test plan. "
                         f"{_PLAYWRIGHT_NETWORK_CONTRACT} "
+                        "An immutable starter already exists. Do not create, list in filePlan, modify, or delete any "
+                        "StarterManifest protectedPaths. Plan only StarterManifest modelOwnedRoots. Reuse listed "
+                        "availableImports directly; do not generate components/ui primitives, package configuration, "
+                        "or dependencies. If a required capability is absent, record it in risks instead of installing "
+                        "or scaffolding it. Put normal generated routes under app/(generated)/** (or app/page.tsx for "
+                        "the root route), business compositions under components/features/**, domain state/types under "
+                        "lib/domain/**, and smoke tests under tests/**. "
                         "Return concise componentDecisions only for decision-bearing UI primitives, composed feature "
                         "surfaces, or custom strategies—not a component inventory. Leave ordinary business composition "
                         "components in components, filePlan, and publicApiContracts without requiring a same-name decision. "
@@ -472,15 +496,14 @@ class SOPRunner:
                         f"{max_planned_files} paths total). Each create/modify file must be completable within the "
                         f"Engineer {max_file_characters}-character source limit; split complex state or features across "
                         "files. Keep every list and description concise, and do not include "
-                        "chain-of-thought, secrets, or fields outside the schema. Never plan system-managed .gitignore "
-                        "files or pnpm-lock.yaml, package-lock.json, yarn.lock, bun.lock, or bun.lockb; FOMO and package "
-                        "installation create those outside the model file plan."
+                        "chain-of-thought, secrets, or fields outside the schema."
                     ),
                 },
                 {
                     "role": "user",
                     "content": (
                         f"ProductSpec:\n{self._json(context.product)}\n"
+                        f"StarterManifest:\n{self._json(self.starter.as_architect_context())}\n"
                         f"Repair evidence (if any):\n{self._json(diagnostic) if diagnostic else ''}"
                     ),
                 },
@@ -524,14 +547,8 @@ class SOPRunner:
                 context.sandbox.id,
                 lease_token=context.lease_token,
             )
+            await self._copy_and_verify_starter(context)
             await self._ensure_system_gitignore(context)
-            await self.repository.append_event(
-                context.run_id,
-                "agent.activity",
-                role="engineer",
-                payload={"action": "sandbox_created", "summary": "Created an isolated workspace."},
-                lease_token=context.lease_token,
-            )
             result = await self._command(
                 context,
                 "git init && git config user.email fomo@local.invalid && git config user.name 'FOMO Agent'",
@@ -539,6 +556,57 @@ class SOPRunner:
             )
             if result.exit_code != 0:
                 raise SOPExecutionError("unable to initialize Git in sandbox")
+            result = await self._command(
+                context,
+                "git add -A && git commit -m 'chore(starter): fomo-next-radix-v1'",
+                role="engineer",
+            )
+            if result.exit_code != 0:
+                raise SOPExecutionError("unable to create immutable starter Git commit")
+            starter_commit = await self._command(context, "git rev-parse HEAD", role="engineer")
+            if starter_commit.exit_code != 0 or not starter_commit.stdout.strip():
+                raise SOPExecutionError("unable to read immutable starter Git commit")
+            initial_commit_sha = starter_commit.stdout.strip().splitlines()[-1]
+            await self.repository.store_artifact(
+                context.run_id,
+                "starter_provenance",
+                self.starter.as_provenance(initial_commit_sha),
+                role="engineer",
+                lease_token=context.lease_token,
+            )
+            await self.repository.append_event(
+                context.run_id,
+                "agent.activity",
+                role="engineer",
+                payload={
+                    "action": "sandbox_created",
+                    "summary": "Created an isolated workspace from the immutable starter.",
+                    "starterId": self.starter.id,
+                    "starterVersion": self.starter.version,
+                    "starterTreeSha256": self.starter.tree_sha256,
+                    "starterCommitSha": initial_commit_sha,
+                },
+                lease_token=context.lease_token,
+            )
+
+    async def _copy_and_verify_starter(self, context: _Context) -> None:
+        """Copy the fixed baseline before any model can write to the sandbox."""
+        if context.sandbox is None:
+            raise SOPExecutionError("cannot bootstrap a starter without a sandbox")
+        image_copy = getattr(self.sandbox, "copy_starter", None)
+        if callable(image_copy):
+            result = await image_copy(context.sandbox, self.starter.id)
+            if result.exit_code != 0:
+                raise SOPExecutionError("unable to copy immutable starter from sandbox image")
+        else:
+            await self.sandbox.apply_changes(context.sandbox, self.starter.file_changes)
+        copied_files: dict[str, bytes] = {}
+        try:
+            for entry in self.starter.files:
+                copied_files[entry.path] = await self.sandbox.read_file(context.sandbox, entry.path)
+            self.starter.verify_tree(copied_files)
+        except (FileNotFoundError, StarterIntegrityError) as exc:
+            raise SOPExecutionError("immutable starter verification failed") from exc
 
     async def _implement(
         self,
@@ -603,9 +671,10 @@ class SOPRunner:
                         "without source code. Split the working Next.js TypeScript app into ordered, independently "
                         f"writable batches of at most {max_files_per_batch} relative {file_label}, with at "
                         f"most {self._engineer_max_batches()} batches and no more than {max_planned_files} files total. "
-                        "Put package/configuration scaffolding first; then UI and supporting files. Every "
-                        "TechnicalSpec.filePlan path must appear exactly once, with no additional paths. Use pnpm scripts named "
-                        "typecheck, build and dev; the dev script must support `pnpm dev --hostname 0.0.0.0 --port 8080`. "
+                        "The immutable starter already provides package configuration, scripts, layout, globals, and "
+                        "components/ui primitives. Do not plan, create, modify, or delete protected paths; plan only "
+                        "model-owned business files. Every TechnicalSpec.filePlan path must appear exactly once, with no "
+                        "additional paths. "
                         f"{_DEFAULT_FRONTEND_STACK_CONTRACT} {_PLAYWRIGHT_NETWORK_CONTRACT} "
                         "Honor TechnicalSpec.componentDecisions and TechnicalSpec.publicApiContracts. "
                         f"{repair_scope_instruction}"
@@ -616,6 +685,7 @@ class SOPRunner:
                     "role": "user",
                     "content": (
                         f"ProductSpec:\n{self._json(product)}\nTechnicalSpec:\n{self._json(implementation_technical)}\n"
+                        f"StarterManifest:\n{self._json(self.starter.as_architect_context())}\n"
                         "Shared public API contracts (preserve across every batch):\n"
                         f"{self._json(technical.public_api_contracts)}\n"
                         f"DiagnosticReport for repair (if any):\n{repair_context}"
@@ -677,6 +747,8 @@ class SOPRunner:
                             "Do not repeat source from earlier or later batches. Each create/modify file must be at most "
                             f"{self._engineer_max_file_characters()} characters. {_DEFAULT_FRONTEND_STACK_CONTRACT} "
                             f"{_PLAYWRIGHT_NETWORK_CONTRACT} Honor every shared public API contract supplied below. "
+                            "The immutable starter already exists. Write only StarterManifest modelOwnedRoots and never "
+                            "write protected paths, package configuration, or components/ui primitives. "
                             "Never write .env files, Git hooks, "
                             "or files outside the workspace. Do not include chain-of-thought."
                         ),
@@ -685,6 +757,7 @@ class SOPRunner:
                         "role": "user",
                         "content": (
                             f"ProductSpec:\n{self._json(product)}\nTechnicalSpec:\n{self._json(implementation_technical)}\n"
+                            f"StarterManifest:\n{self._json(self.starter.as_architect_context())}\n"
                             "Shared public API contracts (preserve across every batch):\n"
                             f"{self._json(technical.public_api_contracts)}\n"
                             f"ImplementationPlan:\n{self._json(plan)}\n"
@@ -822,6 +895,8 @@ class SOPRunner:
         return max(1, self.settings.engineer_max_file_characters)
 
     def _validate_technical_file_plan(self, technical: TechnicalSpec) -> None:
+        if technical.dependencies:
+            raise ArtifactContractViolation(code="technical_spec.dependencies.starter_only")
         self._technical_file_plan_paths(technical)
         decision_names = [decision.component for decision in technical.component_decisions]
         if len(decision_names) != len(set(decision_names)):
@@ -969,6 +1044,14 @@ class SOPRunner:
             raise ArtifactContractViolation(
                 code="technical_spec.file_plan.system_managed",
             )
+        if any(self.starter.is_protected_path(str(path)) for path in workspace_paths):
+            raise ArtifactContractViolation(
+                code="technical_spec.file_plan.starter_protected",
+            )
+        if any(not self.starter.is_model_owned_path(str(path)) for path in workspace_paths):
+            raise ArtifactContractViolation(
+                code="technical_spec.file_plan.model_root",
+            )
         if len(paths) != len(set(paths)):
             raise ArtifactContractViolation(
                 code="technical_spec.file_plan.path_duplicate",
@@ -987,13 +1070,6 @@ class SOPRunner:
         }
         scope_candidates = set(diagnostic.location_files)
         scope_candidates.update(finding.file for finding in diagnostic.findings if finding.file)
-        if any(
-            gate.status == GateStatus.failed and gate.gate in {"dependencies", "package_manifest"}
-            for gate in diagnostic.gates
-        ):
-            # Dependency installation owns the lockfile; package.json is the
-            # only model-writable dependency manifest that may be required.
-            scope_candidates.add("package.json")
 
         scoped_paths: set[str] = set()
         for candidate in scope_candidates:
@@ -1036,8 +1112,12 @@ class SOPRunner:
             if len(batch.paths) > self._engineer_max_files_per_batch():
                 raise ValueError("implementation plan batch exceeds the configured file limit")
             for path in batch.paths:
-                validate_workspace_path(path)
-                planned_paths.append(path)
+                workspace_path = str(validate_workspace_path(path))
+                if self.starter.is_protected_path(workspace_path):
+                    raise ValueError("implementation plan includes an immutable starter path")
+                if not self.starter.is_model_owned_path(workspace_path):
+                    raise ValueError("implementation plan includes a non-model-owned path")
+                planned_paths.append(workspace_path)
         if len(planned_paths) != len(set(planned_paths)):
             raise ValueError("implementation plan must not repeat a path across batches")
         if set(planned_paths) != set(technical_file_paths):
@@ -1055,11 +1135,15 @@ class SOPRunner:
         paths = [change.path for change in report.file_changes]
         for change in report.file_changes:
             try:
-                validate_workspace_path(change.path)
+                workspace_path = str(validate_workspace_path(change.path))
             except ValueError:
                 raise FileBatchContractViolation(
                     code="file_batch_report.workspace_path_invalid"
                 ) from None
+            if self.starter.is_protected_path(workspace_path):
+                raise FileBatchContractViolation(code="file_batch_report.starter_protected")
+            if not self.starter.is_model_owned_path(workspace_path):
+                raise FileBatchContractViolation(code="file_batch_report.model_root")
         if len(paths) != len(set(paths)):
             raise FileBatchContractViolation(code="file_batch_report.paths_duplicate")
         if set(paths) != set(expected.paths):

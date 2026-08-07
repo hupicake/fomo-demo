@@ -36,6 +36,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/fomo"]
+include = ["src/fomo/starter_assets/**"]
 
 [tool.hatch.metadata]
 allow-direct-references = true

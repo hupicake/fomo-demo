@@ -70,7 +70,7 @@ worker call `http://opensandbox:8080` over the Compose network and never mount
 `/var/run/docker.sock`.
 
 `docker compose build sandbox-image` produces the fixed
-`fomo-sandbox-node:2026-08-07` image used by `OPENSANDBOX_IMAGE`. The
+`fomo-sandbox-node:2026-08-08` image used by `OPENSANDBOX_IMAGE`. The
 `sandbox-image` Compose service is in the `build` profile and cannot start in a
 normal `docker compose up`; it exists only as a reproducible image build target.
 The image uses the non-root `node` user with a writable `/workspace`, Node 22,

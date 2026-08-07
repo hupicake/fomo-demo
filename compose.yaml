@@ -21,7 +21,7 @@ x-control-plane-environment: &control-plane-environment
   SANDBOX_PROVIDER: ${SANDBOX_PROVIDER:-opensandbox}
   OPENSANDBOX_BASE_URL: ${OPENSANDBOX_BASE_URL_DOCKER:-http://opensandbox:8080}
   OPENSANDBOX_API_KEY: ${OPENSANDBOX_API_KEY:-fomo-opensandbox-local-development-only}
-  OPENSANDBOX_IMAGE: ${OPENSANDBOX_IMAGE:-fomo-sandbox-node:2026-08-07}
+  OPENSANDBOX_IMAGE: ${OPENSANDBOX_IMAGE:-fomo-sandbox-node:2026-08-08}
   OPENSANDBOX_LIFETIME_SECONDS: ${OPENSANDBOX_LIFETIME_SECONDS:-21600}
   # Generated-code sandboxes never inherit generic container proxy variables.
   # These are the only explicit, non-secret egress values passed to
@@ -167,11 +167,13 @@ services:
     build:
       context: ./infra/opensandbox
       dockerfile: Dockerfile
+      additional_contexts:
+        fomo-control-plane: ./services/control-plane
       args:
         HTTP_PROXY: ${DOCKER_HTTP_PROXY:-}
         HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-}
         NO_PROXY: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,::1,postgres,redis,minio,minio-init,litellm,opensandbox,api,worker,web}
-    image: fomo-sandbox-node:2026-08-07
+    image: fomo-sandbox-node:2026-08-08
     entrypoint: ["/bin/true"]
     restart: "no"
 
