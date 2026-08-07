@@ -86,6 +86,15 @@ _SYSTEM_MANAGED_FILE_PLAN_NAMES = frozenset(
     }
 )
 _MAX_REPAIR_SCOPE_FILES = 8
+# Compiler output can concatenate locations without whitespace. This pattern
+# deliberately scans the whole redacted text and captures relative path-shaped
+# tokens only; ``validate_workspace_path`` remains the final authority.
+_WORKSPACE_PATH_IN_OUTPUT = re.compile(
+    r"(?<![A-Za-z0-9_./@()\[\]-])"
+    r"(?P<path>(?:\./)?(?:(?:[A-Za-z0-9_@().\[\]-]+/)+[A-Za-z0-9_@.-]+|"
+    r"[A-Za-z0-9_@-]+(?:\.[A-Za-z0-9_@-]+)+))"
+    r"(?=(?:\(\d+(?:,\d+)?\)|(?::\d+){1,3}|[\s`'\"<>,;:!?)}\]]|$))"
+)
 _STATE_AGGREGATION_RESPONSIBILITIES = frozenset({"compose", "re_export"})
 _STATE_PERSISTENCE_ADAPTER_RESPONSIBILITIES = frozenset({"load", "save", "migrate"})
 _FEATURE_SURFACE_COMPOSITION_RESPONSIBILITIES = frozenset({"compose", "layout", "props"})
@@ -228,6 +237,38 @@ _TECHNICAL_SPEC_REPAIR_INSTRUCTIONS = MappingProxyType(
         ),
     }
 )
+_DIAGNOSTIC_REPORT_REPAIR_INSTRUCTIONS = MappingProxyType(
+    {
+        "diagnostic_report.location_files.required": (
+            "Provide one to eight locationFiles entries for the scoped repair."
+        ),
+        "diagnostic_report.location_files.duplicate": "Use each locationFiles entry at most once.",
+        "diagnostic_report.location_files.path_invalid": (
+            "Use only valid relative workspace paths in locationFiles."
+        ),
+        "diagnostic_report.location_files.file_unplanned": (
+            "Reference only files from the approved TechnicalSpec.filePlan in locationFiles."
+        ),
+        "diagnostic_report.location_files.capacity_exceeded": (
+            "Limit locationFiles to at most eight approved repair files."
+        ),
+        "diagnostic_report.location_files.not_affected": (
+            "When deterministic gates identify affected files, keep locationFiles within that evidence."
+        ),
+        "diagnostic_report.location_files.evidence_missing": (
+            "Do not select a repair scope without deterministic affected-file evidence."
+        ),
+        "diagnostic_report.findings.file_invalid": (
+            "Use only valid relative workspace paths in findings.file."
+        ),
+        "diagnostic_report.findings.file_out_of_scope": (
+            "Set each findings.file value to one of the approved locationFiles entries."
+        ),
+    }
+)
+_ARTIFACT_CONTRACT_REPAIR_INSTRUCTIONS = MappingProxyType(
+    {**_TECHNICAL_SPEC_REPAIR_INSTRUCTIONS, **_DIAGNOSTIC_REPORT_REPAIR_INSTRUCTIONS}
+)
 _FILE_BATCH_REPAIR_INSTRUCTIONS = MappingProxyType(
     {
         "file_batch_report.batch_id_mismatch": "Set batchId to the requested batch id.",
@@ -269,7 +310,7 @@ class ArtifactContractViolation(ValueError):
 
     def __init__(self, *, code: str) -> None:
         try:
-            repair_instruction = _TECHNICAL_SPEC_REPAIR_INSTRUCTIONS[code]
+            repair_instruction = _ARTIFACT_CONTRACT_REPAIR_INSTRUCTIONS[code]
         except KeyError:
             raise ValueError("unknown artifact contract violation code") from None
         super().__init__(code)
@@ -1083,6 +1124,79 @@ class SOPRunner:
         self._validate_persistent_state_domain_slices(technical, planned_files, public_api_keys)
         self._validate_feature_surface_slices(technical, planned_files, public_api_keys)
 
+    def _validate_diagnostic_repair_scope(
+        self,
+        diagnostic: DiagnosticReport,
+        technical: TechnicalSpec,
+        gates: list[GateResult],
+    ) -> None:
+        """Accept only a small, evidence-bound Reviewer repair scope."""
+        planned_paths = {
+            str(validate_workspace_path(item.path)) for item in technical.file_plan
+        }
+        failed_gates = [gate for gate in gates if gate.status == GateStatus.failed]
+        affected_paths: set[str] = set()
+        for gate in failed_gates:
+            for path in gate.affected_files:
+                try:
+                    affected_paths.add(str(validate_workspace_path(path)))
+                except ValueError:
+                    # Gate paths are deterministic provider output, but an
+                    # invalid token must never expand a model repair scope.
+                    continue
+
+        if failed_gates and not affected_paths:
+            raise ArtifactContractViolation(
+                code="diagnostic_report.location_files.evidence_missing"
+            )
+
+        location_files = diagnostic.location_files
+        requires_scope = bool(failed_gates) or bool(diagnostic.blocking_issues) or any(
+            finding.severity in {"major", "error"} for finding in diagnostic.findings
+        )
+        if not location_files:
+            if requires_scope:
+                raise ArtifactContractViolation(code="diagnostic_report.location_files.required")
+            location_paths: set[str] = set()
+        else:
+            if len(location_files) > _MAX_REPAIR_SCOPE_FILES:
+                raise ArtifactContractViolation(
+                    code="diagnostic_report.location_files.capacity_exceeded"
+                )
+            normalized_locations: list[str] = []
+            for path in location_files:
+                try:
+                    normalized_locations.append(str(validate_workspace_path(path)))
+                except ValueError:
+                    raise ArtifactContractViolation(
+                        code="diagnostic_report.location_files.path_invalid"
+                    ) from None
+            if len(normalized_locations) != len(set(normalized_locations)):
+                raise ArtifactContractViolation(code="diagnostic_report.location_files.duplicate")
+            location_paths = set(normalized_locations)
+            if not location_paths.issubset(planned_paths):
+                raise ArtifactContractViolation(
+                    code="diagnostic_report.location_files.file_unplanned"
+                )
+            if affected_paths and not location_paths.issubset(affected_paths):
+                raise ArtifactContractViolation(
+                    code="diagnostic_report.location_files.not_affected"
+                )
+
+        for finding in diagnostic.findings:
+            if not finding.file:
+                continue
+            try:
+                finding_path = str(validate_workspace_path(finding.file))
+            except ValueError:
+                raise ArtifactContractViolation(
+                    code="diagnostic_report.findings.file_invalid"
+                ) from None
+            if finding_path not in location_paths:
+                raise ArtifactContractViolation(
+                    code="diagnostic_report.findings.file_out_of_scope"
+                )
+
     def _validate_persistent_state_domain_slices(
         self,
         technical: TechnicalSpec,
@@ -1373,23 +1487,25 @@ class SOPRunner:
         planned_paths = {
             str(validate_workspace_path(item.path)): item for item in technical.file_plan
         }
-        scope_candidates = set(diagnostic.location_files)
-        scope_candidates.update(finding.file for finding in diagnostic.findings if finding.file)
+        scope_candidates = diagnostic.location_files
+        if not scope_candidates:
+            raise SOPExecutionError("repair diagnostic did not identify an approved file scope")
+        if len(scope_candidates) > _MAX_REPAIR_SCOPE_FILES:
+            raise SOPExecutionError(
+                f"repair diagnostic scope exceeds the maximum of {_MAX_REPAIR_SCOPE_FILES} approved files"
+            )
 
         scoped_paths: set[str] = set()
         for candidate in scope_candidates:
             try:
                 normalized = str(validate_workspace_path(candidate))
             except ValueError:
-                continue
-            if normalized in planned_paths:
-                scoped_paths.add(normalized)
-        if not scoped_paths:
-            raise SOPExecutionError("repair diagnostic did not identify an approved file scope")
-        if len(scoped_paths) > _MAX_REPAIR_SCOPE_FILES:
-            raise SOPExecutionError(
-                f"repair diagnostic scope exceeds the maximum of {_MAX_REPAIR_SCOPE_FILES} approved files"
-            )
+                raise SOPExecutionError("repair diagnostic contains an invalid file scope") from None
+            if normalized not in planned_paths:
+                raise SOPExecutionError("repair diagnostic contains an unapproved file scope")
+            if normalized in scoped_paths:
+                raise SOPExecutionError("repair diagnostic contains a duplicate file scope")
+            scoped_paths.add(normalized)
 
         return technical.model_copy(
             update={
@@ -1544,8 +1660,9 @@ class SOPRunner:
                         "You are FOMO's independent Reviewer. Consume ProductSpec, TechnicalSpec, and actual "
                         "deterministic command results. Return only DiagnosticReport JSON. Never claim an artifact, "
                         "test, screenshot, or gate that is absent from the supplied evidence. When blockers remain, "
-                        "populate locationFiles with affected workspace files and only direct dependency files necessary "
-                        "for repair; FOMO will reject an unscoped rewrite. Do not include chain-of-thought."
+                        "populate locationFiles with one to eight affected files from TechnicalSpec.filePlan; FOMO "
+                        "will reject an unscoped rewrite. findings.file must be empty or name one of those same "
+                        "locationFiles. Do not include chain-of-thought."
                     ),
                 },
                 {
@@ -1557,6 +1674,11 @@ class SOPRunner:
                     ),
                 },
             ],
+            validate_artifact=lambda diagnostic: self._validate_diagnostic_repair_scope(
+                diagnostic,
+                technical,
+                gates,
+            ),
         )
         failed_gates = [gate for gate in gates if gate.status == GateStatus.failed]
         model_blockers = list(draft.blocking_issues)
@@ -1667,6 +1789,7 @@ class SOPRunner:
             status=status,
             summary=summary,
             evidence=[f"command:{command}"],
+            affected_files=self._affected_workspace_paths(result.stdout, result.stderr),
         )
 
     async def _start_preview_gate(self, context: _Context, scripts: dict[str, Any]) -> GateResult:
@@ -2064,6 +2187,12 @@ class SOPRunner:
                 ):
                     trusted_contract_violation = exc
                 elif (
+                    role == "reviewer"
+                    and schema is DiagnosticReport
+                    and type(exc) is ArtifactContractViolation
+                ):
+                    trusted_contract_violation = exc
+                elif (
                     role == "engineer"
                     and schema is FileBatchReport
                     and type(exc) is FileBatchContractViolation
@@ -2308,8 +2437,25 @@ class SOPRunner:
 
     @staticmethod
     def _failure_summary(result: Any) -> str:
-        text = (result.stderr or result.stdout or "command failed").strip().replace("\n", " ")
-        return SOPRunner._redact(text[:1000])
+        text = f"{result.stdout}\n{result.stderr}".strip().replace("\n", " ") or "command failed"
+        return SOPRunner._redact(text)[:1000]
+
+    @staticmethod
+    def _affected_workspace_paths(stdout: str, stderr: str) -> list[str]:
+        """Extract only normalized workspace file paths from bounded QA output."""
+        # Deliberately inspect both streams. In particular, a short generic
+        # stderr must not hide a useful compiler location printed on stdout.
+        output = SOPRunner._redact(f"{stdout}\n{stderr}")
+        paths: list[str] = []
+        for match in _WORKSPACE_PATH_IN_OUTPUT.finditer(output):
+            candidate = match.group("path")
+            try:
+                normalized = str(validate_workspace_path(candidate))
+            except ValueError:
+                continue
+            if normalized not in paths:
+                paths.append(normalized)
+        return paths
 
     @staticmethod
     def _redact(value: str) -> str:

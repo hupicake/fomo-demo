@@ -21,6 +21,7 @@ from fomo.agent_runtime.sop import (
     FileBatchContractViolation,
     SOPExecutionError,
     SOPRunner,
+    _Context,
 )
 from fomo.agent_runtime.state import FailureRouter, SOPStateMachine
 from fomo.sandbox.base import ExecResult
@@ -32,6 +33,7 @@ from fomo.schemas import (
     GateStatus,
     ImplementationBatchPlan,
     ImplementationPlan,
+    ProductSpec,
     RunPhase,
     TechnicalSpec,
 )
@@ -1129,6 +1131,29 @@ async def test_repair_scope_rejects_an_unrelated_full_rewrite(repository, settin
         )
     with pytest.raises(SOPExecutionError, match="did not identify an approved file scope"):
         runner._repair_technical(technical, DiagnosticReport())
+    with pytest.raises(SOPExecutionError, match="invalid file scope"):
+        runner._repair_technical(technical, DiagnosticReport(location_files=["../outside.tsx"]))
+    with pytest.raises(SOPExecutionError, match="unapproved file scope"):
+        runner._repair_technical(
+            technical,
+            DiagnosticReport(location_files=["components/features/unplanned.tsx"]),
+        )
+    finding_expansion = runner._repair_technical(
+        technical,
+        DiagnosticReport.model_validate(
+            {
+                "locationFiles": ["components/features/library.tsx"],
+                "findings": [
+                    {
+                        "severity": "error",
+                        "message": "untrusted finding cannot expand repair scope",
+                        "file": "app/page.tsx",
+                    }
+                ],
+            }
+        ),
+    )
+    assert [item.path for item in finding_expansion.file_plan] == ["components/features/library.tsx"]
 
 
 @pytest.mark.asyncio
@@ -1171,6 +1196,429 @@ async def test_repair_scope_caps_full_diagnostic_scope_and_preserves_file_plan_o
             technical,
             DiagnosticReport(location_files=[item.path for item in technical.file_plan]),
         )
+
+
+@pytest.mark.asyncio
+async def test_reviewer_scope_capacity_retries_to_an_engineer_eligible_subset_without_leak(
+    repository, settings
+) -> None:
+    session = await repository.create_guest_session()
+    project = await repository.create_project(session.id, "Library")
+    _message, run, _created = await repository.create_message_and_run(
+        project.id, session.id, "reviewer-scope-capacity", "Create a book management system"
+    )
+    assert await repository.claim_next_run("test-worker", 60)
+    context = SimpleNamespace(
+        run_id=run.id,
+        lease_token=await repository.get_active_lease_token(run.id),
+    )
+    technical = TechnicalSpec.model_validate(_architect_response_with_file_plan_count(32))
+    planned_paths = [item.path for item in technical.file_plan]
+    source_marker = "reviewer-scope-untrusted-marker"
+    invalid_report = dict(_responses()["reviewer"])
+    invalid_report.update(
+        {
+            "blockingIssues": [source_marker],
+            "locationFiles": planned_paths,
+        }
+    )
+    corrected_report = dict(_responses()["reviewer"])
+    corrected_report.update(
+        {
+            "blockingIssues": ["typecheck failed"],
+            "locationFiles": planned_paths[:3],
+        }
+    )
+    model = ScriptedModelClient({"reviewer": [invalid_report, corrected_report]})
+    runner = SOPRunner(
+        repository,
+        model,
+        FakeSandboxProvider(),
+        replace(settings, engineer_max_batches=32, structured_output_retries=1),
+    )
+    failed_gate = GateResult(
+        gate="typecheck",
+        status=GateStatus.failed,
+        summary="failed",
+        affected_files=planned_paths,
+    )
+
+    diagnostic = await runner._role(
+        context,
+        role="reviewer",
+        model_alias="reviewer",
+        schema=DiagnosticReport,
+        messages=[{"role": "system", "content": "test reviewer repair scope"}],
+        validate_artifact=lambda report: runner._validate_diagnostic_repair_scope(
+            report,
+            technical,
+            [failed_gate],
+        ),
+    )
+
+    assert diagnostic.location_files == planned_paths[:3]
+    scoped_technical = runner._repair_technical(technical, diagnostic)
+    assert [item.path for item in scoped_technical.file_plan] == planned_paths[:3]
+    runner._validate_implementation_plan(
+        ImplementationPlan.model_validate(
+            {
+                "batches": [
+                    {
+                        "id": f"repair-{index}",
+                        "purpose": "bounded diagnostic repair",
+                        "paths": [path],
+                    }
+                    for index, path in enumerate(planned_paths[:3], start=1)
+                ]
+            }
+        ),
+        scoped_technical,
+    )
+
+    events = await repository.list_events(run.id)
+    retry_event = next(
+        event
+        for event in events
+        if event.kind == "agent.activity" and event.payload.get("action") == "structured_retry"
+    )
+    assert retry_event.payload == {
+        "action": "structured_retry",
+        "summary": "The structured hand-off was invalid; requesting a schema-correct response.",
+        "reasonCode": "diagnostic_report.location_files.capacity_exceeded",
+    }
+    correction = next(
+        message["content"]
+        for message in model.requests[1][1]
+        if message["content"].startswith("Return only a valid DiagnosticReport JSON object")
+    )
+    assert source_marker not in correction
+    assert planned_paths[0] not in correction
+    assert source_marker not in json.dumps([event.payload for event in events])
+    assert planned_paths[0] not in json.dumps([event.payload for event in events])
+
+
+@pytest.mark.asyncio
+async def test_verify_reviewer_scope_contract_retries_without_detail_leak(
+    repository, settings, monkeypatch
+) -> None:
+    session = await repository.create_guest_session()
+    project = await repository.create_project(session.id, "Library")
+    _message, run, _created = await repository.create_message_and_run(
+        project.id, session.id, "reviewer-scope-verify", "Create a book management system"
+    )
+    assert await repository.claim_next_run("test-worker", 60)
+    sandbox = FakeSandboxProvider()
+    ref = await sandbox.create(project.id)
+    context = _Context(
+        run_id=run.id,
+        project_id=project.id,
+        base_version_id=None,
+        phase=RunPhase.implementation,
+        prompt="Create a book management system",
+        lease_token=await repository.get_active_lease_token(run.id),
+        sandbox=ref,
+    )
+    technical = TechnicalSpec.model_validate(_architect_response_with_file_plan_count(9))
+    planned_paths = [item.path for item in technical.file_plan]
+    source_marker = "reviewer-verify-untrusted-marker"
+    invalid_report = dict(_responses()["reviewer"])
+    invalid_report.update(
+        {
+            "blockingIssues": [source_marker],
+            "locationFiles": planned_paths,
+        }
+    )
+    corrected_report = dict(_responses()["reviewer"])
+    corrected_report.update(
+        {
+            "blockingIssues": ["typecheck failed"],
+            "locationFiles": [planned_paths[0]],
+        }
+    )
+    model = ScriptedModelClient({"reviewer": [invalid_report, corrected_report]})
+    runner = SOPRunner(
+        repository,
+        model,
+        sandbox,
+        replace(settings, structured_output_retries=1),
+    )
+
+    async def failed_quality_gates(_context) -> list[GateResult]:
+        return [
+            GateResult(
+                gate="typecheck",
+                status=GateStatus.failed,
+                summary="failed",
+                affected_files=[planned_paths[0]],
+            )
+        ]
+
+    monkeypatch.setattr(runner, "_run_quality_gates", failed_quality_gates)
+
+    report = await runner._verify(
+        context,
+        ProductSpec.model_validate(_responses()["pm"]),
+        technical,
+    )
+
+    assert report.location_files == [planned_paths[0]]
+    assert [gate.gate for gate in report.gates] == ["typecheck"]
+    retry_event = next(
+        event
+        for event in await repository.list_events(run.id)
+        if event.kind == "agent.activity" and event.payload.get("action") == "structured_retry"
+    )
+    assert retry_event.payload["reasonCode"] == "diagnostic_report.location_files.capacity_exceeded"
+    correction = next(
+        message["content"]
+        for message in model.requests[1][1]
+        if message["content"].startswith("Return only a valid DiagnosticReport JSON object")
+    )
+    assert source_marker not in correction
+    assert planned_paths[0] not in correction
+    assert source_marker not in json.dumps(
+        [event.payload for event in await repository.list_events(run.id)]
+    )
+
+
+@pytest.mark.asyncio
+async def test_reviewer_scope_contract_variants_retry_closed_without_detail_leak(
+    repository, settings
+) -> None:
+    technical = TechnicalSpec.model_validate(_architect_response_with_file_plan_count(9))
+    planned_paths = [item.path for item in technical.file_plan]
+    source_marker = "reviewer-contract-untrusted-marker"
+    invalid_cases = [
+        (
+            "capacity",
+            {"locationFiles": planned_paths},
+            "diagnostic_report.location_files.capacity_exceeded",
+        ),
+        (
+            "duplicate",
+            {"locationFiles": [planned_paths[0], planned_paths[0]]},
+            "diagnostic_report.location_files.duplicate",
+        ),
+        (
+            "finding-extension",
+            {
+                "locationFiles": [planned_paths[0]],
+                "findings": [
+                    {
+                        "severity": "error",
+                        "message": source_marker,
+                        "file": planned_paths[1],
+                    }
+                ],
+            },
+            "diagnostic_report.findings.file_out_of_scope",
+        ),
+        (
+            "invalid-path",
+            {"locationFiles": [f"../{source_marker}.tsx"]},
+            "diagnostic_report.location_files.path_invalid",
+        ),
+        (
+            "unplanned-path",
+            {"locationFiles": [f"components/features/{source_marker}.tsx"]},
+            "diagnostic_report.location_files.file_unplanned",
+        ),
+    ]
+    failed_gate = GateResult(
+        gate="typecheck",
+        status=GateStatus.failed,
+        summary="failed",
+        affected_files=planned_paths,
+    )
+
+    for case, invalid_update, expected_code in invalid_cases:
+        session = await repository.create_guest_session()
+        project = await repository.create_project(session.id, f"Library {case}")
+        _message, run, _created = await repository.create_message_and_run(
+            project.id,
+            session.id,
+            f"reviewer-contract-{case}",
+            "Create a book management system",
+        )
+        assert await repository.claim_next_run(f"test-worker-{case}", 60)
+        context = SimpleNamespace(
+            run_id=run.id,
+            lease_token=await repository.get_active_lease_token(run.id),
+        )
+        invalid_report = dict(_responses()["reviewer"])
+        invalid_report.update({"blockingIssues": [source_marker], **invalid_update})
+        corrected_report = dict(_responses()["reviewer"])
+        corrected_report.update(
+            {
+                "blockingIssues": ["typecheck failed"],
+                "locationFiles": [planned_paths[0]],
+            }
+        )
+        model = ScriptedModelClient({"reviewer": [invalid_report, corrected_report]})
+        runner = SOPRunner(
+            repository,
+            model,
+            FakeSandboxProvider(),
+            replace(settings, structured_output_retries=1),
+        )
+
+        diagnostic = await runner._role(
+            context,
+            role="reviewer",
+            model_alias="reviewer",
+            schema=DiagnosticReport,
+            messages=[{"role": "system", "content": "test reviewer contract"}],
+            validate_artifact=lambda report, runner=runner: runner._validate_diagnostic_repair_scope(
+                report,
+                technical,
+                [failed_gate],
+            ),
+        )
+
+        assert diagnostic.location_files == [planned_paths[0]]
+        events = await repository.list_events(run.id)
+        retry_event = next(
+            event
+            for event in events
+            if event.kind == "agent.activity" and event.payload.get("action") == "structured_retry"
+        )
+        assert retry_event.payload["reasonCode"] == expected_code
+        correction = next(
+            message["content"]
+            for message in model.requests[1][1]
+            if message["content"].startswith("Return only a valid DiagnosticReport JSON object")
+        )
+        assert source_marker not in correction
+        assert source_marker not in json.dumps([event.payload for event in events])
+
+
+@pytest.mark.asyncio
+async def test_reviewer_scope_rejects_planned_guess_without_affected_file_evidence(
+    repository, settings
+) -> None:
+    session = await repository.create_guest_session()
+    project = await repository.create_project(session.id, "Library")
+    _message, run, _created = await repository.create_message_and_run(
+        project.id, session.id, "reviewer-evidence-missing", "Create a book management system"
+    )
+    assert await repository.claim_next_run("test-worker", 60)
+    context = SimpleNamespace(
+        run_id=run.id,
+        lease_token=await repository.get_active_lease_token(run.id),
+    )
+    technical = TechnicalSpec.model_validate(_responses()["architect"])
+    planned_path = technical.file_plan[0].path
+    source_marker = "reviewer-evidence-missing-source-marker"
+    command_marker = "reviewer-evidence-missing-command-marker"
+    output_marker = "reviewer-evidence-missing-output-marker"
+    invalid_report = dict(_responses()["reviewer"])
+    invalid_report.update(
+        {
+            "blockingIssues": [source_marker],
+            "locationFiles": [planned_path],
+        }
+    )
+    model = ScriptedModelClient({"reviewer": [invalid_report, dict(invalid_report)]})
+    runner = SOPRunner(
+        repository,
+        model,
+        FakeSandboxProvider(),
+        replace(settings, structured_output_retries=1),
+    )
+    failed_gate = GateResult(
+        gate="typecheck",
+        status=GateStatus.failed,
+        summary=output_marker,
+        evidence=[f"command:{command_marker}"],
+    )
+
+    with pytest.raises(SOPExecutionError, match="reviewer failed to produce a valid DiagnosticReport"):
+        await runner._role(
+            context,
+            role="reviewer",
+            model_alias="reviewer",
+            schema=DiagnosticReport,
+            messages=[{"role": "system", "content": "test missing diagnostic evidence"}],
+            validate_artifact=lambda report: runner._validate_diagnostic_repair_scope(
+                report,
+                technical,
+                [failed_gate],
+            ),
+        )
+
+    events = await repository.list_events(run.id)
+    retry_event = next(
+        event
+        for event in events
+        if event.kind == "agent.activity" and event.payload.get("action") == "structured_retry"
+    )
+    failed_event = next(event for event in events if event.kind == "agent.failed")
+    assert retry_event.payload["reasonCode"] == "diagnostic_report.location_files.evidence_missing"
+    assert failed_event.payload["reasonCode"] == "diagnostic_report.location_files.evidence_missing"
+    correction = next(
+        message["content"]
+        for message in model.requests[1][1]
+        if message["content"].startswith("Return only a valid DiagnosticReport JSON object")
+    )
+    serialized_events = json.dumps([event.payload for event in events])
+    for marker in (planned_path, source_marker, command_marker, output_marker):
+        assert marker not in correction
+        assert marker not in serialized_events
+
+
+@pytest.mark.asyncio
+async def test_gate_command_extracts_concatenated_paths_and_bounds_reviewer_scope(
+    repository, settings
+) -> None:
+    session = await repository.create_guest_session()
+    project = await repository.create_project(session.id, "Library")
+    _message, run, _created = await repository.create_message_and_run(
+        project.id, session.id, "gate-path-extraction", "Create a book management system"
+    )
+    assert await repository.claim_next_run("test-worker", 60)
+    paths = [
+        "lib/domain/library-persistence.ts",
+        "lib/domain/library-actions.ts",
+        "lib/domain/library-types.ts",
+    ]
+    stdout = "".join(f"?{path}({index},28):" for index, path in enumerate(paths, start=1))
+    sandbox = FakeSandboxProvider(
+        {"pnpm typecheck": ExecResult(exit_code=1, stdout=stdout, stderr="error")}
+    )
+    ref = await sandbox.create(project.id)
+    context = SimpleNamespace(
+        run_id=run.id,
+        lease_token=await repository.get_active_lease_token(run.id),
+        sandbox=ref,
+    )
+    runner = SOPRunner(repository, ScriptedModelClient({}), sandbox, settings)
+
+    gate = await runner._gate_command(context, "typecheck", "pnpm typecheck")
+
+    assert gate.affected_files == paths
+    assert paths[0] in gate.summary
+    assert gate.summary.endswith("error")
+    technical = TechnicalSpec.model_validate(_architect_response_with_file_plan_count(4))
+    technical_paths = [item.path for item in technical.file_plan]
+    gate = gate.model_copy(update={"affected_files": technical_paths[:3]})
+    runner._validate_diagnostic_repair_scope(
+        DiagnosticReport(
+            blocking_issues=["typecheck failed"],
+            location_files=technical_paths[:3],
+        ),
+        technical,
+        [gate],
+    )
+    with pytest.raises(ArtifactContractViolation) as violation:
+        runner._validate_diagnostic_repair_scope(
+            DiagnosticReport(
+                blocking_issues=["typecheck failed"],
+                location_files=[technical_paths[3]],
+            ),
+            technical,
+            [gate],
+        )
+    assert violation.value.code == "diagnostic_report.location_files.not_affected"
 
 
 @pytest.mark.asyncio

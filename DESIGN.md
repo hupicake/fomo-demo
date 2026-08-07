@@ -425,6 +425,8 @@ QA 使用确定性工具和独立 Reviewer 判断，按顺序运行：
 
 只有 `error`/`major` 级问题阻断版本发布；`minor` 作为已知问题展示。`FailureRouter` 根据证据把需求遗漏回灌 PM、系统/组件边界问题回灌 Architect，把编译、测试和视觉实现问题回灌 Engineer。回灌内容是结构化 DiagnosticReport 和最小相关日志，不是整段无筛选终端输出。
 
+失败 gate 会从脱敏后的完整 stdout 与 stderr 提取唯一合法的 `affectedFiles`；Reviewer 的 `locationFiles` 必须是 1–8 个已计划文件，并在有该证据时为其子集，repair 不得回退为全量 `filePlan`。
+
 ## 7. 沙箱、预览和版本
 
 ### 7.1 SandboxProvider
