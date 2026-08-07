@@ -125,6 +125,24 @@ _TECHNICAL_SPEC_REPAIR_INSTRUCTIONS = MappingProxyType(
         ),
     }
 )
+_FILE_BATCH_REPAIR_INSTRUCTIONS = MappingProxyType(
+    {
+        "file_batch_report.batch_id_mismatch": "Set batchId to the requested batch id.",
+        "file_batch_report.file_changes_empty": (
+            "Provide one complete fileChanges entry for every requested path."
+        ),
+        "file_batch_report.paths_duplicate": "Use each fileChanges path at most once.",
+        "file_batch_report.paths_mismatch": (
+            "Make fileChanges paths exactly match the requested batch paths."
+        ),
+        "file_batch_report.workspace_path_invalid": (
+            "Use only valid relative workspace paths in fileChanges."
+        ),
+        "file_batch_report.file_size_exceeded": (
+            "Keep every create or modify fileChanges content within the configured character limit stated in the prompt."
+        ),
+    }
+)
 
 
 class RunCancelled(RuntimeError):
@@ -145,6 +163,21 @@ class ArtifactContractViolation(ValueError):
             repair_instruction = _TECHNICAL_SPEC_REPAIR_INSTRUCTIONS[code]
         except KeyError:
             raise ValueError("unknown artifact contract violation code") from None
+        super().__init__(code)
+        self.code = code
+        self.repair_instruction = repair_instruction
+
+
+class FileBatchContractViolation(ValueError):
+    """A trusted, safe-to-return correction for a FileBatchReport contract."""
+
+    __slots__ = ("code", "repair_instruction")
+
+    def __init__(self, *, code: str) -> None:
+        try:
+            repair_instruction = _FILE_BATCH_REPAIR_INSTRUCTIONS[code]
+        except KeyError:
+            raise ValueError("unknown file batch contract violation code") from None
         super().__init__(code)
         self.code = code
         self.repair_instruction = repair_instruction
@@ -364,6 +397,7 @@ class SOPRunner:
         max_batches = self._engineer_max_batches()
         max_files_per_batch = self._engineer_max_files_per_batch()
         max_planned_files = max_batches * max_files_per_batch
+        max_file_characters = self._engineer_max_file_characters()
         path_label = "path" if max_files_per_batch == 1 else "paths"
         technical = await self._role(
             context,
@@ -387,7 +421,9 @@ class SOPRunner:
                         "Strictly use the JSON Schema's literal enum values (never descriptive "
                         f"variants), fit TechnicalSpec.filePlan within {max_batches} Engineer batches of at most "
                         f"{max_files_per_batch} unique valid relative workspace {path_label} each (no more than "
-                        f"{max_planned_files} paths total), keep every list and description concise, and do not include "
+                        f"{max_planned_files} paths total). Each create/modify file must be completable within the "
+                        f"Engineer {max_file_characters}-character source limit; split complex state or features across "
+                        "files. Keep every list and description concise, and do not include "
                         "chain-of-thought, secrets, or fields outside the schema. Never plan system-managed .gitignore "
                         "files or pnpm-lock.yaml, package-lock.json, yarn.lock, bun.lock, or bun.lockb; FOMO and package "
                         "installation create those outside the model file plan."
@@ -868,18 +904,24 @@ class SOPRunner:
         expected: ImplementationBatchPlan,
     ) -> None:
         if report.batch_id != expected.id:
-            raise ValueError("file batch report does not match the requested batch id")
+            raise FileBatchContractViolation(code="file_batch_report.batch_id_mismatch")
         if not report.file_changes:
-            raise ValueError("file batch report must contain complete file changes")
+            raise FileBatchContractViolation(code="file_batch_report.file_changes_empty")
         paths = [change.path for change in report.file_changes]
-        if len(paths) != len(set(paths)):
-            raise ValueError("file batch report must not repeat a path")
-        if set(paths) != set(expected.paths):
-            raise ValueError("file batch report paths must exactly match the requested batch")
         for change in report.file_changes:
-            validate_workspace_path(change.path)
+            try:
+                validate_workspace_path(change.path)
+            except ValueError:
+                raise FileBatchContractViolation(
+                    code="file_batch_report.workspace_path_invalid"
+                ) from None
+        if len(paths) != len(set(paths)):
+            raise FileBatchContractViolation(code="file_batch_report.paths_duplicate")
+        if set(paths) != set(expected.paths):
+            raise FileBatchContractViolation(code="file_batch_report.paths_mismatch")
+        for change in report.file_changes:
             if change.operation != "delete" and len(change.content) > self._engineer_max_file_characters():
-                raise ValueError("file batch report exceeds the configured file size limit")
+                raise FileBatchContractViolation(code="file_batch_report.file_size_exceeded")
 
     def _validate_final_implementation_report(
         self,
@@ -1468,13 +1510,21 @@ class SOPRunner:
                 )
                 raise SOPExecutionError(f"{role} model request failed") from None
             except (ModelError, ValidationError, ValueError, TypeError) as exc:
-                trusted_contract_violation: ArtifactContractViolation | None = (
-                    exc
-                    if role == "architect"
+                trusted_contract_violation: (
+                    ArtifactContractViolation | FileBatchContractViolation | None
+                ) = None
+                if (
+                    role == "architect"
                     and schema is TechnicalSpec
-                    and isinstance(exc, ArtifactContractViolation)
-                    else None
-                )
+                    and type(exc) is ArtifactContractViolation
+                ):
+                    trusted_contract_violation = exc
+                elif (
+                    role == "engineer"
+                    and schema is FileBatchReport
+                    and type(exc) is FileBatchContractViolation
+                ):
+                    trusted_contract_violation = exc
                 reason_code = (
                     trusted_contract_violation.code
                     if trusted_contract_violation is not None

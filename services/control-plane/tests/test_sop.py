@@ -16,14 +16,21 @@ from fomo.agent_runtime.metagpt_adapter import (
     MetaGPTAvailability,
     MetaGPTUnavailable,
 )
-from fomo.agent_runtime.sop import ArtifactContractViolation, SOPExecutionError, SOPRunner
+from fomo.agent_runtime.sop import (
+    ArtifactContractViolation,
+    FileBatchContractViolation,
+    SOPExecutionError,
+    SOPRunner,
+)
 from fomo.agent_runtime.state import FailureRouter, SOPStateMachine
 from fomo.sandbox.base import ExecResult
 from fomo.sandbox.fake import FakeSandboxProvider
 from fomo.schemas import (
     DiagnosticReport,
+    FileBatchReport,
     GateResult,
     GateStatus,
+    ImplementationBatchPlan,
     ImplementationPlan,
     RunPhase,
     TechnicalSpec,
@@ -260,6 +267,110 @@ def test_artifact_contract_violation_uses_a_closed_repair_instruction_map() -> N
         )
 
 
+def test_file_batch_contract_violation_uses_a_closed_repair_instruction_map() -> None:
+    violation = FileBatchContractViolation(code="file_batch_report.file_size_exceeded")
+
+    assert violation.repair_instruction == (
+        "Keep every create or modify fileChanges content within the configured character limit stated in the prompt."
+    )
+    with pytest.raises(ValueError, match="unknown file batch contract violation code") as unknown_code:
+        FileBatchContractViolation(code="untrusted.contract.code")
+    assert "untrusted.contract.code" not in str(unknown_code.value)
+    with pytest.raises(TypeError):
+        FileBatchContractViolation(
+            code="file_batch_report.file_size_exceeded",
+            repair_instruction="untrusted instruction",  # type: ignore[call-arg]
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("report_payload", "expected_payload", "settings_overrides", "code"),
+    [
+        pytest.param(
+            {
+                "batchId": "wrong-batch",
+                "fileChanges": [{"path": "src/book.ts", "content": "export {}"}],
+            },
+            {"id": "requested-batch", "purpose": "test", "paths": ["src/book.ts"]},
+            {},
+            "file_batch_report.batch_id_mismatch",
+            id="batch-id-mismatch",
+        ),
+        pytest.param(
+            {"batchId": "requested-batch", "fileChanges": []},
+            {"id": "requested-batch", "purpose": "test", "paths": ["src/book.ts"]},
+            {},
+            "file_batch_report.file_changes_empty",
+            id="empty-file-changes",
+        ),
+        pytest.param(
+            {
+                "batchId": "requested-batch",
+                "fileChanges": [
+                    {"path": "src/book.ts", "content": "first"},
+                    {"path": "src/book.ts", "content": "second"},
+                ],
+            },
+            {"id": "requested-batch", "purpose": "test", "paths": ["src/book.ts"]},
+            {},
+            "file_batch_report.paths_duplicate",
+            id="duplicate-paths",
+        ),
+        pytest.param(
+            {
+                "batchId": "requested-batch",
+                "fileChanges": [{"path": "src/other.ts", "content": "export {}"}],
+            },
+            {"id": "requested-batch", "purpose": "test", "paths": ["src/book.ts"]},
+            {},
+            "file_batch_report.paths_mismatch",
+            id="paths-mismatch",
+        ),
+        pytest.param(
+            {
+                "batchId": "requested-batch",
+                "fileChanges": [{"path": "../outside.ts", "content": "export {}"}],
+            },
+            {"id": "requested-batch", "purpose": "test", "paths": ["src/book.ts"]},
+            {},
+            "file_batch_report.workspace_path_invalid",
+            id="invalid-workspace-path-before-path-mismatch",
+        ),
+        pytest.param(
+            {
+                "batchId": "requested-batch",
+                "fileChanges": [{"path": "src/book.ts", "content": "too-long"}],
+            },
+            {"id": "requested-batch", "purpose": "test", "paths": ["src/book.ts"]},
+            {"engineer_max_file_characters": 2},
+            "file_batch_report.file_size_exceeded",
+            id="file-size-exceeded",
+        ),
+    ],
+)
+async def test_file_batch_contract_validation_uses_stable_codes(
+    repository,
+    settings,
+    report_payload,
+    expected_payload,
+    settings_overrides,
+    code,
+) -> None:
+    runner = SOPRunner(
+        repository,
+        ScriptedModelClient({}),
+        FakeSandboxProvider(),
+        replace(settings, **settings_overrides),
+    )
+    report = FileBatchReport.model_validate(report_payload)
+    expected = ImplementationBatchPlan.model_validate(expected_payload)
+
+    with pytest.raises(FileBatchContractViolation) as violation:
+        runner._validate_file_batch_report(report, expected)
+    assert violation.value.code == code
+
+
 def _repair_responses() -> dict[str, Any]:
     responses = _responses()
     responses["engineer"] = [*responses["engineer"], *_single_file_repair_engineer_cycle()]
@@ -449,6 +560,8 @@ async def test_four_role_sop_creates_version_and_trace(repository, settings) -> 
     assert "without requiring a same-name decision" in architect_system_prompt
     assert "Avoid per-control Button/Card/Input decisions" in architect_system_prompt
     assert "only for actual cross-file public symbols" in architect_system_prompt
+    assert "Engineer 12000-character source limit" in architect_system_prompt
+    assert "split complex state or features across files" in architect_system_prompt
     assert "publicApiContracts" in architect_system_prompt
     engineer_plan_request = next(request for request in model.requests if request[2] == "ImplementationPlan")
     engineer_plan_system_prompt = engineer_plan_request[1][0]["content"]
@@ -914,6 +1027,140 @@ async def test_non_architect_contract_violation_uses_generic_schema_correction(r
         if message["content"].startswith("Return only a valid TechnicalSpec JSON object")
     )
     assert correction_message == "Return only a valid TechnicalSpec JSON object matching the declared schema."
+
+
+@pytest.mark.asyncio
+async def test_file_batch_contract_violation_adds_targeted_schema_correction(repository, settings) -> None:
+    session = await repository.create_guest_session()
+    project = await repository.create_project(session.id, "Library")
+    _message, run, _created = await repository.create_message_and_run(
+        project.id, session.id, "message-file-batch-contract", "Create a book management system"
+    )
+    assert await repository.claim_next_run("test-worker", 60)
+    context = SimpleNamespace(
+        run_id=run.id,
+        lease_token=await repository.get_active_lease_token(run.id),
+    )
+    expected = ImplementationBatchPlan.model_validate(
+        {"id": "requested-batch", "purpose": "test", "paths": ["src/book.ts"]}
+    )
+    source_marker = "model-body-never-leak"
+    model = ScriptedModelClient(
+        {
+            "engineer": [
+                {
+                    "batchId": "wrong-batch",
+                    "fileChanges": [{"path": "src/book.ts", "content": source_marker}],
+                },
+                {
+                    "batchId": "requested-batch",
+                    "fileChanges": [{"path": "src/book.ts", "content": "export {}"}],
+                },
+            ]
+        }
+    )
+    runner = SOPRunner(
+        repository,
+        model,
+        FakeSandboxProvider(),
+        replace(settings, structured_output_retries=1),
+    )
+
+    artifact = await runner._role(
+        context,
+        role="engineer",
+        model_alias="engineer",
+        schema=FileBatchReport,
+        messages=[{"role": "system", "content": "test file batch correction"}],
+        validate_artifact=lambda report: runner._validate_file_batch_report(report, expected),
+    )
+
+    assert isinstance(artifact, FileBatchReport)
+    events = await repository.list_events(run.id)
+    retry_event = next(
+        event
+        for event in events
+        if event.kind == "agent.activity"
+        and event.role == "engineer"
+        and event.payload.get("action") == "structured_retry"
+    )
+    assert retry_event.payload == {
+        "action": "structured_retry",
+        "summary": "The structured hand-off was invalid; requesting a schema-correct response.",
+        "reasonCode": "file_batch_report.batch_id_mismatch",
+    }
+    repair_instruction = "Set batchId to the requested batch id."
+    assert repair_instruction not in json.dumps([event.payload for event in events])
+    assert source_marker not in json.dumps([event.payload for event in events])
+    correction_message = next(
+        message["content"]
+        for message in model.requests[1][1]
+        if message["content"].startswith("Return only a valid FileBatchReport JSON object")
+    )
+    assert correction_message == (
+        "Return only a valid FileBatchReport JSON object matching the declared schema.\n"
+        + repair_instruction
+    )
+
+
+@pytest.mark.asyncio
+async def test_engineer_non_file_batch_contract_violation_uses_generic_schema_correction(
+    repository, settings
+) -> None:
+    session = await repository.create_guest_session()
+    project = await repository.create_project(session.id, "Library")
+    _message, run, _created = await repository.create_message_and_run(
+        project.id, session.id, "message-engineer-generic-contract", "Create a book management system"
+    )
+    assert await repository.claim_next_run("test-worker", 60)
+    context = SimpleNamespace(
+        run_id=run.id,
+        lease_token=await repository.get_active_lease_token(run.id),
+    )
+    plan_payload = {
+        "batches": [
+            {"id": "requested-batch", "purpose": "test", "paths": ["src/book.ts"]}
+        ]
+    }
+    model = ScriptedModelClient({"engineer": [plan_payload, plan_payload]})
+    validation_attempts = 0
+
+    def reject_once(_artifact: ImplementationPlan) -> None:
+        nonlocal validation_attempts
+        validation_attempts += 1
+        if validation_attempts == 1:
+            raise FileBatchContractViolation(code="file_batch_report.batch_id_mismatch")
+
+    artifact = await SOPRunner(
+        repository,
+        model,
+        FakeSandboxProvider(),
+        replace(settings, structured_output_retries=1),
+    )._role(
+        context,
+        role="engineer",
+        model_alias="engineer",
+        schema=ImplementationPlan,
+        messages=[{"role": "system", "content": "test generic correction"}],
+        validate_artifact=reject_once,
+    )
+
+    assert isinstance(artifact, ImplementationPlan)
+    retry_event = next(
+        event
+        for event in await repository.list_events(run.id)
+        if event.kind == "agent.activity" and event.payload.get("action") == "structured_retry"
+    )
+    assert retry_event.payload == {
+        "action": "structured_retry",
+        "summary": "The structured hand-off was invalid; requesting a schema-correct response.",
+    }
+    correction_message = next(
+        message["content"]
+        for message in model.requests[1][1]
+        if message["content"].startswith("Return only a valid ImplementationPlan JSON object")
+    )
+    assert correction_message == "Return only a valid ImplementationPlan JSON object matching the declared schema."
 
 
 @pytest.mark.asyncio
