@@ -10,7 +10,7 @@ import {
   useArtifactDetailLoader,
 } from "@/components/workbench/project-workbench";
 import { useWorkbenchStore } from "@/lib/store/workbench-store";
-import type { ArtifactDetail, ArtifactKind, ArtifactRef } from "@/lib/contracts";
+import type { ArtifactDetail, ArtifactKind, ArtifactRef, VisibleArtifactRef } from "@/lib/contracts";
 
 const h = vi.hoisted(() => ({
   getArtifact: vi.fn(),
@@ -123,7 +123,7 @@ beforeEach(() => {
   clearArtifactDetailCache();
 });
 
-function refFixture(id: string, kind: ArtifactKind, runId = "run-1"): ArtifactRef {
+function refFixture(id: string, kind: ArtifactKind, runId = "run-1"): VisibleArtifactRef {
   return {
     id,
     runId,
@@ -136,8 +136,8 @@ function refFixture(id: string, kind: ArtifactKind, runId = "run-1"): ArtifactRe
   };
 }
 
-function detailFixture(ref: ArtifactRef, problem: string): ArtifactDetail {
-  return { ...ref, kind: ref.kind as ArtifactKind, content: { problem } };
+function detailFixture(ref: VisibleArtifactRef, problem: string): ArtifactDetail {
+  return { ...ref, content: { problem } };
 }
 
 function snapshotFixture(refs: ArtifactRef[], lastSeq = 12): Record<string, unknown> {

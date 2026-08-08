@@ -283,7 +283,13 @@ describe("artifact ref and detail contract", () => {
       ref,
       { ...ref, id: "artifact-2", kind: "technical_spec", role: "architect" },
     ]);
-    expect(snapshot.artifactRefs[0]).not.toHaveProperty("content");
+    const refs = snapshot.artifactRefs;
+    expect(refs).toBeDefined();
+    expect(refs).toHaveLength(2);
+    if (!refs) {
+      throw new Error("snapshot.artifactRefs must be present");
+    }
+    expect(refs[0]).not.toHaveProperty("content");
   });
 
   it("normalizes snake_case refs identically to camelCase refs", async () => {

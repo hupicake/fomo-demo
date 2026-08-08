@@ -3,7 +3,6 @@ import type {
   AcceptanceTrace,
   ArtifactDetail,
   ArtifactKind,
-  ArtifactRef,
   DomainEvent,
   FileContent,
   FileManifestEntry,
@@ -13,6 +12,7 @@ import type {
   ProjectSummary,
   RunSnapshot,
   VersionSummary,
+  VisibleArtifactRef,
 } from "@/lib/contracts";
 
 const defaultApiOrigin = "http://localhost:8000";
@@ -345,7 +345,7 @@ function normalizePreview(value: unknown): PreviewRef | undefined {
   };
 }
 
-function normalizeArtifactRef(value: unknown): ArtifactRef | undefined {
+function normalizeArtifactRef(value: unknown): VisibleArtifactRef | undefined {
   const source = record(value);
   const id = text(source.id || source.artifactId || source.artifact_id);
   const runId = text(source.runId || source.run_id);
@@ -367,7 +367,7 @@ function normalizeArtifactRef(value: unknown): ArtifactRef | undefined {
   if (role !== expectedRole) {
     return undefined;
   }
-  return { id, runId, kind, role, schemaVersion, title, summary, createdAt };
+  return { id, runId, kind: kind as ArtifactKind, role: expectedRole, schemaVersion, title, summary, createdAt };
 }
 
 function normalizeArtifactDetail(value: unknown): ArtifactDetail | undefined {
@@ -380,7 +380,7 @@ function normalizeArtifactDetail(value: unknown): ArtifactDetail | undefined {
   if (!content || typeof content !== "object" || Array.isArray(content)) {
     return undefined;
   }
-  return { ...ref, kind: ref.kind as ArtifactKind, content: content as Record<string, unknown> };
+  return { ...ref, content: content as Record<string, unknown> };
 }
 
 async function responseProblem(response: Response): Promise<ApiProblem> {

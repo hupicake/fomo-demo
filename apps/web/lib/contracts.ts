@@ -129,14 +129,17 @@ export interface ArtifactRef {
   markdown?: string;
 }
 
-export interface ArtifactDetail extends ArtifactRef {
+export interface VisibleArtifactRef extends ArtifactRef {
   runId: string;
   kind: ArtifactKind;
-  role: string;
+  role: "product_manager" | "architect";
   schemaVersion: number;
   title: string;
   summary: string;
   createdAt: string;
+}
+
+export interface ArtifactDetail extends VisibleArtifactRef {
   content: Record<string, unknown>;
 }
 
@@ -210,7 +213,7 @@ export interface ProjectSnapshot {
   versions?: VersionSummary[];
   trace?: AcceptanceTrace[];
   preview?: PreviewRef;
-  artifactRefs?: ArtifactRef[];
+  artifactRefs?: VisibleArtifactRef[];
 }
 
 export interface RunPresentation {
