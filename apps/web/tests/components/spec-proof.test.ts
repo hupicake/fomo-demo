@@ -9,7 +9,7 @@ import type {
   AcceptanceTrace,
   ArtifactDetail,
   ArtifactLoadState,
-  ArtifactRef,
+  VisibleArtifactRef,
 } from "@/lib/contracts";
 
 vi.mock("@/components/ai-elements/message", () => ({
@@ -28,7 +28,7 @@ vi.mock("@/components/ai-elements/plan", () => ({
 
 afterEach(cleanup);
 
-const ref: ArtifactRef = {
+const ref = {
   id: "artifact-1",
   runId: "run-1",
   kind: "product_spec",
@@ -37,7 +37,7 @@ const ref: ArtifactRef = {
   title: "Library product spec",
   summary: "Readers can manage books.",
   createdAt: "2026-08-07T12:00:00.000Z",
-};
+} satisfies VisibleArtifactRef;
 
 const detail: ArtifactDetail = {
   ...ref,
