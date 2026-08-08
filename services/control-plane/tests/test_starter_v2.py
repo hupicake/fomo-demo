@@ -60,6 +60,16 @@ def test_v2_bare_manifest_is_digest_pinned_and_keeps_a_generic_buildable_boundar
     assert "app/(generated)/composition.tsx" in files
     assert "tests/harness/starter.smoke.spec.ts" in files
     assert "tests/harness/runtime.ts" not in files
+    canonical_next_env = (
+        '/// <reference types="next" />\n'
+        '/// <reference types="next/image-types/global" />\n'
+        'import "./.next/types/routes.d.ts";\n'
+        'import "./.next/types/root-params.d.ts";\n'
+        "\n"
+        "// NOTE: This file should not be edited\n"
+        "// see https://nextjs.org/docs/app/api-reference/config/typescript for more information.\n"
+    )
+    assert files["next-env.d.ts"]._content == canonical_next_env.encode("utf-8")
     page_source = files["app/page.tsx"]._content.decode("utf-8")
     assert "GeneratedComposition" in page_source
     assert "components/features" not in page_source
