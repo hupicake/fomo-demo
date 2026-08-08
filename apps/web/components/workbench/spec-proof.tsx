@@ -105,6 +105,13 @@ function TraceStatus({ status }: { status: AcceptanceTrace["status"] }) {
   return <CircleDotIcon className="size-3.5" />;
 }
 
+function ImplementationBadge({ status }: { status?: AcceptanceTrace["implementationStatus"] }) {
+  if (status === "implemented") {
+    return <Badge className="h-5 text-[10px]" variant="outline">implemented</Badge>;
+  }
+  return <Badge className="h-5 text-[10px] text-muted-foreground" variant="outline">not implemented</Badge>;
+}
+
 export function SpecToProof({ slots, onFileSelect, trace }: { slots: SpecSlot[]; onFileSelect: (path: string) => void; trace: AcceptanceTrace[] }) {
   const specs = slots.filter((slot) => slot.kind === "product_spec" || slot.kind === "technical_spec");
   return (
@@ -114,7 +121,7 @@ export function SpecToProof({ slots, onFileSelect, trace }: { slots: SpecSlot[];
       <div className="space-y-2">
         {trace.map((item) => (
           <article className="rounded-xl border bg-card p-3" key={item.id}>
-            <div className="flex gap-2"><span className={cn("mt-0.5 flex size-5 shrink-0 items-center justify-center rounded-full", item.status === "passed" ? "bg-emerald-500/10 text-emerald-700" : item.status === "failed" ? "bg-destructive/10 text-destructive" : "bg-muted text-muted-foreground")}><TraceStatus status={item.status} /></span><div className="min-w-0 flex-1"><div className="flex items-center gap-2"><span className="font-mono text-[11px] text-muted-foreground">{item.id}</span><Badge className="h-5 text-[10px]" variant="outline">{item.priority}</Badge></div><p className="mt-1 text-sm leading-5">{item.title}</p></div></div>
+            <div className="flex gap-2"><span className={cn("mt-0.5 flex size-5 shrink-0 items-center justify-center rounded-full", item.status === "passed" ? "bg-emerald-500/10 text-emerald-700" : item.status === "failed" ? "bg-destructive/10 text-destructive" : "bg-muted text-muted-foreground")}><TraceStatus status={item.status} /></span><div className="min-w-0 flex-1"><div className="flex items-center gap-2"><span className="font-mono text-[11px] text-muted-foreground">{item.id}</span><ImplementationBadge status={item.implementationStatus} /><Badge className="h-5 text-[10px]" variant="outline">{item.priority}</Badge></div><p className="mt-1 text-sm leading-5">{item.title}</p>{item.status === "unverified" ? <p className="mt-1 text-[11px] text-muted-foreground">unverified · no deterministic playwright evidence yet</p> : null}</div></div>
             <div className="mt-3 flex flex-wrap gap-1.5">
               {item.evidence.map((evidence) => (
                 <button className={cn("inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[11px] transition-colors hover:bg-accent", evidence.status === "passed" && "border-emerald-600/20 bg-emerald-500/5 text-emerald-800")} key={evidence.id} onClick={() => evidence.type === "file" ? onFileSelect(evidence.label) : undefined} type="button">

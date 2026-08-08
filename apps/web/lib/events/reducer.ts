@@ -236,17 +236,23 @@ function commandFromEvent(event: DomainEvent, previous?: CommandLog): CommandLog
   };
 }
 
-function verificationFromEvent(event: DomainEvent): VerificationResult {
+function verificationFromEvent(event: DomainEvent): VerificationResult | undefined {
   const payload = event.payload;
+  // The Release gate consumes only closed-set project scope events. Acceptance
+  // evidence lives in the AC trace; scope-less legacy events fail closed and
+  // never reach the gate.
+  if (payload.scope !== "project") {
+    return undefined;
+  }
   const status = asText(payload.status, event.kind.includes("failed") ? "failed" : "running");
   return {
-    id: asText(payload.id || payload.verificationId || payload.verification_id, event.eventId),
+    id: asText(payload.gateId || payload.id || payload.verificationId || payload.verification_id, event.eventId),
     name: asText(payload.name || payload.check || payload.title, "Verification"),
     status: ["passed", "failed", "running", "skipped"].includes(status)
       ? (status as VerificationResult["status"])
       : "running",
     duration: asNumber(payload.duration || payload.durationMs || payload.duration_ms),
-    detail: asText(payload.detail || payload.message) || undefined,
+    detail: asText(payload.summary || payload.detail || payload.message) || undefined,
     stack: asText(payload.stack || payload.error) || undefined,
   };
 }
@@ -360,6 +366,9 @@ export function reduceDomainEvent(state: RunPresentation, event: DomainEvent): R
     }
     case "verification.updated": {
       const verification = verificationFromEvent(event);
+      if (!verification) {
+        break;
+      }
       next.verifications = replaceById(state.verifications, verification);
       if (verification.status === "failed") {
         next.problems = [...state.problems, ...problemsFromEvent(event)].slice(-maxActivityItems);
@@ -434,7 +443,9 @@ export function domainEventToMessageChunks(
     }
     case "verification.updated": {
       const verification = verificationFromEvent(event);
-      return [dataChunk("verification", verification, `verification-${verification.id}`)];
+      return verification
+        ? [dataChunk("verification", verification, `verification-${verification.id}`)]
+        : [];
     }
     case "preview.ready":
     case "preview.failed":

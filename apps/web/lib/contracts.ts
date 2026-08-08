@@ -109,7 +109,10 @@ export interface AcceptanceTrace {
   id: string;
   title: string;
   priority: "must" | "should" | "could";
-  status: "pending" | "passed" | "failed" | "blocked";
+  /** Derived only from the latest deterministic playwright_smoke evidence. */
+  status: "unverified" | "pending" | "passed" | "failed" | "blocked";
+  /** Derived only from real implemented_in trace links. */
+  implementationStatus?: "implemented" | "not_implemented";
   evidence: TraceEvidence[];
 }
 

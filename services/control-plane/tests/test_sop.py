@@ -23,6 +23,7 @@ from fomo.agent_runtime.sop import (
     SOPExecutionError,
     SOPRunner,
     _Context,
+    _SYSTEM_GITIGNORE,
 )
 from fomo.agent_runtime.state import FailureRouter, SOPStateMachine
 from fomo.sandbox.base import ExecResult, FileChange
@@ -41,6 +42,81 @@ from fomo.schemas import (
 )
 from fomo.starter import default_starter_manifest
 from fomo.worker.runner import WorkerRunner
+
+# The fixed project-scope smoke gate executes the protected starter harness by
+# exact path with the structured JSON reporter; tests mirror that command.
+_HARNESS_SMOKE_COMMAND = (
+    "pnpm playwright test tests/harness/starter.smoke.spec.ts --reporter=json --project=chromium"
+)
+_HARNESS_SMOKE_TITLE = "starter renders a stable application shell"
+_AC_SMOKE_COMMAND = (
+    "pnpm playwright test tests/generated/library.smoke.spec.ts --reporter=json --project=chromium"
+)
+_AC_SMOKE_TITLE = "library keeps a searchable catalog"
+
+
+def _playwright_json(
+    title: str,
+    overall: str = "expected",
+    *,
+    result_status: str = "passed",
+    file: str = "tests/generated/library.smoke.spec.ts",
+    project_name: str = "chromium",
+    no_results: bool = False,
+) -> str:
+    """Real Playwright 1.55.1 JSON reporter shape.
+
+    The unique test title lives on the spec; spec.tests[] entries carry
+    expectedStatus/status/results[] and no title. result.status is one of
+    passed, failed, timedOut, skipped, interrupted.
+    """
+    test_entry: dict[str, Any] = {
+        "expectedStatus": "passed",
+        "status": overall,
+        "projectId": "project-" + project_name,
+        "projectName": project_name,
+        "results": [] if no_results else [{"workerIndex": 0, "status": result_status, "duration": 10}],
+    }
+    return json.dumps(
+        {
+            "config": {"rootDir": "."},
+            "suites": [
+                {
+                    "title": "",
+                    "file": file,
+                    "specs": [{"title": title, "ok": overall == "expected", "tests": [test_entry]}],
+                    "suites": [],
+                }
+            ],
+            "errors": [],
+            "stats": {
+                "expected": 1 if overall == "expected" else 0,
+                "unexpected": 1 if overall == "unexpected" else 0,
+                "flaky": 1 if overall == "flaky" else 0,
+                "skipped": 0,
+            },
+        },
+        separators=(",", ":"),
+    )
+
+
+def _project_gate_sandbox(extra: dict[str, Any] | None = None) -> FakeSandboxProvider:
+    """A fake sandbox whose gates all pass: the fixed harness smoke and the
+    generated acceptance smoke both report exactly one passing test."""
+    results: dict[str, Any] = {
+        _HARNESS_SMOKE_COMMAND: ExecResult(
+            0,
+            _playwright_json(
+                _HARNESS_SMOKE_TITLE, file="tests/harness/starter.smoke.spec.ts"
+            )
+            + "\n",
+            "",
+        ),
+        _AC_SMOKE_COMMAND: ExecResult(0, _playwright_json(_AC_SMOKE_TITLE) + "\n", ""),
+    }
+    if extra:
+        results.update(extra)
+    return FakeSandboxProvider(results)
 
 
 def _final_implementation_response(
@@ -72,6 +148,8 @@ def _engineer_cycle() -> list[dict[str, Any] | object]:
 
 
 def _two_batch_engineer_cycle() -> list[dict[str, Any] | object]:
+    """Three batches: the root composition, the feature, and the acceptance
+    smoke test that every required AC must be bound to."""
     return [
         {
             "baselineVersionId": None,
@@ -87,6 +165,12 @@ def _two_batch_engineer_cycle() -> list[dict[str, Any] | object]:
                     "purpose": "library interaction",
                     "paths": ["components/features/library.tsx"],
                     "acceptanceIds": ["AC-1"],
+                },
+                {
+                    "id": "library-smoke",
+                    "purpose": "playwright acceptance smoke",
+                    "paths": ["tests/generated/library.smoke.spec.ts"],
+                    "acceptanceIds": [],
                 },
             ],
             "designDecisionIds": ["DD-1"],
@@ -117,6 +201,26 @@ def _two_batch_engineer_cycle() -> list[dict[str, Any] | object]:
                     "path": "components/features/library.tsx",
                     "operation": "create",
                     "content": 'export function Library() {\n  return <main>Library</main>;\n}\n',
+                }
+            ],
+        },
+        {
+            "batchId": "library-smoke",
+            "implementedAcceptanceIds": [],
+            "designDecisionIds": ["DD-1"],
+            "changedFiles": ["tests/generated/library.smoke.spec.ts"],
+            "knownLimitations": [],
+            "fileChanges": [
+                {
+                    "path": "tests/generated/library.smoke.spec.ts",
+                    "operation": "create",
+                    "content": (
+                        'import { expect, test } from "@playwright/test";\n\n'
+                        'test("library keeps a searchable catalog", async ({ page }) => {\n'
+                        '  await page.goto("/");\n'
+                        '  await expect(page.getByRole("main")).toBeVisible();\n'
+                        "});\n"
+                    ),
                 }
             ],
         },
@@ -235,8 +339,21 @@ def _responses() -> dict[str, Any]:
                     "operation": "create",
                     "reason": "library interaction",
                 },
+                {
+                    "path": "tests/generated/library.smoke.spec.ts",
+                    "operation": "create",
+                    "reason": "playwright acceptance smoke",
+                },
             ],
-            "testPlan": [{"acceptanceId": "AC-1", "method": "unit", "steps": ["add book"]}],
+            "testPlan": [
+                {
+                    "acceptanceId": "AC-1",
+                    "method": "playwright",
+                    "testPath": "tests/generated/library.smoke.spec.ts",
+                    "testName": "library keeps a searchable catalog",
+                    "steps": ["smoke"],
+                }
+            ],
             "risks": [],
         },
         "engineer": _engineer_cycle(),
@@ -257,8 +374,15 @@ def _responses() -> dict[str, Any]:
 def _architect_response_with_playwright_smoke_path(
     path: str = "tests/generated/library.smoke.spec.ts",
     operation: str = "create",
+    test_name: str = "library keeps a searchable catalog",
 ) -> dict[str, Any]:
+    """Replace the base smoke binding with a custom path/operation/testName."""
     response = _responses()["architect"]
+    response["filePlan"] = [
+        item
+        for item in response["filePlan"]
+        if item["path"] != "tests/generated/library.smoke.spec.ts"
+    ]
     response["filePlan"].append(
         {
             "path": path,
@@ -266,7 +390,15 @@ def _architect_response_with_playwright_smoke_path(
             "reason": "Playwright smoke coverage",
         }
     )
-    response["testPlan"] = [{"acceptanceId": "AC-1", "method": "playwright", "steps": ["smoke"]}]
+    response["testPlan"] = [
+        {
+            "acceptanceId": "AC-1",
+            "method": "playwright",
+            "testPath": path,
+            "testName": test_name,
+            "steps": ["smoke"],
+        }
+    ]
     return response
 
 
@@ -1133,7 +1265,7 @@ async def test_four_role_sop_creates_version_and_trace(repository, settings) -> 
     responses = _responses()
     responses["engineer"] = _two_batch_engineer_cycle()
     model = ScriptedModelClient(responses)
-    runner = SOPRunner(repository, model, FakeSandboxProvider(), settings)
+    runner = SOPRunner(repository, model, _project_gate_sandbox(), settings)
 
     await runner.run(run.id)
 
@@ -1146,6 +1278,7 @@ async def test_four_role_sop_creates_version_and_trace(repository, settings) -> 
         "engineer",
         "engineer",
         "engineer",
+        "engineer",
         "reviewer",
     ]
     versions = await repository.list_versions(project.id)
@@ -1154,6 +1287,7 @@ async def test_four_role_sop_creates_version_and_trace(repository, settings) -> 
         ".gitignore",
         "app/(generated)/composition.tsx",
         "components/features/library.tsx",
+        "tests/generated/library.smoke.spec.ts",
     }
     _version_id, gitignore, _sha256 = await repository.get_version_file_content(project.id, ".gitignore")
     assert "node_modules/" in gitignore
@@ -1162,7 +1296,7 @@ async def test_four_role_sop_creates_version_and_trace(repository, settings) -> 
     implementation = await repository.get_latest_artifact(run.id, "implementation_report")
     assert implementation is not None and implementation["candidateCommit"] == "ok"
     assert implementation["fileChanges"] == []
-    assert len(implementation["batchArtifactIds"]) == 2
+    assert len(implementation["batchArtifactIds"]) == 3
     assert await repository.get_latest_artifact(run.id, "implementation_plan") is not None
     assert await repository.get_latest_artifact(run.id, "implementation_batch") is not None
     starter_provenance = await repository.get_latest_artifact(run.id, "starter_provenance")
@@ -1235,6 +1369,7 @@ async def test_four_role_sop_creates_version_and_trace(repository, settings) -> 
     assert "at most 1 relative file, with at most 24 batches" in engineer_plan_system_prompt
     assert "no more than 24 files total" in engineer_plan_system_prompt
     assert "TechnicalSpec.filePlan path must appear exactly once" in engineer_plan_system_prompt
+    assert "tests/generated/** files must declare an empty" in engineer_plan_system_prompt
     assert "0.0.0.0" in engineer_plan_system_prompt
     assert "http://127.0.0.1:<port>" in engineer_plan_system_prompt
     assert "dynamic hostname" in engineer_plan_system_prompt
@@ -1247,13 +1382,14 @@ async def test_four_role_sop_creates_version_and_trace(repository, settings) -> 
     assert "each controller coordinates only its own at-most-three declared concerns" in engineer_plan_system_prompt
     assert "without duplicating CRUD logic or UI markup" in engineer_plan_system_prompt
     engineer_batch_requests = [request for request in model.requests if request[2] == "FileBatchReport"]
-    assert len(engineer_batch_requests) == 2
+    assert len(engineer_batch_requests) == 3
     engineer_batch_system_prompt = engineer_batch_requests[0][1][0]["content"]
     assert "0.0.0.0" in engineer_batch_system_prompt
     assert "http://127.0.0.1:<port>" in engineer_batch_system_prompt
     assert "dynamic hostname" in engineer_batch_system_prompt
     assert "React + TypeScript + Tailwind CSS + shadcn/ui + Lucide React" in engineer_batch_system_prompt
     assert "Write only StarterManifest modelOwnedRoots" in engineer_batch_system_prompt
+    assert "authorized acceptanceIds" in engineer_batch_system_prompt
     assert "12000-character target" in engineer_batch_system_prompt
     assert "20000-character hard limit" in engineer_batch_system_prompt
     assert "only rejection threshold" in engineer_batch_system_prompt
@@ -1289,7 +1425,7 @@ async def test_architect_prompt_uses_configured_file_character_thresholds(reposi
     await SOPRunner(
         repository,
         model,
-        FakeSandboxProvider(),
+        _project_gate_sandbox(),
         replace(
             settings,
             engineer_target_file_characters=1234,
@@ -1343,6 +1479,7 @@ async def test_system_gitignore_is_idempotent_and_recovers_a_permission_protecte
 async def test_engineer_plan_must_exactly_cover_architect_file_plan(repository, settings) -> None:
     runner = SOPRunner(repository, ScriptedModelClient({}), FakeSandboxProvider(), settings)
     technical = TechnicalSpec.model_validate(_responses()["architect"])
+    product = ProductSpec.model_validate(_responses()["pm"])
 
     missing_path_plan = ImplementationPlan.model_validate(
         {
@@ -1356,7 +1493,7 @@ async def test_engineer_plan_must_exactly_cover_architect_file_plan(repository, 
         }
     )
     with pytest.raises(ValueError, match="exactly match the architect TechnicalSpec file plan"):
-        runner._validate_implementation_plan(missing_path_plan, technical)
+        runner._validate_implementation_plan(missing_path_plan, technical, product)
 
     overfull_batch_plan = ImplementationPlan.model_validate(
         {
@@ -1370,7 +1507,7 @@ async def test_engineer_plan_must_exactly_cover_architect_file_plan(repository, 
         }
     )
     with pytest.raises(ValueError, match="batch exceeds the configured file limit"):
-        runner._validate_implementation_plan(overfull_batch_plan, technical)
+        runner._validate_implementation_plan(overfull_batch_plan, technical, product)
 
     extra_path_plan = ImplementationPlan.model_validate(
         {
@@ -1394,7 +1531,7 @@ async def test_engineer_plan_must_exactly_cover_architect_file_plan(repository, 
         }
     )
     with pytest.raises(ValueError, match="exactly match the architect TechnicalSpec file plan"):
-        runner._validate_implementation_plan(extra_path_plan, technical)
+        runner._validate_implementation_plan(extra_path_plan, technical, product)
 
 
 @pytest.mark.asyncio
@@ -1410,6 +1547,7 @@ async def test_repair_scope_rejects_an_unrelated_full_rewrite(repository, settin
         runner._validate_implementation_plan(
             ImplementationPlan.model_validate(_two_batch_engineer_cycle()[0]),
             scoped_technical,
+            ProductSpec.model_validate(_responses()["pm"]),
         )
     with pytest.raises(SOPExecutionError, match="did not identify an approved file scope"):
         runner._repair_technical(technical, DiagnosticReport())
@@ -1873,60 +2011,1023 @@ async def test_collector_newlines_keep_typecheck_locations_unprefixed() -> None:
 
 def test_playwright_test_plan_requires_matching_model_owned_smoke_file_plan(repository, settings) -> None:
     runner = SOPRunner(repository, ScriptedModelClient({}), FakeSandboxProvider(), settings)
+    product = ProductSpec.model_validate(_responses()["pm"])
 
     runner._validate_technical_file_plan(TechnicalSpec.model_validate(_responses()["architect"]))
     accepted = TechnicalSpec.model_validate(_architect_response_with_playwright_smoke_path())
     runner._validate_technical_file_plan(accepted)
+    runner._validate_technical_test_plan(accepted, product)
 
-    for response in (
-        _architect_response_with_playwright_smoke_path("tests/generated/library-smoke.spec.ts"),
-        _architect_response_with_playwright_smoke_path(operation="delete"),
-    ):
+    invalid_cases = [
+        (
+            _architect_response_with_playwright_smoke_path("tests/generated/library-smoke.spec.ts"),
+            "technical_spec.playwright_smoke.test_path_unplanned",
+        ),
+        (
+            _architect_response_with_playwright_smoke_path(operation="delete"),
+            "technical_spec.playwright_smoke.test_path_unplanned",
+        ),
+        (
+            _architect_response_with_playwright_smoke_path("../tests/generated/library.smoke.spec.ts"),
+            "technical_spec.playwright_smoke.test_path_invalid",
+        ),
+        (
+            _architect_response_with_playwright_smoke_path("lib/domain/library.smoke.spec.ts"),
+            "technical_spec.playwright_smoke.test_path_unplanned",
+        ),
+    ]
+    for response, code in invalid_cases:
         with pytest.raises(ArtifactContractViolation) as violation:
-            runner._validate_technical_file_plan(TechnicalSpec.model_validate(response))
-        assert violation.value.code == "technical_spec.playwright_smoke.file_plan_required"
-
-
-def test_no_tests_smoke_gate_uses_exact_evidence_and_bounded_reviewer_scope(repository, settings) -> None:
-    runner = SOPRunner(repository, ScriptedModelClient({}), FakeSandboxProvider(), settings)
-    technical = TechnicalSpec.model_validate(_architect_response_with_playwright_smoke_path())
-    runner._validate_technical_file_plan(technical)
-    smoke_path = "tests/generated/library.smoke.spec.ts"
-    assert SOPRunner._is_exact_playwright_no_tests_failure("\nError: No tests found\n", "1")
-    assert not SOPRunner._is_exact_playwright_no_tests_failure(
-        "Error: No tests found after an unrelated failure",
-        "",
-    )
-
-    gates = runner._add_no_tests_smoke_affected_files(
-        [
-            GateResult(
-                gate="smoke",
-                status=GateStatus.failed,
-                summary="Error: No tests found",
-                affected_files=["components/features/library.tsx"],
+            runner._validate_technical_test_plan(
+                TechnicalSpec.model_validate(response), product
             )
-        ],
-        technical,
+        assert violation.value.code == code
+
+    # A case-only collision with ANY planned file (not just smoke paths) fails
+    # closed, protecting case-insensitive filesystems from aliasing.
+    conflict = _architect_response_with_playwright_smoke_path()
+    conflict["filePlan"].append(
+        {
+            "path": "components/features/Library.tsx",
+            "operation": "create",
+            "reason": "case-conflicting non-smoke path",
+        }
     )
-    assert gates[0].affected_files == [smoke_path]
+    with pytest.raises(ArtifactContractViolation) as violation:
+        runner._validate_technical_test_plan(TechnicalSpec.model_validate(conflict), product)
+    assert violation.value.code == "technical_spec.playwright_smoke.test_path_conflict"
+
+    # A normalized-spelling duplicate (redundant separator) of the smoke path
+    # must fail closed even though the raw strings differ.
+    spelling = _architect_response_with_playwright_smoke_path()
+    spelling["filePlan"].append(
+        {
+            "path": "tests/generated/./library.smoke.spec.ts",
+            "operation": "create",
+            "reason": "redundant-separator duplicate",
+        }
+    )
+    with pytest.raises(ArtifactContractViolation) as violation:
+        runner._validate_technical_test_plan(TechnicalSpec.model_validate(spelling), product)
+    assert violation.value.code == "technical_spec.playwright_smoke.test_path_conflict"
+
+    # A case-only conflict against a DELETE entry fails closed too: delete
+    # operations are part of the normalized path list.
+    delete_case = _architect_response_with_playwright_smoke_path()
+    delete_case["filePlan"].append(
+        {
+            "path": "tests/generated/Library.smoke.spec.ts",
+            "operation": "delete",
+            "reason": "case-conflicting delete entry",
+        }
+    )
+    with pytest.raises(ArtifactContractViolation) as violation:
+        runner._validate_technical_test_plan(TechnicalSpec.model_validate(delete_case), product)
+    assert violation.value.code == "technical_spec.playwright_smoke.test_path_conflict"
+
+    # Unknown AC, duplicate AC binding, duplicate testPath and duplicate
+    # testName each fail closed with the closed repair code. A second AC is
+    # needed so the later checks can be reached after the per-AC binding.
+    product_payload = dict(_responses()["pm"])
+    product_payload["acceptanceCriteria"].append(
+        {"id": "AC-2", "given": "books", "when": "searching", "then": "results filter"}
+    )
+    two_ac_product = ProductSpec.model_validate(product_payload)
+
+    def _with_test_plan(test_plan: list[dict[str, Any]]) -> dict[str, Any]:
+        response = _architect_response_with_playwright_smoke_path()
+        response["filePlan"].append(
+            {
+                "path": "tests/generated/library-2.smoke.spec.ts",
+                "operation": "create",
+                "reason": "second smoke coverage",
+            }
+        )
+        response["testPlan"] = test_plan
+        return response
+
+    unknown_ac = _with_test_plan(
+        [
+            {
+                "acceptanceId": "AC-MISSING",
+                "method": "playwright",
+                "testPath": "tests/generated/library.smoke.spec.ts",
+                "testName": "unknown ac",
+            }
+        ]
+    )
+    with pytest.raises(ArtifactContractViolation) as violation:
+        runner._validate_technical_test_plan(TechnicalSpec.model_validate(unknown_ac), product)
+    assert violation.value.code == "technical_spec.playwright_smoke.acceptance_unknown"
+
+    duplicate_ac = _with_test_plan(
+        [
+            {
+                "acceptanceId": "AC-1",
+                "method": "playwright",
+                "testPath": "tests/generated/library.smoke.spec.ts",
+                "testName": "first",
+            },
+            {
+                "acceptanceId": "AC-1",
+                "method": "playwright",
+                "testPath": "tests/generated/library-2.smoke.spec.ts",
+                "testName": "second",
+            },
+        ]
+    )
+    with pytest.raises(ArtifactContractViolation) as violation:
+        runner._validate_technical_test_plan(TechnicalSpec.model_validate(duplicate_ac), product)
+    assert violation.value.code == "technical_spec.playwright_smoke.acceptance_duplicate"
+
+    duplicate_path = _with_test_plan(
+        [
+            {
+                "acceptanceId": "AC-1",
+                "method": "playwright",
+                "testPath": "tests/generated/library.smoke.spec.ts",
+                "testName": "first",
+            },
+            {
+                "acceptanceId": "AC-2",
+                "method": "playwright",
+                "testPath": "tests/generated/library.smoke.spec.ts",
+                "testName": "second",
+            },
+        ]
+    )
+    with pytest.raises(ArtifactContractViolation) as violation:
+        runner._validate_technical_test_plan(TechnicalSpec.model_validate(duplicate_path), two_ac_product)
+    assert violation.value.code == "technical_spec.playwright_smoke.test_path_conflict"
+
+    duplicate_name = _with_test_plan(
+        [
+            {
+                "acceptanceId": "AC-1",
+                "method": "playwright",
+                "testPath": "tests/generated/library.smoke.spec.ts",
+                "testName": "same title",
+            },
+            {
+                "acceptanceId": "AC-2",
+                "method": "playwright",
+                "testPath": "tests/generated/library-2.smoke.spec.ts",
+                "testName": "same title",
+            },
+        ]
+    )
+    with pytest.raises(ArtifactContractViolation) as violation:
+        runner._validate_technical_test_plan(TechnicalSpec.model_validate(duplicate_name), two_ac_product)
+    assert violation.value.code == "technical_spec.playwright_smoke.test_name_conflict"
+
+    # Non-playwright items must not forge testPath/testName.
+    forged = _responses()["architect"]
+    forged["testPlan"] = [
+        {"acceptanceId": "AC-1", "method": "unit", "testPath": "tests/generated/library.smoke.spec.ts", "testName": "forged"}
+    ]
+    with pytest.raises(ValueError):
+        TechnicalSpec.model_validate(forged)
+
+    # Every ProductSpec AC is required: a spec that leaves an AC without a
+    # playwright binding fails closed.
+    uncovered = _responses()["architect"]
+    uncovered["testPlan"] = []
+    with pytest.raises(ArtifactContractViolation) as violation:
+        runner._validate_technical_test_plan(
+            TechnicalSpec.model_validate(uncovered), product
+        )
+    assert violation.value.code == "technical_spec.playwright_smoke.acceptance_missing"
+
+
+def test_gate_result_enforces_closed_scope_contract() -> None:
+    # Project scope forbids every acceptance field.
+    with pytest.raises(ValueError):
+        GateResult(
+            gate="smoke",
+            status=GateStatus.passed,
+            summary="x",
+            acceptance_id="AC-1",
+        )
+    with pytest.raises(ValueError):
+        GateResult(
+            gate="smoke",
+            status=GateStatus.passed,
+            summary="x",
+            outcome="passed",
+        )
+    # Acceptance scope requires acceptanceId and outcome.
+    with pytest.raises(ValueError):
+        GateResult(
+            gate="acceptance_test",
+            scope="acceptance",
+            status=GateStatus.failed,
+            summary="x",
+            outcome="passed",
+        )
+    with pytest.raises(ValueError):
+        GateResult(
+            gate="acceptance_test",
+            scope="acceptance",
+            status=GateStatus.failed,
+            summary="x",
+            acceptance_id="AC-1",
+        )
+    # passed/failed requires testPath, testName and exitCode.
+    with pytest.raises(ValueError):
+        GateResult(
+            gate="acceptance_test",
+            scope="acceptance",
+            status=GateStatus.passed,
+            summary="x",
+            acceptance_id="AC-1",
+            outcome="passed",
+            test_path="tests/generated/library.smoke.spec.ts",
+            test_name="library keeps a searchable catalog",
+        )
+    # Blank or oversized test fields are rejected.
+    with pytest.raises(ValueError):
+        GateResult(
+            gate="acceptance_test",
+            scope="acceptance",
+            status=GateStatus.passed,
+            summary="x",
+            acceptance_id="AC-1",
+            outcome="passed",
+            test_path="   ",
+            test_name="name",
+            exit_code=0,
+        )
+    with pytest.raises(ValueError):
+        GateResult(
+            gate="acceptance_test",
+            scope="acceptance",
+            status=GateStatus.passed,
+            summary="x",
+            acceptance_id="AC-1",
+            outcome="passed",
+            test_path="tests/generated/library.smoke.spec.ts",
+            test_name="n" * 301,
+            exit_code=0,
+        )
+    # An infrastructure gate may legitimately lack test fields.
+    GateResult(
+        gate="acceptance_test",
+        scope="acceptance",
+        status=GateStatus.failed,
+        summary="x",
+        acceptance_id="AC-1",
+        outcome="infrastructure_failed",
+        test_name="library keeps a searchable catalog",
+    )
+
+
+def _two_ac_product() -> ProductSpec:
+    payload = dict(_responses()["pm"])
+    payload["acceptanceCriteria"].append(
+        {"id": "AC-2", "given": "books", "when": "searching", "then": "results filter"}
+    )
+    return ProductSpec.model_validate(payload)
+
+
+def _two_playwright_technical() -> TechnicalSpec:
+    response = _architect_response_with_playwright_smoke_path()
+    response["filePlan"].append(
+        {
+            "path": "tests/generated/library-2.smoke.spec.ts",
+            "operation": "create",
+            "reason": "second smoke coverage",
+        }
+    )
+    response["testPlan"] = [
+        {
+            "acceptanceId": "AC-1",
+            "method": "playwright",
+            "testPath": "tests/generated/library.smoke.spec.ts",
+            "testName": "library keeps a searchable catalog",
+        },
+        {
+            "acceptanceId": "AC-2",
+            "method": "playwright",
+            "testPath": "tests/generated/library-2.smoke.spec.ts",
+            "testName": "borrowing rejects an unavailable book",
+        },
+    ]
+    return TechnicalSpec.model_validate(response)
+
+
+def _starter_workspace_changes() -> list[FileChange]:
+    """Starter files plus the exact system .gitignore baseline, mirroring a
+    post-bootstrap sandbox before any model batch."""
+    return [
+        *default_starter_manifest().file_changes,
+        FileChange(
+            path=".gitignore",
+            content=_SYSTEM_GITIGNORE,
+            operation="create",
+        ),
+    ]
+
+
+async def _acceptance_context(repository, sandbox: FakeSandboxProvider, message_id: str):
+    session = await repository.create_guest_session()
+    project = await repository.create_project(session.id, "Library")
+    _message, run, _created = await repository.create_message_and_run(
+        project.id, session.id, message_id, "Create a book management system"
+    )
+    assert await repository.claim_next_run("test-worker", 60)
+    ref = await sandbox.create(project.id)
+    await sandbox.apply_changes(
+        ref,
+        [
+            *_starter_workspace_changes(),
+            FileChange(
+                path="tests/generated/library.smoke.spec.ts",
+                content="import { test } from '@playwright/test';\n",
+                operation="create",
+            ),
+            FileChange(
+                path="tests/generated/library-2.smoke.spec.ts",
+                content="import { test } from '@playwright/test';\n",
+                operation="create",
+            ),
+        ],
+    )
+    context = _Context(
+        run_id=run.id,
+        project_id=project.id,
+        base_version_id=None,
+        phase=RunPhase.implementation,
+        prompt="Create a book management system",
+        lease_token=await repository.get_active_lease_token(run.id),
+        sandbox=ref,
+    )
+    return project, run, context
+
+
+@pytest.mark.asyncio
+async def test_verify_writes_playwright_smoke_evidence_after_diagnostic_artifact(
+    repository, settings
+) -> None:
+    """Project gates pass and the single required AC test passes: the report
+    stores first, then playwright_smoke evidence points at the real artifact.
+    """
+    session = await repository.create_guest_session()
+    project = await repository.create_project(session.id, "Library")
+    _message, run, _created = await repository.create_message_and_run(
+        project.id, session.id, "message-project-ac-pass", "Create a book management system"
+    )
+    assert await repository.claim_next_run("test-worker", 60)
+    sandbox = _project_gate_sandbox()
+    ref = await sandbox.create(project.id)
+    await sandbox.apply_changes(
+        ref,
+        [
+            *_starter_workspace_changes(),
+            FileChange(
+                path="tests/generated/library.smoke.spec.ts",
+                content="import { test } from '@playwright/test';\n",
+                operation="create",
+            ),
+        ],
+    )
+    context = _Context(
+        run_id=run.id,
+        project_id=project.id,
+        base_version_id=None,
+        phase=RunPhase.implementation,
+        prompt="Create a book management system",
+        lease_token=await repository.get_active_lease_token(run.id),
+        sandbox=ref,
+    )
+    product = ProductSpec.model_validate(_responses()["pm"])
+    technical = TechnicalSpec.model_validate(_responses()["architect"])
+    runner = SOPRunner(repository, ScriptedModelClient(_responses()), sandbox, settings)
+
+    report = await runner._verify(context, product, technical)
+
+    assert [gate.scope for gate in report.gates] == ["project"] * 5 + ["acceptance"]
+    assert all(gate.status == GateStatus.passed for gate in report.gates)
+    assert report.gates[-1].outcome == "passed"
+    assert report.gates[-1].exit_code == 0
+    assert not report.blocking_issues
+    diagnostic = await repository.get_latest_artifact(run.id, "diagnostic_report")
+    assert diagnostic is not None
+    artifact_id = diagnostic["id"]
+    trace = await repository.get_trace(project.id, run.id)
+    item = trace["acceptance_trace"][0]
+    assert item["status"] == "passed"
+    assert item["evidence"]
+    assert item["evidence"][0]["kind"] == "playwright_smoke"
+    assert item["evidence"][0]["artifactId"] == artifact_id
+    summary = json.loads(item["evidence"][0]["summary"])
+    assert summary == {
+        "runId": run.id,
+        "acceptanceId": "AC-1",
+        "testPath": "tests/generated/library.smoke.spec.ts",
+        "testName": "library keeps a searchable catalog",
+        "result": "passed",
+        "recordedAt": summary["recordedAt"],
+        "exitCode": 0,
+        "artifactRef": artifact_id,
+    }
+    events = await repository.list_events(run.id)
+    acceptance_events = [
+        event
+        for event in events
+        if event.kind == "verification.updated" and event.payload.get("scope") == "acceptance"
+    ]
+    # Reset (unverified) first, then the evidence event overwrites it.
+    assert [event.payload["status"] for event in acceptance_events] == ["unverified", "passed"]
+    assert acceptance_events[1]["seq"] > acceptance_events[0]["seq"]
+    assert "evidenceId" in acceptance_events[1]["payload"]
+    assert "evidenceId" not in acceptance_events[0]["payload"]
+
+
+@pytest.mark.asyncio
+async def test_verify_assertion_failure_writes_failed_evidence_and_blocks_required_acceptance(
+    repository, settings
+) -> None:
+    """A failed assertion writes failed evidence, and the required-AC blocker
+    is enforced after the Reviewer draft even when the model omits it."""
+    session = await repository.create_guest_session()
+    project = await repository.create_project(session.id, "Library")
+    _message, run, _created = await repository.create_message_and_run(
+        project.id, session.id, "message-project-ac-fail", "Create a book management system"
+    )
+    assert await repository.claim_next_run("test-worker", 60)
+    sandbox = _project_gate_sandbox(
+        {
+            _AC_SMOKE_COMMAND: ExecResult(
+                1,
+                _playwright_json(_AC_SMOKE_TITLE, overall="unexpected", result_status="failed")
+                + "\n",
+                "",
+            )
+        }
+    )
+    ref = await sandbox.create(project.id)
+    await sandbox.apply_changes(
+        ref,
+        [
+            *_starter_workspace_changes(),
+            FileChange(
+                path="tests/generated/library.smoke.spec.ts",
+                content="import { test } from '@playwright/test';\n",
+                operation="create",
+            ),
+        ],
+    )
+    context = _Context(
+        run_id=run.id,
+        project_id=project.id,
+        base_version_id=None,
+        phase=RunPhase.implementation,
+        prompt="Create a book management system",
+        lease_token=await repository.get_active_lease_token(run.id),
+        sandbox=ref,
+    )
+    product = ProductSpec.model_validate(_responses()["pm"])
+    technical = TechnicalSpec.model_validate(_responses()["architect"])
+    # The AC is implemented in a business file; a failing test must scope
+    # repair to that business file, never to the smoke test itself.
+    context.implemented_in_files = {"AC-1": {"components/features/library.tsx"}}
+    responses = _responses()
+    reviewer = dict(responses["reviewer"])
+    reviewer["locationFiles"] = ["components/features/library.tsx"]
+    responses["reviewer"] = reviewer
+    runner = SOPRunner(repository, ScriptedModelClient(responses), sandbox, settings)
+
+    report = await runner._verify(context, product, technical)
+
+    assert report.gates[-1].outcome == "failed"
+    assert report.gates[-1].exit_code == 1
+    assert report.gates[-1].affected_files == ["components/features/library.tsx"]
+    assert any("required acceptance criteria lack exactly one passed" in issue for issue in report.blocking_issues)
+    diagnostic = await repository.get_latest_artifact(run.id, "diagnostic_report")
+    assert diagnostic is not None
+    artifact_id = diagnostic["id"]
+    trace = await repository.get_trace(project.id, run.id)
+    item = trace["acceptance_trace"][0]
+    assert item["status"] == "failed"
+    assert item["evidence"][0]["status"] == "failed"
+    assert item["evidence"][0]["artifactId"] == artifact_id
+    assert json.loads(item["evidence"][0]["summary"])["artifactRef"] == artifact_id
+
+
+@pytest.mark.asyncio
+async def test_acceptance_assertion_passed_gates_carry_no_evidence_until_artifact(
+    repository, settings
+) -> None:
+    """The AC runner itself only produces gates; evidence is written later by
+    _verify after the DiagnosticReport artifact is stored."""
+    technical = _two_playwright_technical()
+    sandbox = _project_gate_sandbox(
+        {
+            _AC_SMOKE_COMMAND: ExecResult(
+                0, _playwright_json(_AC_SMOKE_TITLE) + "\n", ""
+            ),
+            "pnpm playwright test tests/generated/library-2.smoke.spec.ts --reporter=json --project=chromium": ExecResult(
+                0, _playwright_json("borrowing rejects an unavailable book", file="tests/generated/library-2.smoke.spec.ts") + "\n", ""
+            ),
+        }
+    )
+    project, run, context = await _acceptance_context(repository, sandbox, "message-ac-passed")
+    runner = SOPRunner(repository, ScriptedModelClient(_responses()), sandbox, settings)
+
+    gates = await runner._run_acceptance_tests(context, technical)
+
+    assert [gate.outcome for gate in gates] == ["passed", "passed"]
+    assert all(gate.scope == "acceptance" for gate in gates)
+    assert gates[0].test_path == "tests/generated/library.smoke.spec.ts"
+    assert gates[0].test_name == "library keeps a searchable catalog"
+    assert gates[0].acceptance_id == "AC-1"
+    assert gates[0].exit_code == 0
+    trace = await repository.get_trace(project.id, run.id)
+    # No evidence records yet: evidence only appears with the diagnostic artifact.
+    assert trace["acceptance_trace"][0]["evidence"] == []
+    assert trace["acceptance_trace"][0]["status"] == "unverified"
+    assert not any(
+        event.payload.get("scope") == "acceptance" and "evidenceId" in event.payload
+        for event in await repository.list_events(run.id)
+    )
+
+
+@pytest.mark.asyncio
+async def test_acceptance_assertion_failure_gates_scope_repair_without_evidence(
+    repository, settings
+) -> None:
+    technical = _two_playwright_technical()
+    sandbox = _project_gate_sandbox(
+        {
+            _AC_SMOKE_COMMAND: ExecResult(
+                1,
+                _playwright_json(_AC_SMOKE_TITLE, overall="unexpected", result_status="failed")
+                + "\n",
+                "",
+            ),
+            "pnpm playwright test tests/generated/library-2.smoke.spec.ts --reporter=json --project=chromium": ExecResult(
+                0, _playwright_json("borrowing rejects an unavailable book", file="tests/generated/library-2.smoke.spec.ts") + "\n", ""
+            ),
+        }
+    )
+    project, run, context = await _acceptance_context(repository, sandbox, "message-ac-failed")
+    # The AC is implemented in a business file; the smoke test never counts.
+    context.implemented_in_files = {"AC-1": {"components/features/library.tsx"}}
+    runner = SOPRunner(repository, ScriptedModelClient(_responses()), sandbox, settings)
+
+    gates = await runner._run_acceptance_tests(context, technical)
+
+    assert gates[0].outcome == "failed"
+    assert gates[0].status == GateStatus.failed
+    # Repair scope is the trusted business file, never the smoke test.
+    assert gates[0].affected_files == ["components/features/library.tsx"]
+    assert gates[0].exit_code == 1
+    # Assertion failure does not stop the remaining AC tests.
+    assert gates[1].outcome == "passed"
+    assert gates[1].affected_files == []
+    trace = await repository.get_trace(project.id, run.id)
+    items = {item["acceptanceId"]: item for item in trace["acceptance_trace"]}
+    # The runner itself never writes evidence; ACs stay unverified.
+    assert items["AC-1"]["status"] == "unverified"
+    assert items["AC-2"]["status"] == "unverified"
+    # The failed AC's business file is the deterministic raw repair scope.
     runner._validate_diagnostic_repair_scope(
-        DiagnosticReport(blocking_issues=["smoke failed"], location_files=[smoke_path]),
+        DiagnosticReport(
+            blocking_issues=["acceptance_test: Acceptance Playwright assertion failed."],
+            location_files=["components/features/library.tsx"],
+        ),
         technical,
         gates,
     )
 
-    extended = runner._add_no_tests_smoke_affected_files(
-        [
-            GateResult(
-                gate="smoke",
-                status=GateStatus.failed,
-                summary="Error: No tests found after an unrelated failure",
-            )
-        ],
-        technical,
+
+@pytest.mark.asyncio
+async def test_acceptance_infrastructure_failure_keeps_unverified_and_stops_later_tests(
+    repository, settings
+) -> None:
+    technical = _two_playwright_technical()
+    sandbox = _project_gate_sandbox(
+        {
+            _AC_SMOKE_COMMAND: ExecResult(1, "not valid json at all\n", ""),
+            "pnpm playwright test tests/generated/library-2.smoke.spec.ts --reporter=json --project=chromium": ExecResult(
+                0, _playwright_json("borrowing rejects an unavailable book", file="tests/generated/library-2.smoke.spec.ts") + "\n", ""
+            ),
+        }
     )
-    assert extended[0].affected_files == []
+    project, run, context = await _acceptance_context(repository, sandbox, "message-ac-infra")
+    runner = SOPRunner(repository, ScriptedModelClient(_responses()), sandbox, settings)
+
+    gates = await runner._run_acceptance_tests(context, technical)
+
+    assert len(gates) == 1
+    assert gates[0].outcome == "infrastructure_failed"
+    assert gates[0].status == GateStatus.failed
+    assert gates[0].affected_files == []
+    assert gates[0].exit_code is None
+    # The second AC test never executed.
+    sandbox_commands = next(iter(sandbox.sandboxes.values())).commands
+    assert "pnpm playwright test tests/generated/library-2.smoke.spec.ts --reporter=json --project=chromium" not in sandbox_commands
+    trace = await repository.get_trace(project.id, run.id)
+    items = {item["acceptanceId"]: item for item in trace["acceptance_trace"]}
+    # Infrastructure failure never writes AC evidence; both ACs stay unverified.
+    assert items["AC-1"]["status"] == "unverified"
+    assert items["AC-2"]["status"] == "unverified"
+    assert items["AC-1"]["evidence"] == []
+
+
+@pytest.mark.asyncio
+async def test_acceptance_title_mismatch_and_no_test_are_infrastructure_failures(
+    repository, settings
+) -> None:
+    technical = _two_playwright_technical()
+    sandbox = _project_gate_sandbox(
+        {
+            _AC_SMOKE_COMMAND: ExecResult(
+                0, _playwright_json("a completely different title") + "\n", ""
+            ),
+        }
+    )
+    _project, run, context = await _acceptance_context(repository, sandbox, "message-ac-title")
+    runner = SOPRunner(repository, ScriptedModelClient(_responses()), sandbox, settings)
+
+    gates = await runner._run_acceptance_tests(context, technical)
+
+    assert gates[0].outcome == "infrastructure_failed"
+    assert gates[0].summary == "Playwright test title did not match the planned testName."
+    trace = await repository.get_trace(_project.id, run.id)
+    assert trace["acceptance_trace"][0]["status"] == "unverified"
+
+    # A structurally valid report with zero tests is also infrastructure.
+    no_test_sandbox = _project_gate_sandbox(
+        {
+            _AC_SMOKE_COMMAND: ExecResult(
+                1, json.dumps({"suites": [], "errors": [], "stats": {}}) + "\n", ""
+            ),
+        }
+    )
+    _project2, _run2, context2 = await _acceptance_context(
+        repository, no_test_sandbox, "message-ac-no-test"
+    )
+    runner2 = SOPRunner(repository, ScriptedModelClient(_responses()), no_test_sandbox, settings)
+    gates2 = await runner2._run_acceptance_tests(context2, technical)
+    assert gates2[0].outcome == "infrastructure_failed"
+    assert gates2[0].summary == "Playwright did not prove exactly one test."
+
+
+@pytest.mark.asyncio
+async def test_acceptance_reporter_exit_code_contradiction_is_infrastructure(
+    repository, settings
+) -> None:
+    technical = _two_playwright_technical()
+    # Reporter says passed but the process exited non-zero: contradiction.
+    passed_sandbox = _project_gate_sandbox(
+        {_AC_SMOKE_COMMAND: ExecResult(1, _playwright_json(_AC_SMOKE_TITLE) + "\n", "")}
+    )
+    _project, _run, context = await _acceptance_context(
+        repository, passed_sandbox, "message-ac-pass-exit"
+    )
+    runner = SOPRunner(repository, ScriptedModelClient(_responses()), passed_sandbox, settings)
+    gate = await runner._run_acceptance_playwright(context, technical.test_plan[0])
+    assert gate.outcome == "infrastructure_failed"
+    assert gate.summary == "Playwright reported a pass with a non-zero exit code."
+
+    # Reporter says the assertion failed but the process exited zero: contradiction.
+    failed_sandbox = _project_gate_sandbox(
+        {
+            _AC_SMOKE_COMMAND: ExecResult(
+                0,
+                _playwright_json(_AC_SMOKE_TITLE, overall="unexpected", result_status="failed")
+                + "\n",
+                "",
+            )
+        }
+    )
+    _project2, _run2, context2 = await _acceptance_context(
+        repository, failed_sandbox, "message-ac-fail-exit"
+    )
+    runner2 = SOPRunner(repository, ScriptedModelClient(_responses()), failed_sandbox, settings)
+    gate2 = await runner2._run_acceptance_playwright(context2, technical.test_plan[0])
+    assert gate2.outcome == "infrastructure_failed"
+    assert gate2.summary == "Playwright reported a failed assertion with a zero exit code."
+
+
+@pytest.mark.asyncio
+async def test_acceptance_tests_reverify_starter_invariants(repository, settings) -> None:
+    technical = _two_playwright_technical()
+    sandbox = _project_gate_sandbox(
+        {
+            _AC_SMOKE_COMMAND: ExecResult(0, _playwright_json(_AC_SMOKE_TITLE) + "\n", ""),
+        }
+    )
+    _project, _run, context = await _acceptance_context(repository, sandbox, "message-ac-invariant")
+    runner = SOPRunner(repository, ScriptedModelClient(_responses()), sandbox, settings)
+    # A model-written test must never mutate a protected starter asset.
+    await sandbox.apply_changes(
+        context.sandbox,
+        [FileChange(path="app/page.tsx", content="tampered", operation="modify")],
+    )
+    with pytest.raises(SOPExecutionError, match="starter invariant verification failed"):
+        await runner._run_acceptance_playwright(context, technical.test_plan[0])
+
+
+@pytest.mark.asyncio
+async def test_acceptance_test_file_not_listed_is_infrastructure_failure(
+    repository, settings
+) -> None:
+    """list_files reports only regular files: a planned testPath absent from the
+    listing is a symlink, a missing file, or a non-regular file."""
+    technical = _two_playwright_technical()
+    sandbox = _project_gate_sandbox(
+        {
+            _AC_SMOKE_COMMAND: ExecResult(0, _playwright_json(_AC_SMOKE_TITLE) + "\n", ""),
+        }
+    )
+    _project, _run, context = await _acceptance_context(repository, sandbox, "message-ac-not-listed")
+    runner = SOPRunner(repository, ScriptedModelClient(_responses()), sandbox, settings)
+    # Delete the planned test file without listing it (simulating a symlink or
+    # a non-regular file that list_files would never report).
+    await sandbox.apply_changes(
+        context.sandbox,
+        [FileChange(path="tests/generated/library.smoke.spec.ts", operation="delete")],
+    )
+
+    gate = await runner._run_acceptance_playwright(context, technical.test_plan[0])
+
+    assert gate.outcome == "infrastructure_failed"
+    assert gate.summary == "Playwright test file is missing, a symlink, or not a regular file."
+    sandbox_commands = next(iter(sandbox.sandboxes.values())).commands
+    assert _AC_SMOKE_COMMAND not in sandbox_commands
+
+
+@pytest.mark.asyncio
+async def test_starter_invariants_reject_new_protected_glob_files(repository, settings) -> None:
+    """A model-written test must never add a file under a protected glob like
+    components/ui/**, and must never delete or relink protected files."""
+    technical = _two_playwright_technical()
+    sandbox = _project_gate_sandbox(
+        {
+            _AC_SMOKE_COMMAND: ExecResult(0, _playwright_json(_AC_SMOKE_TITLE) + "\n", ""),
+        }
+    )
+    _project, _run, context = await _acceptance_context(repository, sandbox, "message-ac-glob")
+    runner = SOPRunner(repository, ScriptedModelClient(_responses()), sandbox, settings)
+    await sandbox.apply_changes(
+        context.sandbox,
+        [FileChange(path="components/ui/injected.tsx", content="export {}", operation="create")],
+    )
+    with pytest.raises(SOPExecutionError, match="starter invariant verification failed"):
+        await runner._run_acceptance_playwright(context, technical.test_plan[0])
+
+
+@pytest.mark.asyncio
+async def test_verify_skips_acceptance_tests_when_a_project_gate_fails(repository, settings) -> None:
+    session = await repository.create_guest_session()
+    project = await repository.create_project(session.id, "Library")
+    _message, run, _created = await repository.create_message_and_run(
+        project.id, session.id, "message-gate-blocks-ac", "Create a book management system"
+    )
+    assert await repository.claim_next_run("test-worker", 60)
+    sandbox = _project_gate_sandbox(
+        {
+            "pnpm typecheck": ExecResult(1, "", "Type error in components/features/library.tsx"),
+        }
+    )
+    ref = await sandbox.create(project.id)
+    await sandbox.apply_changes(
+        ref,
+        [
+            *_starter_workspace_changes(),
+            FileChange(
+                path="tests/generated/library.smoke.spec.ts",
+                content="import { test } from '@playwright/test';\n",
+                operation="create",
+            ),
+        ],
+    )
+    context = _Context(
+        run_id=run.id,
+        project_id=project.id,
+        base_version_id=None,
+        phase=RunPhase.implementation,
+        prompt="Create a book management system",
+        lease_token=await repository.get_active_lease_token(run.id),
+        sandbox=ref,
+    )
+    product = _two_ac_product()
+    technical = _two_playwright_technical()
+    responses = _responses()
+    reviewer = dict(responses["reviewer"])
+    reviewer["locationFiles"] = ["components/features/library.tsx"]
+    responses["reviewer"] = reviewer
+    runner = SOPRunner(repository, ScriptedModelClient(responses), sandbox, settings)
+
+    report = await runner._verify(context, product, technical)
+
+    assert any(gate.gate == "typecheck" and gate.status == GateStatus.failed for gate in report.gates)
+    assert not any(gate.scope == "acceptance" for gate in report.gates)
+    assert any(
+        "required acceptance criteria lack exactly one passed" in issue
+        for issue in report.blocking_issues
+    )
+    events = await repository.list_events(run.id)
+    reset_events = [
+        event
+        for event in events
+        if event.kind == "verification.updated"
+        and event.payload.get("scope") == "acceptance"
+        and event.payload.get("status") == "unverified"
+    ]
+    # Every required AC gets a durable unverified reset at the start of _verify.
+    assert {event.payload["acceptanceId"] for event in reset_events} == {"AC-1", "AC-2"}
+    assert not any(
+        event.payload.get("scope") == "acceptance" and "evidenceId" in event.payload
+        for event in events
+    )
+    trace = await repository.get_trace(project.id, run.id)
+    assert all(item["status"] == "unverified" for item in trace["acceptance_trace"])
+
+
+def _smoke_evidence_summary(run_id: str, acceptance_id: str, result: str, artifact_id: str) -> str:
+    return json.dumps(
+        {
+            "runId": run_id,
+            "acceptanceId": acceptance_id,
+            "testPath": "tests/generated/library.smoke.spec.ts",
+            "testName": "library keeps a searchable catalog",
+            "result": result,
+            "recordedAt": "2026-08-07T10:00:00Z",
+            "exitCode": 0,
+            "artifactRef": artifact_id,
+        },
+        separators=(",", ":"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_acceptance_status_follows_latest_closed_scope_acceptance_event(
+    repository, settings
+) -> None:
+    session = await repository.create_guest_session()
+    project = await repository.create_project(session.id, "Library")
+    _message, run, _created = await repository.create_message_and_run(
+        project.id, session.id, "message-evidence-status", "Create a book management system"
+    )
+    assert await repository.claim_next_run("test-worker", 60)
+    lease_token = await repository.get_active_lease_token(run.id)
+    await repository.upsert_acceptance_items(
+        project.id,
+        run.id,
+        [{"id": "AC-1", "given": "g", "when": "w", "then": "t"}],
+        lease_token=lease_token,
+    )
+    await repository.append_trace_link(
+        run.id,
+        "acceptance_criterion",
+        "AC-1",
+        "implemented_in",
+        "file",
+        "components/features/library.tsx",
+        lease_token=lease_token,
+    )
+    # Historical qa_gates evidence must fail closed: it never drives status and
+    # never appears in acceptanceTrace.evidence.
+    await repository.record_evidence(
+        run.id, "AC-1", "qa_gates", "failed", "legacy", lease_token=lease_token
+    )
+    trace = await repository.get_trace(project.id, run.id)
+    assert trace["acceptance_trace"][0]["status"] == "unverified"
+    assert trace["acceptance_trace"][0]["implementationStatus"] == "implemented"
+    assert trace["acceptance_trace"][0]["evidence"] == []
+
+    # A passed playwright_smoke record wins while it is the latest event.
+    artifact_one = await repository.store_artifact(
+        run.id, "diagnostic_report", {"gates": []}, lease_token=lease_token
+    )
+    await repository.record_evidence(
+        run.id,
+        "AC-1",
+        "playwright_smoke",
+        "passed",
+        _smoke_evidence_summary(run.id, "AC-1", "passed", artifact_one),
+        artifact_id=artifact_one,
+        lease_token=lease_token,
+    )
+    trace = await repository.get_trace(project.id, run.id)
+    assert trace["acceptance_trace"][0]["status"] == "passed"
+    assert [entry["kind"] for entry in trace["acceptance_trace"][0]["evidence"]] == [
+        "playwright_smoke"
+    ]
+
+    # A newer reset event (infrastructure/not-run round) must un-verify the AC
+    # even though the passed evidence record still exists.
+    await repository.append_event(
+        run.id,
+        "verification.updated",
+        role="reviewer",
+        payload={"scope": "acceptance", "acceptanceId": "AC-1", "status": "unverified"},
+        lease_token=lease_token,
+    )
+    trace = await repository.get_trace(project.id, run.id)
+    assert trace["acceptance_trace"][0]["status"] == "unverified"
+
+    # A later failed evidence event overrides both.
+    artifact_two = await repository.store_artifact(
+        run.id, "diagnostic_report", {"gates": []}, lease_token=lease_token
+    )
+    await repository.record_evidence(
+        run.id,
+        "AC-1",
+        "playwright_smoke",
+        "failed",
+        _smoke_evidence_summary(run.id, "AC-1", "failed", artifact_two),
+        artifact_id=artifact_two,
+        lease_token=lease_token,
+    )
+    trace = await repository.get_trace(project.id, run.id)
+    assert trace["acceptance_trace"][0]["status"] == "failed"
+    events = await repository.list_events(run.id)
+    acceptance_events = [
+        event
+        for event in events
+        if event.kind == "verification.updated" and event.payload.get("scope") == "acceptance"
+    ]
+    assert [event.payload["status"] for event in acceptance_events] == [
+        "failed",  # legacy qa_gates event: never drives validation
+        "passed",
+        "unverified",  # reset after a passed round
+        "failed",
+    ]
+    assert all("acceptanceId" in event.payload for event in acceptance_events)
+
+
+@pytest.mark.asyncio
+async def test_implementation_plan_acceptance_ids_must_come_from_product_spec(
+    repository, settings
+) -> None:
+    runner = SOPRunner(repository, ScriptedModelClient({}), FakeSandboxProvider(), settings)
+    technical = TechnicalSpec.model_validate(_responses()["architect"])
+    product = ProductSpec.model_validate(_responses()["pm"])
+    plan = ImplementationPlan(
+        batches=[
+            ImplementationBatchPlan(
+                id="batch-1",
+                purpose="composition",
+                paths=["app/(generated)/composition.tsx"],
+                acceptance_ids=["AC-NOPE"],
+            ),
+            ImplementationBatchPlan(
+                id="batch-2",
+                purpose="library",
+                paths=["components/features/library.tsx"],
+                acceptance_ids=["AC-1"],
+            ),
+            ImplementationBatchPlan(
+                id="batch-3",
+                purpose="smoke",
+                paths=["tests/generated/library.smoke.spec.ts"],
+                acceptance_ids=["AC-1"],
+            ),
+        ]
+    )
+    with pytest.raises(ValueError, match="must come from ProductSpec"):
+        runner._validate_implementation_plan(plan, technical, product)
+    # Duplicate acceptance ids within one batch are rejected too.
+    plan.batches[0].acceptance_ids = ["AC-1", "AC-1"]
+    with pytest.raises(ValueError, match="must not repeat"):
+        runner._validate_implementation_plan(plan, technical, product)
+    # A tests/generated-only batch must never claim it implements an AC.
+    plan.batches[0].acceptance_ids = ["AC-1"]
+    plan.batches[2].acceptance_ids = ["AC-1"]
+    with pytest.raises(ValueError, match="tests-only implementation plan batches"):
+        runner._validate_implementation_plan(plan, technical, product)
+    # The authorized set is a subset check, not an equality check.
+    plan.batches[2].acceptance_ids = []
+    runner._validate_implementation_plan(plan, technical, product)
+
+
+@pytest.mark.asyncio
+async def test_file_batch_report_acceptance_ids_stay_within_batch_authorization(
+    repository, settings
+) -> None:
+    runner = SOPRunner(repository, ScriptedModelClient({}), FakeSandboxProvider(), settings)
+    expected = ImplementationBatchPlan(
+        id="batch-1", purpose="library", paths=["components/features/library.tsx"], acceptance_ids=["AC-1"]
+    )
+    report = FileBatchReport(
+        batch_id="batch-1",
+        implemented_acceptance_ids=["AC-1", "AC-2"],
+        changed_files=["components/features/library.tsx"],
+        file_changes=[
+            {
+                "path": "components/features/library.tsx",
+                "operation": "create",
+                "content": "export function Library() {}\n",
+            }
+        ],
+    )
+    with pytest.raises(FileBatchContractViolation) as violation:
+        runner._validate_file_batch_report(report, expected, starter=default_starter_manifest())
+    assert violation.value.code == "file_batch_report.acceptance_ids_out_of_scope"
 
 
 @pytest.mark.asyncio
@@ -2594,6 +3695,7 @@ async def test_architect_two_concern_feature_surface_slices_bind_explicit_concer
     runner._validate_implementation_plan(
         ImplementationPlan.model_validate({"batches": split_batches}),
         split_technical,
+        ProductSpec.model_validate(_responses()["pm"]),
     )
     missing_and_extra_batches = [
         *split_batches[:-1],
@@ -2606,6 +3708,7 @@ async def test_architect_two_concern_feature_surface_slices_bind_explicit_concer
         runner._validate_implementation_plan(
             ImplementationPlan.model_validate({"batches": missing_and_extra_batches}),
             split_technical,
+            ProductSpec.model_validate(_responses()["pm"]),
         )
 
     missing_surface = technical.model_copy(update={"feature_surfaces": []})
@@ -2665,7 +3768,7 @@ async def test_architect_file_plan_over_capacity_retries_before_sandbox_creation
         responses["architect"],
     ]
     model = ScriptedModelClient(responses)
-    sandbox = FakeSandboxProvider()
+    sandbox = _project_gate_sandbox()
     await SOPRunner(
         repository,
         model,
@@ -2678,6 +3781,7 @@ async def test_architect_file_plan_over_capacity_retries_before_sandbox_creation
         ("architect", "TechnicalSpec"),
         ("architect", "TechnicalSpec"),
         ("engineer", "ImplementationPlan"),
+        ("engineer", "FileBatchReport"),
         ("engineer", "FileBatchReport"),
         ("engineer", "FileBatchReport"),
         ("engineer", "ImplementationReport"),
@@ -2833,7 +3937,7 @@ async def test_system_managed_file_plan_retries_before_sandbox_creation(reposito
         responses["architect"],
     ]
     model = ScriptedModelClient(responses)
-    sandbox = FakeSandboxProvider()
+    sandbox = _project_gate_sandbox()
 
     await SOPRunner(
         repository,
@@ -2849,6 +3953,7 @@ async def test_system_managed_file_plan_retries_before_sandbox_creation(reposito
         ("engineer", "ImplementationPlan"),
         ("engineer", "FileBatchReport"),
         ("engineer", "FileBatchReport"),
+        ("engineer", "FileBatchReport"),
         ("engineer", "ImplementationReport"),
         ("reviewer", "DiagnosticReport"),
     ]
@@ -2858,6 +3963,7 @@ async def test_system_managed_file_plan_retries_before_sandbox_creation(reposito
     assert {item["path"] for item in technical["filePlan"]} == {
         "app/(generated)/composition.tsx",
         "components/features/library.tsx",
+        "tests/generated/library.smoke.spec.ts",
     }
     events = await repository.list_events(run.id)
     retry_event = next(
@@ -3375,12 +4481,13 @@ async def test_file_batch_size_retry_persists_only_the_compact_requested_path(
         engineer_cycle[1],
         engineer_cycle[2],
         engineer_cycle[3],
+        engineer_cycle[4],
     ]
 
     await SOPRunner(
         repository,
         ScriptedModelClient(responses),
-        FakeSandboxProvider(),
+        _project_gate_sandbox(),
         replace(settings, structured_output_retries=1),
     ).run(run.id)
 
@@ -3419,7 +4526,7 @@ async def test_over_target_file_batch_persists_then_emits_one_safe_warning(repos
     )
     responses["engineer"] = engineer_cycle
 
-    await SOPRunner(repository, ScriptedModelClient(responses), FakeSandboxProvider(), settings).run(run.id)
+    await SOPRunner(repository, ScriptedModelClient(responses), _project_gate_sandbox(), settings).run(run.id)
 
     final = await repository.get_run(run.id)
     assert final.status.value == "succeeded"
@@ -3566,7 +4673,7 @@ async def test_real_metagpt_roles_exchange_persisted_artifact_references(reposit
         repository,
         metagpt_settings,
         model=model,
-        sandbox=FakeSandboxProvider(),
+        sandbox=_project_gate_sandbox(),
         worker_id="test-worker",
     )
     assert isinstance(worker.agent_adapter, MetaGPTAdapter)
@@ -3579,6 +4686,7 @@ async def test_real_metagpt_roles_exchange_persisted_artifact_references(reposit
     assert [invocation.role for invocation in adapter.invocations] == [
         "product_manager",
         "architect",
+        "engineer",
         "engineer",
         "engineer",
         "engineer",
@@ -3620,13 +4728,14 @@ async def test_real_metagpt_roles_exchange_persisted_artifact_references(reposit
         "ImplementationPlan",
         "FileBatchReport",
         "FileBatchReport",
+        "FileBatchReport",
         "ImplementationReport",
     ]
     assert engineer_invocations[0].output_message.metadata["fomo"]["kind"] == "intermediate_artifact"
     assert engineer_invocations[1].output_message.metadata["fomo"]["kind"] == "intermediate_artifact"
     assert engineer_invocations[2].output_message.metadata["fomo"]["kind"] == "intermediate_artifact"
     engineer_handoff = adapter.handoff(run.id, "engineer")
-    assert engineer_handoff is engineer_invocations[3].output_message
+    assert engineer_handoff is engineer_invocations[4].output_message
     assert engineer_handoff.metadata["fomo"]["artifact"]["artifactKind"] == "implementation_report"
 
 
@@ -3652,7 +4761,7 @@ async def test_metagpt_model_failure_uses_controlled_message_and_fomo_retry(
         repository,
         metagpt_settings,
         model=model,
-        sandbox=FakeSandboxProvider(),
+        sandbox=_project_gate_sandbox(),
         worker_id="test-worker",
     )
     adapter = worker.agent_adapter
@@ -3688,6 +4797,7 @@ async def test_metagpt_model_failure_uses_controlled_message_and_fomo_retry(
         "pm",
         "pm",
         "architect",
+        "engineer",
         "engineer",
         "engineer",
         "engineer",
@@ -3767,7 +4877,7 @@ async def test_sop_persists_safe_model_transport_retry_telemetry(repository, set
     await SOPRunner(
         repository,
         _RetryReportingScriptedModelClient(_responses()),
-        FakeSandboxProvider(),
+        _project_gate_sandbox(),
         settings,
     ).run(run.id)
 
@@ -3851,7 +4961,11 @@ async def test_blocking_typecheck_routes_one_repair_to_engineer(repository, sett
             "pnpm typecheck": [
                 ExecResult(1, "", "Type error in components/features/library.tsx"),
                 ExecResult(0, "ok\n", ""),
-            ]
+            ],
+            _HARNESS_SMOKE_COMMAND: ExecResult(
+                0, _playwright_json(_HARNESS_SMOKE_TITLE, file="tests/harness/starter.smoke.spec.ts") + "\n", ""
+            ),
+            _AC_SMOKE_COMMAND: ExecResult(0, _playwright_json(_AC_SMOKE_TITLE) + "\n", ""),
         }
     )
     await SOPRunner(repository, model, sandbox, settings).run(run.id)
@@ -3862,6 +4976,7 @@ async def test_blocking_typecheck_routes_one_repair_to_engineer(repository, sett
     assert [alias for alias, _schema in model.calls] == [
         "pm",
         "architect",
+        "engineer",
         "engineer",
         "engineer",
         "engineer",

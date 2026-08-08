@@ -1,0 +1,241 @@
+"""Bounded fail-closed contract for the Playwright 1.55.1 JSON reporter parser."""
+
+from __future__ import annotations
+
+import json
+
+from fomo.agent_runtime.playwright_reporter import parse_playwright_json
+
+
+def _report(suites: list[dict], errors: list | None = None, stats: dict | None = None) -> str:
+    return json.dumps(
+        {"config": {"rootDir": "."}, "suites": suites, "errors": errors or [], "stats": stats or {}}
+    )
+
+
+def _suite(specs: list[dict], nested: list[dict] | None = None) -> dict:
+    return {
+        "title": "",
+        "file": "tests/generated/library.smoke.spec.ts",
+        "specs": specs,
+        "suites": nested or [],
+    }
+
+
+def _spec(
+    title: str,
+    overall: str,
+    result_status: str | None = "passed",
+    *,
+    project_name: str = "chromium",
+    no_results: bool = False,
+) -> dict:
+    """One real-shaped spec: title on the spec, tests[] without a title."""
+    test_entry = {
+        "expectedStatus": "passed",
+        "status": overall,
+        "projectId": "project-" + project_name,
+        "projectName": project_name,
+        "results": (
+            []
+            if no_results or result_status is None
+            else [{"workerIndex": 0, "status": result_status, "duration": 10}]
+        ),
+    }
+    return {"title": title, "ok": overall == "expected", "tests": [test_entry]}
+
+
+def test_exactly_one_passed_test_is_trusted() -> None:
+    outcome = parse_playwright_json(
+        _report([_suite([_spec("library keeps a searchable catalog", "expected", "passed")])])
+    )
+    assert outcome is not None
+    assert outcome.test_count == 1
+    # The unique title comes from spec.title, never from test entries.
+    assert outcome.title == "library keeps a searchable catalog"
+    assert outcome.status == "passed"
+    assert outcome.top_level_errors == 0
+    assert outcome.load_errors == 0
+
+
+def test_overall_expected_requires_a_real_passed_result() -> None:
+    # Overall expected but the last result is timedOut: not a pass.
+    timed_out = parse_playwright_json(
+        _report([_suite([_spec("slow", "expected", "timedOut")])])
+    )
+    assert timed_out is not None and timed_out.status == "did_not_run"
+    interrupted = parse_playwright_json(
+        _report([_suite([_spec("halted", "expected", "interrupted")])])
+    )
+    assert interrupted is not None and interrupted.status == "did_not_run"
+    skipped_result = parse_playwright_json(
+        _report([_suite([_spec("skipped", "expected", "skipped")])])
+    )
+    assert skipped_result is not None and skipped_result.status == "did_not_run"
+    # No results at all: fail closed.
+    no_results = parse_playwright_json(
+        _report([_suite([_spec("no results", "expected", no_results=True)])])
+    )
+    assert no_results is not None and no_results.status == "did_not_run"
+
+
+def test_assertion_failure_requires_unexpected_overall_with_plain_failed_result() -> None:
+    failed = parse_playwright_json(
+        _report([_suite([_spec("broke", "unexpected", "failed")])])
+    )
+    assert failed is not None
+    assert failed.status == "failed"
+    assert failed.title == "broke"
+    # unexpected with a timedOut result is infrastructure, not an assertion.
+    timed_out = parse_playwright_json(
+        _report([_suite([_spec("broke", "unexpected", "timedOut")])])
+    )
+    assert timed_out is not None and timed_out.status == "did_not_run"
+
+
+def test_flaky_skipped_and_interrupted_overall_never_become_assertions() -> None:
+    for overall in ("flaky", "skipped", "didNotRun", "interrupted"):
+        outcome = parse_playwright_json(
+            _report([_suite([_spec("odd", overall, "passed")])])
+        )
+        assert outcome is not None
+        assert outcome.status == "did_not_run"
+
+
+def test_multiple_specs_and_projects_count_every_test() -> None:
+    report = _report(
+        [
+            _suite(
+                [
+                    _spec("first", "expected", "passed", project_name="chromium"),
+                    _spec("first", "expected", "passed", project_name="firefox"),
+                ]
+            ),
+            _suite([_spec("second", "unexpected", "failed", project_name="chromium")]),
+        ]
+    )
+    outcome = parse_playwright_json(report)
+    assert outcome is not None
+    assert outcome.test_count == 3
+    # More than one test can never prove a single planned title.
+    assert outcome.title is None
+    assert outcome.status is None
+
+
+def test_zero_tests_fails_closed() -> None:
+    outcome = parse_playwright_json(_report([_suite([])]))
+    assert outcome is not None
+    assert outcome.test_count == 0
+    assert outcome.status is None
+
+
+def test_nested_describe_suites_are_walked_deterministically() -> None:
+    outcome = parse_playwright_json(
+        _report([_suite([], nested=[_suite([_spec("nested test", "expected", "passed")])])])
+    )
+    assert outcome is not None
+    assert outcome.test_count == 1
+    assert outcome.title == "nested test"
+
+
+def test_top_level_and_load_errors_are_infrastructure_signal() -> None:
+    with_error = parse_playwright_json(
+        _report([_suite([_spec("x", "expected", "passed")])], errors=[{"message": "boom"}])
+    )
+    assert with_error is not None and with_error.top_level_errors == 1
+    with_load_error = parse_playwright_json(
+        _report(
+            [
+                _suite(
+                    [
+                        {
+                            "title": "bad spec",
+                            "ok": False,
+                            "errors": [{"message": "load failed"}],
+                            "tests": [],
+                        }
+                    ]
+                )
+            ]
+        )
+    )
+    assert with_load_error is not None and with_load_error.load_errors == 1
+
+
+def test_structural_validation_covers_every_result_entry() -> None:
+    # A malformed middle result must fail closed even when the last result
+    # would otherwise read as passed.
+    report = _report(
+        [
+            _suite(
+                [
+                    {
+                        "title": "x",
+                        "ok": True,
+                        "tests": [
+                            {
+                                "expectedStatus": "passed",
+                                "status": "expected",
+                                "projectName": "chromium",
+                                "results": [
+                                    {"workerIndex": 0, "status": "passed"},
+                                    {"workerIndex": 0, "status": 42},
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            )
+        ]
+    )
+    assert parse_playwright_json(report) is None
+
+    # Every result entry must be validated; the last result still decides the
+    # single-run status.
+    retried = parse_playwright_json(
+        _report(
+            [
+                _suite(
+                    [
+                        {
+                            "title": "retried",
+                            "ok": True,
+                            "tests": [
+                                {
+                                    "expectedStatus": "passed",
+                                    "status": "expected",
+                                    "projectName": "chromium",
+                                    "results": [
+                                        {"workerIndex": 0, "status": "failed"},
+                                        {"workerIndex": 0, "status": "passed"},
+                                    ],
+                                }
+                            ],
+                        }
+                    ]
+                )
+            ]
+        )
+    )
+    assert retried is not None
+    assert retried.status == "passed"
+
+
+def test_malformed_oversized_or_non_object_output_fails_closed() -> None:
+    assert parse_playwright_json("") is None
+    assert parse_playwright_json("not json") is None
+    assert parse_playwright_json('{"stats": 1}') is None
+    assert parse_playwright_json("[1, 2]") is None
+    assert parse_playwright_json(
+        _report([_suite([_spec("x", "expected", "passed")])]), max_bytes=10
+    ) is None
+    assert parse_playwright_json('{"suites": [{"specs": "bad"}], "errors": []}') is None
+    assert (
+        parse_playwright_json(
+            '{"suites": [{"specs": [{"title": "x", "tests": [{"status": 1}]}]}], "errors": []}'
+        )
+        is None
+    )
+    assert (
+        parse_playwright_json('{"suites": [{"suites": [1], "specs": []}], "errors": []}') is None
+    )

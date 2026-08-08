@@ -67,6 +67,16 @@ class ProductSpec(SchemaModel):
             raise ValueError("acceptance criteria ids must be unique")
         return values
 
+    @field_validator("acceptance_criteria")
+    @classmethod
+    def bounded_acceptance_criteria(cls, values: list[AcceptanceCriterion]) -> list[AcceptanceCriterion]:
+        if not 1 <= len(values) <= 8:
+            raise ValueError("acceptance criteria must contain between 1 and 8 items")
+        for item in values:
+            if not item.id.strip() or len(item.id) > 64:
+                raise ValueError("acceptance criterion ids must be nonempty and bounded")
+        return values
+
 
 class RouteSpec(SchemaModel):
     path: str
@@ -210,6 +220,32 @@ class TestPlanItem(SchemaModel):
     acceptance_id: str
     method: Literal["playwright", "unit", "manual", "typecheck", "build"]
     steps: list[str] = Field(default_factory=list)
+    # Only Playwright items may bind a concrete smoke test. The testPath must
+    # be a planned model-owned tests/generated/*.smoke.spec.ts file and the
+    # testName must be the exact Playwright title proven by the JSON reporter.
+    test_path: str | None = None
+    test_name: str | None = None
+
+    @model_validator(mode="after")
+    def _enforce_playwright_test_binding(self) -> TestPlanItem:
+        if self.method == "playwright":
+            if not self.test_path or not self.test_name:
+                raise ValueError(
+                    "playwright test plan items must declare testPath and testName"
+                )
+            if not self.test_path.strip() or not self.test_name.strip():
+                raise ValueError(
+                    "playwright testPath and testName must not be blank"
+                )
+            if len(self.test_path) > 512 or len(self.test_name) > 300:
+                raise ValueError(
+                    "playwright testPath and testName must stay within bounded lengths"
+                )
+        elif self.test_path is not None or self.test_name is not None:
+            raise ValueError(
+                "only playwright test plan items may declare testPath or testName"
+            )
+        return self
 
 
 class TechnicalSpec(SchemaModel):
@@ -313,6 +349,53 @@ class GateResult(SchemaModel):
     # Deterministic QA may expose only normalized workspace paths, never the
     # command output used to derive them.
     affected_files: list[str] = Field(default_factory=list)
+    # Project gates (dependencies/typecheck/build/smoke/preview) are closed-set
+    # project scope; acceptance gates bind one Playwright item to one AC.
+    scope: Literal["project", "acceptance"] = "project"
+    acceptance_id: str | None = None
+    test_path: str | None = None
+    test_name: str | None = None
+    # acceptance-only: assertion outcomes write AC evidence; an
+    # infrastructure_failed gate blocks the run without touching AC validation.
+    outcome: Literal["passed", "failed", "infrastructure_failed"] | None = None
+    # Bounded command exit code; required for a passed/failed acceptance gate
+    # so evidence can carry it without persisting full logs.
+    exit_code: int | None = None
+
+    @model_validator(mode="after")
+    def _enforce_gate_scope_contract(self) -> GateResult:
+        acceptance_fields = (
+            self.acceptance_id,
+            self.test_path,
+            self.test_name,
+            self.outcome,
+        )
+        if self.scope == "project":
+            if any(value is not None for value in acceptance_fields):
+                raise ValueError(
+                    "project-scope gates must not carry acceptanceId, testPath, testName, or outcome"
+                )
+            return self
+        if not self.acceptance_id or not self.outcome:
+            raise ValueError(
+                "acceptance-scope gates require a nonempty acceptanceId and outcome"
+            )
+        if self.outcome in {"passed", "failed"}:
+            if (
+                not self.test_path
+                or not self.test_name
+                or self.exit_code is None
+            ):
+                raise ValueError(
+                    "passed or failed acceptance gates require testPath, testName, and exitCode"
+                )
+        for label, value, limit in (
+            ("testPath", self.test_path, 512),
+            ("testName", self.test_name, 300),
+        ):
+            if value is not None and (len(value) > limit or not value.strip()):
+                raise ValueError(f"{label} must be a bounded non-blank value")
+        return self
 
 
 class DiagnosticFinding(SchemaModel):
@@ -464,7 +547,10 @@ class AcceptanceTraceItem(SchemaModel):
 
     acceptance_id: str
     criterion: dict[str, Any]
+    # Derived only from the latest deterministic playwright_smoke evidence.
     status: Literal["unverified", "passed", "failed", "skipped"] = "unverified"
+    # Derived only from real implemented_in trace links.
+    implementation_status: Literal["implemented", "not_implemented"] = "not_implemented"
     links: list[dict[str, Any]] = Field(default_factory=list)
     evidence: list[dict[str, Any]] = Field(default_factory=list)
 
