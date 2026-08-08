@@ -84,11 +84,16 @@ class _OutputCollector:
 
     @property
     def stdout(self) -> str:
-        return "".join(self._stdout)
+        return self._joined_output(self._stdout)
 
     @property
     def stderr(self) -> str:
-        return "".join(self._stderr)
+        return self._joined_output(self._stderr)
+
+    @staticmethod
+    def _joined_output(chunks: list[str]) -> str:
+        """Match the pinned SDK's line-safe aggregation of output messages."""
+        return "\n".join(chunk.rstrip("\n") for chunk in chunks)
 
     async def emit(self, stream: str, value: Any) -> None:
         text = getattr(value, "text", value)

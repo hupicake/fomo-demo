@@ -11,7 +11,7 @@ from fomo.config import DEFAULT_OPENSANDBOX_IMAGE, Settings
 from fomo.sandbox import create_sandbox_provider
 from fomo.sandbox.base import Command, FileChange, SandboxPathError, SourceRef
 from fomo.sandbox.fake import FakeSandboxProvider
-from fomo.sandbox.opensandbox import OpenSandboxProvider
+from fomo.sandbox.opensandbox import OpenSandboxProvider, _OutputCollector
 from fomo.sandbox.process import ProcessSandboxProvider
 from fomo.schemas import ProductSpec
 
@@ -120,6 +120,42 @@ async def test_fake_sandbox_contract() -> None:
 
 async def _noop() -> None:
     return None
+
+
+@pytest.mark.asyncio
+async def test_opensandbox_output_collector_joins_messages_like_sdk_and_keeps_truncation_streaming() -> None:
+    emitted: list[tuple[str, str]] = []
+
+    async def sink(stream: str, text: str) -> None:
+        emitted.append((stream, text))
+
+    collector = _OutputCollector(sink, limit_bytes=128)
+    await collector.emit("stdout", SimpleNamespace(text="first line\n"))
+    await collector.emit("stdout", SimpleNamespace(text="second line"))
+    await collector.emit("stderr", SimpleNamespace(text="warning\n"))
+    await collector.emit("stderr", SimpleNamespace(text="detail"))
+
+    assert collector.stdout == "first line\nsecond line"
+    assert collector.stderr == "warning\ndetail"
+    assert emitted == [
+        ("stdout", "first line\n"),
+        ("stdout", "second line"),
+        ("stderr", "warning\n"),
+        ("stderr", "detail"),
+    ]
+
+    truncated = _OutputCollector(sink, limit_bytes=5)
+    await truncated.emit("stdout", SimpleNamespace(text="ab\n"))
+    await truncated.emit("stdout", SimpleNamespace(text="cde"))
+    await truncated.finish()
+
+    assert truncated.stdout == "ab\ncd"
+    assert truncated.stderr == "\n[output truncated]"
+    assert emitted[-3:] == [
+        ("stdout", "ab\n"),
+        ("stdout", "cd"),
+        ("stderr", "\n[output truncated]\n"),
+    ]
 
 
 @pytest.mark.asyncio
