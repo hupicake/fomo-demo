@@ -1,0 +1,39 @@
+{
+  "name": "fomo-generated-app",
+  "version": "0.0.0",
+  "private": true,
+  "packageManager": "pnpm@10.17.1",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "test:smoke": "playwright test --project=chromium"
+  },
+  "dependencies": {
+    "@radix-ui/react-slot": "^1.2.3",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "geist": "1.7.0",
+    "lucide-react": "^0.468.0",
+    "next": "16.3.0",
+    "radix-ui": "^1.6.7",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "sonner": "^2.0.7",
+    "tailwind-merge": "^3.3.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.55.1",
+    "@tailwindcss/postcss": "^4.1.13",
+    "@types/node": "^22.15.3",
+    "@types/react": "^19.1.2",
+    "@types/react-dom": "^19.1.2",
+    "postcss": "^8.5.3",
+    "tailwindcss": "^4.1.13",
+    "typescript": "^5.8.3"
+  }
+}

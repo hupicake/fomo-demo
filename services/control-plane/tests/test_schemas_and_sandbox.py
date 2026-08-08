@@ -355,11 +355,11 @@ async def test_opensandbox_provider_uses_pinned_sdk_contract_and_application_por
     assert SDK.handle.commands.runs[0][1].working_directory == "/workspace"
     assert SDK.handle.commands.runs[0][1].timeout.total_seconds() == 12
 
-    starter_copy = await provider.copy_starter(ref, "fomo-next-radix-v1")
+    starter_copy = await provider.copy_starter(ref, "fomo-next-radix-v2")
     assert starter_copy.exit_code == 0
     assert SDK.handle.commands.runs[1][0] == (
         "cp -R --no-preserve=mode,ownership -- "
-        "/opt/fomo/starters/fomo-next-radix-v1/. /workspace/"
+        "/opt/fomo/starters/fomo-next-radix-v2/base/. /workspace/"
     )
     with pytest.raises(ValueError, match="unsupported immutable starter"):
         await provider.copy_starter(ref, "unapproved-starter")
