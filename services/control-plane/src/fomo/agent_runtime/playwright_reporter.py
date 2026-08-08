@@ -33,25 +33,26 @@ class PlaywrightReport:
     load_errors: int
 
 
-def _result_status(test: dict[str, Any]) -> str | None:
-    """Return the last result's status after validating every result entry.
+def _result_status(test: dict[str, Any]) -> tuple[bool, str | None]:
+    """Return ``(valid, last_result_status)`` after validating every result.
 
-    Structural damage in any single result fails closed; the last result still
-    determines the single-run status while a flaky overall status keeps the
-    test unverified at the caller.
+    ``valid=False`` means the results structure is missing, empty, or
+    malformed and the caller must fail closed (``None``). ``valid=True``
+    returns the last result's status, which still decides the single-run
+    status; a flaky overall status keeps the test unverified at the caller.
     """
     results = test.get("results")
     if not isinstance(results, list) or not results:
-        return None
+        return False, None
     statuses: list[str] = []
     for result in results:
         if not isinstance(result, dict):
-            return None
+            return False, None
         status = result.get("status")
         if not isinstance(status, str):
-            return None
+            return False, None
         statuses.append(status)
-    return statuses[-1]
+    return True, statuses[-1]
 
 
 def parse_playwright_json(
@@ -127,7 +128,10 @@ def parse_playwright_json(
             overall = test.get("status")
             if not isinstance(overall, str):
                 return None
-            tests.append((title, overall, _result_status(test)))
+            valid_results, result_status = _result_status(test)
+            if not valid_results:
+                return None
+            tests.append((title, overall, result_status))
 
     if len(tests) == 1:
         title, overall, result_status = tests[0]
