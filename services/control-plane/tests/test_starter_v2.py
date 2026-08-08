@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import re
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -63,6 +65,24 @@ def test_v2_bare_manifest_is_digest_pinned_and_keeps_a_generic_buildable_boundar
     assert "components/features" not in page_source
     assert 'testDir: "./tests"' in files["playwright.config.ts"]._content.decode("utf-8")
     assert 'reporter: "line"' in files["playwright.config.ts"]._content.decode("utf-8")
+    tsconfig = json.loads(files["tsconfig.json"]._content.decode("utf-8"))
+    assert tsconfig["compilerOptions"]["jsx"] == "react-jsx"
+    assert tsconfig["include"] == [
+        "next-env.d.ts",
+        "**/*.ts",
+        "**/*.tsx",
+        ".next/types/**/*.ts",
+        ".next/dev/types/**/*.ts",
+    ]
+    next_config = files["next.config.ts"]._content.decode("utf-8")
+    allowed_dev_origins = re.search(
+        r"allowedDevOrigins:\s*\[(?P<origins>[^]]*)\]",
+        next_config,
+    )
+    assert allowed_dev_origins is not None
+    origins = allowed_dev_origins.group("origins").strip()
+    assert origins == '"127.0.0.1"'
+    assert "*" not in origins
     manifest.verify_tree({entry.path: entry._content for entry in manifest.files})
 
 
