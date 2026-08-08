@@ -48,6 +48,8 @@ model_list:
       model: deepseek/deepseek-v4-flash
       api_key: os.environ/DEEPSEEK_API_KEY
       api_base: https://api.deepseek.com
+      thinking:
+        type: disabled
 
 router_settings:
   num_retries: 1
