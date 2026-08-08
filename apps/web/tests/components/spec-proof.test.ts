@@ -170,7 +170,7 @@ describe("SpecToProof rendering", () => {
     expect(screen.getByText("fetch failed")).toBeTruthy();
     expect(screen.queryByTestId("markdown")).toBeNull();
     expect(screen.queryByText("Readers cannot manage books")).toBeNull();
-    expect(screen.queryByText("No structured spec received yet.")).toBeNull();
+    expect(screen.getAllByText("No structured spec received yet.")).toHaveLength(1);
   });
 
   it("renders an absent slot when no ref exists for the kind", () => {
