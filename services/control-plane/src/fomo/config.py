@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
 from urllib.parse import urlparse
 
 DEFAULT_OPENSANDBOX_IMAGE = "fomo-sandbox-node:2026-08-08"
 DEFAULT_OPENSANDBOX_LIFETIME_SECONDS = 21_600
 MAX_ENGINEER_FILE_CHARACTERS = 24_000
+INFERENCE_TOKEN_EXPIRY_GRACE_SECONDS = 600
 
 
 def _bool(name: str, default: bool = False) -> bool:
@@ -36,6 +38,47 @@ def _positive_int_environment_value(name: str, default: int) -> int:
     if value <= 0:
         raise ValueError(f"{name} must be greater than 0")
     return value
+
+
+def _positive_float_environment_value(name: str, default: float) -> float:
+    raw_value = os.getenv(name, str(default))
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a number") from None
+    if not isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be greater than 0")
+    return value
+
+
+def _litellm_endpoints(base_url: str) -> tuple[str, str]:
+    """Return the management root and OpenAI-compatible ``/v1`` endpoint."""
+    value = base_url.strip().rstrip("/")
+    parsed = urlparse(value)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("LITELLM_BASE_URL must contain a valid port") from exc
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+        or port is not None
+        and not 1 <= port <= 65_535
+    ):
+        raise ValueError("LITELLM_BASE_URL must be an http(s) URL without userinfo")
+    path = parsed.path.rstrip("/")
+    if path == "/v1":
+        path = ""
+    if path:
+        raise ValueError("LITELLM_BASE_URL may only use the root path or /v1")
+    management_url = parsed._replace(path="", params="", query="", fragment="").geturl()
+    management_url = management_url.rstrip("/")
+    return management_url, f"{management_url}/v1"
 
 
 def _engineer_file_character_limits(default_target: int, default_hard: int) -> tuple[int, int]:
@@ -95,6 +138,14 @@ class Settings:
     session_cookie_name: str = "fomo_session"
     litellm_base_url: str = "http://localhost:4000/v1"
     litellm_api_key: str | None = None
+    # Direct Pi receives only a short-lived LiteLLM virtual key. The master key
+    # stays in the control plane and provider credentials stay inside LiteLLM.
+    inference_token_ttl_seconds: int = 4_200
+    inference_management_timeout_seconds: int = 15
+    run_max_wall_seconds: int = 3_600
+    run_max_spend: float = 2.0
+    run_inference_rpm_limit: int = 60
+    run_inference_tpm_limit: int = 1_000_000
     # Model calls are intentionally decoupled from sandbox command timeouts.
     # Smaller Engineer batches should complete well within this bound.
     model_request_timeout_seconds: int = 300
@@ -142,6 +193,35 @@ class Settings:
     structured_output_retries: int = 1
     max_repair_rounds: int = 3
 
+    def __post_init__(self) -> None:
+        _litellm_endpoints(self.litellm_base_url)
+        positive_values = {
+            "inference_token_ttl_seconds": self.inference_token_ttl_seconds,
+            "inference_management_timeout_seconds": self.inference_management_timeout_seconds,
+            "run_max_wall_seconds": self.run_max_wall_seconds,
+            "run_inference_rpm_limit": self.run_inference_rpm_limit,
+            "run_inference_tpm_limit": self.run_inference_tpm_limit,
+        }
+        for name, value in positive_values.items():
+            if value <= 0:
+                raise ValueError(f"{name} must be greater than 0")
+        if not isfinite(self.run_max_spend) or self.run_max_spend <= 0:
+            raise ValueError("run_max_spend must be greater than 0")
+        minimum_ttl = self.run_max_wall_seconds + INFERENCE_TOKEN_EXPIRY_GRACE_SECONDS
+        if self.inference_token_ttl_seconds < minimum_ttl:
+            raise ValueError(
+                "inference_token_ttl_seconds must be at least "
+                "run_max_wall_seconds + 600 seconds"
+            )
+
+    @property
+    def litellm_management_url(self) -> str:
+        return _litellm_endpoints(self.litellm_base_url)[0]
+
+    @property
+    def pi_provider_base_url(self) -> str:
+        return _litellm_endpoints(self.litellm_base_url)[1]
+
     @property
     def sandbox_proxy_environment(self) -> dict[str, str]:
         return {
@@ -174,6 +254,25 @@ class Settings:
             # This is only a LiteLLM gateway credential. Provider keys stay inside LiteLLM.
             litellm_api_key=(
                 os.getenv("LITELLM_API_KEY") or os.getenv("LITELLM_MASTER_KEY") or None
+            ),
+            inference_token_ttl_seconds=_positive_int_environment_value(
+                "FOMO_INFERENCE_TOKEN_TTL", defaults.inference_token_ttl_seconds
+            ),
+            inference_management_timeout_seconds=_positive_int_environment_value(
+                "INFERENCE_MANAGEMENT_TIMEOUT_SECONDS",
+                defaults.inference_management_timeout_seconds,
+            ),
+            run_max_wall_seconds=_positive_int_environment_value(
+                "RUN_MAX_WALL_SECONDS", defaults.run_max_wall_seconds
+            ),
+            run_max_spend=_positive_float_environment_value(
+                "RUN_MAX_SPEND", defaults.run_max_spend
+            ),
+            run_inference_rpm_limit=_positive_int_environment_value(
+                "RUN_INFERENCE_RPM_LIMIT", defaults.run_inference_rpm_limit
+            ),
+            run_inference_tpm_limit=_positive_int_environment_value(
+                "RUN_INFERENCE_TPM_LIMIT", defaults.run_inference_tpm_limit
             ),
             model_request_timeout_seconds=int(
                 os.getenv("MODEL_REQUEST_TIMEOUT_SECONDS", str(defaults.model_request_timeout_seconds))

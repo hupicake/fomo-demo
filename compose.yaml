@@ -13,6 +13,12 @@ x-control-plane-environment: &control-plane-environment
   AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-fomo-minio-local-only-0123456789}
   LITELLM_BASE_URL: ${LITELLM_BASE_URL_DOCKER:-http://litellm:4000}
   LITELLM_API_KEY: ${LITELLM_MASTER_KEY:-sk-local-fomo-development-only}
+  FOMO_INFERENCE_TOKEN_TTL: ${FOMO_INFERENCE_TOKEN_TTL:-4200}
+  INFERENCE_MANAGEMENT_TIMEOUT_SECONDS: ${INFERENCE_MANAGEMENT_TIMEOUT_SECONDS:-15}
+  RUN_MAX_WALL_SECONDS: ${RUN_MAX_WALL_SECONDS:-3600}
+  RUN_MAX_SPEND: ${RUN_MAX_SPEND:-2.0}
+  RUN_INFERENCE_RPM_LIMIT: ${RUN_INFERENCE_RPM_LIMIT:-60}
+  RUN_INFERENCE_TPM_LIMIT: ${RUN_INFERENCE_TPM_LIMIT:-1000000}
   MODEL_PM: ${MODEL_PM:-pm}
   MODEL_ARCHITECT: ${MODEL_ARCHITECT:-architect}
   MODEL_ENGINEER: ${MODEL_ENGINEER:-engineer}
@@ -61,6 +67,25 @@ services:
       timeout: 5s
       retries: 10
     restart: unless-stopped
+
+  # LiteLLM virtual keys require persistent storage. Keep its schema out of the
+  # FOMO application database while reusing the same local PostgreSQL server.
+  litellm-db-init:
+    image: postgres:17-alpine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGUSER: ${POSTGRES_USER:-fomo}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-fomo-local-only}
+      PGDATABASE: ${POSTGRES_DB:-fomo}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        psql -tAc "SELECT 1 FROM pg_database WHERE datname = 'fomo_litellm'" | grep -q 1 ||
+        psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE fomo_litellm"
+    restart: "no"
 
   redis:
     image: redis:7.4-alpine
@@ -114,6 +139,7 @@ services:
     image: ghcr.io/berriai/litellm:v1.95.0
     command: ["--config", "/app/config.yaml", "--port", "4000"]
     environment:
+      DATABASE_URL: ${LITELLM_DATABASE_URL_DOCKER:-postgresql://fomo:fomo-local-only@postgres:5432/fomo_litellm}
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-local-fomo-development-only}
       LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:-local-litellm-salt-change-before-production-0123456789}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
@@ -128,6 +154,9 @@ services:
       http_proxy: ${DOCKER_HTTP_PROXY:-}
       https_proxy: ${DOCKER_HTTPS_PROXY:-}
       no_proxy: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,::1,postgres,redis,minio,minio-init,litellm,opensandbox,api,worker,web}
+    depends_on:
+      litellm-db-init:
+        condition: service_completed_successfully
     ports:
       - "${LITELLM_HOST_PORT:-4000}:4000"
     volumes:

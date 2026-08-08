@@ -51,6 +51,16 @@ model_list:
       thinking:
         type: disabled
 
+  # Direct Pi route. Keep this separate from the legacy structured-JSON alias:
+  # Pi uses reasoning and the virtual key restricts every run to this model.
+  - model_name: fomo-pi-flash
+    litellm_params:
+      model: deepseek/deepseek-v4-flash
+      api_key: os.environ/DEEPSEEK_API_KEY
+      api_base: https://api.deepseek.com
+      thinking:
+        type: enabled
+
 router_settings:
   num_retries: 1
   fallbacks:
