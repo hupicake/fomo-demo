@@ -425,7 +425,9 @@ QA 使用确定性工具和独立 Reviewer 判断，按顺序运行：
 
 只有 `error`/`major` 级问题阻断版本发布；`minor` 作为已知问题展示。`FailureRouter` 根据证据把需求遗漏回灌 PM、系统/组件边界问题回灌 Architect，把编译、测试和视觉实现问题回灌 Engineer。回灌内容是结构化 DiagnosticReport 和最小相关日志，不是整段无筛选终端输出。
 
-失败 gate 会从脱敏后的完整 stdout 与 stderr 提取唯一合法的 `affectedFiles`；Reviewer 的 `locationFiles` 必须是 1–8 个已计划文件，并在有该证据时为其子集，repair 不得回退为全量 `filePlan`。
+失败 gate 会从脱敏后的完整 stdout 与 stderr 提取唯一合法的 `affectedFiles`。其中的 **raw compiler paths** 是唯一的确定性 seed；它们与仅在控制面内计算、不会由模型填写的 **derived dependency paths** 分开保存。对每个 raw path，控制面只从沙箱读取 `TechnicalSpec.filePlan` 中已计划、非删除、model-owned 的 TypeScript 源码，并沿一跳本地静态 `import`/`export` 的 provider 与 consumer 边扩展；支持相对路径、`@/`、`index`、`.ts`/`.tsx` 解析，以及 `TechnicalSpec` 显式声明的直接契约关系：两端均绑定 public API contract 的 feature-surface composition/module，及 `stateAggregation.filePath` 与每个 `persistentStateDomains.actionsStoreFile`、`stateAggregation.persistenceAdapter.filePath` 的关系。包依赖、目录扫描、动态 import、歧义或未知目标、未计划/受保护文件都不能产生派生路径，绝不回退为全量 `filePlan`。
+
+Reviewer 的 `locationFiles` 必须是 raw 与 derived 的确定性并集中的 1–8 个已计划文件；同一并集同时约束 Reviewer schema 校验和后续 `_repair_technical`，避免模型先通过诊断再在 repair 阶段扩大范围。并集超过 8 个即 fail closed，禁止截断或让模型任选前 8 个；普通 build/smoke 失败但没有 raw 文件证据时保持 `evidence_missing`，不得猜测依赖。图只取 raw 节点的一跳邻居并去重，因此循环依赖必然终止。
 
 ## 7. 沙箱、预览和版本
 
