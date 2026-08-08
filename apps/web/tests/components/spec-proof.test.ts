@@ -33,6 +33,7 @@ const ref = {
   runId: "run-1",
   kind: "product_spec",
   role: "product_manager",
+  stage: "product",
   schemaVersion: 1,
   title: "Library product spec",
   summary: "Readers can manage books.",
@@ -56,15 +57,22 @@ function renderSpecToProof(slots: ReturnType<typeof specSlotsFromArtifacts>) {
 }
 
 describe("specSlotsFromArtifacts", () => {
-  it("projects refs and loads into canonical Product then Architect slots", () => {
+  it("projects refs and loads into the canonical Direct Pi artifact order", () => {
     const slots = specSlotsFromArtifacts([
-      { ...ref, id: "artifact-2", kind: "technical_spec", role: "architect" },
+      { ...ref, id: "artifact-2", kind: "technical_spec", role: "architect", stage: "architecture" },
       ref,
     ], {});
 
-    expect(slots.map((slot) => slot.kind)).toEqual(["product_spec", "technical_spec"]);
-    expect(slots[0]).toEqual({ kind: "product_spec", state: "loading", title: "Library product spec" });
-    expect(slots[1]).toEqual({ kind: "technical_spec", state: "loading", title: "Library product spec" });
+    expect(slots.map((slot) => slot.kind)).toEqual([
+      "run_input",
+      "build_plan",
+      "acceptance_contract",
+      "diagnostic_report",
+      "product_spec",
+      "technical_spec",
+    ]);
+    expect(slots[4]).toEqual({ kind: "product_spec", state: "loading", title: "Library product spec" });
+    expect(slots[5]).toEqual({ kind: "technical_spec", state: "loading", title: "Library product spec" });
   });
 
   it("is absent for a kind with no ref and ignores hidden kinds entirely", () => {
@@ -72,10 +80,8 @@ describe("specSlotsFromArtifacts", () => {
       { ...ref, id: "artifact-hidden", kind: "implementation_plan", role: "engineer" },
     ], {});
 
-    expect(slots).toEqual([
-      { kind: "product_spec", state: "absent" },
-      { kind: "technical_spec", state: "absent" },
-    ]);
+    expect(slots).toHaveLength(6);
+    expect(slots.every((slot) => slot.state === "absent")).toBe(true);
   });
 
   it("distinguishes loading, error and ready from the load states", () => {
@@ -89,31 +95,31 @@ describe("specSlotsFromArtifacts", () => {
       { ...ref, id: "artifact-2", kind: "technical_spec" },
     ], loads);
 
-    expect(slots[0]).toEqual({
+    expect(slots[4]).toEqual({
       kind: "product_spec",
       state: "ready",
       title: "Library product spec",
       markdown: expect.stringContaining("# Library product spec"),
     });
-    expect(slots[0]).not.toHaveProperty("error");
-    expect(slots[1]).toEqual({
+    expect(slots[4]).not.toHaveProperty("error");
+    expect(slots[5]).toEqual({
       kind: "technical_spec",
       state: "error",
       title: "Library product spec",
       error: "fetch failed",
     });
-    expect(slots[1]).not.toHaveProperty("markdown");
+    expect(slots[5]).not.toHaveProperty("markdown");
   });
 
   it("never falls back to another ref's ready content", () => {
     const slots = specSlotsFromArtifacts([
-      { ...ref, id: "artifact-2", kind: "technical_spec", role: "architect" },
+      { ...ref, id: "artifact-2", kind: "technical_spec", role: "architect", stage: "architecture" },
     ], {
       "artifact-1": { status: "ready", detail },
     });
 
-    expect(slots[1]).toEqual({ kind: "technical_spec", state: "loading", title: "Library product spec" });
-    expect(slots[1]).not.toHaveProperty("markdown");
+    expect(slots[5]).toEqual({ kind: "technical_spec", state: "loading", title: "Library product spec" });
+    expect(slots[5]).not.toHaveProperty("markdown");
   });
 
   it("uses the last ref in input order when multiple refs share a canonical kind", () => {
@@ -125,7 +131,7 @@ describe("specSlotsFromArtifacts", () => {
       },
     });
 
-    expect(slots[0]).toEqual({
+    expect(slots[4]).toEqual({
       kind: "product_spec",
       state: "ready",
       title: "Newer product spec",
@@ -137,7 +143,7 @@ describe("specSlotsFromArtifacts", () => {
     const reversed = specSlotsFromArtifacts([newer, ref], {
       "artifact-1": { status: "ready", detail },
     });
-    expect(reversed[0]).toEqual({
+    expect(reversed[4]).toEqual({
       kind: "product_spec",
       state: "ready",
       title: "Library product spec",
@@ -170,18 +176,18 @@ describe("SpecToProof rendering", () => {
     expect(screen.getByText("fetch failed")).toBeTruthy();
     expect(screen.queryByTestId("markdown")).toBeNull();
     expect(screen.queryByText("Readers cannot manage books")).toBeNull();
-    expect(screen.getAllByText("No structured spec received yet.")).toHaveLength(1);
+    expect(screen.queryByText("No structured spec received yet.")).toBeNull();
   });
 
-  it("renders an absent slot when no ref exists for the kind", () => {
+  it("does not render empty placeholder cards when no artifact exists", () => {
     renderSpecToProof(specSlotsFromArtifacts([], {}));
 
-    expect(screen.getAllByText("No structured spec received yet.")).toHaveLength(2);
+    expect(screen.queryByText("No structured spec received yet.")).toBeNull();
   });
 
   it("renders slots in the canonical Product then Architect order", () => {
     const { container } = renderSpecToProof(specSlotsFromArtifacts([
-      { ...ref, id: "artifact-2", kind: "technical_spec", role: "architect", title: "Tech spec" },
+      { ...ref, id: "artifact-2", kind: "technical_spec", role: "architect", stage: "architecture", title: "Tech spec" },
       ref,
     ], {
       "artifact-1": { status: "ready", detail },

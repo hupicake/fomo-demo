@@ -33,14 +33,19 @@ def test_product_spec_requires_unique_acceptance_ids() -> None:
 
 def test_preview_ready_requires_run_id_and_absolute_http_url() -> None:
     PreviewResponse.model_validate(
-        {"status": "ready", "url": "https://preview.example.test/app", "runId": "run-1"}
+        {"status": "ready", "url": "https://preview.example.test/app", "runId": "run-1", "verificationStatus": "verified"}
     )
     PreviewResponse.model_validate(
-        {"status": "ready", "url": "http://localhost:3000/app", "runId": "run-1"}
+        {"status": "ready", "url": "http://localhost:3000/app", "runId": "run-1", "verificationStatus": "unverified"}
     )
     PreviewResponse.model_validate(
-        {"status": "ready", "url": "https://preview.example.test:8443/app?x=1", "runId": "run-1"}
+        {"status": "ready", "url": "https://preview.example.test:8443/app?x=1", "runId": "run-1", "verificationStatus": "verified"}
     )
+
+    with pytest.raises(ValidationError, match="verificationStatus"):
+        PreviewResponse.model_validate(
+            {"status": "ready", "url": "https://preview.example.test/app", "runId": "run-1"}
+        )
 
     with pytest.raises(ValidationError, match="runId"):
         PreviewResponse.model_validate({"status": "ready", "url": "https://preview.example.test/app"})

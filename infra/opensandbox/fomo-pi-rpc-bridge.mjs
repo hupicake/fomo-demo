@@ -19,7 +19,7 @@ const PROVIDER_ID = "fomo-litellm";
 const MODEL_ID = "fomo-pi-flash";
 const MODEL_REF = `${PROVIDER_ID}/${MODEL_ID}`;
 const THINKING_LEVEL = "max";
-const ALLOWED_TOOLS = "read,grep,find,ls,edit,write,bash";
+const ALLOWED_TOOLS = "read,grep,find,ls,edit,write";
 
 const ENV = Object.freeze({
   prompt: "FOMO_PI_PROMPT_B64",

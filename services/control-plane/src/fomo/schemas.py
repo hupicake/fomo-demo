@@ -430,6 +430,13 @@ class RunStatus(StrEnum):
 
 class RunPhase(StrEnum):
     queued = "queued"
+    preparing = "preparing"
+    planning = "planning"
+    building = "building"
+    verifying = "verifying"
+    repairing = "repairing"
+    ready = "ready"
+    # Legacy phases remain readable until historical runs are retired.
     product_analysis = "product_analysis"
     architecture = "architecture"
     implementation = "implementation"
@@ -562,22 +569,53 @@ class TraceResponse(SchemaModel):
     acceptance_trace: list[AcceptanceTraceItem] = Field(default_factory=list)
 
 
-VisibleArtifactKind = Literal["product_spec", "technical_spec"]
+VisibleArtifactKind = Literal[
+    "run_input",
+    "build_plan",
+    "acceptance_contract",
+    "diagnostic_report",
+    "product_spec",
+    "technical_spec",
+]
 
 # The fixed role for every visible kind. The persisted artifact record carries
 # no role, so the workspace role is derived from the kind alone.
-VisibleArtifactRole = Literal["product_manager", "architect"]
+VisibleArtifactRole = Literal["user", "pi", "fomo", "product_manager", "architect"]
+VisibleArtifactStage = Literal[
+    "input",
+    "planning",
+    "acceptance",
+    "verification",
+    "product",
+    "architecture",
+]
 
 # The one closed set of artifact kinds surfaced by the workspace. The order is
 # the canonical presentation order (Product then Architect) and the kind->role
 # mapping is fixed because the persisted artifact record carries no role.
 VISIBLE_ARTIFACT_KIND_ORDER: tuple[VisibleArtifactKind, ...] = (
+    "run_input",
+    "build_plan",
+    "acceptance_contract",
+    "diagnostic_report",
     "product_spec",
     "technical_spec",
 )
 ARTIFACT_KIND_TO_ROLE: dict[VisibleArtifactKind, VisibleArtifactRole] = {
+    "run_input": "user",
+    "build_plan": "pi",
+    "acceptance_contract": "fomo",
+    "diagnostic_report": "fomo",
     "product_spec": "product_manager",
     "technical_spec": "architect",
+}
+ARTIFACT_KIND_TO_STAGE: dict[VisibleArtifactKind, VisibleArtifactStage] = {
+    "run_input": "input",
+    "build_plan": "planning",
+    "acceptance_contract": "acceptance",
+    "diagnostic_report": "verification",
+    "product_spec": "product",
+    "technical_spec": "architecture",
 }
 
 
@@ -588,6 +626,7 @@ class ArtifactRefResponse(SchemaModel):
     run_id: str
     kind: VisibleArtifactKind
     role: VisibleArtifactRole
+    stage: VisibleArtifactStage
     schema_version: int
     title: str
     summary: str
@@ -609,6 +648,7 @@ class PreviewResponse(SchemaModel):
     status: Literal["ready", "expired", "unavailable"]
     url: str | None = None
     run_id: str | None = None
+    verification_status: Literal["unverified", "verified"] | None = None
 
     @model_validator(mode="after")
     def _enforce_preview_contract(self) -> PreviewResponse:
@@ -622,8 +662,12 @@ class PreviewResponse(SchemaModel):
                 raise ValueError("preview url must be an absolute http(s) URL")
             if parsed.username is not None or parsed.password is not None:
                 raise ValueError("preview url must not contain userinfo")
+            if self.verification_status is None:
+                raise ValueError("ready preview requires verificationStatus")
         elif self.url is not None:
             raise ValueError("expired or unavailable preview must have url null")
+        elif self.verification_status is not None:
+            raise ValueError("expired or unavailable preview must have verificationStatus null")
         return self
 
 

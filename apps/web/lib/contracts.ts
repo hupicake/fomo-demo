@@ -8,6 +8,8 @@ export const agentRoles = [
 ] as const;
 
 export type AgentRole = (typeof agentRoles)[number];
+export const agentStages = ["planning", "building", "verifying", "repairing"] as const;
+export type AgentStage = (typeof agentStages)[number];
 export type RunStatus =
   | "queued"
   | "running"
@@ -64,6 +66,7 @@ export interface RunSnapshot {
   id: string;
   projectId: string;
   status: RunStatus;
+  phase?: string;
   lastSeq: number;
   createdAt?: string;
   updatedAt?: string;
@@ -95,6 +98,7 @@ export interface PreviewRef {
   url?: string;
   runId?: string;
   error?: string;
+  verificationStatus?: "unverified" | "verified";
 }
 
 export interface TraceEvidence {
@@ -116,7 +120,14 @@ export interface AcceptanceTrace {
   evidence: TraceEvidence[];
 }
 
-export const artifactKinds = ["product_spec", "technical_spec"] as const;
+export const artifactKinds = [
+  "run_input",
+  "build_plan",
+  "acceptance_contract",
+  "diagnostic_report",
+  "product_spec",
+  "technical_spec",
+] as const;
 export type ArtifactKind = (typeof artifactKinds)[number];
 
 export interface ArtifactRef {
@@ -124,6 +135,7 @@ export interface ArtifactRef {
   runId?: string;
   kind: string;
   role?: string;
+  stage?: string;
   schemaVersion?: number;
   title?: string;
   summary?: string;
@@ -135,7 +147,8 @@ export interface ArtifactRef {
 export interface VisibleArtifactRef extends ArtifactRef {
   runId: string;
   kind: ArtifactKind;
-  role: "product_manager" | "architect";
+  role: "user" | "pi" | "fomo" | "product_manager" | "architect";
+  stage: "input" | "planning" | "acceptance" | "verification" | "product" | "architecture";
   schemaVersion: number;
   title: string;
   summary: string;
@@ -153,6 +166,14 @@ export type ArtifactLoadState =
 
 export interface RoleActivity {
   role: AgentRole;
+  status: RoleStatus;
+  title: string;
+  detail?: string;
+  updatedAt?: string;
+}
+
+export interface StageActivity {
+  stage: AgentStage;
   status: RoleStatus;
   title: string;
   detail?: string;
@@ -200,7 +221,7 @@ export interface DomainEvent {
   projectId: string;
   runId: string;
   kind: string;
-  role?: AgentRole;
+  role?: string;
   occurredAt: string;
   payload: Record<string, unknown>;
 }
@@ -225,6 +246,7 @@ export interface RunPresentation {
   status: RunStatus;
   lastSeq: number;
   roles: Record<AgentRole, RoleActivity>;
+  stages: Record<AgentStage, StageActivity>;
   artifacts: ArtifactRef[];
   trace: AcceptanceTrace[];
   fileChanges: FileChange[];
@@ -246,6 +268,7 @@ export type AgentMessageMetadata = {
 
 export type AgentDataParts = {
   "agent-role": RoleActivity;
+  "agent-stage": StageActivity;
   "product-spec": ArtifactRef;
   "technical-spec": ArtifactRef;
   "acceptance-trace": AcceptanceTrace[];

@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from fomo.ids import utcnow, uuid7
 from fomo.schemas import (
     ARTIFACT_KIND_TO_ROLE,
+    ARTIFACT_KIND_TO_STAGE,
     VISIBLE_ARTIFACT_KIND_ORDER,
     EventEnvelope,
     MessageResponse,
@@ -158,12 +159,31 @@ def _bounded_text(value: object, fallback: str, limit: int = 120) -> str:
 
 
 def _artifact_title(kind: str, content: dict[str, Any]) -> str:
+    if kind == "run_input":
+        return _bounded_text(content.get("title"), "User request")
+    if kind == "build_plan":
+        return _bounded_text(content.get("title"), "Build plan")
+    if kind == "acceptance_contract":
+        return "Acceptance contract"
+    if kind == "diagnostic_report":
+        round_number = content.get("round")
+        return f"Verification round {round_number}" if isinstance(round_number, int) else "Verification report"
     if kind == "product_spec":
         return _bounded_text(content.get("title"), "Product Specification")
     return _bounded_text(content.get("title"), "Technical Specification")
 
 
 def _artifact_summary(kind: str, content: dict[str, Any]) -> str:
+    if kind == "run_input":
+        return _bounded_text(content.get("requirement"), "User request")
+    if kind == "build_plan":
+        return _bounded_text(content.get("summary"), "Direct Pi build plan")
+    if kind == "acceptance_contract":
+        criteria = content.get("criteria")
+        count = len(criteria) if isinstance(criteria, list) else 0
+        return f"{count} frozen acceptance workflows"
+    if kind == "diagnostic_report":
+        return "All deterministic gates passed" if content.get("passed") is True else "Deterministic verification found blockers"
     if kind == "product_spec":
         return _bounded_text(content.get("problem"), "Product Specification")
     return _bounded_text(content.get("framework"), "Technical Specification")
@@ -178,6 +198,7 @@ def _artifact_ref_response(record: ArtifactRecord) -> dict[str, Any]:
         "runId": record.run_id,
         "kind": kind,
         "role": ARTIFACT_KIND_TO_ROLE[kind],
+        "stage": ARTIFACT_KIND_TO_STAGE[kind],
         "schemaVersion": record.schema_version,
         "title": _artifact_title(kind, content),
         "summary": _artifact_summary(kind, content),
@@ -614,7 +635,12 @@ class Repository:
                     payload={"status": run.status, "summary": summary},
                 )
                 await self._advance_project_after_terminal(session, run)
-                if run.sandbox_id:
+                # A failed/needs-attention run may deliberately retain its
+                # unverified preview for inspection. Cancellation always
+                # destroys the sandbox; failures without a preview do too.
+                if run.sandbox_id and (
+                    run.status == RunStatus.cancelled.value or run.preview_url is None
+                ):
                     recovered.append(
                         SandboxCleanupTarget(
                             run_id=run.id,
@@ -657,6 +683,10 @@ class Repository:
                 )
                 for record in records
                 if record.sandbox_id is not None
+                and (
+                    record.status == RunStatus.cancelled.value
+                    or record.preview_url is None
+                )
             ]
 
     async def clear_sandbox_id(
@@ -705,11 +735,17 @@ class Repository:
             )
             await session.commit()
 
-    async def increment_repair_round(self, run_id: str, *, lease_token: str | None = None) -> int:
+    async def increment_repair_round(
+        self,
+        run_id: str,
+        *,
+        phase: RunPhase = RunPhase.repair,
+        lease_token: str | None = None,
+    ) -> int:
         async with self.database.session_factory() as session:
             run = await self._run_for_write(session, run_id, lease_token=lease_token)
             run.repair_round += 1
-            run.phase = RunPhase.repair.value
+            run.phase = phase.value
             run.updated_at = utcnow()
             await self._append_event_in_session(
                 session,
@@ -876,6 +912,9 @@ class Repository:
                 raise NotFoundError("run not found for project")
             for item in items:
                 stable_key = str(item["id"])
+                priority = str(item.get("priority", "must"))
+                if priority not in {"must", "should", "could"}:
+                    raise ValueError("acceptance priority is invalid")
                 existing = await session.scalar(
                     select(SpecItemRecord).where(
                         SpecItemRecord.project_id == project_id,
@@ -889,13 +928,14 @@ class Repository:
                             project_id=project_id,
                             stable_key=stable_key,
                             kind="acceptance_criterion",
-                            priority="must",
+                            priority=priority,
                             content=dict(item),
                             introduced_run_id=run_id,
                         )
                     )
                 else:
                     existing.content = dict(item)
+                    existing.priority = priority
                     existing.retired_run_id = None
             await session.commit()
 
@@ -1481,7 +1521,14 @@ class Repository:
             .limit(1)
         )
         if run is not None and run.preview_url:
-            return {"status": "ready", "url": run.preview_url, "runId": run.id}
+            return {
+                "status": "ready",
+                "url": run.preview_url,
+                "runId": run.id,
+                "verificationStatus": (
+                    "verified" if run.status == RunStatus.succeeded.value else "unverified"
+                ),
+            }
         if project.head_version_id:
             last_run_id = await session.scalar(
                 select(RunRecord.id)
@@ -1489,8 +1536,18 @@ class Repository:
                 .order_by(RunRecord.created_at.desc())
                 .limit(1)
             )
-            return {"status": "expired", "url": None, "runId": last_run_id}
-        return {"status": "unavailable", "url": None, "runId": None}
+            return {
+                "status": "expired",
+                "url": None,
+                "runId": last_run_id,
+                "verificationStatus": None,
+            }
+        return {
+            "status": "unavailable",
+            "url": None,
+            "runId": None,
+            "verificationStatus": None,
+        }
 
     @staticmethod
     def _acceptance_status(

@@ -5,13 +5,20 @@ from __future__ import annotations
 import asyncio
 import logging
 import socket
+from typing import Protocol
 
 from fomo.agent_runtime import MetaGPTAdapter, ModelClient, OpenAICompatibleClient, SOPRunner
 from fomo.config import Settings
+from fomo.direct_pi import DirectPiOrchestrator
+from fomo.fomo_pi_ds import LiteLLMRunKeyClient, OpenSandboxPiTransport
 from fomo.persistence import Database, Repository, SandboxCleanupTarget
-from fomo.sandbox import SandboxProvider, SandboxRef, create_sandbox_provider
+from fomo.sandbox import OpenSandboxProvider, SandboxProvider, SandboxRef, create_sandbox_provider
 
 logger = logging.getLogger(__name__)
+
+
+class RunOrchestrator(Protocol):
+    async def run(self, run_id: str, *, lease_token: str | None = None) -> None: ...
 
 
 class WorkerRunner:
@@ -23,23 +30,56 @@ class WorkerRunner:
         model: ModelClient | None = None,
         sandbox: SandboxProvider | None = None,
         agent_adapter: MetaGPTAdapter | None = None,
+        direct_orchestrator: RunOrchestrator | None = None,
         worker_id: str | None = None,
     ) -> None:
         if settings.worker_lease_seconds <= 0:
             raise ValueError("WORKER_LEASE_SECONDS must be positive")
         self.repository = repository
         self.settings = settings
-        self.model = model or OpenAICompatibleClient(
-            settings.litellm_base_url,
-            api_key=settings.litellm_api_key,
-            timeout_seconds=settings.model_request_timeout_seconds,
-            network_retries=settings.model_network_retries,
-            network_retry_base_delay_seconds=settings.model_network_retry_base_delay_seconds,
-            network_retry_max_delay_seconds=settings.model_network_retry_max_delay_seconds,
-            retry_after_max_seconds=settings.model_retry_after_max_seconds,
-        )
         self.sandbox = sandbox or create_sandbox_provider(settings)
+        self.direct_orchestrator: RunOrchestrator | None = None
+        self.model: ModelClient | None = None
+        if settings.agent_framework == "direct_pi":
+            if agent_adapter is not None or model is not None:
+                raise ValueError("direct_pi does not accept a legacy model or MetaGPT adapter")
+            if direct_orchestrator is not None:
+                self.direct_orchestrator = direct_orchestrator
+            else:
+                if not isinstance(self.sandbox, OpenSandboxProvider):
+                    raise ValueError("direct_pi production requires OpenSandbox")
+                if not settings.litellm_api_key:
+                    raise ValueError("direct_pi requires a LiteLLM master key")
+                gateway = LiteLLMRunKeyClient(
+                    management_url=settings.litellm_management_url,
+                    master_key=settings.litellm_api_key,
+                    timeout_seconds=settings.inference_management_timeout_seconds,
+                )
+                transport = OpenSandboxPiTransport(
+                    self.sandbox,
+                    default_timeout_seconds=settings.run_max_wall_seconds,
+                    stderr_limit_bytes=settings.command_output_limit_bytes,
+                )
+                self.direct_orchestrator = DirectPiOrchestrator(
+                    repository, self.sandbox, settings, gateway, transport
+                )
+            self.agent_adapter = None
+        elif settings.agent_framework in {"metagpt", "native"}:
+            if direct_orchestrator is not None:
+                raise ValueError("legacy agent framework cannot receive a Direct Pi orchestrator")
+            self.model = model or OpenAICompatibleClient(
+                settings.litellm_base_url,
+                api_key=settings.litellm_api_key,
+                timeout_seconds=settings.model_request_timeout_seconds,
+                network_retries=settings.model_network_retries,
+                network_retry_base_delay_seconds=settings.model_network_retry_base_delay_seconds,
+                network_retry_max_delay_seconds=settings.model_network_retry_max_delay_seconds,
+                retry_after_max_seconds=settings.model_retry_after_max_seconds,
+            )
+        else:
+            raise ValueError("AGENT_FRAMEWORK must be direct_pi, metagpt, or native")
         if settings.agent_framework == "metagpt":
+            assert self.model is not None
             # Fail at worker construction when the explicitly selected default
             # is unavailable; never run a fake native fallback in production.
             self.agent_adapter = agent_adapter or MetaGPTAdapter(self.model)
@@ -47,8 +87,6 @@ class WorkerRunner:
             if agent_adapter is not None:
                 raise ValueError("native agent framework cannot receive a MetaGPT adapter")
             self.agent_adapter = None
-        else:
-            raise ValueError("AGENT_FRAMEWORK must be either 'metagpt' or 'native'")
         self.worker_id = worker_id or f"{socket.gethostname()}:{id(self)}"
 
     async def run_once(self) -> bool:
@@ -56,27 +94,33 @@ class WorkerRunner:
         run = await self.repository.claim_next_run(self.worker_id, self.settings.worker_lease_seconds)
         if run is None:
             return False
-        sop = SOPRunner(
-            self.repository,
-            self.model,
-            self.sandbox,
-            self.settings,
-            agent_adapter=self.agent_adapter,
-        )
+        if self.direct_orchestrator is not None:
+            orchestrator = self.direct_orchestrator
+            task_name = f"fomo-direct-pi:{run.id}"
+        else:
+            assert self.model is not None
+            orchestrator = SOPRunner(
+                self.repository,
+                self.model,
+                self.sandbox,
+                self.settings,
+                agent_adapter=self.agent_adapter,
+            )
+            task_name = f"fomo-legacy-sop:{run.id}"
         lease_token = run.lease_owner
         if not lease_token:
             raise RuntimeError("claimed run is missing its lease token")
         lease_lost = asyncio.Event()
-        sop_task = asyncio.create_task(
-            sop.run(run.id, lease_token=lease_token),
-            name=f"fomo-sop:{run.id}",
+        run_task = asyncio.create_task(
+            orchestrator.run(run.id, lease_token=lease_token),
+            name=task_name,
         )
         heartbeat = asyncio.create_task(
-            self._renew_lease_forever(run.id, lease_token, sop_task, lease_lost),
+            self._renew_lease_forever(run.id, lease_token, run_task, lease_lost),
             name=f"fomo-lease-heartbeat:{run.id}",
         )
         try:
-            await sop_task
+            await run_task
         except asyncio.CancelledError:
             # A heartbeat-induced cancel means the durable fence/recovery now
             # owns this run. A real process/task cancellation must still reach
@@ -86,7 +130,7 @@ class WorkerRunner:
             if not lease_lost.is_set() or externally_cancelling:
                 raise
         except Exception:
-            # SOP already persisted a safe event + terminal status. Avoid raw
+            # The selected orchestrator persisted a safe terminal status. Avoid raw
             # exception data because model/provider failures may contain it.
             logger.error("FOMO run failed", extra={"run_id": run.id})
         finally:
@@ -98,7 +142,7 @@ class WorkerRunner:
         self,
         run_id: str,
         lease_token: str,
-        sop_task: asyncio.Task[None],
+        run_task: asyncio.Task[None],
         lease_lost: asyncio.Event,
     ) -> None:
         """Keep one claimed run recoverable without allowing it to go stale."""
@@ -117,13 +161,13 @@ class WorkerRunner:
                 # longer prove it owns the durable write fence.
                 logger.error("FOMO lease heartbeat failed", extra={"run_id": run_id})
                 lease_lost.set()
-                if not sop_task.done():
-                    sop_task.cancel()
+                if not run_task.done():
+                    run_task.cancel()
                 return
             if not renewed:
                 lease_lost.set()
-                if not sop_task.done():
-                    sop_task.cancel()
+                if not run_task.done():
+                    run_task.cancel()
                 return
 
     async def _recover_expired_runs(self) -> None:

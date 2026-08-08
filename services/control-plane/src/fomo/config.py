@@ -146,6 +146,10 @@ class Settings:
     run_max_spend: float = 2.0
     run_inference_rpm_limit: int = 60
     run_inference_tpm_limit: int = 1_000_000
+    run_max_tool_calls: int = 300
+    run_max_tokens: int = 400_000
+    pi_max_file_characters: int = 20_000
+    pi_max_changed_files: int = 24
     # Model calls are intentionally decoupled from sandbox command timeouts.
     # Smaller Engineer batches should complete well within this bound.
     model_request_timeout_seconds: int = 300
@@ -165,9 +169,9 @@ class Settings:
     engineer_max_files_per_batch: int = 1
     engineer_target_file_characters: int = 12_000
     engineer_max_file_characters: int = 20_000
-    # MetaGPT is the production coordination layer. `native` is intentionally
-    # reserved for explicit test and diagnostic runs.
-    agent_framework: str = "metagpt"
+    # Direct Pi is the production path. MetaGPT/native remain loadable only
+    # while historical runs and focused compatibility tests are retired.
+    agent_framework: str = "direct_pi"
     sandbox_provider: str = "opensandbox"
     opensandbox_base_url: str = "http://localhost:8080"
     opensandbox_api_key: str | None = None
@@ -201,10 +205,18 @@ class Settings:
             "run_max_wall_seconds": self.run_max_wall_seconds,
             "run_inference_rpm_limit": self.run_inference_rpm_limit,
             "run_inference_tpm_limit": self.run_inference_tpm_limit,
+            "run_max_tool_calls": self.run_max_tool_calls,
+            "run_max_tokens": self.run_max_tokens,
+            "pi_max_file_characters": self.pi_max_file_characters,
+            "pi_max_changed_files": self.pi_max_changed_files,
         }
         for name, value in positive_values.items():
             if value <= 0:
                 raise ValueError(f"{name} must be greater than 0")
+        if self.pi_max_file_characters > 24_000:
+            raise ValueError("pi_max_file_characters must not exceed 24000")
+        if self.pi_max_changed_files > 24:
+            raise ValueError("pi_max_changed_files must not exceed 24")
         if not isfinite(self.run_max_spend) or self.run_max_spend <= 0:
             raise ValueError("run_max_spend must be greater than 0")
         minimum_ttl = self.run_max_wall_seconds + INFERENCE_TOKEN_EXPIRY_GRACE_SECONDS
@@ -273,6 +285,18 @@ class Settings:
             ),
             run_inference_tpm_limit=_positive_int_environment_value(
                 "RUN_INFERENCE_TPM_LIMIT", defaults.run_inference_tpm_limit
+            ),
+            run_max_tool_calls=_positive_int_environment_value(
+                "RUN_MAX_TOOL_CALLS", defaults.run_max_tool_calls
+            ),
+            run_max_tokens=_positive_int_environment_value(
+                "RUN_MAX_TOKENS", defaults.run_max_tokens
+            ),
+            pi_max_file_characters=_positive_int_environment_value(
+                "PI_MAX_FILE_CHARACTERS", defaults.pi_max_file_characters
+            ),
+            pi_max_changed_files=_positive_int_environment_value(
+                "PI_MAX_CHANGED_FILES", defaults.pi_max_changed_files
             ),
             model_request_timeout_seconds=int(
                 os.getenv("MODEL_REQUEST_TIMEOUT_SECONDS", str(defaults.model_request_timeout_seconds))

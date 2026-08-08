@@ -1,8 +1,19 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from fomo.config import Settings
+
+
+def test_direct_pi_bridge_exposes_only_bounded_filesystem_tools() -> None:
+    bridge = (
+        Path(__file__).parents[3] / "infra" / "opensandbox" / "fomo-pi-rpc-bridge.mjs"
+    ).read_text(encoding="utf-8")
+
+    assert 'const ALLOWED_TOOLS = "read,grep,find,ls,edit,write";' in bridge
+    assert 'const ALLOWED_TOOLS = "read,grep,find,ls,edit,write,bash";' not in bridge
 
 
 def test_litellm_root_and_v1_urls_have_one_canonical_direct_pi_contract() -> None:

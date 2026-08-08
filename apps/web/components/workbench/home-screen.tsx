@@ -125,7 +125,7 @@ export function HomeScreen() {
         <aside className="rounded-2xl border bg-card/70 p-5 shadow-sm">
           <p className="text-sm font-medium">What stays visible</p>
           <ul className="mt-5 space-y-5 text-sm text-muted-foreground">
-            <li className="flex gap-3"><BoxesIcon className="mt-0.5 size-4 shrink-0 text-primary" /><span>Four roles share structured handoffs, not hidden narration.</span></li>
+            <li className="flex gap-3"><BoxesIcon className="mt-0.5 size-4 shrink-0 text-primary" /><span>One persistent Direct Pi session plans, builds, and repairs against FOMO-owned proof.</span></li>
             <li className="flex gap-3"><BookOpenCheckIcon className="mt-0.5 size-4 shrink-0 text-primary" /><span>Every must AC maps to files, tests, screenshots or versions.</span></li>
             <li className="flex gap-3"><PlusIcon className="mt-0.5 size-4 shrink-0 text-primary" /><span>Each successful run produces a recoverable version.</span></li>
           </ul>

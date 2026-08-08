@@ -61,6 +61,7 @@ _BASE_STARTER_PROTECTED_PATHS = (
     "components/ui/**",
     "components/system/**",
     "tests/harness/**",
+    "tests/fomo-acceptance/**",
 )
 _MODEL_OWNED_ROOTS = (
     "app/(generated)/**",
