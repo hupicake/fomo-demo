@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import posixpath
 import re
 import time
 from collections.abc import Awaitable, Callable
@@ -95,6 +96,19 @@ _WORKSPACE_PATH_IN_OUTPUT = re.compile(
     r"[A-Za-z0-9_@-]+(?:\.[A-Za-z0-9_@-]+)+))"
     r"(?=(?:\(\d+(?:,\d+)?\)|(?::\d+){1,3}|[\s`'\"<>,;:!?)}\]]|$))"
 )
+_STATIC_LOCAL_MODULE_REFERENCE = re.compile(
+    r"""
+    ^[ \t]*
+    (?:
+        import[ \t]+(?:type[ \t]+)?(?:[^'"\r\n;]+?[ \t]+from[ \t]+)?
+        |
+        export[ \t]+(?:type[ \t]+)?[^'"\r\n;]+?[ \t]+from[ \t]+
+    )
+    (?P<quote>["'])(?P<specifier>[^"'\r\n]+)(?P=quote)
+    """,
+    re.MULTILINE | re.VERBOSE,
+)
+_TYPESCRIPT_SOURCE_SUFFIXES = frozenset({".ts", ".tsx"})
 _STATE_AGGREGATION_RESPONSIBILITIES = frozenset({"compose", "re_export"})
 _STATE_PERSISTENCE_ADAPTER_RESPONSIBILITIES = frozenset({"load", "save", "migrate"})
 _FEATURE_SURFACE_COMPOSITION_RESPONSIBILITIES = frozenset({"compose", "layout", "props"})
@@ -265,7 +279,7 @@ _DIAGNOSTIC_REPORT_REPAIR_INSTRUCTIONS = MappingProxyType(
             "Limit locationFiles to at most eight approved repair files."
         ),
         "diagnostic_report.location_files.not_affected": (
-            "When deterministic gates identify affected files, keep locationFiles within that evidence."
+            "Keep locationFiles within the deterministic raw-or-derived eligible repair scope."
         ),
         "diagnostic_report.location_files.evidence_missing": (
             "Do not select a repair scope without deterministic affected-file evidence."
@@ -394,6 +408,15 @@ class EngineerPlanCapacityError(SOPExecutionError):
     """The Architect plan cannot fit in this run's bounded Engineer protocol."""
 
 
+@dataclass(frozen=True, slots=True)
+class _ReviewerRepairScope:
+    """Trusted raw QA evidence plus one-hop deterministic dependency neighbors."""
+
+    raw_paths: tuple[str, ...] = ()
+    derived_paths: tuple[str, ...] = ()
+    eligible_paths: tuple[str, ...] = ()
+
+
 @dataclass(slots=True)
 class _Context:
     run_id: str
@@ -411,6 +434,7 @@ class _Context:
     implementation_plan_artifact_id: str | None = None
     implementation_batch_artifact_ids: list[str] = field(default_factory=list)
     candidate_commit: str | None = None
+    reviewer_repair_scope: _ReviewerRepairScope | None = None
 
 
 class SOPRunner:
@@ -797,7 +821,13 @@ class SOPRunner:
         if run.repair_round > 0:
             if diagnostic is None:
                 raise SOPExecutionError("repair implementation requires a diagnostic scope")
-            implementation_technical = self._repair_technical(technical, diagnostic)
+            if context.reviewer_repair_scope is None:
+                raise SOPExecutionError("repair implementation requires a verified deterministic scope")
+            implementation_technical = self._repair_technical(
+                technical,
+                diagnostic,
+                context.reviewer_repair_scope,
+            )
             repair_scope_instruction = (
                 "This is a repair. TechnicalSpec.filePlan is the complete diagnosis-derived repair scope: plan "
                 "exactly those files and never rewrite unrelated files. "
@@ -1220,36 +1250,381 @@ class SOPRunner:
                 enriched.append(gate)
         return enriched
 
+    def _reviewer_scope_planned_paths(self, technical: TechnicalSpec) -> tuple[str, ...]:
+        """Return only files that a deterministic repair is allowed to consider."""
+        paths: list[str] = []
+        for item in technical.file_plan:
+            if item.operation == "delete":
+                continue
+            try:
+                path = str(validate_workspace_path(item.path))
+            except ValueError:
+                continue
+            if self.starter.is_protected_path(path) or not self.starter.is_model_owned_path(
+                path
+            ):
+                continue
+            if path not in paths:
+                paths.append(path)
+        return tuple(paths)
+
+    @staticmethod
+    def _static_local_module_specifiers(source: str) -> tuple[str, ...]:
+        """Extract only code-level local static TypeScript import/export specifiers."""
+        masked_source = SOPRunner._typescript_static_code_mask(source)
+        specifiers: list[str] = []
+        for match in _STATIC_LOCAL_MODULE_REFERENCE.finditer(masked_source):
+            specifier = source[match.start("specifier") : match.end("specifier")]
+            # Escaped and multiline module strings need a real TypeScript parser.
+            # Treat them as unresolved rather than guessing a workspace edge.
+            if "\\" in specifier or "\r" in specifier or "\n" in specifier:
+                continue
+            if not specifier.startswith(("./", "../", "@/")):
+                continue
+            if specifier not in specifiers:
+                specifiers.append(specifier)
+        return tuple(specifiers)
+
+    @staticmethod
+    def _typescript_static_code_mask(source: str) -> str:
+        """Mask comments and literal bodies while preserving source offsets.
+
+        The dependency graph is intentionally built without a TypeScript parser.
+        Keeping the statement regex on a same-length code mask prevents commented
+        examples and string/template content from becoming reviewer repair edges.
+        An unterminated literal or comment masks the remaining input, which is the
+        conservative (fail-closed) outcome.
+        """
+        masked = list(source)
+        length = len(source)
+
+        def blank(start: int, end: int) -> None:
+            for index in range(start, end):
+                if source[index] not in {"\r", "\n"}:
+                    masked[index] = " "
+
+        def skip_quoted_literal(start: int, quote: str) -> int | None:
+            literal_cursor = start + 1
+            while literal_cursor < length:
+                current = source[literal_cursor]
+                if current == "\\":
+                    literal_cursor += 2
+                    continue
+                if current == quote:
+                    return literal_cursor + 1
+                literal_cursor += 1
+            return None
+
+        def skip_template_expression(start: int) -> int | None:
+            depth = 1
+            expression_cursor = start
+            while expression_cursor < length:
+                current = source[expression_cursor]
+                following = (
+                    source[expression_cursor + 1]
+                    if expression_cursor + 1 < length
+                    else ""
+                )
+                if current == "/" and following == "/":
+                    line_end = source.find("\n", expression_cursor + 2)
+                    expression_cursor = length if line_end == -1 else line_end
+                    continue
+                if current == "/" and following == "*":
+                    comment_end = source.find("*/", expression_cursor + 2)
+                    if comment_end == -1:
+                        return None
+                    expression_cursor = comment_end + 2
+                    continue
+                if current in {"'", '"'}:
+                    quoted_end = skip_quoted_literal(expression_cursor, current)
+                    if quoted_end is None:
+                        return None
+                    expression_cursor = quoted_end
+                    continue
+                if current == "`":
+                    template_end = skip_template_literal(expression_cursor)
+                    if template_end is None:
+                        return None
+                    expression_cursor = template_end
+                    continue
+                if current == "{":
+                    depth += 1
+                elif current == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return expression_cursor + 1
+                expression_cursor += 1
+            return None
+
+        def skip_template_literal(start: int) -> int | None:
+            template_cursor = start + 1
+            while template_cursor < length:
+                current = source[template_cursor]
+                if current == "\\":
+                    template_cursor += 2
+                    continue
+                if current == "`":
+                    return template_cursor + 1
+                if (
+                    current == "$"
+                    and template_cursor + 1 < length
+                    and source[template_cursor + 1] == "{"
+                ):
+                    expression_end = skip_template_expression(template_cursor + 2)
+                    if expression_end is None:
+                        return None
+                    template_cursor = expression_end
+                    continue
+                template_cursor += 1
+            return None
+
+        cursor = 0
+        while cursor < length:
+            character = source[cursor]
+            following = source[cursor + 1] if cursor + 1 < length else ""
+            if character == "/" and following == "/":
+                line_end = source.find("\n", cursor + 2)
+                if line_end == -1:
+                    line_end = length
+                blank(cursor, line_end)
+                cursor = line_end
+                continue
+            if character == "/" and following == "*":
+                comment_end = source.find("*/", cursor + 2)
+                if comment_end == -1:
+                    blank(cursor, length)
+                    break
+                comment_end += 2
+                blank(cursor, comment_end)
+                cursor = comment_end
+                continue
+            if character in {"'", '"'}:
+                quote = character
+                start = cursor
+                quoted_end = skip_quoted_literal(start, quote)
+                if quoted_end is None:
+                    blank(start, length)
+                    break
+                blank(start + 1, quoted_end - 1)
+                cursor = quoted_end
+                continue
+            if character == "`":
+                start = cursor
+                template_end = skip_template_literal(start)
+                if template_end is None:
+                    blank(start, length)
+                    break
+                # A template expression cannot introduce a static module edge.
+                blank(start, template_end)
+                cursor = template_end
+                continue
+            cursor += 1
+        return "".join(masked)
+
+    @staticmethod
+    def _resolve_reviewer_scope_module(
+        source_path: str,
+        specifier: str,
+        planned_paths: set[str],
+    ) -> str | None:
+        """Resolve one local TypeScript module without guessing an ambiguous target."""
+        if specifier.startswith("@/"):
+            candidate = specifier[2:]
+        elif specifier.startswith(("./", "../")):
+            candidate = posixpath.normpath(
+                posixpath.join(posixpath.dirname(source_path), specifier)
+            )
+        else:
+            return None
+        try:
+            normalized = str(validate_workspace_path(candidate))
+        except ValueError:
+            return None
+
+        extension = posixpath.splitext(normalized)[1]
+        if extension:
+            candidates = (normalized,) if extension in _TYPESCRIPT_SOURCE_SUFFIXES else ()
+        else:
+            candidates = (
+                f"{normalized}.ts",
+                f"{normalized}.tsx",
+                f"{normalized}/index.ts",
+                f"{normalized}/index.tsx",
+            )
+        resolved = [candidate for candidate in candidates if candidate in planned_paths]
+        return resolved[0] if len(resolved) == 1 else None
+
+    def _raw_reviewer_scope_paths(
+        self,
+        gates: list[GateResult],
+        planned_paths: set[str],
+    ) -> tuple[str, ...]:
+        """Keep raw deterministic QA paths separate from any derived graph neighbors."""
+        raw_paths: list[str] = []
+        for gate in gates:
+            if gate.status != GateStatus.failed:
+                continue
+            for candidate in gate.affected_files:
+                try:
+                    path = str(validate_workspace_path(candidate))
+                except ValueError:
+                    continue
+                if path in planned_paths and path not in raw_paths:
+                    raw_paths.append(path)
+        return tuple(raw_paths)
+
+    def _declared_technical_contract_edges(
+        self,
+        technical: TechnicalSpec,
+        planned_paths: set[str],
+    ) -> set[tuple[str, str]]:
+        """Return direct relationships explicitly declared by ``TechnicalSpec``.
+
+        A PublicApiContract identifies a provider, not an arbitrary consumer, so symbol-name
+        matching or a global contract scan must never create an edge on its own. Feature
+        surfaces are direct only when both declared endpoints bind those contracts. State
+        aggregation directly declares its domain action stores and persistence adapter.
+        """
+
+        def approved_path(path: str) -> str | None:
+            try:
+                normalized = str(validate_workspace_path(path))
+            except ValueError:
+                return None
+            return normalized if normalized in planned_paths else None
+
+        public_contracts: set[tuple[str, str]] = set()
+        for contract in technical.public_api_contracts:
+            contract_path = approved_path(contract.file_path)
+            if contract_path is not None:
+                public_contracts.add((contract_path, contract.symbol))
+
+        edges: set[tuple[str, str]] = set()
+        for surface in technical.feature_surfaces:
+            composition_path = approved_path(surface.composition_file)
+            if (
+                composition_path is None
+                or (composition_path, surface.composition_symbol) not in public_contracts
+            ):
+                continue
+            for module in surface.modules:
+                module_path = approved_path(module.file_path)
+                if (
+                    module_path is not None
+                    and (module_path, module.public_symbol) in public_contracts
+                    and module_path != composition_path
+                ):
+                    edges.add((composition_path, module_path))
+
+        aggregation = technical.state_aggregation
+        if aggregation is None:
+            return edges
+        aggregation_path = approved_path(aggregation.file_path)
+        if aggregation_path is None:
+            return edges
+        for domain in technical.persistent_state_domains:
+            store_path = approved_path(domain.actions_store_file)
+            if store_path is not None and store_path != aggregation_path:
+                edges.add((aggregation_path, store_path))
+        if aggregation.persistence_adapter is not None:
+            adapter_path = approved_path(aggregation.persistence_adapter.file_path)
+            if adapter_path is not None and adapter_path != aggregation_path:
+                edges.add((aggregation_path, adapter_path))
+        return edges
+
+    async def _derive_reviewer_repair_scope(
+        self,
+        context: _Context,
+        technical: TechnicalSpec,
+        gates: list[GateResult],
+    ) -> _ReviewerRepairScope:
+        """Build the one-hop, deterministic raw-plus-dependency repair scope."""
+        if context.sandbox is None:
+            raise SOPExecutionError("cannot derive reviewer repair scope without a sandbox")
+        planned_paths = self._reviewer_scope_planned_paths(technical)
+        planned_path_set = set(planned_paths)
+        raw_paths = self._raw_reviewer_scope_paths(gates, planned_path_set)
+        if not raw_paths:
+            return _ReviewerRepairScope()
+        if len(raw_paths) > _MAX_REPAIR_SCOPE_FILES:
+            raise SOPExecutionError(
+                "deterministic reviewer repair scope exceeds the maximum of "
+                f"{_MAX_REPAIR_SCOPE_FILES} files"
+            )
+
+        adjacency: dict[str, set[str]] = {path: set() for path in planned_paths}
+        for source_path in planned_paths:
+            if posixpath.splitext(source_path)[1] not in _TYPESCRIPT_SOURCE_SUFFIXES:
+                continue
+            try:
+                source = (await self.sandbox.read_file(context.sandbox, source_path)).decode(
+                    "utf-8"
+                )
+            except (FileNotFoundError, UnicodeDecodeError):
+                continue
+            for specifier in self._static_local_module_specifiers(source):
+                target_path = self._resolve_reviewer_scope_module(
+                    source_path,
+                    specifier,
+                    planned_path_set,
+                )
+                if target_path is not None and target_path != source_path:
+                    adjacency[source_path].add(target_path)
+                    adjacency[target_path].add(source_path)
+
+        for source_path, target_path in self._declared_technical_contract_edges(
+            technical,
+            planned_path_set,
+        ):
+            adjacency[source_path].add(target_path)
+            adjacency[target_path].add(source_path)
+
+        raw_path_set = set(raw_paths)
+        derived_paths = tuple(
+            path
+            for path in planned_paths
+            if path not in raw_path_set
+            and any(path in adjacency[raw_path] for raw_path in raw_paths)
+        )
+        eligible_paths = (*raw_paths, *derived_paths)
+        if len(eligible_paths) > _MAX_REPAIR_SCOPE_FILES:
+            raise SOPExecutionError(
+                "deterministic reviewer repair scope exceeds the maximum of "
+                f"{_MAX_REPAIR_SCOPE_FILES} files"
+            )
+        return _ReviewerRepairScope(
+            raw_paths=raw_paths,
+            derived_paths=derived_paths,
+            eligible_paths=eligible_paths,
+        )
+
     def _validate_diagnostic_repair_scope(
         self,
         diagnostic: DiagnosticReport,
         technical: TechnicalSpec,
         gates: list[GateResult],
+        repair_scope: _ReviewerRepairScope | None = None,
     ) -> None:
         """Accept only a small, evidence-bound Reviewer repair scope."""
-        planned_paths = {
-            str(validate_workspace_path(item.path)) for item in technical.file_plan
-        }
+        planned_paths = set(self._reviewer_scope_planned_paths(technical))
         failed_gates = [gate for gate in gates if gate.status == GateStatus.failed]
-        affected_paths: set[str] = set()
-        for gate in failed_gates:
-            for path in gate.affected_files:
-                try:
-                    affected_paths.add(str(validate_workspace_path(path)))
-                except ValueError:
-                    # Gate paths are deterministic provider output, but an
-                    # invalid token must never expand a model repair scope.
-                    continue
-
-        if failed_gates and not affected_paths:
+        if repair_scope is None:
+            raw_paths = self._raw_reviewer_scope_paths(gates, planned_paths)
+            repair_scope = _ReviewerRepairScope(raw_paths=raw_paths, eligible_paths=raw_paths)
+        if len(repair_scope.eligible_paths) > _MAX_REPAIR_SCOPE_FILES:
             raise ArtifactContractViolation(
-                code="diagnostic_report.location_files.evidence_missing"
+                code="diagnostic_report.location_files.capacity_exceeded"
             )
 
         location_files = diagnostic.location_files
         requires_scope = bool(failed_gates) or bool(diagnostic.blocking_issues) or any(
             finding.severity in {"major", "error"} for finding in diagnostic.findings
         )
+        if requires_scope and not repair_scope.raw_paths:
+            raise ArtifactContractViolation(
+                code="diagnostic_report.location_files.evidence_missing"
+            )
+
         if not location_files:
             if requires_scope:
                 raise ArtifactContractViolation(code="diagnostic_report.location_files.required")
@@ -1274,7 +1649,7 @@ class SOPRunner:
                 raise ArtifactContractViolation(
                     code="diagnostic_report.location_files.file_unplanned"
                 )
-            if affected_paths and not location_paths.issubset(affected_paths):
+            if not location_paths.issubset(repair_scope.eligible_paths):
                 raise ArtifactContractViolation(
                     code="diagnostic_report.location_files.not_affected"
                 )
@@ -1581,12 +1956,22 @@ class SOPRunner:
             )
         return paths
 
-    def _repair_technical(self, technical: TechnicalSpec, diagnostic: DiagnosticReport) -> TechnicalSpec:
+    def _repair_technical(
+        self,
+        technical: TechnicalSpec,
+        diagnostic: DiagnosticReport,
+        repair_scope: _ReviewerRepairScope | None = None,
+    ) -> TechnicalSpec:
         """Restrict repair plans to structured diagnostic evidence, never a full rewrite."""
         self._technical_file_plan_paths(technical)
         planned_paths = {
             str(validate_workspace_path(item.path)): item for item in technical.file_plan
         }
+        eligible_paths = set(repair_scope.eligible_paths) if repair_scope is not None else None
+        if eligible_paths is not None and len(eligible_paths) > _MAX_REPAIR_SCOPE_FILES:
+            raise SOPExecutionError(
+                f"repair diagnostic scope exceeds the maximum of {_MAX_REPAIR_SCOPE_FILES} approved files"
+            )
         scope_candidates = diagnostic.location_files
         if not scope_candidates:
             raise SOPExecutionError("repair diagnostic did not identify an approved file scope")
@@ -1605,6 +1990,8 @@ class SOPRunner:
                 raise SOPExecutionError("repair diagnostic contains an unapproved file scope")
             if normalized in scoped_paths:
                 raise SOPExecutionError("repair diagnostic contains a duplicate file scope")
+            if eligible_paths is not None and normalized not in eligible_paths:
+                raise SOPExecutionError("repair diagnostic contains a file outside the verified repair scope")
             scoped_paths.add(normalized)
 
         return technical.model_copy(
@@ -1750,6 +2137,8 @@ class SOPRunner:
             await self._run_quality_gates(context),
             technical,
         )
+        repair_scope = await self._derive_reviewer_repair_scope(context, technical, gates)
+        context.reviewer_repair_scope = repair_scope
         candidate_commit = await self._create_candidate_commit(context)
         draft = await self._role(
             context,
@@ -1763,9 +2152,9 @@ class SOPRunner:
                         "You are FOMO's independent Reviewer. Consume ProductSpec, TechnicalSpec, and actual "
                         "deterministic command results. Return only DiagnosticReport JSON. Never claim an artifact, "
                         "test, screenshot, or gate that is absent from the supplied evidence. When blockers remain, "
-                        "populate locationFiles with one to eight affected files from TechnicalSpec.filePlan; FOMO "
-                        "will reject an unscoped rewrite. findings.file must be empty or name one of those same "
-                        "locationFiles. Do not include chain-of-thought."
+                        "populate locationFiles with one to eight files from the supplied deterministic eligible repair "
+                        "scope and never add another path; FOMO will reject an unscoped rewrite. findings.file must be "
+                        "empty or name one of those same locationFiles. Do not include chain-of-thought."
                     ),
                 },
                 {
@@ -1773,7 +2162,9 @@ class SOPRunner:
                     "content": (
                         f"ProductSpec:\n{self._json(product)}\nTechnicalSpec:\n{self._json(technical)}\n"
                         f"Candidate Git commit:\n{candidate_commit}\n"
-                        f"Actual QA gates:\n{self._json(gates)}"
+                        f"Actual QA gates:\n{self._json(gates)}\n"
+                        "Deterministic eligible repair paths (raw evidence plus direct dependencies):\n"
+                        f"{self._json(list(repair_scope.eligible_paths))}"
                     ),
                 },
             ],
@@ -1781,6 +2172,7 @@ class SOPRunner:
                 diagnostic,
                 technical,
                 gates,
+                repair_scope,
             ),
         )
         failed_gates = [gate for gate in gates if gate.status == GateStatus.failed]
