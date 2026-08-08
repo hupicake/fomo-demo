@@ -64,6 +64,21 @@ hard, and hard must not exceed 24,000. Content over the target through the hard
 limit succeeds and emits one aggregate, source-free `file_batch_over_target`
 activity; only content over the hard limit is rejected.
 
+### Reviewer repair scope
+
+For a failed compiler gate, FOMO keeps compiler-reported raw paths separate
+from deterministic derived dependency paths. It may add only direct planned,
+non-delete, model-owned TypeScript providers or consumers resolved from local
+static imports/exports (relative paths or `@/`, including `index`, `.ts`, and
+`.tsx`) and explicitly declared direct TechnicalSpec relationships: feature
+surface composition/modules when both symbols bind public APIs, plus state
+aggregation links to each persistent-domain actions store and its persistence
+adapter. Dynamic, package, unknown,
+ambiguous, unplanned, or protected targets never expand the scope. The shared
+raw-plus-derived scope constrains both Reviewer and repair planning; it must
+contain at most eight files or fail closed. A build or smoke failure with no
+compiler file evidence remains `evidence_missing` rather than guessing a file.
+
 ### Optional desktop proxy
 
 Proxying is disabled by default. If an opt-in local proxy listens at

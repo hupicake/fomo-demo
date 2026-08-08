@@ -24,7 +24,7 @@ from fomo.agent_runtime.sop import (
     _Context,
 )
 from fomo.agent_runtime.state import FailureRouter, SOPStateMachine
-from fomo.sandbox.base import ExecResult
+from fomo.sandbox.base import ExecResult, FileChange
 from fomo.sandbox.fake import FakeSandboxProvider
 from fomo.sandbox.opensandbox import _OutputCollector
 from fomo.schemas import (
@@ -277,6 +277,64 @@ def _architect_response_with_file_plan_count(count: int) -> dict[str, Any]:
         }
     ]
     return response
+
+
+def _technical_for_reviewer_dependency_scope(
+    paths: list[str],
+    *,
+    operations: dict[str, str] | None = None,
+    public_api_contracts: list[dict[str, Any]] | None = None,
+    feature_surfaces: list[dict[str, Any]] | None = None,
+    persistent_state_domains: list[dict[str, Any]] | None = None,
+    state_aggregation: dict[str, Any] | None = None,
+) -> TechnicalSpec:
+    response = _responses()["architect"]
+    operations = operations or {}
+    response["filePlan"] = [
+        {
+            "path": path,
+            "operation": operations.get(path, "create"),
+            "reason": "reviewer dependency-scope fixture",
+        }
+        for path in paths
+    ]
+    response["publicApiContracts"] = public_api_contracts or []
+    response["featureSurfaces"] = feature_surfaces or []
+    response["persistentStateDomains"] = persistent_state_domains or []
+    response["stateAggregation"] = state_aggregation
+    response["stateModel"] = []
+    return TechnicalSpec.model_validate(response)
+
+
+async def _derive_reviewer_dependency_scope(
+    repository,
+    settings,
+    technical: TechnicalSpec,
+    raw_paths: list[str],
+    source_files: dict[str, str],
+) -> tuple[SOPRunner, list[GateResult], Any]:
+    sandbox = FakeSandboxProvider()
+    ref = await sandbox.create("reviewer-dependency-scope")
+    await sandbox.apply_changes(
+        ref,
+        [FileChange(path=path, content=content, operation="create") for path, content in source_files.items()],
+    )
+    runner = SOPRunner(repository, ScriptedModelClient({}), sandbox, settings)
+    compiler_output = "\n".join(f"{path}(1,1): error" for path in raw_paths)
+    gates = [
+        GateResult(
+            gate="typecheck",
+            status=GateStatus.failed,
+            summary="typecheck failed",
+            affected_files=SOPRunner._affected_workspace_paths(compiler_output, ""),
+        )
+    ]
+    scope = await runner._derive_reviewer_repair_scope(
+        SimpleNamespace(sandbox=ref),
+        technical,
+        gates,
+    )
+    return runner, gates, scope
 
 
 def _architect_response_with_system_managed_path(path: str) -> dict[str, Any]:
@@ -1403,102 +1461,31 @@ async def test_repair_scope_caps_full_diagnostic_scope_and_preserves_file_plan_o
 
 
 @pytest.mark.asyncio
-async def test_reviewer_scope_capacity_retries_to_an_engineer_eligible_subset_without_leak(
+async def test_reviewer_scope_fails_closed_when_deterministic_union_exceeds_capacity(
     repository, settings
 ) -> None:
-    session = await repository.create_guest_session()
-    project = await repository.create_project(session.id, "Library")
-    _message, run, _created = await repository.create_message_and_run(
-        project.id, session.id, "reviewer-scope-capacity", "Create a book management system"
-    )
-    assert await repository.claim_next_run("test-worker", 60)
-    context = SimpleNamespace(
-        run_id=run.id,
-        lease_token=await repository.get_active_lease_token(run.id),
-    )
-    technical = TechnicalSpec.model_validate(_architect_response_with_file_plan_count(32))
-    planned_paths = [item.path for item in technical.file_plan]
-    source_marker = "reviewer-scope-untrusted-marker"
-    invalid_report = dict(_responses()["reviewer"])
-    invalid_report.update(
-        {
-            "blockingIssues": [source_marker],
-            "locationFiles": planned_paths,
-        }
-    )
-    corrected_report = dict(_responses()["reviewer"])
-    corrected_report.update(
-        {
-            "blockingIssues": ["typecheck failed"],
-            "locationFiles": planned_paths[:3],
-        }
-    )
-    model = ScriptedModelClient({"reviewer": [invalid_report, corrected_report]})
-    runner = SOPRunner(
-        repository,
-        model,
-        FakeSandboxProvider(),
-        replace(settings, engineer_max_batches=32, structured_output_retries=1),
-    )
-    failed_gate = GateResult(
-        gate="typecheck",
-        status=GateStatus.failed,
-        summary="failed",
-        affected_files=planned_paths,
-    )
-
-    diagnostic = await runner._role(
-        context,
-        role="reviewer",
-        model_alias="reviewer",
-        schema=DiagnosticReport,
-        messages=[{"role": "system", "content": "test reviewer repair scope"}],
-        validate_artifact=lambda report: runner._validate_diagnostic_repair_scope(
-            report,
-            technical,
-            [failed_gate],
+    root = "lib/domain/root.ts"
+    dependencies = [f"lib/domain/dependency-{index}.ts" for index in range(8)]
+    technical = _technical_for_reviewer_dependency_scope([root, *dependencies])
+    source_files = {
+        root: "\n".join(
+            f'import {{ dependency{index} }} from "./dependency-{index}";'
+            for index in range(8)
         ),
-    )
-
-    assert diagnostic.location_files == planned_paths[:3]
-    scoped_technical = runner._repair_technical(technical, diagnostic)
-    assert [item.path for item in scoped_technical.file_plan] == planned_paths[:3]
-    runner._validate_implementation_plan(
-        ImplementationPlan.model_validate(
-            {
-                "batches": [
-                    {
-                        "id": f"repair-{index}",
-                        "purpose": "bounded diagnostic repair",
-                        "paths": [path],
-                    }
-                    for index, path in enumerate(planned_paths[:3], start=1)
-                ]
-            }
-        ),
-        scoped_technical,
-    )
-
-    events = await repository.list_events(run.id)
-    retry_event = next(
-        event
-        for event in events
-        if event.kind == "agent.activity" and event.payload.get("action") == "structured_retry"
-    )
-    assert retry_event.payload == {
-        "action": "structured_retry",
-        "summary": "The structured hand-off was invalid; requesting a schema-correct response.",
-        "reasonCode": "diagnostic_report.location_files.capacity_exceeded",
+        **{
+            path: f"export const dependency{index} = {index};"
+            for index, path in enumerate(dependencies)
+        },
     }
-    correction = next(
-        message["content"]
-        for message in model.requests[1][1]
-        if message["content"].startswith("Return only a valid DiagnosticReport JSON object")
-    )
-    assert source_marker not in correction
-    assert planned_paths[0] not in correction
-    assert source_marker not in json.dumps([event.payload for event in events])
-    assert planned_paths[0] not in json.dumps([event.payload for event in events])
+
+    with pytest.raises(SOPExecutionError, match="exceeds the maximum of 8"):
+        await _derive_reviewer_dependency_scope(
+            repository,
+            settings,
+            technical,
+            [root],
+            source_files,
+        )
 
 
 @pytest.mark.asyncio
@@ -1632,7 +1619,7 @@ async def test_reviewer_scope_contract_variants_retry_closed_without_detail_leak
         gate="typecheck",
         status=GateStatus.failed,
         summary="failed",
-        affected_files=planned_paths,
+        affected_files=[planned_paths[0]],
     )
 
     for case, invalid_update, expected_code in invalid_cases:
@@ -1920,6 +1907,446 @@ def test_no_tests_smoke_gate_uses_exact_evidence_and_bounded_reviewer_scope(repo
         technical,
     )
     assert extended[0].affected_files == []
+
+
+@pytest.mark.asyncio
+async def test_reviewer_dependency_scope_adds_direct_provider_consumer_and_contract_edges(
+    repository, settings
+) -> None:
+    books_path = "lib/domain/books.ts"
+    persistence_path = "lib/domain/library-persistence.ts"
+    catalog_path = "lib/domain/catalog.ts"
+    unrelated_path = "lib/domain/unrelated.ts"
+    technical = _technical_for_reviewer_dependency_scope(
+        [books_path, persistence_path, catalog_path, unrelated_path],
+        public_api_contracts=[
+            {
+                "filePath": persistence_path,
+                "exportStyle": "named",
+                "symbol": "loadLibraryState",
+                "props": [],
+                "type": "() => LibraryState",
+            }
+        ],
+    )
+    runner, gates, scope = await _derive_reviewer_dependency_scope(
+        repository,
+        settings,
+        technical,
+        [books_path],
+        {
+            books_path: 'import { loadLibraryState } from "./library-persistence";\nexport const books = loadLibraryState;',
+            persistence_path: "export const loadLibraryState = () => ({ books: [] });",
+            catalog_path: 'import { books } from "./books";\nexport const catalog = books;',
+            unrelated_path: "export const unrelated = true;",
+        },
+    )
+
+    assert scope.raw_paths == (books_path,)
+    assert scope.derived_paths == (persistence_path, catalog_path)
+    assert scope.eligible_paths == (books_path, persistence_path, catalog_path)
+    diagnostic = DiagnosticReport(location_files=[books_path, persistence_path])
+    runner._validate_diagnostic_repair_scope(diagnostic, technical, gates, scope)
+    scoped_technical = runner._repair_technical(technical, diagnostic, scope)
+    assert [item.path for item in scoped_technical.file_plan] == [books_path, persistence_path]
+    with pytest.raises(ArtifactContractViolation) as out_of_scope:
+        runner._validate_diagnostic_repair_scope(
+            DiagnosticReport(location_files=[unrelated_path]),
+            technical,
+            gates,
+            scope,
+        )
+    assert out_of_scope.value.code == "diagnostic_report.location_files.not_affected"
+    with pytest.raises(SOPExecutionError, match="outside the verified repair scope"):
+        runner._repair_technical(
+            technical,
+            DiagnosticReport(location_files=[unrelated_path]),
+            scope,
+        )
+
+
+@pytest.mark.asyncio
+async def test_reviewer_dependency_scope_adds_declared_public_contract_feature_edges(
+    repository, settings
+) -> None:
+    composition_path = "components/features/library/library-surface.tsx"
+    controller_path = "components/features/library/use-library-controller.ts"
+    technical = _technical_for_reviewer_dependency_scope(
+        [composition_path, controller_path],
+        public_api_contracts=[
+            {
+                "filePath": composition_path,
+                "exportStyle": "named",
+                "symbol": "LibrarySurface",
+                "props": [],
+                "type": "React.ComponentType",
+            },
+            {
+                "filePath": controller_path,
+                "exportStyle": "named",
+                "symbol": "useLibraryController",
+                "props": [],
+                "type": "() => void",
+            },
+        ],
+        feature_surfaces=[
+            {
+                "componentName": "LibrarySurface",
+                "compositionFile": composition_path,
+                "compositionSymbol": "LibrarySurface",
+                "compositionResponsibilities": ["compose"],
+                "modules": [
+                    {
+                        "role": "controller",
+                        "filePath": controller_path,
+                        "publicSymbol": "useLibraryController",
+                    }
+                ],
+            }
+        ],
+    )
+
+    _runner, _gates, scope = await _derive_reviewer_dependency_scope(
+        repository,
+        settings,
+        technical,
+        [composition_path],
+        {
+            composition_path: "export const LibrarySurface = () => null;",
+            controller_path: "export const useLibraryController = () => undefined;",
+        },
+    )
+
+    assert scope.raw_paths == (composition_path,)
+    assert scope.derived_paths == (controller_path,)
+    assert scope.eligible_paths == (composition_path, controller_path)
+
+
+@pytest.mark.asyncio
+async def test_reviewer_dependency_scope_uses_declared_state_aggregation_edges_bidirectionally(
+    repository, settings
+) -> None:
+    aggregation_path = "lib/domain/use-library-state.ts"
+    books_store_path = "lib/domain/state/books-store.ts"
+    readers_store_path = "lib/domain/state/readers-store.ts"
+    loans_store_path = "lib/domain/state/loans-store.ts"
+    adapter_path = "lib/domain/state/library-persistence-adapter.ts"
+    planned_paths = [
+        aggregation_path,
+        books_store_path,
+        readers_store_path,
+        loans_store_path,
+        adapter_path,
+    ]
+    state_aggregation = {
+        "filePath": aggregation_path,
+        "responsibilities": ["compose", "re_export"],
+        "persistenceAdapter": {
+            "filePath": adapter_path,
+            "publicSymbol": "loadLibraryState",
+            "storageKey": "library-state",
+            "schemaVersion": 1,
+            "responsibilities": ["load", "save", "migrate"],
+        },
+    }
+    persistent_state_domains = [
+        {
+            "domain": "books",
+            "stateModelName": "library",
+            "actionsStoreFile": books_store_path,
+        },
+        {
+            "domain": "readers",
+            "stateModelName": "library",
+            "actionsStoreFile": readers_store_path,
+        },
+        {
+            "domain": "loans",
+            "stateModelName": "library",
+            "actionsStoreFile": loans_store_path,
+        },
+    ]
+    technical = _technical_for_reviewer_dependency_scope(
+        planned_paths,
+        persistent_state_domains=persistent_state_domains,
+        state_aggregation=state_aggregation,
+    )
+    source_files = {path: "export const value = true;" for path in planned_paths}
+
+    _runner, _gates, aggregation_scope = await _derive_reviewer_dependency_scope(
+        repository,
+        settings,
+        technical,
+        [aggregation_path],
+        source_files,
+    )
+    assert aggregation_scope.raw_paths == (aggregation_path,)
+    assert aggregation_scope.derived_paths == (
+        books_store_path,
+        readers_store_path,
+        loans_store_path,
+        adapter_path,
+    )
+
+    _runner, _gates, domain_scope = await _derive_reviewer_dependency_scope(
+        repository,
+        settings,
+        technical,
+        [books_store_path],
+        source_files,
+    )
+    assert domain_scope.raw_paths == (books_store_path,)
+    assert domain_scope.derived_paths == (aggregation_path,)
+    assert domain_scope.eligible_paths == (books_store_path, aggregation_path)
+
+    _runner, _gates, adapter_scope = await _derive_reviewer_dependency_scope(
+        repository,
+        settings,
+        technical,
+        [adapter_path],
+        source_files,
+    )
+    assert adapter_scope.raw_paths == (adapter_path,)
+    assert adapter_scope.derived_paths == (aggregation_path,)
+    assert adapter_scope.eligible_paths == (adapter_path, aggregation_path)
+
+
+@pytest.mark.asyncio
+async def test_reviewer_dependency_scope_excludes_unplanned_or_protected_contract_endpoints(
+    repository, settings
+) -> None:
+    aggregation_path = "lib/domain/use-library-state.ts"
+    protected_store_path = "components/ui/button.tsx"
+    unplanned_adapter_path = "lib/domain/state/unplanned-persistence-adapter.ts"
+    technical = _technical_for_reviewer_dependency_scope(
+        [aggregation_path, protected_store_path],
+        persistent_state_domains=[
+            {
+                "domain": "books",
+                "stateModelName": "library",
+                "actionsStoreFile": protected_store_path,
+            }
+        ],
+        state_aggregation={
+            "filePath": aggregation_path,
+            "responsibilities": ["compose", "re_export"],
+            "persistenceAdapter": {
+                "filePath": unplanned_adapter_path,
+                "publicSymbol": "loadLibraryState",
+                "storageKey": "library-state",
+                "schemaVersion": 1,
+                "responsibilities": ["load", "save", "migrate"],
+            },
+        },
+    )
+
+    _runner, _gates, scope = await _derive_reviewer_dependency_scope(
+        repository,
+        settings,
+        technical,
+        [aggregation_path],
+        {
+            aggregation_path: "export const libraryState = true;",
+            protected_store_path: "export const Button = () => null;",
+        },
+    )
+
+    assert scope.raw_paths == (aggregation_path,)
+    assert scope.derived_paths == ()
+    assert scope.eligible_paths == (aggregation_path,)
+
+
+@pytest.mark.asyncio
+async def test_reviewer_dependency_scope_resolves_barrels_aliases_indexes_and_tsx(
+    repository, settings
+) -> None:
+    consumer_path = "components/features/consumer.tsx"
+    provider_path = "components/features/provider.tsx"
+    barrel_path = "lib/domain/index.ts"
+    persistence_path = "lib/domain/library-persistence/index.ts"
+    technical = _technical_for_reviewer_dependency_scope(
+        [consumer_path, provider_path, barrel_path, persistence_path]
+    )
+
+    _runner, _gates, scope = await _derive_reviewer_dependency_scope(
+        repository,
+        settings,
+        technical,
+        [consumer_path, barrel_path],
+        {
+            consumer_path: (
+                'import { Provider } from "@/components/features/provider";\n'
+                'import { loadLibraryState } from "@/lib/domain/library-persistence";\n'
+                "export const Consumer = Provider;"
+            ),
+            provider_path: "export const Provider = () => null;",
+            barrel_path: 'export { loadLibraryState } from "./library-persistence";',
+            persistence_path: "export const loadLibraryState = () => ({ books: [] });",
+        },
+    )
+
+    assert scope.raw_paths == (consumer_path, barrel_path)
+    assert scope.derived_paths == (provider_path, persistence_path)
+    assert scope.eligible_paths == (consumer_path, barrel_path, provider_path, persistence_path)
+
+
+@pytest.mark.asyncio
+async def test_reviewer_dependency_scope_terminates_cycles_and_ignores_dynamic_or_unknown_targets(
+    repository, settings
+) -> None:
+    first_path = "lib/domain/first.ts"
+    second_path = "lib/domain/second.ts"
+    protected_path = "components/ui/button.tsx"
+    technical = _technical_for_reviewer_dependency_scope(
+        [first_path, second_path, protected_path],
+    )
+
+    _runner, _gates, scope = await _derive_reviewer_dependency_scope(
+        repository,
+        settings,
+        technical,
+        [first_path],
+        {
+            first_path: (
+                'import { second } from "./second";\n'
+                'const dynamic = import("./unknown");\n'
+                'import { missing } from "./missing";\n'
+                'import { Button } from "@/components/ui/button";\n'
+                "export const first = second;"
+            ),
+            second_path: 'import { first } from "./first";\nexport const second = first;',
+            protected_path: "export const Button = () => null;",
+        },
+    )
+
+    assert scope.raw_paths == (first_path,)
+    assert scope.derived_paths == (second_path,)
+    assert scope.eligible_paths == (first_path, second_path)
+
+
+@pytest.mark.asyncio
+async def test_reviewer_dependency_scope_ignores_comment_and_literal_module_text(
+    repository, settings
+) -> None:
+    books_path = "lib/domain/books.ts"
+    persistence_path = "lib/domain/library-persistence.ts"
+    technical = _technical_for_reviewer_dependency_scope([books_path, persistence_path])
+
+    _runner, _gates, scope = await _derive_reviewer_dependency_scope(
+        repository,
+        settings,
+        technical,
+        [books_path],
+        {
+            books_path: (
+                '// import { loadLibraryState } from "./library-persistence";\n'
+                "/*\n"
+                'import { loadLibraryState } from "./library-persistence";\n'
+                "*/\n"
+                'const quoted = \'export { loadLibraryState } from "./library-persistence";\';\n'
+                'const template = `example: ${`import { loadLibraryState } from "./library-persistence";`}`;\n'
+                "export const books = [];"
+            ),
+            persistence_path: "export const loadLibraryState = () => ({ books: [] });",
+        },
+    )
+
+    assert scope.raw_paths == (books_path,)
+    assert scope.derived_paths == ()
+    assert scope.eligible_paths == (books_path,)
+
+
+@pytest.mark.asyncio
+async def test_reviewer_dependency_scope_drops_unplanned_and_protected_raw_paths(
+    repository, settings
+) -> None:
+    books_path = "lib/domain/books.ts"
+    protected_path = "components/ui/button.tsx"
+    technical = _technical_for_reviewer_dependency_scope([books_path, protected_path])
+
+    _runner, _gates, scope = await _derive_reviewer_dependency_scope(
+        repository,
+        settings,
+        technical,
+        ["package.json", protected_path, books_path],
+        {books_path: "export const books = [];", protected_path: "export const Button = () => null;"},
+    )
+
+    assert scope.raw_paths == (books_path,)
+    assert scope.derived_paths == ()
+    assert scope.eligible_paths == (books_path,)
+
+
+@pytest.mark.asyncio
+async def test_reviewer_dependency_scope_keeps_no_evidence_fail_closed_without_expansion(
+    repository, settings
+) -> None:
+    books_path = "lib/domain/books.ts"
+    persistence_path = "lib/domain/library-persistence.ts"
+    technical = _technical_for_reviewer_dependency_scope([books_path, persistence_path])
+    runner, gates, scope = await _derive_reviewer_dependency_scope(
+        repository,
+        settings,
+        technical,
+        [],
+        {
+            books_path: 'import { loadLibraryState } from "./library-persistence";\nexport const books = [];',
+            persistence_path: "export const loadLibraryState = () => ({ books: [] });",
+        },
+    )
+
+    assert scope.raw_paths == ()
+    assert scope.derived_paths == ()
+    assert scope.eligible_paths == ()
+    with pytest.raises(ArtifactContractViolation) as evidence_missing:
+        runner._validate_diagnostic_repair_scope(
+            DiagnosticReport(location_files=[books_path]),
+            technical,
+            gates,
+            scope,
+        )
+    assert evidence_missing.value.code == "diagnostic_report.location_files.evidence_missing"
+
+
+@pytest.mark.asyncio
+async def test_reviewer_dependency_scope_allows_books_to_persistence_cross_batch_repair(
+    repository, settings
+) -> None:
+    books_path = "lib/domain/books.ts"
+    persistence_path = "lib/domain/library-persistence.ts"
+    readers_path = "lib/domain/readers.ts"
+    technical = _technical_for_reviewer_dependency_scope(
+        [books_path, persistence_path, readers_path],
+        public_api_contracts=[
+            {
+                "filePath": persistence_path,
+                "exportStyle": "named",
+                "symbol": "loadLibraryState",
+                "props": [],
+                "type": "() => LibraryState",
+            }
+        ],
+    )
+    runner, gates, scope = await _derive_reviewer_dependency_scope(
+        repository,
+        settings,
+        technical,
+        [books_path],
+        {
+            books_path: (
+                'import { loadLibraryState } from "./library-persistence";\n'
+                "export const listBooks = () => loadLibraryState().books;"
+            ),
+            persistence_path: "export const loadLibraryState = () => ({ books: [] });",
+            readers_path: "export const readers = [];",
+        },
+    )
+
+    assert scope.eligible_paths == (books_path, persistence_path)
+    diagnostic = DiagnosticReport(location_files=[books_path, persistence_path])
+    runner._validate_diagnostic_repair_scope(diagnostic, technical, gates, scope)
+    scoped_technical = runner._repair_technical(technical, diagnostic, scope)
+    assert [item.path for item in scoped_technical.file_plan] == [books_path, persistence_path]
 
 
 @pytest.mark.asyncio
