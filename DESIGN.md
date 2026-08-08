@@ -431,8 +431,8 @@ Engineer 只能通过以下应用工具操作，所有实现最终落到沙箱�
   超目标文件数。
 - 禁止“修改第 N 行”式脆弱指令。
 - 每次工具调用带 `operationId`，worker 重试时先检查是否已执行。
-- 依赖安装只发生在沙箱；V1 不允许模型修改固定 starter 的 `package.json` 或锁文件，缺少能力必须记录为风险，
-  由后续受控 starter 版本演进处理。
+- 依赖安装只发生在沙箱；Golden Starter v2 不允许模型修改固定 base 或 capability 的 `package.json`、锁文件，
+  缺少能力必须记录为风险，由后续受控 starter 版本演进处理。
 - 模型不能直接写 `.env*`、Git hooks、宿主配置或沙箱外路径。
 
 ### 6.5 QA 与自愈

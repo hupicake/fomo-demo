@@ -39,7 +39,12 @@ from fomo.schemas import (
     RunStatus,
     TechnicalSpec,
 )
-from fomo.starter import StarterIntegrityError, StarterManifest, default_starter_manifest
+from fomo.starter import (
+    StarterIntegrityError,
+    StarterManifest,
+    default_starter_manifest,
+    resolve_starter_manifest,
+)
 
 from .llm import ModelClient, ModelError, ModelRequestError, ModelRetry
 from .metagpt_adapter import MetaGPTAdapter
@@ -116,7 +121,8 @@ _MAX_FEATURE_SURFACE_CONTROLLER_CONCERNS = 3
 _DEFAULT_FRONTEND_STACK_CONTRACT = (
     "Use FOMO's default Next.js + React + TypeScript + Tailwind CSS + shadcn/ui + Lucide React "
     "frontend stack. Prefer existing components and mature shadcn/ui primitives with Lucide icons. "
-    "CRUD uses Table + DropdownMenu, Sheet/Dialog editing, AlertDialog deletion, and Badge status; "
+    "When TechnicalSpec selects the crud starter capability, use its generic hooks/slots with Table + DropdownMenu, "
+    "Sheet/Dialog editing, AlertDialog deletion, and Badge status; "
     "forms use Label + Input/Textarea/Select/Checkbox/Switch with validation and pending submission. "
     "When a shadcn primitive exists, do not use raw button/input/textarea/select or an unjustified custom "
     "Dialog/Menu/Select/Tooltip; every custom decision must document the missing capability in "
@@ -159,9 +165,27 @@ _TECHNICAL_SPEC_REPAIR_INSTRUCTIONS = MappingProxyType(
         "technical_spec.file_plan.capacity_exceeded": (
             "Reduce TechnicalSpec.filePlan to the configured Engineer capacity."
         ),
+        "technical_spec.starter_capabilities.invalid": (
+            "Select only compatible starterCapabilities values from the immutable StarterManifest capabilityCatalog."
+        ),
+        "technical_spec.starter_capabilities.selection_changed": (
+            "Keep starterCapabilities exactly equal to the already selected immutable starter capabilities during repair."
+        ),
+        "technical_spec.extension_contract.file_plan_required": (
+            "Include the required StarterManifest extensionContracts path exactly once in TechnicalSpec.filePlan."
+        ),
+        "technical_spec.extension_contract.operation_invalid": (
+            "Use the exact required operation from StarterManifest extensionContracts for the root composition path."
+        ),
+        "technical_spec.extension_contract.public_api_required": (
+            "Bind the required StarterManifest extensionContracts path, exportStyle, and symbol in publicApiContracts."
+        ),
+        "technical_spec.extension_contract.page_path_rejected": (
+            "Do not plan app/(generated)/page.tsx; use the fixed root composition extension contract instead."
+        ),
         "technical_spec.playwright_smoke.file_plan_required": (
             "When testPlan includes Playwright, include a model-owned create or modify filePlan path matching "
-            "tests/**/*.smoke.spec.ts."
+            "tests/generated/**/*.smoke.spec.ts."
         ),
         "technical_spec.dependencies.starter_only": (
             "Do not declare additional dependencies; use the immutable starter baseline or record a risk."
@@ -426,6 +450,7 @@ class _Context:
     prompt: str
     lease_token: str
     sandbox: SandboxRef | None = None
+    starter: StarterManifest | None = None
     product: ProductSpec | None = None
     technical: TechnicalSpec | None = None
     product_artifact_id: str | None = None
@@ -453,6 +478,9 @@ class SOPRunner:
         self.model = model
         self.sandbox = sandbox
         self.settings = settings
+        # This bare manifest is the Architect-visible catalog. Each run resolves
+        # its selected overlays once into ``context.starter`` before sandbox
+        # creation; never mutate this shared catalog based on a model response.
         self.starter: StarterManifest = default_starter_manifest()
         if settings.agent_framework == "metagpt":
             self.agent_adapter = agent_adapter or MetaGPTAdapter(model)
@@ -630,6 +658,29 @@ class SOPRunner:
         max_files_per_batch = self._engineer_max_files_per_batch()
         max_planned_files = max_batches * max_files_per_batch
         path_label = "path" if max_files_per_batch == 1 else "paths"
+        architect_starter = (
+            self._context_starter(context) if context.sandbox is not None else self.starter
+        )
+        repair_selection_instruction = (
+            ""
+            if context.sandbox is None
+            else (
+                "This is a repair. Keep starterCapabilities exactly equal to the already selected "
+                f"capabilities {list(architect_starter.capability_ids)}; do not add, remove, or replace an overlay. "
+            )
+        )
+
+        def validate_technical(candidate: TechnicalSpec) -> None:
+            self._validate_technical_file_plan(candidate)
+            if (
+                context.sandbox is not None
+                and self._starter_for_technical(candidate).capability_ids
+                != architect_starter.capability_ids
+            ):
+                raise ArtifactContractViolation(
+                    code="technical_spec.starter_capabilities.selection_changed"
+                )
+
         technical = await self._role(
             context,
             role="architect",
@@ -643,14 +694,22 @@ class SOPRunner:
                         f"{_DEFAULT_FRONTEND_STACK_CONTRACT} Use the starter's typecheck/build/dev scripts in the test plan. "
                         f"{_PLAYWRIGHT_NETWORK_CONTRACT} "
                         "An immutable starter already exists. Do not create, list in filePlan, modify, or delete any "
-                        "StarterManifest protectedPaths. Plan only StarterManifest modelOwnedRoots. Reuse listed "
+                        "StarterManifest protectedPaths. Set starterCapabilities explicitly to only compatible IDs from "
+                        "StarterManifest capabilityCatalog (use [] when no overlay is needed); do not invent a capability, "
+                        "dependency, install command, or image path. Plan only StarterManifest modelOwnedRoots. Reuse listed "
                         "availableImports directly; do not generate components/ui primitives, package configuration, "
                         "or dependencies. If a required capability is absent, record it in risks instead of installing "
-                        "or scaffolding it. Put normal generated routes under app/(generated)/** (or app/page.tsx for "
-                        "the root route), business compositions under components/features/**, domain state/types under "
-                        "lib/domain/**, and smoke tests under tests/**. When testPlan includes Playwright, filePlan must "
+                        "or scaffolding it. Select crud for a collection create/update/remove lifecycle and select "
+                        "local-persistence for durable state that must survive refresh; when selected, reuse its exact "
+                        "available import and do not rewrite its generic infrastructure in business code. "
+                        "Follow StarterManifest extensionContracts exactly: the initial complete filePlan must include each "
+                        "contract path with its required operation, and publicApiContracts must bind its path, exportStyle, "
+                        "and symbol. Never plan StarterManifest forbiddenModelOwnedPaths. "
+                        "Put normal generated routes under app/(generated)/**, business compositions under "
+                        "components/features/**, domain state/types under lib/domain/**, and smoke tests under tests/generated/**. "
+                        "app/page.tsx is an immutable delegation entry and must never be planned. When testPlan includes Playwright, filePlan must "
                         "include at least one model-owned create or modify smoke test path matching "
-                        "tests/**/*.smoke.spec.ts, including a direct tests/<name>.smoke.spec.ts file; do not use a "
+                        "tests/generated/**/*.smoke.spec.ts; do not use a "
                         "hyphen in place of the required .smoke.spec.ts suffix. "
                         "Return concise componentDecisions only for decision-bearing UI primitives, composed feature "
                         "surfaces, or custom strategies—not a component inventory. Leave ordinary business composition "
@@ -692,7 +751,8 @@ class SOPRunner:
                         "Strictly use the JSON Schema's literal enum values (never descriptive "
                         f"variants), fit TechnicalSpec.filePlan within {max_batches} Engineer batches of at most "
                         f"{max_files_per_batch} unique valid relative workspace {path_label} each (no more than "
-                        f"{max_planned_files} paths total). {self._engineer_file_character_prompt()} "
+                        f"{max_planned_files} paths total). {repair_selection_instruction}"
+                        f"{self._engineer_file_character_prompt()} "
                         "Keep every list and description concise, and do not include "
                         "chain-of-thought, secrets, or fields outside the schema."
                     ),
@@ -701,13 +761,18 @@ class SOPRunner:
                     "role": "user",
                     "content": (
                         f"ProductSpec:\n{self._json(context.product)}\n"
-                        f"StarterManifest:\n{self._json(self.starter.as_architect_context())}\n"
+                        f"StarterManifest:\n{self._json(architect_starter.as_architect_context())}\n"
                         f"Repair evidence (if any):\n{self._json(diagnostic) if diagnostic else ''}"
                     ),
                 },
             ],
-            validate_artifact=self._validate_technical_file_plan,
+            validate_artifact=validate_technical,
         )
+        resolved_starter = self._starter_for_technical(technical)
+        if context.sandbox is not None and context.starter is not None:
+            if resolved_starter.capability_ids != context.starter.capability_ids:
+                raise SOPExecutionError("repair cannot change immutable starter capability selection")
+        context.starter = resolved_starter
         context.technical = technical
         artifact_id = await self.repository.store_artifact(
             context.run_id,
@@ -738,6 +803,7 @@ class SOPRunner:
 
     async def _create_sandbox(self, context: _Context) -> None:
         await self._check_cancelled(context)
+        starter = self._context_starter(context)
         if context.sandbox is None:
             context.sandbox = await self.sandbox.create(context.project_id)
             await self.repository.set_sandbox_id(
@@ -756,7 +822,7 @@ class SOPRunner:
                 raise SOPExecutionError("unable to initialize Git in sandbox")
             result = await self._command(
                 context,
-                "git add -A && git commit -m 'chore(starter): fomo-next-radix-v1'",
+                f"git add -A && git commit -m 'chore(starter): {starter.id}@{starter.version}'",
                 role="engineer",
             )
             if result.exit_code != 0:
@@ -768,7 +834,7 @@ class SOPRunner:
             await self.repository.store_artifact(
                 context.run_id,
                 "starter_provenance",
-                self.starter.as_provenance(initial_commit_sha),
+                starter.as_provenance(initial_commit_sha),
                 role="engineer",
                 lease_token=context.lease_token,
             )
@@ -779,9 +845,10 @@ class SOPRunner:
                 payload={
                     "action": "sandbox_created",
                     "summary": "Created an isolated workspace from the immutable starter.",
-                    "starterId": self.starter.id,
-                    "starterVersion": self.starter.version,
-                    "starterTreeSha256": self.starter.tree_sha256,
+                    "starterId": starter.id,
+                    "starterVersion": starter.version,
+                    "starterTreeSha256": starter.tree_sha256,
+                    "starterCapabilities": list(starter.capability_ids),
                     "starterCommitSha": initial_commit_sha,
                 },
                 lease_token=context.lease_token,
@@ -791,20 +858,39 @@ class SOPRunner:
         """Copy the fixed baseline before any model can write to the sandbox."""
         if context.sandbox is None:
             raise SOPExecutionError("cannot bootstrap a starter without a sandbox")
+        starter = self._context_starter(context)
         image_copy = getattr(self.sandbox, "copy_starter", None)
         if callable(image_copy):
-            result = await image_copy(context.sandbox, self.starter.id)
+            result = await image_copy(context.sandbox, starter.id, starter.capability_ids)
             if result.exit_code != 0:
                 raise SOPExecutionError("unable to copy immutable starter from sandbox image")
         else:
-            await self.sandbox.apply_changes(context.sandbox, self.starter.file_changes)
+            await self.sandbox.apply_changes(context.sandbox, starter.file_changes)
         copied_files: dict[str, bytes] = {}
         try:
-            for entry in self.starter.files:
+            list_files = getattr(self.sandbox, "list_files", None)
+            if callable(list_files):
+                self._verify_starter_workspace_file_set(starter, await list_files(context.sandbox))
+            for entry in starter.files:
                 copied_files[entry.path] = await self.sandbox.read_file(context.sandbox, entry.path)
-            self.starter.verify_tree(copied_files)
+            starter.verify_tree(copied_files)
         except (FileNotFoundError, StarterIntegrityError) as exc:
             raise SOPExecutionError("immutable starter verification failed") from exc
+
+    @staticmethod
+    def _verify_starter_workspace_file_set(
+        starter: StarterManifest,
+        listed_files: list[dict[str, object]],
+    ) -> None:
+        paths: list[str] = []
+        for entry in listed_files:
+            path = entry.get("path")
+            if not isinstance(path, str):
+                raise StarterIntegrityError("starter workspace file set verification failed")
+            paths.append(path)
+        expected_paths = {entry.path for entry in starter.files}
+        if len(paths) != len(expected_paths) or set(paths) != expected_paths:
+            raise StarterIntegrityError("starter workspace file set verification failed")
 
     async def _implement(
         self,
@@ -835,6 +921,9 @@ class SOPRunner:
         else:
             implementation_technical = technical
             repair_scope_instruction = ""
+        starter = self._context_starter(context)
+        if starter.tree_sha256 != self._starter_for_technical(implementation_technical).tree_sha256:
+            raise SOPExecutionError("Engineer starter does not match TechnicalSpec capability selection")
         try:
             technical_file_paths = self._technical_file_plan_paths(implementation_technical)
         except ValueError:
@@ -893,7 +982,7 @@ class SOPRunner:
                     "role": "user",
                     "content": (
                         f"ProductSpec:\n{self._json(product)}\nTechnicalSpec:\n{self._json(implementation_technical)}\n"
-                        f"StarterManifest:\n{self._json(self.starter.as_architect_context())}\n"
+                        f"StarterManifest:\n{self._json(starter.as_architect_context())}\n"
                         "Shared public API contracts (preserve across every batch):\n"
                         f"{self._json(technical.public_api_contracts)}\n"
                         f"DiagnosticReport for repair (if any):\n{repair_context}"
@@ -968,7 +1057,7 @@ class SOPRunner:
                         "role": "user",
                         "content": (
                             f"ProductSpec:\n{self._json(product)}\nTechnicalSpec:\n{self._json(implementation_technical)}\n"
-                            f"StarterManifest:\n{self._json(self.starter.as_architect_context())}\n"
+                            f"StarterManifest:\n{self._json(starter.as_architect_context())}\n"
                             "Shared public API contracts (preserve across every batch):\n"
                             f"{self._json(technical.public_api_contracts)}\n"
                             f"ImplementationPlan:\n{self._json(plan)}\n"
@@ -978,7 +1067,7 @@ class SOPRunner:
                     },
                 ],
                 validate_artifact=lambda report, expected=batch: self._validate_file_batch_report(
-                    report, expected
+                    report, expected, starter=starter
                 ),
                 persist_handoff=False,
             )
@@ -1166,7 +1255,39 @@ class SOPRunner:
             if change.operation != "delete" and target < len(change.content) <= hard
         ]
 
+    @staticmethod
+    def _starter_for_technical(technical: TechnicalSpec) -> StarterManifest:
+        """Resolve model-selected enum values into the exact immutable manifest."""
+        try:
+            return resolve_starter_manifest(
+                tuple(capability.value for capability in technical.starter_capabilities)
+            )
+        except StarterIntegrityError as exc:
+            raise ArtifactContractViolation(code="technical_spec.starter_capabilities.invalid") from exc
+
+    def _context_starter(self, context: _Context) -> StarterManifest:
+        """Return the one resolved seed used for copy, prompts, and validation."""
+        starter = getattr(context, "starter", None)
+        if starter is not None:
+            technical = getattr(context, "technical", None)
+            if (
+                technical is not None
+                and starter.tree_sha256 != self._starter_for_technical(technical).tree_sha256
+            ):
+                raise SOPExecutionError("resolved starter does not match TechnicalSpec capability selection")
+            return starter
+        technical = getattr(context, "technical", None)
+        if technical is not None:
+            starter = self._starter_for_technical(technical)
+            context.starter = starter
+            return starter
+        # Direct bootstrap tests and internal recovery helpers can construct a
+        # context before an Architect artifact exists. They receive only the
+        # bare catalog seed, never an inferred optional capability.
+        return self.starter
+
     def _validate_technical_file_plan(self, technical: TechnicalSpec) -> None:
+        starter = self._starter_for_technical(technical)
         if technical.dependencies:
             raise ArtifactContractViolation(code="technical_spec.dependencies.starter_only")
         self._technical_file_plan_paths(technical)
@@ -1205,11 +1326,49 @@ class SOPRunner:
                 code="technical_spec.public_api_contracts.symbol_duplicate",
             )
         public_api_keys = set(contract_keys)
+        self._validate_root_extension_contract(technical, starter, planned_files, public_api_keys)
         self._validate_persistent_state_domain_slices(technical, planned_files, public_api_keys)
         self._validate_feature_surface_slices(technical, planned_files, public_api_keys)
 
+    @staticmethod
+    def _validate_root_extension_contract(
+        technical: TechnicalSpec,
+        starter: StarterManifest,
+        planned_files: dict[str, Any],
+        public_api_keys: set[tuple[str, str]],
+    ) -> None:
+        extension = starter.root_extension_contract
+        matching_plan_items = [
+            item
+            for item in technical.file_plan
+            if str(validate_workspace_path(item.path)) == extension.path
+        ]
+        if len(matching_plan_items) != 1:
+            raise ArtifactContractViolation(
+                code="technical_spec.extension_contract.file_plan_required"
+            )
+        if matching_plan_items[0].operation != extension.operation:
+            raise ArtifactContractViolation(
+                code="technical_spec.extension_contract.operation_invalid"
+            )
+        planned_file = planned_files.get(extension.path)
+        if planned_file is None or planned_file.operation != extension.operation:
+            raise ArtifactContractViolation(
+                code="technical_spec.extension_contract.file_plan_required"
+            )
+        if (extension.path, extension.symbol) not in public_api_keys or not any(
+            str(validate_workspace_path(contract.file_path)) == extension.path
+            and contract.export_style == extension.export_style
+            and contract.symbol == extension.symbol
+            for contract in technical.public_api_contracts
+        ):
+            raise ArtifactContractViolation(
+                code="technical_spec.extension_contract.public_api_required"
+            )
+
     def _playwright_smoke_paths(self, technical: TechnicalSpec) -> list[str]:
         """Return only model-owned non-delete file-plan paths runnable by the fixed starter."""
+        starter = self._starter_for_technical(technical)
         if not any(item.method == "playwright" for item in technical.test_plan):
             return []
         paths: list[str] = []
@@ -1221,9 +1380,9 @@ class SOPRunner:
             except ValueError:
                 continue
             if (
-                path.startswith("tests/")
+                path.startswith("tests/generated/")
                 and path.endswith(_PLAYWRIGHT_SMOKE_TEST_SUFFIX)
-                and self.starter.is_model_owned_path(path)
+                and starter.is_model_owned_path(path)
                 and path not in paths
             ):
                 paths.append(path)
@@ -1252,6 +1411,7 @@ class SOPRunner:
 
     def _reviewer_scope_planned_paths(self, technical: TechnicalSpec) -> tuple[str, ...]:
         """Return only files that a deterministic repair is allowed to consider."""
+        starter = self._starter_for_technical(technical)
         paths: list[str] = []
         for item in technical.file_plan:
             if item.operation == "delete":
@@ -1260,7 +1420,7 @@ class SOPRunner:
                 path = str(validate_workspace_path(item.path))
             except ValueError:
                 continue
-            if self.starter.is_protected_path(path) or not self.starter.is_model_owned_path(
+            if starter.is_protected_path(path) or not starter.is_model_owned_path(
                 path
             ):
                 continue
@@ -1921,6 +2081,7 @@ class SOPRunner:
                     )
 
     def _technical_file_plan_paths(self, technical: TechnicalSpec) -> list[str]:
+        starter = self._starter_for_technical(technical)
         paths = [item.path for item in technical.file_plan]
         if not paths:
             raise ArtifactContractViolation(
@@ -1938,11 +2099,15 @@ class SOPRunner:
             raise ArtifactContractViolation(
                 code="technical_spec.file_plan.system_managed",
             )
-        if any(self.starter.is_protected_path(str(path)) for path in workspace_paths):
+        if any(starter.is_forbidden_model_owned_path(str(path)) for path in workspace_paths):
+            raise ArtifactContractViolation(
+                code="technical_spec.extension_contract.page_path_rejected"
+            )
+        if any(starter.is_protected_path(str(path)) for path in workspace_paths):
             raise ArtifactContractViolation(
                 code="technical_spec.file_plan.starter_protected",
             )
-        if any(not self.starter.is_model_owned_path(str(path)) for path in workspace_paths):
+        if any(not starter.is_model_owned_path(str(path)) for path in workspace_paths):
             raise ArtifactContractViolation(
                 code="technical_spec.file_plan.model_root",
             )
@@ -2005,6 +2170,7 @@ class SOPRunner:
         )
 
     def _validate_implementation_plan(self, plan: ImplementationPlan, technical: TechnicalSpec) -> None:
+        starter = self._starter_for_technical(technical)
         technical_file_paths = self._technical_file_plan_paths(technical)
         if not plan.batches:
             raise ValueError("implementation plan must contain at least one batch")
@@ -2021,9 +2187,9 @@ class SOPRunner:
                 raise ValueError("implementation plan batch exceeds the configured file limit")
             for path in batch.paths:
                 workspace_path = str(validate_workspace_path(path))
-                if self.starter.is_protected_path(workspace_path):
+                if starter.is_protected_path(workspace_path):
                     raise ValueError("implementation plan includes an immutable starter path")
-                if not self.starter.is_model_owned_path(workspace_path):
+                if not starter.is_model_owned_path(workspace_path):
                     raise ValueError("implementation plan includes a non-model-owned path")
                 planned_paths.append(workspace_path)
         if len(planned_paths) != len(set(planned_paths)):
@@ -2035,7 +2201,10 @@ class SOPRunner:
         self,
         report: FileBatchReport,
         expected: ImplementationBatchPlan,
+        *,
+        starter: StarterManifest | None = None,
     ) -> None:
+        starter = starter or self.starter
         if report.batch_id != expected.id:
             raise FileBatchContractViolation(code="file_batch_report.batch_id_mismatch")
         if not report.file_changes:
@@ -2048,9 +2217,9 @@ class SOPRunner:
                 raise FileBatchContractViolation(
                     code="file_batch_report.workspace_path_invalid"
                 ) from None
-            if self.starter.is_protected_path(workspace_path):
+            if starter.is_protected_path(workspace_path):
                 raise FileBatchContractViolation(code="file_batch_report.starter_protected")
-            if not self.starter.is_model_owned_path(workspace_path):
+            if not starter.is_model_owned_path(workspace_path):
                 raise FileBatchContractViolation(code="file_batch_report.model_root")
         if len(paths) != len(set(paths)):
             raise FileBatchContractViolation(code="file_batch_report.paths_duplicate")

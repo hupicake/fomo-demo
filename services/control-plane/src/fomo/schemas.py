@@ -192,6 +192,13 @@ class DependencySpec(SchemaModel):
     reason: str
 
 
+class StarterCapabilityId(StrEnum):
+    """The only server-owned Golden Starter overlays an Architect may select."""
+
+    crud = "crud"
+    local_persistence = "local-persistence"
+
+
 class FilePlanItem(SchemaModel):
     path: str
     operation: Literal["create", "modify", "delete"]
@@ -206,6 +213,7 @@ class TestPlanItem(SchemaModel):
 
 class TechnicalSpec(SchemaModel):
     framework: str
+    starter_capabilities: list[StarterCapabilityId] = Field(default_factory=list)
     routes: list[RouteSpec] = Field(default_factory=list)
     components: list[ComponentSpec] = Field(default_factory=list)
     component_decisions: list[ComponentDecision] = Field(min_length=1)
@@ -218,6 +226,15 @@ class TechnicalSpec(SchemaModel):
     file_plan: list[FilePlanItem] = Field(default_factory=list)
     test_plan: list[TestPlanItem] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
+
+    @field_validator("starter_capabilities")
+    @classmethod
+    def unique_starter_capabilities(
+        cls, values: list[StarterCapabilityId]
+    ) -> list[StarterCapabilityId]:
+        if len(values) != len(set(values)):
+            raise ValueError("starter capabilities must not contain a duplicate")
+        return values
 
 
 class GeneratedFile(SchemaModel):

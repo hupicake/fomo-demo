@@ -44,7 +44,11 @@ from .base import (
 _APPLICATION_PORT = 8080
 _WORKSPACE = "/workspace"
 _STARTER_ROOT = "/opt/fomo/starters"
-_SUPPORTED_STARTER_ID = "fomo-next-radix-v1"
+_SUPPORTED_STARTER_ID = "fomo-next-radix-v2"
+_SUPPORTED_STARTER_CAPABILITIES = {
+    "crud": "crud",
+    "local-persistence": "local-persistence",
+}
 # OpenSandbox serializes permission modes as octal-looking JSON integers
 # (for example, 644), not Python ``0o`` integer literals (which become 420).
 _OPENSANDBOX_DIRECTORY_WIRE_MODE = 755
@@ -311,10 +315,38 @@ class OpenSandboxProvider:
         if delete_paths:
             await sandbox.files.delete_files(delete_paths)
 
-    async def copy_starter(self, ref: SandboxRef, starter_id: str) -> ExecResult:
-        """Copy the baked immutable seed into a writable generated workspace."""
+    @staticmethod
+    def _starter_copy_command(starter_id: str, capability_ids: tuple[str, ...]) -> str:
+        """Build a command entirely from trusted starter/capability enum values."""
         if starter_id != _SUPPORTED_STARTER_ID:
             raise ValueError("unsupported immutable starter")
+        requested = tuple(str(capability_id) for capability_id in capability_ids)
+        if len(requested) != len(set(requested)):
+            raise ValueError("duplicate starter capability")
+        unknown = sorted(set(requested) - set(_SUPPORTED_STARTER_CAPABILITIES))
+        if unknown:
+            raise ValueError("unsupported starter capability")
+        source_directories = [f"{_STARTER_ROOT}/{_SUPPORTED_STARTER_ID}/base"]
+        source_directories.extend(
+            (
+                f"{_STARTER_ROOT}/{_SUPPORTED_STARTER_ID}/capabilities/"
+                f"{_SUPPORTED_STARTER_CAPABILITIES[capability_id]}"
+            )
+            for capability_id in sorted(requested)
+        )
+        return " && ".join(
+            f"cp -R --no-preserve=mode,ownership -- {source_directory}/. {_WORKSPACE}/"
+            for source_directory in source_directories
+        )
+
+    async def copy_starter(
+        self,
+        ref: SandboxRef,
+        starter_id: str,
+        capability_ids: tuple[str, ...] = (),
+    ) -> ExecResult:
+        """Copy only the resolved baked seed into a writable generated workspace."""
+        command = self._starter_copy_command(starter_id, capability_ids)
 
         async def discard_output(_stream: str, _text: str) -> None:
             return None
@@ -325,10 +357,7 @@ class OpenSandboxProvider:
         return await self.exec(
             ref,
             Command(
-                command=(
-                    "cp -R --no-preserve=mode,ownership -- "
-                    f"{_STARTER_ROOT}/{_SUPPORTED_STARTER_ID}/. {_WORKSPACE}/"
-                ),
+                command=command,
                 timeout_seconds=30,
             ),
             discard_output,

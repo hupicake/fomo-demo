@@ -78,7 +78,7 @@ def _two_batch_engineer_cycle() -> list[dict[str, Any] | object]:
                 {
                     "id": "library-page",
                     "purpose": "root route composition",
-                    "paths": ["app/page.tsx"],
+                    "paths": ["app/(generated)/composition.tsx"],
                     "acceptanceIds": ["AC-1"],
                 },
                 {
@@ -95,13 +95,13 @@ def _two_batch_engineer_cycle() -> list[dict[str, Any] | object]:
             "batchId": "library-page",
             "implementedAcceptanceIds": ["AC-1"],
             "designDecisionIds": ["DD-1"],
-            "changedFiles": ["app/page.tsx"],
+            "changedFiles": ["app/(generated)/composition.tsx"],
             "knownLimitations": [],
             "fileChanges": [
                 {
-                    "path": "app/page.tsx",
+                    "path": "app/(generated)/composition.tsx",
                     "operation": "modify",
-                    "content": 'import { Library } from "@/components/features/library";\n\nexport default function HomePage() {\n  return <Library />;\n}\n',
+                    "content": 'import { Library } from "@/components/features/library";\n\nexport function GeneratedComposition() {\n  return <Library />;\n}\n',
                 }
             ],
         },
@@ -198,6 +198,13 @@ def _responses() -> dict[str, Any]:
             ],
             "publicApiContracts": [
                 {
+                    "filePath": "app/(generated)/composition.tsx",
+                    "exportStyle": "named",
+                    "symbol": "GeneratedComposition",
+                    "props": [],
+                    "type": "React.ComponentType",
+                },
+                {
                     "filePath": "components/features/library.tsx",
                     "exportStyle": "named",
                     "symbol": "Library",
@@ -216,7 +223,11 @@ def _responses() -> dict[str, Any]:
             ],
             "dependencies": [],
             "filePlan": [
-                {"path": "app/page.tsx", "operation": "modify", "reason": "root route composition"},
+                {
+                    "path": "app/(generated)/composition.tsx",
+                    "operation": "modify",
+                    "reason": "root route composition",
+                },
                 {
                     "path": "components/features/library.tsx",
                     "operation": "create",
@@ -242,7 +253,7 @@ def _responses() -> dict[str, Any]:
 
 
 def _architect_response_with_playwright_smoke_path(
-    path: str = "tests/library.smoke.spec.ts",
+    path: str = "tests/generated/library.smoke.spec.ts",
     operation: str = "create",
 ) -> dict[str, Any]:
     response = _responses()["architect"]
@@ -800,14 +811,16 @@ def test_file_batch_contract_violation_uses_a_closed_repair_instruction_map() ->
 def test_default_starter_manifest_is_digest_pinned_and_exposes_approved_primitives() -> None:
     manifest = default_starter_manifest()
 
-    assert manifest.id == "fomo-next-radix-v1"
-    assert manifest.version == "1.0.0"
-    assert manifest.tree_sha256 == "07cd7372813569fd270f04a11a219ad4fc200d3a21274ac677fd85b3da1d32d1"
+    assert manifest.id == "fomo-next-radix-v2"
+    assert manifest.version == "2.0.0"
+    assert manifest.tree_sha256 == "acae2845e79415b6c75a5aeee6057a63333ceddfd7f55921c32a02615832302a"
     assert "@/components/ui/button" in manifest.available_imports
     assert "@/components/ui/card" in manifest.available_imports
     assert "package.json" in manifest.protected_paths
     assert "playwright.config.ts" in manifest.protected_paths
     assert "components/features/**" in manifest.model_owned_roots
+    assert "app/page.tsx" in manifest.protected_paths
+    assert "tests/generated/**" in manifest.model_owned_roots
     assert manifest.base_scripts["test:smoke"] == "playwright test --project=chromium"
     manifest.verify_tree(
         {change.path: change.content.encode("utf-8") for change in manifest.file_changes}
@@ -844,7 +857,7 @@ async def test_sandbox_bootstrap_copies_verified_starter_before_initial_commit(r
     )
     assert workspace.commands == [
         "git init && git config user.email fomo@local.invalid && git config user.name 'FOMO Agent'",
-        "git add -A && git commit -m 'chore(starter): fomo-next-radix-v1'",
+        "git add -A && git commit -m 'chore(starter): fomo-next-radix-v2@2.0.0'",
         "git rev-parse HEAD",
     ]
     provenance = await repository.get_latest_artifact(run.id, "starter_provenance")
@@ -1132,7 +1145,7 @@ async def test_four_role_sop_creates_version_and_trace(repository, settings) -> 
     assert len(versions) == 1
     assert {item["path"] for item in await repository.list_version_files(project.id)} >= {
         ".gitignore",
-        "app/page.tsx",
+        "app/(generated)/composition.tsx",
         "components/features/library.tsx",
     }
     _version_id, gitignore, _sha256 = await repository.get_version_file_content(project.id, ".gitignore")
@@ -1147,8 +1160,8 @@ async def test_four_role_sop_creates_version_and_trace(repository, settings) -> 
     assert await repository.get_latest_artifact(run.id, "implementation_batch") is not None
     starter_provenance = await repository.get_latest_artifact(run.id, "starter_provenance")
     assert starter_provenance is not None
-    assert starter_provenance["id"] == "fomo-next-radix-v1"
-    assert starter_provenance["version"] == "1.0.0"
+    assert starter_provenance["id"] == "fomo-next-radix-v2"
+    assert starter_provenance["version"] == "2.0.0"
     assert starter_provenance["initialCommitSha"] == "ok"
     assert {entry["path"] for entry in starter_provenance["files"]} >= {
         "components/ui/button.tsx",
@@ -1330,7 +1343,7 @@ async def test_engineer_plan_must_exactly_cover_architect_file_plan(repository, 
                 {
                     "id": "page",
                     "purpose": "only one planned model-owned file",
-                    "paths": ["app/page.tsx"],
+                    "paths": ["app/(generated)/composition.tsx"],
                 },
             ]
         }
@@ -1344,7 +1357,7 @@ async def test_engineer_plan_must_exactly_cover_architect_file_plan(repository, 
                 {
                     "id": "overfull",
                     "purpose": "violates the bounded batch contract",
-                    "paths": ["app/page.tsx", "components/features/library.tsx"],
+                    "paths": ["app/(generated)/composition.tsx", "components/features/library.tsx"],
                 }
             ]
         }
@@ -1358,7 +1371,7 @@ async def test_engineer_plan_must_exactly_cover_architect_file_plan(repository, 
                 {
                     "id": "page",
                     "purpose": "initial files",
-                    "paths": ["app/page.tsx"],
+                    "paths": ["app/(generated)/composition.tsx"],
                 },
                 {
                     "id": "feature",
@@ -1409,7 +1422,7 @@ async def test_repair_scope_rejects_an_unrelated_full_rewrite(repository, settin
                     {
                         "severity": "error",
                         "message": "untrusted finding cannot expand repair scope",
-                        "file": "app/page.tsx",
+                        "file": "app/(generated)/composition.tsx",
                     }
                 ],
             }
@@ -1859,7 +1872,7 @@ def test_playwright_test_plan_requires_matching_model_owned_smoke_file_plan(repo
     runner._validate_technical_file_plan(accepted)
 
     for response in (
-        _architect_response_with_playwright_smoke_path("tests/library-smoke.spec.ts"),
+        _architect_response_with_playwright_smoke_path("tests/generated/library-smoke.spec.ts"),
         _architect_response_with_playwright_smoke_path(operation="delete"),
     ):
         with pytest.raises(ArtifactContractViolation) as violation:
@@ -1871,7 +1884,7 @@ def test_no_tests_smoke_gate_uses_exact_evidence_and_bounded_reviewer_scope(repo
     runner = SOPRunner(repository, ScriptedModelClient({}), FakeSandboxProvider(), settings)
     technical = TechnicalSpec.model_validate(_architect_response_with_playwright_smoke_path())
     runner._validate_technical_file_plan(technical)
-    smoke_path = "tests/library.smoke.spec.ts"
+    smoke_path = "tests/generated/library.smoke.spec.ts"
     assert SOPRunner._is_exact_playwright_no_tests_failure("\nError: No tests found\n", "1")
     assert not SOPRunner._is_exact_playwright_no_tests_failure(
         "Error: No tests found after an unrelated failure",
@@ -2386,7 +2399,9 @@ async def test_architect_contracts_bind_component_decisions_and_public_api_files
     no_contract_response.pop("publicApiContracts")
     no_contract_technical = TechnicalSpec.model_validate(no_contract_response)
     assert no_contract_technical.public_api_contracts == []
-    runner._validate_technical_file_plan(no_contract_technical)
+    with pytest.raises(ArtifactContractViolation) as missing_root_contract:
+        runner._validate_technical_file_plan(no_contract_technical)
+    assert missing_root_contract.value.code == "technical_spec.extension_contract.public_api_required"
     deleted_file_plan = [
         item.model_copy(update={"operation": "delete"})
         if item.path == "components/features/library.tsx"
@@ -2834,7 +2849,7 @@ async def test_system_managed_file_plan_retries_before_sandbox_creation(reposito
     technical = await repository.get_latest_artifact(run.id, "technical_spec")
     assert technical is not None
     assert {item["path"] for item in technical["filePlan"]} == {
-        "app/page.tsx",
+        "app/(generated)/composition.tsx",
         "components/features/library.tsx",
     }
     events = await repository.list_events(run.id)
@@ -3371,9 +3386,11 @@ async def test_file_batch_size_retry_persists_only_the_compact_requested_path(
         if event.kind == "file.changed" and event.payload.get("batchId") == "library-page"
     ]
     assert first_batch_changes == [
-        {"path": "app/page.tsx", "operation": "modify", "batchId": "library-page"}
+        {"path": "app/(generated)/composition.tsx", "operation": "modify", "batchId": "library-page"}
     ]
-    _version_id, page_source, _sha256 = await repository.get_version_file_content(project.id, "app/page.tsx")
+    _version_id, page_source, _sha256 = await repository.get_version_file_content(
+        project.id, "app/(generated)/composition.tsx"
+    )
     assert page_source == engineer_cycle[1]["fileChanges"][0]["content"]
     assert source_marker not in page_source
     assert source_marker not in json.dumps([event.payload for event in events])
