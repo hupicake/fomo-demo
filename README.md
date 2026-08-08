@@ -113,10 +113,32 @@ worker call `http://opensandbox:8080` over the Compose network and never mount
 normal `docker compose up`; it exists only as a reproducible image build target.
 The image uses the non-root `node` user with a writable `/workspace`, Node 22,
 pnpm pinned through Corepack, Git, Playwright Chromium, native Node build tools,
-and the read-only `fomo-next-radix-v1` source seed. Every workspace copies and
-verifies that seed before its first Git commit. Do not add OpenSandbox `execd`
-to it: the OpenSandbox server injects that runtime component when it creates a
-sandbox.
+and the read-only `fomo-next-radix-v2` Golden Starter assets. Every workspace
+copies a digest-pinned base plus only the Architect-selected approved
+capabilities before its first Git commit. The initial provenance records the
+base, selected capability IDs and versions, composite digest, and per-file
+hashes; an unknown, duplicate, conflicting, or tampered capability fails
+closed. Do not add OpenSandbox `execd` to it: the OpenSandbox server injects
+that runtime component when it creates a sandbox.
+
+The v2 base is deliberately generic: it supplies the Next/TypeScript/Tailwind
+foundation, vendored shadcn/Radix primitives, Geist typography, responsive app
+shell slots, and reusable loading/empty/error/toast/confirmation/validation
+states. Its protected Playwright harness includes one domain-neutral smoke spec
+so the bare base and every capability selection can pass the fixed smoke entry;
+generated acceptance tests remain limited to `tests/generated/**`. The protected
+root page delegates only to `app/(generated)/composition.tsx`, whose required
+named export is `GeneratedComposition`. It does not prescribe an entity, fields,
+business rules, navigation labels, storage key, authentication, payment, API,
+or information architecture.
+The only currently approved optional capabilities are `crud` and
+`local-persistence`; they are fixed source overlays, not model-installed
+packages. The catalog describes `crud` as generic client collection
+state/actions/render slots and `local-persistence` as an SSR-safe typed,
+versioned localStorage migration adapter. Generated product code is restricted to `app/(generated)/**`,
+`components/features/**`, `lib/domain/**`, and `tests/generated/**`.
+The official Next.js, shadcn/ui, and v0 references inform these starter
+patterns only; FOMO does not import a v0 SDK, v0 runtime, v0 API, or v0 key.
 
 The API and worker share a Python 3.11 image. Its build installs the locked
 `metagpt` extra because `AGENT_FRAMEWORK=metagpt` is the default; provider keys

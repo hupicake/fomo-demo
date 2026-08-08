@@ -390,14 +390,39 @@ Engineer 只能通过以下应用工具操作，所有实现最终落到沙箱�
 
 策略：
 
-- 首轮从受控 Next.js starter 开始，不让模型自己选择任意脚手架。
-- V1 固定使用 `fomo-next-radix-v1`：镜像与 control plane 都持有同一份 vendored
-  Next/TypeScript/Tailwind/Radix shadcn 源码、pnpm lock 和 Playwright 配置。创建 sandbox 后先复制，
-  按逐文件 SHA-256 与 canonical tree SHA-256 校验，再创建 `chore(starter)` 初始 Git commit 并持久化
-  starter provenance。
-- Architect 只接收 compact StarterManifest（可用 imports、受保护路径、model-owned roots 和 scripts）；
-  TechnicalSpec 与 Engineer 写入前都拒绝 starter/system 路径。常规路由、业务组合、领域状态和 smoke tests
-  分别位于 `app/(generated)/**`、`components/features/**`、`lib/domain/**` 与 `tests/**`。
+- 首轮从受控 Next.js Golden Starter 开始，不让模型自己选择任意脚手架。V2 的 base 固定为
+  `fomo-next-radix-v2@2.0.0`，包含精确锁定的 Next/TypeScript/Tailwind、vendored shadcn/Radix
+  源码、Geist、Playwright 配置、响应式 app shell/nav slots，以及 loading/empty/error/toast/
+  confirmation/validation 通用状态；`app/page.tsx` 是受保护的单一委托入口，只调用
+  `app/(generated)/composition.tsx`，而后者在 bare starter 中已经是可构建的中性占位实现。该固定
+  extension contract 要求 `app/(generated)/composition.tsx` 以 `modify` 出现在初始完整 `filePlan`，
+  并以 named `GeneratedComposition` 出现在 `publicApiContracts`；`app/(generated)/page.tsx` 一律拒绝。
+- base 不固化任何业务实体、字段、规则、业务文案、信息架构、storage key、schema、认证、支付或后端
+  API。模型拥有的扩展边界只有 `app/(generated)/**`、`components/features/**`、`lib/domain/**`
+  与 `tests/generated/**`；root page、测试 harness、配置、锁文件、UI primitive、app shell 和所有
+  已选 capability 都是不可写边界。受保护 harness 含一个没有领域语义的 bare `starter.smoke.spec.ts`；
+  Playwright 固定扫描 `tests/**`，模型验收测试仍只能写入 `tests/generated/**`。
+- Architect 在 `TechnicalSpec.starterCapabilities` 中显式选择能力，只能从 compact catalog 的
+  `crud` 与 `local-persistence` 中选取。能力的 id、version、asset hash、可用 imports、受保护路径和
+  conflicts 都由服务端 manifest 固定；模型不能声明任意 npm dependency、镜像路径或安装命令。
+  catalog 同时给出精炼 description/provides：`crud` 提供与业务实体无关的 client collection
+  state/create-update-remove actions/render slots；`local-persistence` 只提供 SSR-safe、typed、
+  versioned 的 localStorage envelope/migration/adapter 接口，key、schema、domain migration 和 state
+  shape 仍由模型代码决定。遇到 CRUD 生命周期或刷新后持久状态时，Architect 应选择并直接复用相应 import，
+  不在业务层重写基础设施。
+- manifest 先校验 base 和每个已选 capability 的逐文件 SHA-256 与固定 asset hash，再用
+  `base(id, version, hash) + sort(capability(id, version, hash))` 计算顺序无关的 composite hash。
+  未知、重复、冲突或文件重叠的选择一律 fail closed。OpenSandbox 镜像只保存 base 和两个独立
+  capability 目录；启动时按 manifest 的受控枚举复制 base 后叠加已选 capability，绝不接受模型提供的
+  shell 路径。provider 支持 `list_files` 时，copy 后先将实际 workspace 文件集合与 manifest 精确比较，
+  extra asset、缺失 asset 或 hash 不匹配都 fail closed；无 `list_files` 的 in-memory fallback 仅应用 manifest
+  已知精确集合。
+- sandbox 首次 Git commit 与 `starter_provenance` 同时记录 base、选中的 capability、composite hash
+  和逐文件 hash。Architect 只接收 compact manifest（catalog、选中项、imports、保护路径、模型 root 和
+  scripts），Engineer prompt、copy、校验、写入验证和 provenance 使用同一个解析后的 manifest。repair
+  Architect 直接收到已选 manifest，且 structured retry 同时校验 selection 不变；repair 计划的子集本身
+  不必再次包含 root extension contract。repair 不允许改变已经创建 sandbox 的 capability selection，避免
+  “设计/实际 seed”漂移。
 - 小改动优先 unified diff；新文件或大范围重构允许整文件写入。
 - Engineer 单个 create/modify 文件默认以 12,000 字符为拆分目标，20,000 字符为唯一硬拒收线；
   通过 `ENGINEER_TARGET_FILE_CHARACTERS` 与 `ENGINEER_MAX_FILE_CHARACTERS` 配置，二者必须为正数、
