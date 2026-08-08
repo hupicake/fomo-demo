@@ -905,7 +905,7 @@ FOMO_INFERENCE_TOKEN_TTL=4200  # virtual key duration；必须始终 >= RUN_MAX_
 # fomo-pi-ds runtime（唯一实现，无用户可选后端）
 PI_RPC_BIN=/opt/pi/bin/pi            # 基础镜像内 root 拥有的不可变工具
 PI_RPC_VERSION=0.84.1
-PI_MODEL=deepseek/deepseek-v4-flash
+PI_MODEL=fomo-litellm/fomo-pi-flash   # Pi custom provider；LiteLLM alias 再映射官方 DeepSeek Flash
 PI_THINKING=max
 # 预算：run-total 非重置 + per-command 上限
 RUN_MAX_WALL_SECONDS=3600
