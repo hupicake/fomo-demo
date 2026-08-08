@@ -1103,6 +1103,30 @@ class SOPRunner:
             "limit remain valid."
         )
 
+    def _file_batch_retry_instruction(self, violation: FileBatchContractViolation) -> str:
+        """Return a safe, trusted correction for a rejected Engineer batch."""
+        if violation.code != "file_batch_report.file_size_exceeded":
+            return violation.repair_instruction
+
+        hard = violation.hard_limit_characters
+        maximum = violation.max_observed_characters
+        if hard is None or maximum is None:
+            raise AssertionError("file size retry requires trusted size metrics")
+        target = self._engineer_target_file_characters()
+        headroom = hard - target
+        return (
+            f"The prior FileBatchReport exceeded the {hard}-character hard limit; its maximum observed "
+            f"file size was {maximum} characters. Regenerate a complete FileBatchReport for exactly the "
+            "same requested path set. For every create or modify file, rewrite the entire file from "
+            "scratch; do not trim or continue the rejected response. Do not add, remove, rename, or "
+            "substitute requested paths. Preserve the requested batch's acceptance IDs, all shared public "
+            "API contracts, and required business behavior, side effects, and imports. Do not use stubs, "
+            "TODOs, no-ops, or error-path-only implementations to shorten the result. Reuse planned domain "
+            f"stores and modules instead of duplicating them. Keep each create or modify file at or below "
+            f"the {target}-character soft target, leaving {headroom} characters of headroom below the "
+            f"{hard}-character hard limit."
+        )
+
     def _over_target_file_sizes(self, report: FileBatchReport) -> list[int]:
         target = self._engineer_target_file_characters()
         hard = self._engineer_max_file_characters()
@@ -2300,6 +2324,7 @@ class SOPRunner:
                     hard_limit_characters = trusted_contract_violation.hard_limit_characters
                     max_observed_characters = trusted_contract_violation.max_observed_characters
                     oversized_file_count = trusted_contract_violation.oversized_file_count
+                    repair_instruction = self._file_batch_retry_instruction(trusted_contract_violation)
                 if attempt + 1 < attempts:
                     retry_payload: dict[str, Any] = {
                         "action": "structured_retry",

@@ -2881,8 +2881,75 @@ async def test_file_batch_size_retry_and_failure_include_only_safe_metrics(repos
         for message in model.requests[1][1]
         if message["content"].startswith("Return only a valid FileBatchReport JSON object")
     )
+    assert correction_message == (
+        "Return only a valid FileBatchReport JSON object matching the declared schema.\n"
+        "The prior FileBatchReport exceeded the 20000-character hard limit; its maximum observed "
+        "file size was 20001 characters. Regenerate a complete FileBatchReport for exactly the "
+        "same requested path set. For every create or modify file, rewrite the entire file from "
+        "scratch; do not trim or continue the rejected response. Do not add, remove, rename, or "
+        "substitute requested paths. Preserve the requested batch's acceptance IDs, all shared public "
+        "API contracts, and required business behavior, side effects, and imports. Do not use stubs, "
+        "TODOs, no-ops, or error-path-only implementations to shorten the result. Reuse planned domain "
+        "stores and modules instead of duplicating them. Keep each create or modify file at or below "
+        "the 12000-character soft target, leaving 8000 characters of headroom below the "
+        "20000-character hard limit."
+    )
     assert source_marker not in correction_message
     assert prompt_marker not in correction_message
+
+
+@pytest.mark.asyncio
+async def test_file_batch_size_retry_persists_only_the_compact_requested_path(
+    repository, settings
+) -> None:
+    session = await repository.create_guest_session()
+    project = await repository.create_project(session.id, "Library")
+    _message, run, _created = await repository.create_message_and_run(
+        project.id, session.id, "message-file-batch-size-retry", "Create a book management system"
+    )
+    assert await repository.claim_next_run("test-worker", 60)
+    source_marker = "oversized-batch-never-persist"
+    engineer_cycle = _two_batch_engineer_cycle()
+    oversized_first_batch = {
+        **engineer_cycle[1],
+        "fileChanges": [
+            {
+                **engineer_cycle[1]["fileChanges"][0],
+                "content": source_marker + "x" * (20_001 - len(source_marker)),
+            }
+        ],
+    }
+    responses = _responses()
+    responses["engineer"] = [
+        engineer_cycle[0],
+        oversized_first_batch,
+        engineer_cycle[1],
+        engineer_cycle[2],
+        engineer_cycle[3],
+    ]
+
+    await SOPRunner(
+        repository,
+        ScriptedModelClient(responses),
+        FakeSandboxProvider(),
+        replace(settings, structured_output_retries=1),
+    ).run(run.id)
+
+    final = await repository.get_run(run.id)
+    assert final.status.value == "succeeded"
+    events = await repository.list_events(run.id)
+    first_batch_changes = [
+        event.payload
+        for event in events
+        if event.kind == "file.changed" and event.payload.get("batchId") == "library-page"
+    ]
+    assert first_batch_changes == [
+        {"path": "app/page.tsx", "operation": "modify", "batchId": "library-page"}
+    ]
+    _version_id, page_source, _sha256 = await repository.get_version_file_content(project.id, "app/page.tsx")
+    assert page_source == engineer_cycle[1]["fileChanges"][0]["content"]
+    assert source_marker not in page_source
+    assert source_marker not in json.dumps([event.payload for event in events])
 
 
 @pytest.mark.asyncio
