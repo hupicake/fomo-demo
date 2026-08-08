@@ -11,7 +11,7 @@ import httpx
 import pytest
 
 from fomo.api import create_app
-from fomo.persistence.models import ArtifactRecord, SessionRecord
+from fomo.persistence.models import ArtifactRecord, RunRecord, SessionRecord
 from fomo.schemas import ProjectResponse, RunResponse
 
 PRODUCT_CONTENT: dict[str, object] = {
@@ -190,7 +190,7 @@ async def test_snapshot_refs_use_display_run_newest_per_kind_and_canonical_order
         # Deterministic bounded title/summary; the stored content is untouched.
         assert product_ref["title"].endswith("…")
         assert len(product_ref["title"]) <= 120
-        assert product_ref["title"] == " ".join(["Alpha"] * 20)
+        assert product_ref["title"] == " ".join(["Alpha"] * 20) + "…"
         assert product_ref["summary"] == "Readers cannot manage books."
 
         assert refs[1]["id"] == technical
@@ -246,6 +246,13 @@ async def test_snapshot_refs_track_the_display_run_including_terminal(repository
             artifact_id="artifact-run-one",
             created_at=datetime(2026, 1, 1, tzinfo=UTC),
         )
+
+        # Release the active slot through the real cancel API before run two.
+        cancelled_one = await client.post(f"/v1/runs/{run_one.id}/cancel", headers=headers)
+        assert cancelled_one.status_code == 200
+        released_snapshot = (await client.get(f"/v1/projects/{project.id}", headers=headers)).json()
+        assert released_snapshot["activeRun"] is None
+
         _message, run_two, _created = await repository.create_message_and_run(
             project.id, session.id, "msg-two", "Next request", None
         )
@@ -258,14 +265,29 @@ async def test_snapshot_refs_track_the_display_run_including_terminal(repository
             created_at=datetime(2026, 1, 2, tzinfo=UTC),
         )
 
+        # Both runs share one created_at so the display-run ordering must fall
+        # through to the deterministic UUIDv7 id DESC tie-break.
+        same_instant = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+        async with repository.database.session_factory() as db_session:
+            for run_id in (run_one.id, run_two.id):
+                run_record = await db_session.get(RunRecord, run_id)
+                assert run_record is not None
+                run_record.created_at = same_instant
+            await db_session.commit()
+
+        # UUIDv7 ids are millisecond-sortable and run two was created later,
+        # so its id sorts after run one's.
+        assert run_two.id > run_one.id
+
         # The active run is the display run; run one's product ref must not leak.
         active_snapshot = (await client.get(f"/v1/projects/{project.id}", headers=headers)).json()
         assert active_snapshot["activeRun"]["id"] == run_two.id
         assert [ref["id"] for ref in active_snapshot["artifactRefs"]] == [technical]
 
-        # A terminal display run (active run cleared) still yields its refs.
-        cancelled = await client.post(f"/v1/runs/{run_two.id}/cancel", headers=headers)
-        assert cancelled.status_code == 200
+        # A terminal display run (active run cleared) still yields its refs;
+        # the id DESC tie-break must select run two over same-instant run one.
+        cancelled_two = await client.post(f"/v1/runs/{run_two.id}/cancel", headers=headers)
+        assert cancelled_two.status_code == 200
         terminal_snapshot = (await client.get(f"/v1/projects/{project.id}", headers=headers)).json()
         assert terminal_snapshot["activeRun"] is None
         assert [ref["id"] for ref in terminal_snapshot["artifactRefs"]] == [technical]
