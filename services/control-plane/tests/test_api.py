@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from io import BytesIO
 from zipfile import ZipFile
 
@@ -187,12 +188,30 @@ async def test_versioned_file_edits_restore_download_and_acceptance_projection(r
             "file",
             "src/books.ts",
         )
+        diagnostic_artifact_id = await repository.store_artifact(
+            run_id,
+            "diagnostic_report",
+            {"gates": []},
+        )
         await repository.record_evidence(
             run_id,
             "AC-BOOKS",
-            "qa_gates",
+            "playwright_smoke",
             "passed",
-            "smoke test passed",
+            json.dumps(
+                {
+                    "runId": run_id,
+                    "acceptanceId": "AC-BOOKS",
+                    "testPath": "tests/generated/books.smoke.spec.ts",
+                    "testName": "books appear",
+                    "result": "passed",
+                    "recordedAt": "2026-08-07T10:00:00Z",
+                    "exitCode": 0,
+                    "artifactRef": diagnostic_artifact_id,
+                },
+                separators=(",", ":"),
+            ),
+            artifact_id=diagnostic_artifact_id,
         )
 
         trace = await client.get(f"/v1/projects/{project_id}/trace", headers=headers)
@@ -200,6 +219,8 @@ async def test_versioned_file_edits_restore_download_and_acceptance_projection(r
         acceptance_trace = trace.json()["acceptanceTrace"]
         assert acceptance_trace[0]["acceptanceId"] == "AC-BOOKS"
         assert acceptance_trace[0]["status"] == "passed"
+        assert acceptance_trace[0]["implementationStatus"] == "implemented"
+        assert acceptance_trace[0]["evidence"][0]["kind"] == "playwright_smoke"
         assert acceptance_trace[0]["links"][0]["targetRef"] == "src/books.ts"
 
         project_snapshot = await client.get(f"/v1/projects/{project_id}", headers=headers)

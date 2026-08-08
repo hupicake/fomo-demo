@@ -6,17 +6,19 @@ import asyncio
 import json
 import posixpath
 import re
+import shlex
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 import httpx
 from pydantic import ValidationError
 
+from fomo.agent_runtime.playwright_reporter import parse_playwright_json
 from fomo.config import Settings
-from fomo.ids import uuid7
+from fomo.ids import utcnow, uuid7
 from fomo.persistence import Repository, RunLeaseLost
 from fomo.sandbox.base import (
     Command,
@@ -38,6 +40,7 @@ from fomo.schemas import (
     RunPhase,
     RunStatus,
     TechnicalSpec,
+    TestPlanItem,
 )
 from fomo.starter import (
     StarterIntegrityError,
@@ -134,7 +137,13 @@ _PLAYWRIGHT_NETWORK_CONTRACT = (
     "or any other dynamic hostname."
 )
 _PLAYWRIGHT_SMOKE_TEST_SUFFIX = ".smoke.spec.ts"
-_PLAYWRIGHT_NO_TESTS_FOUND = "Error: No tests found"
+# The fixed, protected starter harness is the only project-scope smoke gate.
+# It is executed by exact path, never via auto-discovery (pnpm test:smoke).
+_HARNESS_SMOKE_TEST_PATH = "tests/harness/starter.smoke.spec.ts"
+# testName is deliberately never interpolated into this command; only the
+# strictly validated testPath may appear, quoted as a single shell word.
+# --project=chromium pins the exact project the starter harness uses.
+_PLAYWRIGHT_JSON_COMMAND = "pnpm playwright test {} --reporter=json --project=chromium"
 _TECHNICAL_SPEC_REPAIR_INSTRUCTIONS = MappingProxyType(
     {
         "technical_spec.component_decisions.duplicate": "Use each componentDecisions.component value at most once.",
@@ -183,9 +192,30 @@ _TECHNICAL_SPEC_REPAIR_INSTRUCTIONS = MappingProxyType(
         "technical_spec.extension_contract.page_path_rejected": (
             "Do not plan app/(generated)/page.tsx; use the fixed root composition extension contract instead."
         ),
-        "technical_spec.playwright_smoke.file_plan_required": (
-            "When testPlan includes Playwright, include a model-owned create or modify filePlan path matching "
-            "tests/generated/**/*.smoke.spec.ts."
+        "technical_spec.playwright_smoke.acceptance_unknown": (
+            "Bind every playwright testPlan item to an acceptanceId that exists in "
+            "ProductSpec.acceptanceCriteria."
+        ),
+        "technical_spec.playwright_smoke.acceptance_duplicate": (
+            "Bind at most one playwright testPlan item to each acceptanceId."
+        ),
+        "technical_spec.playwright_smoke.acceptance_missing": (
+            "Bind every ProductSpec acceptanceCriterion to exactly one playwright testPlan item."
+        ),
+        "technical_spec.playwright_smoke.test_path_invalid": (
+            "Give every playwright testPlan item a testPath that is a valid relative "
+            "workspace path without traversal or case conflicts."
+        ),
+        "technical_spec.playwright_smoke.test_path_unplanned": (
+            "Make every playwright testPlan item testPath a planned model-owned create "
+            "or modify file under tests/generated/** with the .smoke.spec.ts suffix."
+        ),
+        "technical_spec.playwright_smoke.test_path_conflict": (
+            "Use each playwright testPlan testPath at most once without case-only "
+            "differences from any other planned file plan path."
+        ),
+        "technical_spec.playwright_smoke.test_name_conflict": (
+            "Use each playwright testPlan testName at most once."
         ),
         "technical_spec.dependencies.starter_only": (
             "Do not declare additional dependencies; use the immutable starter baseline or record a risk."
@@ -341,6 +371,12 @@ _FILE_BATCH_REPAIR_INSTRUCTIONS = MappingProxyType(
         "file_batch_report.file_size_exceeded": (
             "Keep every create or modify fileChanges content at or below the hard character limit stated in the prompt."
         ),
+        "file_batch_report.acceptance_ids_out_of_scope": (
+            "Keep implementedAcceptanceIds within the requested batch's authorized acceptanceIds."
+        ),
+        "file_batch_report.acceptance_ids_duplicate": (
+            "Use each implementedAcceptanceIds entry at most once."
+        ),
     }
 )
 
@@ -460,6 +496,9 @@ class _Context:
     implementation_batch_artifact_ids: list[str] = field(default_factory=list)
     candidate_commit: str | None = None
     reviewer_repair_scope: _ReviewerRepairScope | None = None
+    # acceptanceId -> non-test business files it is actually implemented in,
+    # deduplicated across batches and repair rounds. Test files never appear.
+    implemented_in_files: dict[str, set[str]] = field(default_factory=dict)
 
 
 class SOPRunner:
@@ -601,7 +640,8 @@ class SOPRunner:
                     "role": "system",
                     "content": (
                         "You are FOMO's Product Manager. Turn the user request into a concise ProductSpec JSON. "
-                        "Use stable AC-1, AC-2 acceptance IDs. Do not provide chain-of-thought, markdown, source "
+                        "Return exactly 1 to 8 acceptance criteria (canonical product scenarios prefer 4 to 6), each "
+                        "with a stable unique ID like AC-1, AC-2. Do not provide chain-of-thought, markdown, source "
                         "code, secrets, or unsupported fields."
                     ),
                 },
@@ -672,6 +712,13 @@ class SOPRunner:
 
         def validate_technical(candidate: TechnicalSpec) -> None:
             self._validate_technical_file_plan(candidate)
+            # Every ProductSpec AC must be bound to exactly one Playwright item
+            # in the initial and in every repair TechnicalSpec: _produce_technical
+            # always receives the complete spec and the plan is narrowed only
+            # later by _repair_technical.
+            product = context.product
+            assert product is not None
+            self._validate_technical_test_plan(candidate, product)
             if (
                 context.sandbox is not None
                 and self._starter_for_technical(candidate).capability_ids
@@ -707,10 +754,14 @@ class SOPRunner:
                         "and symbol. Never plan StarterManifest forbiddenModelOwnedPaths. "
                         "Put normal generated routes under app/(generated)/**, business compositions under "
                         "components/features/**, domain state/types under lib/domain/**, and smoke tests under tests/generated/**. "
-                        "app/page.tsx is an immutable delegation entry and must never be planned. When testPlan includes Playwright, filePlan must "
-                        "include at least one model-owned create or modify smoke test path matching "
-                        "tests/generated/**/*.smoke.spec.ts; do not use a "
-                        "hyphen in place of the required .smoke.spec.ts suffix. "
+                        "app/page.tsx is an immutable delegation entry and must never be planned. Every ProductSpec "
+                        "acceptanceCriterion must be bound to exactly one Playwright testPlan item, and every Playwright "
+                        "testPlan "
+                        "item must bind an existing ProductSpec acceptanceId with a unique testPath and testName: testPath "
+                        "must be a model-owned create or modify filePlan path matching tests/generated/**/*.smoke.spec.ts "
+                        "(no hyphen in place of the required .smoke.spec.ts suffix), and testName must be the exact "
+                        "Playwright test title that the JSON reporter will prove. Use each acceptanceId, testPath, and "
+                        "testName at most once across testPlan. "
                         "Return concise componentDecisions only for decision-bearing UI primitives, composed feature "
                         "surfaces, or custom strategies—not a component inventory. Leave ordinary business composition "
                         "components in components, filePlan, and publicApiContracts without requiring a same-name decision. "
@@ -797,6 +848,19 @@ class SOPRunner:
                 "designed_by",
                 "artifact",
                 artifact_id,
+                lease_token=context.lease_token,
+            )
+        for item in technical.test_plan:
+            if item.method != "playwright" or not item.test_path:
+                continue
+            await self.repository.append_trace_link(
+                context.run_id,
+                "acceptance_criterion",
+                item.acceptance_id,
+                "has_test",
+                "file",
+                str(validate_workspace_path(item.test_path)),
+                metadata={"testName": item.test_name},
                 lease_token=context.lease_token,
             )
         return technical
@@ -969,6 +1033,9 @@ class SOPRunner:
                         "components/ui primitives. Do not plan, create, modify, or delete protected paths; plan only "
                         "model-owned business files. Every TechnicalSpec.filePlan path must appear exactly once, with no "
                         "additional paths. "
+                        "Each batch.acceptanceIds must be the acceptance criteria its business source actually "
+                        "implements; a batch that writes only tests/generated/** files must declare an empty "
+                        "acceptanceIds. "
                         f"{_DEFAULT_FRONTEND_STACK_CONTRACT} {_PLAYWRIGHT_NETWORK_CONTRACT} "
                         "Honor TechnicalSpec.componentDecisions and TechnicalSpec.publicApiContracts. Preserve "
                         "TechnicalSpec.featureSurfaces: each controller coordinates only its own at-most-three declared "
@@ -990,7 +1057,7 @@ class SOPRunner:
                 },
             ],
             validate_artifact=lambda candidate: self._validate_implementation_plan(
-                candidate, implementation_technical
+                candidate, implementation_technical, product
             ),
             persist_handoff=False,
         )
@@ -1042,6 +1109,7 @@ class SOPRunner:
                             "You are FOMO's Engineer. Return only FileBatchReport JSON for the requested batch. "
                             "Generate complete source for exactly the requested relative paths and no other paths. "
                             "Do not repeat source from earlier or later batches. "
+                            "Set implementedAcceptanceIds only from the requested batch's authorized acceptanceIds. "
                             f"{self._engineer_file_character_prompt()} {_DEFAULT_FRONTEND_STACK_CONTRACT} "
                             f"{_PLAYWRIGHT_NETWORK_CONTRACT} Honor every shared public API contract supplied below. Preserve "
                             "TechnicalSpec.featureSurfaces: each controller coordinates only its own at-most-three declared "
@@ -1115,6 +1183,14 @@ class SOPRunner:
                     lease_token=context.lease_token,
                 )
                 for acceptance_id in batch_report.implemented_acceptance_ids:
+                    # implemented_in links prove business implementation only;
+                    # smoke test files never count as implementation.
+                    if change.path.startswith("tests/generated/"):
+                        continue
+                    implemented = context.implemented_in_files.setdefault(acceptance_id, set())
+                    if change.path in implemented:
+                        continue
+                    implemented.add(change.path)
                     await self.repository.append_trace_link(
                         context.run_id,
                         "acceptance_criterion",
@@ -1291,10 +1367,6 @@ class SOPRunner:
         if technical.dependencies:
             raise ArtifactContractViolation(code="technical_spec.dependencies.starter_only")
         self._technical_file_plan_paths(technical)
-        if any(item.method == "playwright" for item in technical.test_plan) and not self._playwright_smoke_paths(
-            technical
-        ):
-            raise ArtifactContractViolation(code="technical_spec.playwright_smoke.file_plan_required")
         decision_names = [decision.component for decision in technical.component_decisions]
         if len(decision_names) != len(set(decision_names)):
             raise ArtifactContractViolation(
@@ -1388,26 +1460,88 @@ class SOPRunner:
                 paths.append(path)
         return paths
 
-    def _add_no_tests_smoke_affected_files(
-        self,
-        gates: list[GateResult],
-        technical: TechnicalSpec,
-    ) -> list[GateResult]:
-        """Scope Playwright discovery failures to already validated smoke-test paths only."""
-        smoke_paths = self._playwright_smoke_paths(technical)
-        if not smoke_paths:
-            return gates
-        enriched: list[GateResult] = []
-        for gate in gates:
+    def _validate_technical_test_plan(
+        self, technical: TechnicalSpec, product: ProductSpec
+    ) -> None:
+        """Bind every Playwright item to one existing AC and one planned smoke file.
+
+        The binding is one-to-one: a Playwright item must reference an existing
+        ProductSpec AC, at most one item per AC, globally unique testPath and
+        testName, and a testPath that is a planned, non-delete, model-owned
+        tests/generated/**/*.smoke.spec.ts file. Path traversal and case-only
+        collisions fail closed.
+        """
+        product_acceptance_ids = {item.id for item in product.acceptance_criteria}
+        planned_smoke_paths = set(self._playwright_smoke_paths(technical))
+        seen_acceptance: set[str] = set()
+        seen_test_paths: set[str] = set()
+        seen_test_names: set[str] = set()
+        for item in technical.test_plan:
+            if item.method != "playwright":
+                continue
+            if item.acceptance_id not in product_acceptance_ids:
+                raise ArtifactContractViolation(
+                    code="technical_spec.playwright_smoke.acceptance_unknown"
+                )
+            if item.acceptance_id in seen_acceptance:
+                raise ArtifactContractViolation(
+                    code="technical_spec.playwright_smoke.acceptance_duplicate"
+                )
+            seen_acceptance.add(item.acceptance_id)
+            try:
+                test_path = str(validate_workspace_path(item.test_path or ""))
+            except ValueError:
+                raise ArtifactContractViolation(
+                    code="technical_spec.playwright_smoke.test_path_invalid"
+                ) from None
             if (
-                gate.gate == "smoke"
-                and gate.status == GateStatus.failed
-                and gate.summary.strip() == _PLAYWRIGHT_NO_TESTS_FOUND
+                not test_path.startswith("tests/generated/")
+                or not test_path.endswith(_PLAYWRIGHT_SMOKE_TEST_SUFFIX)
+                or test_path not in planned_smoke_paths
             ):
-                enriched.append(gate.model_copy(update={"affected_files": smoke_paths}))
-            else:
-                enriched.append(gate)
-        return enriched
+                raise ArtifactContractViolation(
+                    code="technical_spec.playwright_smoke.test_path_unplanned"
+                )
+            if test_path in seen_test_paths:
+                raise ArtifactContractViolation(
+                    code="technical_spec.playwright_smoke.test_path_conflict"
+                )
+            seen_test_paths.add(test_path)
+            if item.test_name in seen_test_names:
+                raise ArtifactContractViolation(
+                    code="technical_spec.playwright_smoke.test_name_conflict"
+                )
+            seen_test_names.add(item.test_name)
+        # Case conflicts are checked against the whole TechnicalSpec file plan,
+        # not only smoke paths: on case-insensitive filesystems a smoke test
+        # path can alias a non-smoke planned file.
+        # The conflict check covers the normalized paths of the ENTIRE file
+        # plan as a list, including delete entries: redundant-separator
+        # spellings and case-only aliases must fail closed so a Playwright
+        # test path can never alias another filePlan entry.
+        normalized_paths: list[str] = []
+        for item in technical.file_plan:
+            try:
+                normalized_paths.append(str(validate_workspace_path(item.path)))
+            except ValueError:
+                # Invalid paths are rejected by the existing file-plan
+                # validation; keep this check focused on the contract.
+                continue
+        if len(normalized_paths) != len(set(normalized_paths)):
+            raise ArtifactContractViolation(
+                code="technical_spec.playwright_smoke.test_path_conflict"
+            )
+        folded_paths = {path.casefold() for path in normalized_paths}
+        if len(folded_paths) != len(normalized_paths):
+            raise ArtifactContractViolation(
+                code="technical_spec.playwright_smoke.test_path_conflict"
+            )
+        # Every ProductSpec AC is required: exactly one Playwright item per AC.
+        missing = sorted(product_acceptance_ids - seen_acceptance)
+        if missing:
+            raise ArtifactContractViolation(
+                code="technical_spec.playwright_smoke.acceptance_missing"
+            )
 
     def _reviewer_scope_planned_paths(self, technical: TechnicalSpec) -> tuple[str, ...]:
         """Return only files that a deterministic repair is allowed to consider."""
@@ -2169,9 +2303,12 @@ class SOPRunner:
             }
         )
 
-    def _validate_implementation_plan(self, plan: ImplementationPlan, technical: TechnicalSpec) -> None:
+    def _validate_implementation_plan(
+        self, plan: ImplementationPlan, technical: TechnicalSpec, product: ProductSpec
+    ) -> None:
         starter = self._starter_for_technical(technical)
         technical_file_paths = self._technical_file_plan_paths(technical)
+        product_acceptance_ids = {item.id for item in product.acceptance_criteria}
         if not plan.batches:
             raise ValueError("implementation plan must contain at least one batch")
         if len(plan.batches) > self._engineer_max_batches():
@@ -2185,6 +2322,11 @@ class SOPRunner:
                 raise ValueError("implementation plan batch must contain at least one path")
             if len(batch.paths) > self._engineer_max_files_per_batch():
                 raise ValueError("implementation plan batch exceeds the configured file limit")
+            if not set(batch.acceptance_ids).issubset(product_acceptance_ids):
+                raise ValueError("implementation plan batch acceptance ids must come from ProductSpec")
+            if len(batch.acceptance_ids) != len(set(batch.acceptance_ids)):
+                raise ValueError("implementation plan batch acceptance ids must not repeat")
+            workspace_paths: list[str] = []
             for path in batch.paths:
                 workspace_path = str(validate_workspace_path(path))
                 if starter.is_protected_path(workspace_path):
@@ -2192,6 +2334,13 @@ class SOPRunner:
                 if not starter.is_model_owned_path(workspace_path):
                     raise ValueError("implementation plan includes a non-model-owned path")
                 planned_paths.append(workspace_path)
+                workspace_paths.append(workspace_path)
+            if batch.acceptance_ids and all(
+                path.startswith("tests/generated/") for path in workspace_paths
+            ):
+                raise ValueError(
+                    "tests-only implementation plan batches must not declare acceptance ids"
+                )
         if len(planned_paths) != len(set(planned_paths)):
             raise ValueError("implementation plan must not repeat a path across batches")
         if set(planned_paths) != set(technical_file_paths):
@@ -2225,6 +2374,14 @@ class SOPRunner:
             raise FileBatchContractViolation(code="file_batch_report.paths_duplicate")
         if set(paths) != set(expected.paths):
             raise FileBatchContractViolation(code="file_batch_report.paths_mismatch")
+        if len(report.implemented_acceptance_ids) != len(set(report.implemented_acceptance_ids)):
+            raise FileBatchContractViolation(
+                code="file_batch_report.acceptance_ids_duplicate"
+            )
+        if not set(report.implemented_acceptance_ids).issubset(set(expected.acceptance_ids)):
+            raise FileBatchContractViolation(
+                code="file_batch_report.acceptance_ids_out_of_scope"
+            )
         hard_limit_characters = self._engineer_max_file_characters()
         oversized_sizes = [
             len(change.content)
@@ -2302,10 +2459,20 @@ class SOPRunner:
         await self._transition(context, RunPhase.verification)
         if context.sandbox is None:
             raise SOPExecutionError("reviewer was invoked without a sandbox")
-        gates = self._add_no_tests_smoke_affected_files(
-            await self._run_quality_gates(context),
-            technical,
-        )
+        # Every required AC starts this round unverified: durable reset events
+        # so a prior round's passed evidence can never outlive an infra failure
+        # or a skipped execution in this round. Evidence events overwrite them.
+        await self._record_acceptance_reset_events(context, product)
+        # Project gates are closed-set project scope: they never write AC
+        # evidence, and the durable project-scope events drive the Release gate.
+        project_gates = await self._run_quality_gates(context)
+        await self._record_project_gate_events(context, project_gates)
+        project_passed = all(gate.status == GateStatus.passed for gate in project_gates)
+        acceptance_gates: list[GateResult] = []
+        if project_passed:
+            # Bounded per-AC execution only after every project gate is green.
+            acceptance_gates = await self._run_acceptance_tests(context, technical)
+        gates = [*project_gates, *acceptance_gates]
         repair_scope = await self._derive_reviewer_repair_scope(context, technical, gates)
         context.reviewer_repair_scope = repair_scope
         candidate_commit = await self._create_candidate_commit(context)
@@ -2320,7 +2487,12 @@ class SOPRunner:
                     "content": (
                         "You are FOMO's independent Reviewer. Consume ProductSpec, TechnicalSpec, and actual "
                         "deterministic command results. Return only DiagnosticReport JSON. Never claim an artifact, "
-                        "test, screenshot, or gate that is absent from the supplied evidence. When blockers remain, "
+                        "test, screenshot, or gate that is absent from the supplied evidence. Gates carry a closed "
+                        "set scope: project gates cover dependencies/typecheck/build/smoke/preview; acceptance gates "
+                        "carry acceptanceId, testPath, testName, and an outcome of passed, failed, or "
+                        "infrastructure_failed. An infrastructure_failed acceptance gate blocks the run without "
+                        "changing any AC validation. Every acceptanceCriterion in ProductSpec is required: the run "
+                        "cannot publish until each has exactly one passed acceptance gate this round. When blockers remain, "
                         "populate locationFiles with one to eight files from the supplied deterministic eligible repair "
                         "scope and never add another path; FOMO will reject an unscoped rewrite. findings.file must be "
                         "empty or name one of those same locationFiles. Do not include chain-of-thought."
@@ -2350,12 +2522,14 @@ class SOPRunner:
             finding.message for finding in draft.findings if finding.severity in {"major", "error"}
         )
         model_blockers.extend(f"{gate.gate}: {gate.summary}" for gate in failed_gates)
+        blockers = list(dict.fromkeys(item for item in model_blockers if item))
+        blockers.extend(self._missing_required_acceptance_blockers(product, gates))
         report = DiagnosticReport(
             gates=gates,
             acceptance_ids=[item.id for item in product.acceptance_criteria],
             issue_fingerprint=None,
             responsible_role=draft.responsible_role,
-            blocking_issues=list(dict.fromkeys(item for item in model_blockers if item)),
+            blocking_issues=blockers,
             evidence=[item for gate in gates for item in gate.evidence],
             location_files=draft.location_files,
             suggested_fix=draft.suggested_fix,
@@ -2382,18 +2556,94 @@ class SOPRunner:
                 artifact_id=artifact_id,
                 artifact=report,
             )
-        status = "failed" if report.blocking_issues else "passed"
-        for acceptance in product.acceptance_criteria:
+        # Evidence is written only after the DiagnosticReport artifact is
+        # durably stored, so every playwright_smoke record points at the real
+        # artifact. Infrastructure failures never write AC evidence.
+        await self._record_acceptance_evidence(context, acceptance_gates, artifact_id)
+        return report
+
+    @staticmethod
+    def _missing_required_acceptance_blockers(
+        product: ProductSpec, gates: list[GateResult]
+    ) -> list[str]:
+        """Every ProductSpec AC is required: exactly one passed gate this round.
+
+        This runs after the Reviewer draft is merged so a missing or unverified
+        AC blocks publishing even when the Reviewer model omits it.
+        """
+        passed_counts: dict[str, int] = {}
+        for gate in gates:
+            if (
+                gate.scope == "acceptance"
+                and gate.outcome == "passed"
+                and gate.acceptance_id is not None
+            ):
+                passed_counts[gate.acceptance_id] = passed_counts.get(gate.acceptance_id, 0) + 1
+        missing = [
+            item.id
+            for item in product.acceptance_criteria
+            if passed_counts.get(item.id) != 1
+        ]
+        if not missing:
+            return []
+        return [
+            "required acceptance criteria lack exactly one passed acceptance test this round: "
+            + ", ".join(sorted(missing))
+        ]
+
+    async def _record_acceptance_reset_events(
+        self, context: _Context, product: ProductSpec
+    ) -> None:
+        """Persist scope=acceptance unverified reset events for every required AC."""
+        for item in product.acceptance_criteria:
+            await self.repository.append_event(
+                context.run_id,
+                "verification.updated",
+                role="reviewer",
+                payload={
+                    "scope": "acceptance",
+                    "acceptanceId": item.id,
+                    "status": "unverified",
+                },
+                lease_token=context.lease_token,
+            )
+
+    async def _record_acceptance_evidence(
+        self,
+        context: _Context,
+        acceptance_gates: list[GateResult],
+        artifact_id: str,
+    ) -> None:
+        """Write playwright_smoke evidence only for real assertion outcomes."""
+        for gate in acceptance_gates:
+            if gate.outcome not in {"passed", "failed"}:
+                continue
+            assert gate.acceptance_id is not None
+            assert gate.test_path is not None and gate.test_name is not None
+            assert gate.exit_code is not None
+            # Bounded structured summary only; never full logs or sensitive content.
             await self.repository.record_evidence(
                 context.run_id,
-                acceptance.id,
-                "qa_gates",
-                status,
-                "All deterministic gates passed." if status == "passed" else "; ".join(report.blocking_issues),
+                gate.acceptance_id,
+                "playwright_smoke",
+                gate.outcome,
+                summary=json.dumps(
+                    {
+                        "runId": context.run_id,
+                        "acceptanceId": gate.acceptance_id,
+                        "testPath": gate.test_path,
+                        "testName": gate.test_name,
+                        "result": gate.outcome,
+                        "recordedAt": utcnow().isoformat(),
+                        "exitCode": gate.exit_code,
+                        "artifactRef": artifact_id,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
                 artifact_id=artifact_id,
                 lease_token=context.lease_token,
             )
-        return report
 
     async def _run_quality_gates(self, context: _Context) -> list[GateResult]:
         assert context.sandbox is not None
@@ -2427,33 +2677,315 @@ class SOPRunner:
                 )
             else:
                 gates.append(await self._gate_command(context, gate_name, f"pnpm {script_name}"))
-        if isinstance(scripts, dict) and "test:smoke" in scripts:
-            gates.append(await self._gate_command(context, "smoke", "pnpm test:smoke"))
-        else:
-            gates.append(
-                GateResult(
-                    gate="smoke",
-                    status=GateStatus.skipped,
-                    summary="No test:smoke script was supplied; core QA remains typecheck/build/preview.",
-                )
-            )
+        # The project smoke gate executes the fixed protected harness by exact
+        # path; it never auto-discovers generated tests via pnpm test:smoke.
+        gates.append(await self._run_project_smoke_gate(context))
         gates.append(await self._start_preview_gate(context, scripts))
         return gates
+
+    async def _run_project_smoke_gate(self, context: _Context) -> GateResult:
+        assert context.sandbox is not None
+        starter = self._context_starter(context)
+        command = _PLAYWRIGHT_JSON_COMMAND.format(shlex.quote(_HARNESS_SMOKE_TEST_PATH))
+        await self._verify_starter_invariants(context, starter)
+        result = await self._command(context, command, role="reviewer")
+        await self._verify_starter_invariants(context, starter)
+        outcome = parse_playwright_json(result.stdout)
+        if (
+            result.timed_out
+            or result.exit_code != 0
+            or outcome is None
+            or outcome.top_level_errors > 0
+            or outcome.load_errors > 0
+            or outcome.test_count != 1
+            or outcome.status != "passed"
+        ):
+            summary = (
+                self._failure_summary(result)
+                if outcome is None
+                else "Fixed starter harness smoke test did not prove exactly one passing test."
+            )
+            return GateResult(
+                gate="smoke",
+                status=GateStatus.failed,
+                summary=summary,
+                evidence=[f"command:{command}"],
+            )
+        return GateResult(
+            gate="smoke",
+            status=GateStatus.passed,
+            summary="Fixed starter harness smoke test passed.",
+            evidence=[f"command:{command}"],
+        )
+
+    async def _record_project_gate_events(
+        self, context: _Context, gates: list[GateResult]
+    ) -> None:
+        """Persist project-scope verification events replayable for the Release gate."""
+        for gate in gates:
+            await self.repository.append_event(
+                context.run_id,
+                "verification.updated",
+                role="reviewer",
+                payload={
+                    "scope": "project",
+                    "gateId": f"project:{gate.gate}",
+                    "name": gate.gate,
+                    "status": gate.status.value,
+                    "summary": gate.summary,
+                    "affectedFiles": gate.affected_files,
+                },
+                lease_token=context.lease_token,
+            )
+
+    async def _run_acceptance_tests(
+        self,
+        context: _Context,
+        technical: TechnicalSpec,
+    ) -> list[GateResult]:
+        """Run every Playwright item bound to an AC; infrastructure failure stops the batch."""
+        gates: list[GateResult] = []
+        for item in technical.test_plan:
+            if item.method != "playwright":
+                continue
+            gate = await self._run_acceptance_playwright(context, item)
+            gates.append(gate)
+            if gate.outcome == "infrastructure_failed":
+                break
+        return gates
+
+    async def _run_acceptance_playwright(
+        self, context: _Context, item: TestPlanItem
+    ) -> GateResult:
+        """One Playwright item: exactly one test whose title equals testName.
+
+        The command contains only the strictly validated, shell-quoted testPath;
+        testName is never interpolated into a shell command or regex. Only a
+        real assertion outcome (passed/failed) can produce a passed/failed
+        gate, and the reporter must agree with the exit code: passed requires
+        exitCode 0, assertion failed requires a non-zero Playwright exit.
+        Every infrastructure failure leaves the AC unverified and blocks.
+        Evidence is written later by the caller, never here.
+        """
+        assert context.sandbox is not None
+        assert item.test_path is not None and item.test_name is not None
+        starter = self._context_starter(context)
+        try:
+            test_path = str(validate_workspace_path(item.test_path))
+        except ValueError:
+            return self._acceptance_gate(
+                item,
+                None,
+                "infrastructure_failed",
+                summary="Playwright testPath is not a valid workspace path.",
+            )
+        # list_files only reports regular files: a planned testPath absent from
+        # the listing is a symlink, a missing file, or a non-regular file. The
+        # shell lstat probe below is the strong guarantee even where the
+        # provider's entry_type is not trustworthy.
+        list_files = getattr(self.sandbox, "list_files", None)
+        if not callable(list_files):
+            raise SOPExecutionError("sandbox provider cannot verify the workspace file set")
+        listed = await list_files(context.sandbox)
+        if not any(
+            isinstance(entry, dict) and str(entry.get("path")) == test_path for entry in listed
+        ):
+            return self._acceptance_gate(
+                item,
+                test_path,
+                "infrastructure_failed",
+                summary="Playwright test file is missing, a symlink, or not a regular file.",
+            )
+        if not await self._probe_regular_files(context, [test_path]):
+            return self._acceptance_gate(
+                item,
+                test_path,
+                "infrastructure_failed",
+                summary="Playwright test file is missing, a symlink, or not a regular file.",
+            )
+        # Reuse the existing starter invariant helper around generated-test
+        # execution so model-written tests can never mutate starter core.
+        await self._verify_starter_invariants(context, starter)
+        command = _PLAYWRIGHT_JSON_COMMAND.format(shlex.quote(test_path))
+        result = await self._command(context, command, role="reviewer")
+        await self._verify_starter_invariants(context, starter)
+        outcome = parse_playwright_json(result.stdout)
+        if result.timed_out or outcome is None:
+            return self._acceptance_gate(
+                item,
+                test_path,
+                "infrastructure_failed",
+                summary="Playwright JSON reporter output was missing, oversized, or malformed.",
+            )
+        if outcome.top_level_errors > 0 or outcome.load_errors > 0:
+            return self._acceptance_gate(
+                item,
+                test_path,
+                "infrastructure_failed",
+                summary="Playwright reported a startup or load failure.",
+            )
+        if outcome.test_count != 1:
+            return self._acceptance_gate(
+                item,
+                test_path,
+                "infrastructure_failed",
+                summary="Playwright did not prove exactly one test.",
+            )
+        if outcome.title != item.test_name:
+            return self._acceptance_gate(
+                item,
+                test_path,
+                "infrastructure_failed",
+                summary="Playwright test title did not match the planned testName.",
+            )
+        if outcome.status == "did_not_run":
+            return self._acceptance_gate(
+                item,
+                test_path,
+                "infrastructure_failed",
+                summary="The planned Playwright test did not run.",
+            )
+        assert outcome.status in {"passed", "failed"}
+        # Reporter and exit code must agree; any contradiction is infrastructure.
+        if outcome.status == "passed" and result.exit_code != 0:
+            return self._acceptance_gate(
+                item,
+                test_path,
+                "infrastructure_failed",
+                summary="Playwright reported a pass with a non-zero exit code.",
+            )
+        if outcome.status == "failed" and result.exit_code == 0:
+            return self._acceptance_gate(
+                item,
+                test_path,
+                "infrastructure_failed",
+                summary="Playwright reported a failed assertion with a zero exit code.",
+            )
+        result_status = outcome.status
+        summary = (
+            "Acceptance Playwright assertion passed."
+            if result_status == "passed"
+            else "Acceptance Playwright assertion failed."
+        )
+        # An assertion failure must never scope repair to the test file: only
+        # the AC's trusted non-test implemented_in files qualify, deduplicated
+        # in context. Empty scope stays empty and fails closed downstream;
+        # the existing repair-scope capacity check rejects over-large scopes.
+        affected_files = (
+            sorted(context.implemented_in_files.get(item.acceptance_id, ()))
+            if result_status == "failed"
+            else []
+        )
+        return self._acceptance_gate(
+            item,
+            test_path,
+            result_status,
+            summary=summary,
+            exit_code=result.exit_code,
+            affected_files=affected_files,
+        )
+
+    @staticmethod
+    def _acceptance_gate(
+        item: TestPlanItem,
+        test_path: str | None,
+        outcome: Literal["passed", "failed", "infrastructure_failed"],
+        *,
+        summary: str,
+        exit_code: int | None = None,
+        affected_files: list[str] | None = None,
+    ) -> GateResult:
+        return GateResult(
+            gate="acceptance_test",
+            scope="acceptance",
+            status=GateStatus.passed if outcome == "passed" else GateStatus.failed,
+            outcome=outcome,
+            summary=summary,
+            acceptance_id=item.acceptance_id,
+            test_path=test_path,
+            test_name=item.test_name,
+            exit_code=exit_code,
+            affected_files=list(affected_files or []),
+        )
+
+    async def _verify_starter_invariants(
+        self, context: _Context, starter: StarterManifest
+    ) -> None:
+        """Reuse the starter invariant helper around every Playwright run.
+
+        The protected path set currently listed in the workspace must be
+        exactly the manifest's protected files plus the system-maintained
+        .gitignore, whose content must equal the system baseline exactly;
+        every protected manifest file must still match its pinned size and
+        SHA-256; and protected files, .gitignore, and extra probe paths must
+        be regular files, never symlinks. list_files only reports regular
+        files, so a protected symlink or a newly created protected-glob file
+        fails closed even before the shell probe.
+        """
+        if context.sandbox is None:
+            raise SOPExecutionError("cannot verify starter invariants without a sandbox")
+        list_files = getattr(self.sandbox, "list_files", None)
+        if not callable(list_files):
+            raise SOPExecutionError("sandbox provider cannot verify the workspace file set")
+        try:
+            listed = await list_files(context.sandbox)
+            listed_paths = {
+                str(entry["path"])
+                for entry in listed
+                if isinstance(entry, dict) and isinstance(entry.get("path"), str)
+            }
+            protected_entries = [
+                entry for entry in starter.files if starter.is_protected_path(entry.path)
+            ]
+            expected_paths = {entry.path for entry in protected_entries} | {
+                _SYSTEM_GITIGNORE_PATH
+            }
+            listed_protected = {
+                path
+                for path in listed_paths
+                if starter.is_protected_path(path) or path == _SYSTEM_GITIGNORE_PATH
+            }
+            if listed_protected != expected_paths:
+                raise StarterIntegrityError(
+                    "starter protected file set verification failed"
+                )
+            for entry in protected_entries:
+                content = await self.sandbox.read_file(context.sandbox, entry.path)
+                starter.verify_file(entry.path, content)
+            gitignore = await self.sandbox.read_file(context.sandbox, _SYSTEM_GITIGNORE_PATH)
+            if gitignore != _SYSTEM_GITIGNORE.encode("utf-8"):
+                raise StarterIntegrityError(
+                    "starter .gitignore content verification failed"
+                )
+            if not await self._probe_regular_files(context, sorted(expected_paths)):
+                raise StarterIntegrityError(
+                    "starter protected files must be regular files, not symlinks"
+                )
+        except (FileNotFoundError, StarterIntegrityError) as exc:
+            raise SOPExecutionError("starter invariant verification failed") from exc
+
+    async def _probe_regular_files(self, context: _Context, paths: list[str]) -> bool:
+        """Trusted read-only lstat probe: every path must be a regular file and
+        never a symlink. Paths come only from the strictly validated testPath
+        or the server-owned manifest; model text is never interpolated."""
+        if context.sandbox is None:
+            raise SOPExecutionError("cannot probe files without a sandbox")
+        if not paths:
+            return True
+        checks = " && ".join(
+            f"test -f {shlex.quote(path)} && test ! -L {shlex.quote(path)}"
+            for path in paths
+        )
+        result = await self._command(context, checks, role="reviewer")
+        return result.exit_code == 0 and not result.timed_out
 
     async def _gate_command(self, context: _Context, gate: str, command: str) -> GateResult:
         result = await self._command(context, command, role="reviewer")
         status = GateStatus.passed if result.exit_code == 0 and not result.timed_out else GateStatus.failed
-        summary = "passed"
-        if status == GateStatus.failed:
-            summary = (
-                _PLAYWRIGHT_NO_TESTS_FOUND
-                if gate == "smoke" and self._is_exact_playwright_no_tests_failure(result.stdout, result.stderr)
-                else self._failure_summary(result)
-            )
         return GateResult(
             gate=gate,
             status=status,
-            summary=summary,
+            summary="passed" if status == GateStatus.passed else self._failure_summary(result),
             evidence=[f"command:{command}"],
             affected_files=self._affected_workspace_paths(result.stdout, result.stderr),
         )
@@ -3106,14 +3638,6 @@ class SOPRunner:
     def _failure_summary(result: Any) -> str:
         text = f"{result.stdout}\n{result.stderr}".strip().replace("\n", " ") or "command failed"
         return SOPRunner._redact(text)[:1000]
-
-    @staticmethod
-    def _is_exact_playwright_no_tests_failure(stdout: str, stderr: str) -> bool:
-        return any(
-            line.strip() == _PLAYWRIGHT_NO_TESTS_FOUND
-            for output in (stdout, stderr)
-            for line in output.splitlines()
-        )
 
     @staticmethod
     def _affected_workspace_paths(stdout: str, stderr: str) -> list[str]:

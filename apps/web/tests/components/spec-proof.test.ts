@@ -216,4 +216,35 @@ describe("SpecToProof rendering", () => {
     fireEvent.click(screen.getByText("search.spec.ts"));
     expect(onFileSelect).toHaveBeenCalledTimes(1);
   });
+
+  it("shows an independent implemented badge and an unverified validation state", () => {
+    const withTrace: AcceptanceTrace[] = [
+      {
+        id: "AC-1",
+        title: "Readers can search",
+        priority: "must",
+        status: "unverified",
+        implementationStatus: "implemented",
+        evidence: [],
+      },
+      {
+        id: "AC-2",
+        title: "Readers can borrow",
+        priority: "must",
+        status: "unverified",
+        implementationStatus: "not_implemented",
+        evidence: [],
+      },
+    ];
+    render(createElement(SpecToProof, {
+      onFileSelect: () => undefined,
+      slots: specSlotsFromArtifacts([], {}),
+      trace: withTrace,
+    }));
+
+    // implemented · unverified is displayed as two independent signals.
+    expect(screen.getAllByText("implemented")).toHaveLength(1);
+    expect(screen.getAllByText("not implemented")).toHaveLength(1);
+    expect(screen.getAllByText("unverified · no deterministic playwright evidence yet")).toHaveLength(2);
+  });
 });

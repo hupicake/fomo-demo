@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import mimetypes
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -940,8 +941,22 @@ class Repository:
         *,
         lease_token: str | None = None,
     ) -> str:
+        if kind == "playwright_smoke":
+            if status not in {"passed", "failed"}:
+                raise ValueError("playwright_smoke evidence status must be passed or failed")
+            if not artifact_id or not isinstance(artifact_id, str) or not artifact_id.strip():
+                raise ValueError("playwright_smoke evidence requires a nonempty artifactId")
+            self._validate_playwright_smoke_summary(
+                run_id, acceptance_key, status, summary, artifact_id
+            )
         async with self.database.session_factory() as session:
             run = await self._run_for_write(session, run_id, lease_token=lease_token)
+            if kind == "playwright_smoke":
+                artifact = await session.get(ArtifactRecord, artifact_id)
+                if artifact is None or artifact.run_id != run.id:
+                    raise ValueError(
+                        "playwright_smoke evidence artifactId must belong to the same run"
+                    )
             record = VerificationEvidenceRecord(
                 id=uuid7(),
                 run_id=run_id,
@@ -952,15 +967,64 @@ class Repository:
                 artifact_id=artifact_id,
             )
             session.add(record)
+            # Acceptance evidence always carries the closed-set acceptance
+            # scope; the frontend Release gate consumes only project scope.
             await self._append_event_in_session(
                 session,
                 run,
                 "verification.updated",
                 role="reviewer",
-                payload={"evidenceId": record.id, "acceptanceId": acceptance_key, "status": status},
+                payload={
+                    "evidenceId": record.id,
+                    "acceptanceId": acceptance_key,
+                    "status": status,
+                    "scope": "acceptance",
+                },
             )
             await session.commit()
             return record.id
+
+    @staticmethod
+    def _validate_playwright_smoke_summary(
+        run_id: str,
+        acceptance_key: str,
+        status: str,
+        summary: str,
+        artifact_id: str,
+    ) -> None:
+        """Bounded structured summary contract for playwright_smoke evidence.
+        Never full logs; every field must agree with the record parameters.
+        """
+        if len(summary.encode("utf-8")) > 4096:
+            raise ValueError("playwright_smoke evidence summary exceeds the bounded size")
+        try:
+            payload = json.loads(summary)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise ValueError(
+                "playwright_smoke evidence summary must be structured JSON"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise ValueError("playwright_smoke evidence summary must be a JSON object")
+        if payload.get("runId") != run_id:
+            raise ValueError("playwright_smoke evidence summary runId must match the run")
+        if payload.get("acceptanceId") != acceptance_key:
+            raise ValueError(
+                "playwright_smoke evidence summary acceptanceId must match the record"
+            )
+        if payload.get("result") != status:
+            raise ValueError("playwright_smoke evidence summary result must match the status")
+        if payload.get("artifactRef") != artifact_id:
+            raise ValueError(
+                "playwright_smoke evidence summary artifactRef must match the artifactId"
+            )
+        for key, limit in (("testPath", 512), ("testName", 300), ("recordedAt", 64)):
+            value = payload.get(key)
+            if not isinstance(value, str) or not value.strip() or len(value) > limit:
+                raise ValueError(
+                    f"playwright_smoke evidence summary {key} must be nonempty and bounded"
+                )
+        if type(payload.get("exitCode")) is not int:
+            raise ValueError("playwright_smoke evidence summary exitCode must be an integer")
 
     async def create_version(
         self,
@@ -1301,6 +1365,7 @@ class Repository:
     ) -> dict[str, Any]:
         links: list[TraceLinkRecord] = []
         evidence: list[VerificationEvidenceRecord] = []
+        verification_events: list[RunEventRecord] = []
         if run_id is not None:
             links = list(
                 await session.scalars(
@@ -1314,6 +1379,16 @@ class Repository:
                     select(VerificationEvidenceRecord)
                     .where(VerificationEvidenceRecord.run_id == run_id)
                     .order_by(VerificationEvidenceRecord.id.asc())
+                )
+            )
+            verification_events = list(
+                await session.scalars(
+                    select(RunEventRecord)
+                    .where(
+                        RunEventRecord.run_id == run_id,
+                        RunEventRecord.kind == "verification.updated",
+                    )
+                    .order_by(RunEventRecord.seq.asc(), RunEventRecord.id.asc())
                 )
             )
         link_payload = [
@@ -1353,18 +1428,38 @@ class Repository:
         acceptance_trace: list[dict[str, Any]] = []
         for item in specification_items:
             acceptance_id = item.stable_key
+            # Only deterministic playwright_smoke records surface as AC
+            # evidence; historical qa_gates records stay hidden.
+            item_evidence = [
+                entry
+                for entry in evidence_payload
+                if entry["acceptanceId"] == acceptance_id
+                and entry["kind"] == "playwright_smoke"
+            ]
             item_links = [
                 link
                 for link in link_payload
                 if (link["sourceKind"] == "acceptance_criterion" and link["sourceRef"] == acceptance_id)
                 or (link["targetKind"] == "acceptance_criterion" and link["targetRef"] == acceptance_id)
             ]
-            item_evidence = [entry for entry in evidence_payload if entry["acceptanceId"] == acceptance_id]
             acceptance_trace.append(
                 {
                     "acceptanceId": acceptance_id,
                     "criterion": dict(item.content),
-                    "status": self._acceptance_status(item_evidence),
+                    "status": self._acceptance_status(
+                        verification_events, acceptance_id, evidence_payload
+                    ),
+                    "implementationStatus": (
+                        "implemented"
+                        if any(
+                            link["relation"] == "implemented_in"
+                            and link["sourceKind"] == "acceptance_criterion"
+                            and link["targetKind"] == "file"
+                            and not str(link["targetRef"]).startswith("tests/generated/")
+                            for link in item_links
+                        )
+                        else "not_implemented"
+                    ),
                     "links": item_links,
                     "evidence": item_evidence,
                 }
@@ -1398,15 +1493,48 @@ class Repository:
         return {"status": "unavailable", "url": None, "runId": None}
 
     @staticmethod
-    def _acceptance_status(evidence: list[dict[str, Any]]) -> str:
-        statuses = {str(item["status"]).lower() for item in evidence}
-        if "failed" in statuses:
-            return "failed"
-        if "passed" in statuses:
-            return "passed"
-        if "skipped" in statuses:
-            return "skipped"
-        return "unverified"
+    def _acceptance_status(
+        events: list[RunEventRecord],
+        acceptance_id: str,
+        evidence_payload: list[dict[str, Any]],
+    ) -> str:
+        """Derive validation status from the latest closed-scope acceptance event.
+
+        Events are ordered by seq with a stable UUIDv7 id tie-break; the newest
+        event for the AC wins. A passed/failed event counts only when it points
+        at a real playwright_smoke evidence record; reset (unverified), scope-
+        less legacy events, and infrastructure outcomes keep the AC unverified.
+        """
+        latest: RunEventRecord | None = None
+        for event in events:
+            payload = event.payload or {}
+            if payload.get("scope") != "acceptance":
+                continue
+            if payload.get("acceptanceId") != acceptance_id:
+                continue
+            latest = event
+        if latest is None:
+            return "unverified"
+        status = str(latest.payload.get("status") or "").lower()
+        if status not in {"passed", "failed"}:
+            return "unverified"
+        evidence_id = latest.payload.get("evidenceId")
+        if not isinstance(evidence_id, str):
+            return "unverified"
+        record = next(
+            (entry for entry in evidence_payload if entry["id"] == evidence_id),
+            None,
+        )
+        if (
+            record is None
+            or record.get("kind") != "playwright_smoke"
+            or str(record.get("status")).lower() != status
+            or record.get("acceptanceId") != acceptance_id
+            or not isinstance(record.get("artifactId"), str)
+            or not record["artifactId"]
+        ):
+            return "unverified"
+        return status
 
     @staticmethod
     def _ensure_no_active_writer(project: ProjectRecord) -> None:

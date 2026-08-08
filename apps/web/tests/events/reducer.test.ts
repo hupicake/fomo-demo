@@ -50,6 +50,67 @@ describe("run presentation reducer", () => {
     expect(state.versions).toEqual([expect.objectContaining({ id: "v1", hash: "abc1234" })]);
   });
 
+  it("puts only closed-set project scope verification events into the Release gate", () => {
+    let state = createRunPresentation({
+      projectId: "project-library",
+      run: { id: "run-library", projectId: "project-library", status: "running", lastSeq: 0 },
+    });
+
+    state = reduceDomainEvent(state, event(1, "verification.updated", {
+      scope: "project",
+      gateId: "project:typecheck",
+      name: "typecheck",
+      status: "passed",
+      summary: "passed",
+    }, "reviewer"));
+    // Acceptance evidence, unverified reset events and scope-less legacy
+    // events fail closed and never reach the Release gate.
+    state = reduceDomainEvent(state, event(2, "verification.updated", {
+      scope: "acceptance",
+      evidenceId: "evidence-1",
+      acceptanceId: "AC-1",
+      status: "failed",
+    }, "reviewer"));
+    state = reduceDomainEvent(state, event(3, "verification.updated", {
+      scope: "acceptance",
+      acceptanceId: "AC-1",
+      status: "unverified",
+    }, "reviewer"));
+    state = reduceDomainEvent(state, event(4, "verification.updated", {
+      evidenceId: "legacy",
+      status: "failed",
+    }, "reviewer"));
+
+    expect(state.verifications).toEqual([
+      expect.objectContaining({ id: "project:typecheck", name: "typecheck", status: "passed", detail: "passed" }),
+    ]);
+    expect(state.problems).toEqual([]);
+
+    const chunks = domainEventToMessageChunks(event(5, "verification.updated", {
+      scope: "acceptance",
+      evidenceId: "evidence-2",
+      acceptanceId: "AC-1",
+      status: "passed",
+    }, "reviewer"));
+    expect(chunks).toEqual([]);
+  });
+
+  it("replaces a project gate result by stable gate id across repair rounds", () => {
+    let state = createRunPresentation({
+      projectId: "project-library",
+      run: { id: "run-library", projectId: "project-library", status: "running", lastSeq: 0 },
+    });
+    state = reduceDomainEvent(state, event(1, "verification.updated", {
+      scope: "project", gateId: "project:build", name: "build", status: "failed", summary: "build broke",
+    }, "reviewer"));
+    state = reduceDomainEvent(state, event(2, "verification.updated", {
+      scope: "project", gateId: "project:build", name: "build", status: "passed", summary: "passed",
+    }, "reviewer"));
+    expect(state.verifications).toEqual([
+      expect.objectContaining({ id: "project:build", status: "passed" }),
+    ]);
+  });
+
   it("drops duplicate and stale sequence numbers before mutating visible evidence", () => {
     const initial = createRunPresentation({
       projectId: "project-library",

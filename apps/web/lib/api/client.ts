@@ -161,7 +161,46 @@ function traceEvidenceStatus(value: unknown): AcceptanceTrace["evidence"][number
 function traceStatus(value: unknown): AcceptanceTrace["status"] {
   const status = text(value);
   if (status === "passed" || status === "failed" || status === "blocked") return status;
+  if (status === "unverified") return "unverified";
   return status === "skipped" ? "blocked" : "pending";
+}
+
+function implementationStatus(value: unknown): AcceptanceTrace["implementationStatus"] {
+  return value === "implemented" ? "implemented" : value === "not_implemented" ? "not_implemented" : undefined;
+}
+
+/** Only a well-formed business-file implemented_in link proves implementation:
+ * source acceptance_criterion -> target file, with a nonempty targetRef that
+ * is not a tests/generated smoke path. Explicit backend implementationStatus
+ * stays authoritative and is checked before any link-derived fallback. */
+function isImplementedInLink(link: JsonRecord): boolean {
+  if (text(link.relation) !== "implemented_in") return false;
+  const sourceKind = text(link.sourceKind || link.source_kind);
+  const targetKind = text(link.targetKind || link.target_kind);
+  const targetRef = text(link.targetRef || link.target_ref);
+  return (
+    sourceKind === "acceptance_criterion" &&
+    targetKind === "file" &&
+    targetRef.length > 0 &&
+    !targetRef.startsWith("tests/generated/")
+  );
+}
+
+/** The evidence summary is a bounded structured JSON object, never a log. */
+function evidenceLabel(source: JsonRecord, fallback: string): string {
+  const explicit = text(source.label || source.title);
+  if (explicit) return explicit;
+  const summary = text(source.summary);
+  if (!summary || summary[0] !== "{") return fallback;
+  try {
+    const parsed = JSON.parse(summary) as JsonRecord;
+    const testName = text(parsed.testName);
+    const result = text(parsed.result);
+    if (testName && result) return `${testName} · ${result}`;
+  } catch {
+    return fallback;
+  }
+  return fallback;
 }
 
 function tracePriority(value: unknown): AcceptanceTrace["priority"] {
@@ -181,11 +220,10 @@ function traceTitle(source: JsonRecord): string {
 function normalizeTraceEvidence(value: unknown, fallbackId: string): AcceptanceTrace["evidence"][number] | undefined {
   const source = record(value);
   const id = text(source.id || source.linkId || source.link_id || source.artifactId || source.artifact_id, fallbackId);
-  const label = text(source.label || source.title || source.summary || source.targetRef || source.target_ref, "Evidence");
   return {
     id,
     type: traceEvidenceType(source.type || source.kind || source.targetKind || source.target_kind),
-    label,
+    label: evidenceLabel(source, text(source.targetRef || source.target_ref, "Evidence")),
     href: text(source.href || source.url) || undefined,
     status: traceEvidenceStatus(source.status),
   };
@@ -207,6 +245,12 @@ function normalizeTrace(value: unknown): AcceptanceTrace | undefined {
     title: traceTitle(source),
     priority: tracePriority(source.priority || criterion.priority),
     status: traceStatus(source.status),
+    implementationStatus: implementationStatus(source.implementationStatus || source.implementation_status)
+      || (source.links && Array.isArray(source.links)
+        ? toArray(source.links).some((link) => isImplementedInLink(record(link)))
+          ? "implemented"
+          : "not_implemented"
+        : undefined),
     evidence,
   };
 }
@@ -238,6 +282,7 @@ function normalizeTraceResponse(value: unknown): AcceptanceTrace[] {
       title: `Acceptance criterion ${id}`,
       priority: "must",
       status: "pending",
+      implementationStatus: "not_implemented",
       evidence: [],
     };
     byAcceptanceId.set(id, created);
@@ -259,6 +304,9 @@ function normalizeTraceResponse(value: unknown): AcceptanceTrace[] {
         label: targetRef,
         status: "pending",
       });
+      if (isImplementedInLink(item)) {
+        trace.implementationStatus = "implemented";
+      }
     }
   }
 

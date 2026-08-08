@@ -213,6 +213,159 @@ describe("control plane client contract", () => {
     expect(snapshot.activeRun).toEqual(expect.objectContaining({ id: "run-failed", status: "failed" }));
   });
 
+  it("maps unverified validation and link-derived implementation status from the trace", async () => {
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    installFetch(jsonResponse({
+      project: { id: "project-1", title: "Library" },
+      messages: [],
+      runs: [],
+      trace: {
+        acceptanceTrace: [{
+          acceptanceId: "AC-1",
+          criterion: { then: "Readers can search." },
+          status: "unverified",
+          implementationStatus: "implemented",
+          links: [{ id: "link-has-test", relation: "has_test", targetKind: "file", targetRef: "tests/generated/library.smoke.spec.ts" }],
+          evidence: [{
+            id: "evidence-1",
+            kind: "playwright_smoke",
+            status: "passed",
+            summary: '{"runId":"run-9","acceptanceId":"AC-1","testPath":"tests/generated/library.smoke.spec.ts","testName":"library keeps a searchable catalog","result":"passed","recordedAt":"2026-08-07T10:00:00Z","exitCode":0,"artifactRef":null}',
+          }],
+        }],
+      },
+    }));
+
+    const snapshot = await controlPlane.getProject("project-1");
+
+    expect(snapshot.trace).toEqual([expect.objectContaining({
+      id: "AC-1",
+      status: "unverified",
+      implementationStatus: "implemented",
+      evidence: expect.arrayContaining([
+        // The bounded structured summary renders as a compact human label.
+        expect.objectContaining({ id: "evidence-1", type: "test", status: "passed", label: "library keeps a searchable catalog · passed" }),
+      ]),
+    })]);
+  });
+
+  it("derives not_implemented from the absence of implemented_in links in the graph fallback", async () => {
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    installFetch(jsonResponse({
+      project: { id: "project-1", title: "Library" },
+      messages: [],
+      runs: [],
+      trace: {
+        links: [{ id: "link-1", sourceKind: "acceptance_criterion", sourceRef: "AC-1", relation: "has_test", targetKind: "file", targetRef: "tests/generated/library.smoke.spec.ts" }],
+        evidence: [],
+      },
+    }));
+
+    const snapshot = await controlPlane.getProject("project-1");
+
+    expect(snapshot.trace).toEqual([expect.objectContaining({
+      id: "AC-1",
+      implementationStatus: "not_implemented",
+    })]);
+  });
+
+  it("does not mark implemented from a test-file implemented_in link in the graph fallback", async () => {
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    installFetch(jsonResponse({
+      project: { id: "project-1", title: "Library" },
+      messages: [],
+      runs: [],
+      trace: {
+        links: [{ id: "link-test", sourceKind: "acceptance_criterion", sourceRef: "AC-1", relation: "implemented_in", targetKind: "file", targetRef: "tests/generated/library.smoke.spec.ts" }],
+        evidence: [],
+      },
+    }));
+
+    const snapshot = await controlPlane.getProject("project-1");
+
+    expect(snapshot.trace).toEqual([expect.objectContaining({
+      id: "AC-1",
+      implementationStatus: "not_implemented",
+    })]);
+  });
+
+  it("does not mark implemented from a malformed implemented_in link in the graph fallback", async () => {
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    installFetch(jsonResponse({
+      project: { id: "project-1", title: "Library" },
+      messages: [],
+      runs: [],
+      trace: {
+        links: [
+          // implemented_in with a non-file target kind: not a business link.
+          { id: "link-bad", sourceKind: "acceptance_criterion", sourceRef: "AC-1", relation: "implemented_in", targetKind: "artifact", targetRef: "artifact-1" },
+        ],
+        evidence: [],
+      },
+    }));
+
+    const snapshot = await controlPlane.getProject("project-1");
+
+    expect(snapshot.trace).toEqual([expect.objectContaining({
+      id: "AC-1",
+      implementationStatus: "not_implemented",
+    })]);
+  });
+
+  it("marks implemented only from a well-formed business-file implemented_in link", async () => {
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    installFetch(jsonResponse({
+      project: { id: "project-1", title: "Library" },
+      messages: [],
+      runs: [],
+      trace: {
+        links: [{ id: "link-real", sourceKind: "acceptance_criterion", sourceRef: "AC-1", relation: "implemented_in", targetKind: "file", targetRef: "components/features/library.tsx" }],
+        evidence: [],
+      },
+    }));
+
+    const snapshot = await controlPlane.getProject("project-1");
+
+    expect(snapshot.trace).toEqual([expect.objectContaining({
+      id: "AC-1",
+      implementationStatus: "implemented",
+    })]);
+  });
+
+  it("applies the business-file predicate to acceptanceTrace links and keeps explicit status authoritative", async () => {
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    installFetch(jsonResponse({
+      project: { id: "project-1", title: "Library" },
+      messages: [],
+      runs: [],
+      trace: {
+        acceptanceTrace: [
+          {
+            acceptanceId: "AC-1",
+            criterion: { then: "Readers can search." },
+            status: "unverified",
+            links: [{ id: "link-snake", source_kind: "acceptance_criterion", source_ref: "AC-1", relation: "implemented_in", target_kind: "file", target_ref: "tests/generated/library.smoke.spec.ts" }],
+          },
+          {
+            acceptanceId: "AC-2",
+            criterion: { then: "Readers can borrow." },
+            status: "unverified",
+            implementationStatus: "implemented",
+            links: [{ id: "link-test-only", source_kind: "acceptance_criterion", source_ref: "AC-2", relation: "implemented_in", target_kind: "file", target_ref: "tests/generated/library-2.smoke.spec.ts" }],
+          },
+        ],
+      },
+    }));
+
+    const snapshot = await controlPlane.getProject("project-1");
+
+    expect(snapshot.trace).toEqual([
+      expect.objectContaining({ id: "AC-1", implementationStatus: "not_implemented" }),
+      // Explicit backend implementationStatus wins over link-derived fallback.
+      expect.objectContaining({ id: "AC-2", implementationStatus: "implemented" }),
+    ]);
+  });
+
   it("normalizes a ready preview from the snapshot without preserving a second origin field", async () => {
     process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
     installFetch(jsonResponse({
