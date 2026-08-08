@@ -18,12 +18,12 @@ from fomo.agent_runtime.metagpt_adapter import (
     MetaGPTUnavailable,
 )
 from fomo.agent_runtime.sop import (
+    _SYSTEM_GITIGNORE,
     ArtifactContractViolation,
     FileBatchContractViolation,
     SOPExecutionError,
     SOPRunner,
     _Context,
-    _SYSTEM_GITIGNORE,
 )
 from fomo.agent_runtime.state import FailureRouter, SOPStateMachine
 from fomo.sandbox.base import ExecResult, FileChange
@@ -2466,10 +2466,10 @@ async def test_verify_writes_playwright_smoke_evidence_after_diagnostic_artifact
     # Reset (unverified) first, then the evidence event overwrites it; the
     # diagnostic artifact is stored before the acceptance evidence is written.
     assert [event.payload["status"] for event in acceptance_events] == ["unverified", "passed"]
-    assert acceptance_events[1]["seq"] > acceptance_events[0]["seq"]
-    assert diagnostic_upsert.seq < acceptance_events[1]["seq"]
-    assert "evidenceId" in acceptance_events[1]["payload"]
-    assert "evidenceId" not in acceptance_events[0]["payload"]
+    assert acceptance_events[1].seq > acceptance_events[0].seq
+    assert diagnostic_upsert.seq < acceptance_events[1].seq
+    assert "evidenceId" in acceptance_events[1].payload
+    assert "evidenceId" not in acceptance_events[0].payload
 
 
 @pytest.mark.asyncio
