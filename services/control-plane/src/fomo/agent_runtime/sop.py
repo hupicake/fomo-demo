@@ -98,6 +98,7 @@ _WORKSPACE_PATH_IN_OUTPUT = re.compile(
 _STATE_AGGREGATION_RESPONSIBILITIES = frozenset({"compose", "re_export"})
 _STATE_PERSISTENCE_ADAPTER_RESPONSIBILITIES = frozenset({"load", "save", "migrate"})
 _FEATURE_SURFACE_COMPOSITION_RESPONSIBILITIES = frozenset({"compose", "layout", "props"})
+_MAX_FEATURE_SURFACE_CONTROLLER_CONCERNS = 3
 _DEFAULT_FRONTEND_STACK_CONTRACT = (
     "Use FOMO's default Next.js + React + TypeScript + Tailwind CSS + shadcn/ui + Lucide React "
     "frontend stack. Prefer existing components and mature shadcn/ui primitives with Lucide icons. "
@@ -154,6 +155,11 @@ _TECHNICAL_SPEC_REPAIR_INSTRUCTIONS = MappingProxyType(
         "technical_spec.feature_surfaces.component_mapping_invalid": (
             "Give every ComponentSpec an explicit interactionResponsibilities list and declare exactly one "
             "featureSurfaces entry for each component with two or more concerns."
+        ),
+        "technical_spec.feature_surfaces.controller_scope_exceeded": (
+            "Split any ComponentSpec with more than three interactionResponsibilities into multiple featureSurfaces "
+            "of at most three concerns, each with its own controller; keep the top-level aggregate composition-only "
+            "with an empty interactionResponsibilities list."
         ),
         "technical_spec.feature_surfaces.module_mapping_invalid": (
             "For each feature surface, map every declared interaction responsibility to exactly one module and "
@@ -630,10 +636,15 @@ class SOPRunner:
                         "Return publicApiContracts only for actual cross-file public symbols, not an inventory of internal "
                         "or same-file symbols; include file path, export style, symbol, props, and type. "
                         "Every ComponentSpec must explicitly set interactionResponsibilities from the schema; use [] for "
-                        "leaf or presentational components. For each component with two or more declared concerns, provide "
-                        "exactly one featureSurfaces entry. Give every declared concern its own module with filePath and "
-                        "publicSymbol, plus one separate controller module. The compositionFile may only compose children, "
-                        "arrange layout, and pass props. All composition and module files must be different model-owned create "
+                        "leaf or presentational components. A feature-surface controller may coordinate at most "
+                        f"{_MAX_FEATURE_SURFACE_CONTROLLER_CONCERNS} declared concerns. Split broader interactive areas into "
+                        "multiple featureSurfaces, each with its own composition, controller, and concern modules; a top-level "
+                        "aggregate must use [] and only compose, arrange layout, and pass props. After splitting, for each "
+                        "component with two or more declared concerns, provide exactly one featureSurfaces entry. Give every "
+                        "declared concern its own module with filePath and publicSymbol, plus one separate "
+                        "controller module. The compositionFile may only compose children, arrange layout, and pass props. "
+                        "Controllers and concern modules must reuse declared domain stores and shadcn/ui concern modules without "
+                        "duplicating CRUD logic or UI markup. All composition and module files must be different model-owned create "
                         "or modify filePlan files, and every compositionFile/compositionSymbol and module filePath/publicSymbol "
                         "pair must appear in publicApiContracts. Do not infer or merge UI responsibilities from product-domain "
                         "names. "
@@ -840,7 +851,10 @@ class SOPRunner:
                         "model-owned business files. Every TechnicalSpec.filePlan path must appear exactly once, with no "
                         "additional paths. "
                         f"{_DEFAULT_FRONTEND_STACK_CONTRACT} {_PLAYWRIGHT_NETWORK_CONTRACT} "
-                        "Honor TechnicalSpec.componentDecisions and TechnicalSpec.publicApiContracts. "
+                        "Honor TechnicalSpec.componentDecisions and TechnicalSpec.publicApiContracts. Preserve "
+                        "TechnicalSpec.featureSurfaces: each controller coordinates only its own at-most-three declared "
+                        "concerns, reusing declared domain stores and shadcn/ui concern modules without duplicating CRUD logic "
+                        "or UI markup. "
                         f"{repair_scope_instruction}"
                         "Never plan .env files, Git hooks, or files outside the workspace. Do not include chain-of-thought."
                     ),
@@ -910,7 +924,10 @@ class SOPRunner:
                             "Generate complete source for exactly the requested relative paths and no other paths. "
                             "Do not repeat source from earlier or later batches. "
                             f"{self._engineer_file_character_prompt()} {_DEFAULT_FRONTEND_STACK_CONTRACT} "
-                            f"{_PLAYWRIGHT_NETWORK_CONTRACT} Honor every shared public API contract supplied below. "
+                            f"{_PLAYWRIGHT_NETWORK_CONTRACT} Honor every shared public API contract supplied below. Preserve "
+                            "TechnicalSpec.featureSurfaces: each controller coordinates only its own at-most-three declared "
+                            "concerns, reusing declared domain stores and shadcn/ui concern modules without duplicating CRUD "
+                            "logic or UI markup. "
                             "The immutable starter already exists. Write only StarterManifest modelOwnedRoots and never "
                             "write protected paths, package configuration, or components/ui primitives. "
                             "Never write .env files, Git hooks, "
@@ -1410,6 +1427,10 @@ class SOPRunner:
             if len(concerns) != len(set(concerns)):
                 raise ArtifactContractViolation(
                     code="technical_spec.feature_surfaces.component_mapping_invalid",
+                )
+            if len(concerns) > _MAX_FEATURE_SURFACE_CONTROLLER_CONCERNS:
+                raise ArtifactContractViolation(
+                    code="technical_spec.feature_surfaces.controller_scope_exceeded",
                 )
             if len(concerns) >= 2:
                 complex_component_names.add(component.name)

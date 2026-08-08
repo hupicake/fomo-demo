@@ -511,6 +511,186 @@ def _architect_response_with_feature_surface_slices() -> dict[str, Any]:
     return response
 
 
+def _architect_response_with_three_concern_feature_surface_slices() -> dict[str, Any]:
+    response = _architect_response_with_feature_surface_slices()
+    response["components"][0]["interactionResponsibilities"].append("data_table")
+    response["featureSurfaces"][0]["modules"].append(
+        {
+            "role": "data_table",
+            "filePath": "components/features/catalog/catalog-table.tsx",
+            "publicSymbol": "CatalogTable",
+        }
+    )
+    return response
+
+
+def _architect_response_with_four_concern_feature_surface() -> dict[str, Any]:
+    response = _architect_response_with_three_concern_feature_surface_slices()
+    response["components"][0]["children"].append("CatalogRowActions")
+    response["components"][0]["interactionResponsibilities"].append("row_actions")
+    response["components"].append(
+        {
+            "name": "CatalogRowActions",
+            "responsibility": "render catalog row action controls",
+            "children": [],
+            "interactionResponsibilities": [],
+        }
+    )
+    response["featureSurfaces"][0]["modules"].append(
+        {
+            "role": "row_actions",
+            "filePath": "components/features/catalog/catalog-row-actions.tsx",
+            "publicSymbol": "CatalogRowActions",
+        }
+    )
+    response["filePlan"].append(
+        {
+            "path": "components/features/catalog/catalog-row-actions.tsx",
+            "operation": "create",
+            "reason": "catalog row action controls",
+        }
+    )
+    response["publicApiContracts"].append(
+        {
+            "filePath": "components/features/catalog/catalog-row-actions.tsx",
+            "exportStyle": "named",
+            "symbol": "CatalogRowActions",
+            "props": [],
+            "type": "React.ComponentType",
+        }
+    )
+    return response
+
+
+def _architect_response_with_split_feature_surface_slices() -> dict[str, Any]:
+    response = _architect_response_with_feature_surface_slices()
+    response["components"].insert(
+        0,
+        {
+            "name": "CatalogShell",
+            "responsibility": "compose catalog discovery and operations surfaces only",
+            "children": ["CatalogSurface", "CatalogOperationsSurface"],
+            "interactionResponsibilities": [],
+        },
+    )
+    response["components"].extend(
+        [
+            {
+                "name": "CatalogOperationsSurface",
+                "responsibility": "compose bounded catalog workflow controls",
+                "children": ["CatalogRowActions", "CatalogConfirmation"],
+                "interactionResponsibilities": ["row_actions", "confirmation"],
+            },
+            {
+                "name": "CatalogRowActions",
+                "responsibility": "render catalog row action controls",
+                "children": [],
+                "interactionResponsibilities": [],
+            },
+            {
+                "name": "CatalogConfirmation",
+                "responsibility": "render catalog confirmation controls",
+                "children": [],
+                "interactionResponsibilities": [],
+            },
+        ]
+    )
+    response["featureSurfaces"].append(
+        {
+            "componentName": "CatalogOperationsSurface",
+            "compositionFile": "components/features/catalog/catalog-operations-surface.tsx",
+            "compositionSymbol": "CatalogOperationsSurface",
+            "compositionResponsibilities": ["compose", "layout", "props"],
+            "modules": [
+                {
+                    "role": "controller",
+                    "filePath": "components/features/catalog/use-catalog-operations-controller.ts",
+                    "publicSymbol": "useCatalogOperationsController",
+                },
+                {
+                    "role": "row_actions",
+                    "filePath": "components/features/catalog/catalog-row-actions.tsx",
+                    "publicSymbol": "CatalogRowActions",
+                },
+                {
+                    "role": "confirmation",
+                    "filePath": "components/features/catalog/catalog-confirmation.tsx",
+                    "publicSymbol": "CatalogConfirmation",
+                },
+            ],
+        }
+    )
+    response["filePlan"].extend(
+        [
+            {
+                "path": "components/features/catalog/catalog-shell.tsx",
+                "operation": "create",
+                "reason": "top-level catalog composition only",
+            },
+            {
+                "path": "components/features/catalog/catalog-operations-surface.tsx",
+                "operation": "create",
+                "reason": "compose bounded catalog workflow controls",
+            },
+            {
+                "path": "components/features/catalog/use-catalog-operations-controller.ts",
+                "operation": "create",
+                "reason": "catalog workflow coordination only",
+            },
+            {
+                "path": "components/features/catalog/catalog-row-actions.tsx",
+                "operation": "create",
+                "reason": "catalog row action controls",
+            },
+            {
+                "path": "components/features/catalog/catalog-confirmation.tsx",
+                "operation": "create",
+                "reason": "catalog confirmation controls",
+            },
+        ]
+    )
+    response["publicApiContracts"].extend(
+        [
+            {
+                "filePath": "components/features/catalog/catalog-shell.tsx",
+                "exportStyle": "named",
+                "symbol": "CatalogShell",
+                "props": [],
+                "type": "React.ComponentType",
+            },
+            {
+                "filePath": "components/features/catalog/catalog-operations-surface.tsx",
+                "exportStyle": "named",
+                "symbol": "CatalogOperationsSurface",
+                "props": [],
+                "type": "React.ComponentType",
+            },
+            {
+                "filePath": "components/features/catalog/use-catalog-operations-controller.ts",
+                "exportStyle": "named",
+                "symbol": "useCatalogOperationsController",
+                "props": [],
+                "type": "() => CatalogOperationsController",
+            },
+            {
+                "filePath": "components/features/catalog/catalog-row-actions.tsx",
+                "exportStyle": "named",
+                "symbol": "CatalogRowActions",
+                "props": [],
+                "type": "React.ComponentType",
+            },
+            {
+                "filePath": "components/features/catalog/catalog-confirmation.tsx",
+                "exportStyle": "named",
+                "symbol": "CatalogConfirmation",
+                "props": [],
+                "type": "React.ComponentType",
+            },
+        ]
+    )
+    return response
+
+
 def test_artifact_contract_violation_uses_a_closed_repair_instruction_map() -> None:
     violation = ArtifactContractViolation(code="technical_spec.file_plan.system_managed")
 
@@ -957,6 +1137,9 @@ async def test_four_role_sop_creates_version_and_trace(repository, settings) -> 
     assert "featureSurfaces" in architect_system_prompt
     assert "two or more declared concerns" in architect_system_prompt
     assert "separate controller module" in architect_system_prompt
+    assert "at most 3 declared concerns" in architect_system_prompt
+    assert "top-level aggregate must use []" in architect_system_prompt
+    assert "without duplicating CRUD logic or UI markup" in architect_system_prompt
     assert "Do not infer or merge UI responsibilities from product-domain names" in architect_system_prompt
     assert "persistent_business, transient, or derived" in architect_system_prompt
     assert "mutableDomains" in architect_system_prompt
@@ -983,6 +1166,8 @@ async def test_four_role_sop_creates_version_and_trace(repository, settings) -> 
     assert "12000-character target" in engineer_plan_system_prompt
     assert "20000-character hard limit" in engineer_plan_system_prompt
     assert "only rejection threshold" in engineer_plan_system_prompt
+    assert "each controller coordinates only its own at-most-three declared concerns" in engineer_plan_system_prompt
+    assert "without duplicating CRUD logic or UI markup" in engineer_plan_system_prompt
     engineer_batch_requests = [request for request in model.requests if request[2] == "FileBatchReport"]
     assert len(engineer_batch_requests) == 2
     engineer_batch_system_prompt = engineer_batch_requests[0][1][0]["content"]
@@ -994,6 +1179,8 @@ async def test_four_role_sop_creates_version_and_trace(repository, settings) -> 
     assert "12000-character target" in engineer_batch_system_prompt
     assert "20000-character hard limit" in engineer_batch_system_prompt
     assert "only rejection threshold" in engineer_batch_system_prompt
+    assert "each controller coordinates only its own at-most-three declared concerns" in engineer_batch_system_prompt
+    assert "without duplicating CRUD logic or UI markup" in engineer_batch_system_prompt
     for engineer_batch_request in engineer_batch_requests:
         assert "Shared public API contracts" in engineer_batch_request[1][1]["content"]
         assert "StarterManifest:" in engineer_batch_request[1][1]["content"]
@@ -1933,6 +2120,45 @@ async def test_architect_two_concern_feature_surface_slices_bind_explicit_concer
 
     runner._validate_technical_file_plan(technical)
 
+    three_concern_technical = TechnicalSpec.model_validate(
+        _architect_response_with_three_concern_feature_surface_slices()
+    )
+    runner._validate_technical_file_plan(three_concern_technical)
+
+    over_budget_technical = TechnicalSpec.model_validate(
+        _architect_response_with_four_concern_feature_surface()
+    )
+    with pytest.raises(ArtifactContractViolation) as over_budget_violation:
+        runner._validate_technical_file_plan(over_budget_technical)
+    assert over_budget_violation.value.code == "technical_spec.feature_surfaces.controller_scope_exceeded"
+
+    split_technical = TechnicalSpec.model_validate(_architect_response_with_split_feature_surface_slices())
+    runner._validate_technical_file_plan(split_technical)
+    split_batches = [
+        {
+            "id": f"split-{index}",
+            "purpose": "bounded feature surface file",
+            "paths": [item.path],
+        }
+        for index, item in enumerate(split_technical.file_plan, start=1)
+    ]
+    runner._validate_implementation_plan(
+        ImplementationPlan.model_validate({"batches": split_batches}),
+        split_technical,
+    )
+    missing_and_extra_batches = [
+        *split_batches[:-1],
+        {
+            **split_batches[-1],
+            "paths": ["components/features/catalog/unplanned.tsx"],
+        },
+    ]
+    with pytest.raises(ValueError, match="paths must exactly match"):
+        runner._validate_implementation_plan(
+            ImplementationPlan.model_validate({"batches": missing_and_extra_batches}),
+            split_technical,
+        )
+
     missing_surface = technical.model_copy(update={"feature_surfaces": []})
     with pytest.raises(ArtifactContractViolation) as missing_surface_violation:
         runner._validate_technical_file_plan(missing_surface)
@@ -2341,6 +2567,84 @@ async def test_architect_feature_surface_retry_uses_closed_component_mapping_cod
     repair_instruction = (
         "Give every ComponentSpec an explicit interactionResponsibilities list and declare exactly one "
         "featureSurfaces entry for each component with two or more concerns."
+    )
+    serialized_events = json.dumps([event.payload for event in events])
+    assert repair_instruction not in serialized_events
+    assert source_marker not in serialized_events
+    correction_message = next(
+        message["content"]
+        for message in model.requests[1][1]
+        if message["content"].startswith("Return only a valid TechnicalSpec JSON object")
+    )
+    assert correction_message == (
+        "Return only a valid TechnicalSpec JSON object matching the declared schema.\n"
+        + repair_instruction
+    )
+
+
+@pytest.mark.asyncio
+async def test_architect_feature_surface_controller_budget_retries_to_split_surfaces_without_event_leak(
+    repository, settings
+) -> None:
+    session = await repository.create_guest_session()
+    project = await repository.create_project(session.id, "Catalog")
+    _message, run, _created = await repository.create_message_and_run(
+        project.id, session.id, "message-feature-surface-budget-retry", "Create a catalog management system"
+    )
+    assert await repository.claim_next_run("test-worker", 60)
+    context = SimpleNamespace(
+        run_id=run.id,
+        lease_token=await repository.get_active_lease_token(run.id),
+    )
+    source_marker = "model-body-never-leak"
+    invalid_response = _architect_response_with_four_concern_feature_surface()
+    invalid_response["components"][0]["responsibility"] = source_marker
+    model = ScriptedModelClient(
+        {
+            "architect": [
+                invalid_response,
+                _architect_response_with_split_feature_surface_slices(),
+            ]
+        }
+    )
+    runner = SOPRunner(
+        repository,
+        model,
+        FakeSandboxProvider(),
+        replace(settings, structured_output_retries=1),
+    )
+
+    artifact = await runner._role(
+        context,
+        role="architect",
+        model_alias="architect",
+        schema=TechnicalSpec,
+        messages=[{"role": "system", "content": "test architect controller budget correction"}],
+        validate_artifact=runner._validate_technical_file_plan,
+    )
+
+    assert isinstance(artifact, TechnicalSpec)
+    assert [surface.component_name for surface in artifact.feature_surfaces] == [
+        "CatalogSurface",
+        "CatalogOperationsSurface",
+    ]
+    events = await repository.list_events(run.id)
+    retry_event = next(
+        event
+        for event in events
+        if event.kind == "agent.activity"
+        and event.role == "architect"
+        and event.payload.get("action") == "structured_retry"
+    )
+    assert retry_event.payload == {
+        "action": "structured_retry",
+        "summary": "The structured hand-off was invalid; requesting a schema-correct response.",
+        "reasonCode": "technical_spec.feature_surfaces.controller_scope_exceeded",
+    }
+    repair_instruction = (
+        "Split any ComponentSpec with more than three interactionResponsibilities into multiple featureSurfaces "
+        "of at most three concerns, each with its own controller; keep the top-level aggregate composition-only "
+        "with an empty interactionResponsibilities list."
     )
     serialized_events = json.dumps([event.payload for event in events])
     assert repair_instruction not in serialized_events

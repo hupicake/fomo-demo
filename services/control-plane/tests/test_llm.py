@@ -697,7 +697,7 @@ def test_settings_rejects_invalid_engineer_file_character_limits(
         Settings.from_env()
 
 
-def test_gpt55_role_routes_use_high_reasoning_effort_without_pro_models() -> None:
+def test_gpt55_role_routes_use_xhigh_reasoning_effort_without_pro_models() -> None:
     config = (Path(__file__).resolve().parents[3] / "infra" / "litellm" / "config.yaml").read_text(
         encoding="utf-8"
     )
@@ -708,6 +708,6 @@ def test_gpt55_role_routes_use_high_reasoning_effort_without_pro_models() -> Non
         )
         assert match is not None
         assert "model: openai/gpt-5.5" in match.group("body")
-        assert "reasoning_effort: high" in match.group("body")
+        assert "reasoning_effort: xhigh" in match.group("body")
 
     assert all("pro" not in model.lower() for model in re.findall(r"^      model: (.+)$", config, re.M))
