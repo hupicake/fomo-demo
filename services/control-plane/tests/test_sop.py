@@ -2335,6 +2335,19 @@ async def _acceptance_context(repository, sandbox: FakeSandboxProvider, message_
         project.id, session.id, message_id, "Create a book management system"
     )
     assert await repository.claim_next_run("test-worker", 60)
+    lease_token = await repository.get_active_lease_token(run.id)
+    # These tests invoke the acceptance runners directly without
+    # _produce_product, so the two ProductSpec AC spec items are seeded with
+    # the active lease before any get_trace assertion.
+    await repository.upsert_acceptance_items(
+        project.id,
+        run.id,
+        [
+            {"id": "AC-1", "given": "books", "when": "adding", "then": "the list updates"},
+            {"id": "AC-2", "given": "books", "when": "searching", "then": "results filter"},
+        ],
+        lease_token=lease_token,
+    )
     ref = await sandbox.create(project.id)
     await sandbox.apply_changes(
         ref,
@@ -2358,7 +2371,7 @@ async def _acceptance_context(repository, sandbox: FakeSandboxProvider, message_
         base_version_id=None,
         phase=RunPhase.implementation,
         prompt="Create a book management system",
-        lease_token=await repository.get_active_lease_token(run.id),
+        lease_token=lease_token,
         sandbox=ref,
     )
     return project, run, context
@@ -2390,13 +2403,22 @@ async def test_verify_writes_playwright_smoke_evidence_after_diagnostic_artifact
             ),
         ],
     )
+    lease_token = await repository.get_active_lease_token(run.id)
+    # This test drives _verify directly without _produce_product, so the AC
+    # spec item is seeded with the active lease before get_trace assertions.
+    await repository.upsert_acceptance_items(
+        project.id,
+        run.id,
+        [{"id": "AC-1", "given": "books", "when": "adding", "then": "the list updates"}],
+        lease_token=lease_token,
+    )
     context = _Context(
         run_id=run.id,
         project_id=project.id,
         base_version_id=None,
         phase=RunPhase.implementation,
         prompt="Create a book management system",
-        lease_token=await repository.get_active_lease_token(run.id),
+        lease_token=lease_token,
         sandbox=ref,
     )
     product = ProductSpec.model_validate(_responses()["pm"])
@@ -2410,9 +2432,15 @@ async def test_verify_writes_playwright_smoke_evidence_after_diagnostic_artifact
     assert report.gates[-1].outcome == "passed"
     assert report.gates[-1].exit_code == 0
     assert not report.blocking_issues
-    diagnostic = await repository.get_latest_artifact(run.id, "diagnostic_report")
-    assert diagnostic is not None
-    artifact_id = diagnostic["id"]
+    events = await repository.list_events(run.id)
+    # get_latest_artifact returns the content only, never an envelope; the
+    # diagnostic artifact id comes from its artifact.upserted event.
+    diagnostic_upsert = next(
+        event
+        for event in events
+        if event.kind == "artifact.upserted" and event.payload.get("kind") == "diagnostic_report"
+    )
+    artifact_id = diagnostic_upsert.payload["artifactId"]
     trace = await repository.get_trace(project.id, run.id)
     item = trace["acceptance_trace"][0]
     assert item["status"] == "passed"
@@ -2430,15 +2458,16 @@ async def test_verify_writes_playwright_smoke_evidence_after_diagnostic_artifact
         "exitCode": 0,
         "artifactRef": artifact_id,
     }
-    events = await repository.list_events(run.id)
     acceptance_events = [
         event
         for event in events
         if event.kind == "verification.updated" and event.payload.get("scope") == "acceptance"
     ]
-    # Reset (unverified) first, then the evidence event overwrites it.
+    # Reset (unverified) first, then the evidence event overwrites it; the
+    # diagnostic artifact is stored before the acceptance evidence is written.
     assert [event.payload["status"] for event in acceptance_events] == ["unverified", "passed"]
     assert acceptance_events[1]["seq"] > acceptance_events[0]["seq"]
+    assert diagnostic_upsert.seq < acceptance_events[1]["seq"]
     assert "evidenceId" in acceptance_events[1]["payload"]
     assert "evidenceId" not in acceptance_events[0]["payload"]
 
@@ -2477,13 +2506,22 @@ async def test_verify_assertion_failure_writes_failed_evidence_and_blocks_requir
             ),
         ],
     )
+    lease_token = await repository.get_active_lease_token(run.id)
+    # This test drives _verify directly without _produce_product, so the AC
+    # spec item is seeded with the active lease before get_trace assertions.
+    await repository.upsert_acceptance_items(
+        project.id,
+        run.id,
+        [{"id": "AC-1", "given": "books", "when": "adding", "then": "the list updates"}],
+        lease_token=lease_token,
+    )
     context = _Context(
         run_id=run.id,
         project_id=project.id,
         base_version_id=None,
         phase=RunPhase.implementation,
         prompt="Create a book management system",
-        lease_token=await repository.get_active_lease_token(run.id),
+        lease_token=lease_token,
         sandbox=ref,
     )
     product = ProductSpec.model_validate(_responses()["pm"])
@@ -2503,15 +2541,29 @@ async def test_verify_assertion_failure_writes_failed_evidence_and_blocks_requir
     assert report.gates[-1].exit_code == 1
     assert report.gates[-1].affected_files == ["components/features/library.tsx"]
     assert any("required acceptance criteria lack exactly one passed" in issue for issue in report.blocking_issues)
-    diagnostic = await repository.get_latest_artifact(run.id, "diagnostic_report")
-    assert diagnostic is not None
-    artifact_id = diagnostic["id"]
+    events = await repository.list_events(run.id)
+    # get_latest_artifact returns the content only, never an envelope; the
+    # diagnostic artifact id comes from its artifact.upserted event.
+    diagnostic_upsert = next(
+        event
+        for event in events
+        if event.kind == "artifact.upserted" and event.payload.get("kind") == "diagnostic_report"
+    )
+    artifact_id = diagnostic_upsert.payload["artifactId"]
     trace = await repository.get_trace(project.id, run.id)
     item = trace["acceptance_trace"][0]
     assert item["status"] == "failed"
     assert item["evidence"][0]["status"] == "failed"
     assert item["evidence"][0]["artifactId"] == artifact_id
     assert json.loads(item["evidence"][0]["summary"])["artifactRef"] == artifact_id
+    evidence_event = next(
+        event
+        for event in events
+        if event.kind == "verification.updated"
+        and event.payload.get("scope") == "acceptance"
+        and "evidenceId" in event.payload
+    )
+    assert diagnostic_upsert.seq < evidence_event.seq
 
 
 @pytest.mark.asyncio
@@ -2804,13 +2856,25 @@ async def test_verify_skips_acceptance_tests_when_a_project_gate_fails(repositor
             ),
         ],
     )
+    lease_token = await repository.get_active_lease_token(run.id)
+    # This test drives _verify directly without _produce_product, so the AC
+    # spec items are seeded with the active lease before get_trace assertions.
+    await repository.upsert_acceptance_items(
+        project.id,
+        run.id,
+        [
+            {"id": "AC-1", "given": "books", "when": "adding", "then": "the list updates"},
+            {"id": "AC-2", "given": "books", "when": "searching", "then": "results filter"},
+        ],
+        lease_token=lease_token,
+    )
     context = _Context(
         run_id=run.id,
         project_id=project.id,
         base_version_id=None,
         phase=RunPhase.implementation,
         prompt="Create a book management system",
-        lease_token=await repository.get_active_lease_token(run.id),
+        lease_token=lease_token,
         sandbox=ref,
     )
     product = _two_ac_product()
@@ -2825,10 +2889,14 @@ async def test_verify_skips_acceptance_tests_when_a_project_gate_fails(repositor
 
     assert any(gate.gate == "typecheck" and gate.status == GateStatus.failed for gate in report.gates)
     assert not any(gate.scope == "acceptance" for gate in report.gates)
-    assert any(
+    # A project gate failure already blocks publishing; the unrun ACs stay
+    # unverified and must not add a required-AC blocker that would reroute the
+    # typecheck failure to the Product Manager.
+    assert not any(
         "required acceptance criteria lack exactly one passed" in issue
         for issue in report.blocking_issues
     )
+    assert report.responsible_role == "engineer"
     events = await repository.list_events(run.id)
     reset_events = [
         event

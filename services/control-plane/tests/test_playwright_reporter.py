@@ -72,11 +72,11 @@ def test_overall_expected_requires_a_real_passed_result() -> None:
         _report([_suite([_spec("skipped", "expected", "skipped")])])
     )
     assert skipped_result is not None and skipped_result.status == "did_not_run"
-    # No results at all: fail closed.
+    # No results at all is structurally invalid: fail closed to None.
     no_results = parse_playwright_json(
         _report([_suite([_spec("no results", "expected", no_results=True)])])
     )
-    assert no_results is not None and no_results.status == "did_not_run"
+    assert no_results is None
 
 
 def test_assertion_failure_requires_unexpected_overall_with_plain_failed_result() -> None:
@@ -189,6 +189,28 @@ def test_structural_validation_covers_every_result_entry() -> None:
         ]
     )
     assert parse_playwright_json(report) is None
+
+    # A test without a results key at all is also structurally invalid.
+    missing = _report(
+        [
+            _suite(
+                [
+                    {
+                        "title": "missing",
+                        "ok": True,
+                        "tests": [
+                            {
+                                "expectedStatus": "passed",
+                                "status": "expected",
+                                "projectName": "chromium",
+                            }
+                        ],
+                    }
+                ]
+            )
+        ]
+    )
+    assert parse_playwright_json(missing) is None
 
     # Every result entry must be validated; the last result still decides the
     # single-run status.

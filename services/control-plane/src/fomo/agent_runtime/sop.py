@@ -2523,7 +2523,12 @@ class SOPRunner:
         )
         model_blockers.extend(f"{gate.gate}: {gate.summary}" for gate in failed_gates)
         blockers = list(dict.fromkeys(item for item in model_blockers if item))
-        blockers.extend(self._missing_required_acceptance_blockers(product, gates))
+        if project_passed:
+            # Only this round's executed acceptance gates can prove required
+            # ACs. A project gate failure already blocks publishing, and the
+            # untouched unverified ACs must not reroute a typecheck/build
+            # failure to the Product Manager.
+            blockers.extend(self._missing_required_acceptance_blockers(product, gates))
         report = DiagnosticReport(
             gates=gates,
             acceptance_ids=[item.id for item in product.acceptance_criteria],
