@@ -100,6 +100,7 @@ export function normalizeRun(value: unknown): RunSnapshot | undefined {
     id,
     projectId: text(source.projectId || source.project_id),
     status: toRunStatus(source.status),
+    phase: text(source.phase) || undefined,
     lastSeq: numberValue(source.lastSeq ?? source.last_seq),
     createdAt: text(source.createdAt || source.created_at) || undefined,
     updatedAt: text(source.updatedAt || source.updated_at) || undefined,
@@ -385,11 +386,18 @@ function normalizePreview(value: unknown): PreviewRef | undefined {
   if (!status && !source.url) {
     return undefined;
   }
+  const verificationStatus = text(source.verificationStatus || source.verification_status);
+  const normalizedVerificationStatus = verificationStatus === "verified"
+    ? "verified"
+    : verificationStatus === "unverified"
+      ? "unverified"
+      : undefined;
   return {
     status: (status || "pending") as PreviewRef["status"],
     url: text(source.url) || undefined,
     runId: text(source.runId || source.run_id) || undefined,
     error: text(source.error || source.detail) || undefined,
+    ...(normalizedVerificationStatus ? { verificationStatus: normalizedVerificationStatus } : {}),
   };
 }
 
@@ -399,23 +407,30 @@ function normalizeArtifactRef(value: unknown): VisibleArtifactRef | undefined {
   const runId = text(source.runId || source.run_id);
   const kind = text(source.kind);
   const role = text(source.role);
+  const stage = text(source.stage);
   const schemaVersion = numberValue(source.schemaVersion ?? source.schema_version, -1);
   const title = text(source.title);
   const summary = text(source.summary);
   const createdAt = text(source.createdAt || source.created_at);
-  if (!id || !runId || !kind || !role || schemaVersion < 0 || !title || !summary || !createdAt) {
+  if (!id || !runId || !kind || !role || !stage || schemaVersion < 0 || !title || !summary || !createdAt) {
     return undefined;
   }
   if (!artifactKinds.includes(kind as ArtifactKind)) {
     return undefined;
   }
-  // The kind->role mapping is fixed: a ref whose role does not match its kind
-  // is malformed and fails closed.
-  const expectedRole = kind === "product_spec" ? "product_manager" : "architect";
-  if (role !== expectedRole) {
+  const expected = {
+    run_input: ["user", "input"],
+    build_plan: ["pi", "planning"],
+    acceptance_contract: ["fomo", "acceptance"],
+    diagnostic_report: ["fomo", "verification"],
+    product_spec: ["product_manager", "product"],
+    technical_spec: ["architect", "architecture"],
+  } as const;
+  const [expectedRole, expectedStage] = expected[kind as ArtifactKind];
+  if (role !== expectedRole || stage !== expectedStage) {
     return undefined;
   }
-  return { id, runId, kind: kind as ArtifactKind, role: expectedRole, schemaVersion, title, summary, createdAt };
+  return { id, runId, kind: kind as ArtifactKind, role: expectedRole, stage: expectedStage, schemaVersion, title, summary, createdAt };
 }
 
 function normalizeArtifactDetail(value: unknown): ArtifactDetail | undefined {

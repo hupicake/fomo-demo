@@ -21,7 +21,7 @@ export const demoProjectSnapshot: ProjectSnapshot = {
       id: "demo-summary",
       role: "assistant",
       content:
-        "## 图书管理系统已生成\n\n四个角色已完成需求、架构、实现与验收。右侧可以查看**代码**、**验证记录**和版本证据；这个页面是明确标注的本地演示夹具，并不代表真实 sandbox 成功。",
+        "## 图书管理系统已生成\n\nDirect Pi 已完成规划、实现与修复，FOMO 已执行独立验收。右侧可以查看**代码**、**验证记录**和版本证据；这个页面是明确标注的本地演示夹具，并不代表真实 sandbox 成功。",
       createdAt: "2026-08-07T11:22:00.000Z",
     },
   ],
@@ -29,6 +29,7 @@ export const demoProjectSnapshot: ProjectSnapshot = {
     id: "demo-run-library",
     projectId: demoProjectId,
     status: "completed",
+    phase: "ready",
     lastSeq: 28,
   },
   lastSeq: 28,
@@ -197,6 +198,12 @@ export function createDemoRunPresentation(): RunPresentation {
   });
   return {
     ...state,
+    stages: {
+      planning: { stage: "planning", status: "completed", title: "Plan", detail: "BuildPlan 与验收契约已冻结。", updatedAt: "2026-08-07T10:38:00.000Z" },
+      building: { stage: "building", status: "completed", title: "Build", detail: "Direct Pi 在受控目录完成产品实现。", updatedAt: "2026-08-07T11:12:00.000Z" },
+      verifying: { stage: "verifying", status: "completed", title: "Verify", detail: "干净沙箱与浏览器验收均通过。", updatedAt: "2026-08-07T11:21:00.000Z" },
+      repairing: { stage: "repairing", status: "idle", title: "Repair" },
+    },
     roles: {
       product_manager: {
         role: "product_manager",
@@ -229,17 +236,17 @@ export function createDemoRunPresentation(): RunPresentation {
     },
     artifacts: [
       {
-        id: "product-spec-demo",
-        kind: "product-spec",
-        role: "product_manager",
-        title: "Product Spec · 图书管理系统",
+        id: "build-plan-demo",
+        kind: "build_plan",
+        role: "pi",
+        title: "Build Plan · 图书管理系统",
         markdown: `### 核心用户流\n\n1. 管理员搜索、筛选并维护图书目录。\n2. 读者借阅或归还图书，库存即时刷新。\n3. 管理员查看逾期和库存预警。\n\n### Must AC\n\n- [x] 多字段检索与分类筛选\n- [x] 不可借时给出明确反馈\n- [x] 借阅、归还、库存状态一致`,
       },
       {
-        id: "technical-spec-demo",
-        kind: "technical-spec",
-        role: "architect",
-        title: "Technical Spec · 可证明的借阅事务",
+        id: "acceptance-demo",
+        kind: "acceptance_contract",
+        role: "fomo",
+        title: "Acceptance Contract · 可证明的借阅事务",
         markdown: `### 领域模型\n\n\`Book\`、\`Reader\`、\`Loan\` 以 \`availableCopies\` 建立库存约束。\n\n### 关键保障\n\n- 借阅和库存扣减在同一事务中完成。\n- API 返回 \`409 BOOK_UNAVAILABLE\`，前端不伪装成功。\n- Playwright 覆盖检索、借阅拦截与归还。`,
       },
     ],

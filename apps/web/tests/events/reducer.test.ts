@@ -194,6 +194,10 @@ describe("run presentation reducer", () => {
     expect(domainEventToMessageChunks(event(3, "artifact.upserted", {
       kind: "product_spec",
     }, "product_manager"))).toEqual([]);
+    expect(domainEventToMessageChunks(event(4, "artifact.upserted", {
+      artifactId: "plan-1",
+      kind: "build_plan",
+    }, "pi"))).toEqual([]);
   });
 
   it("creates a lightweight loading ref from artifact.upserted without inventing fields", () => {
@@ -302,6 +306,7 @@ describe("run presentation reducer", () => {
       status: "ready",
       url: "https://preview.example.test/app",
       runId: "run-library",
+      verificationStatus: "unverified",
     });
     expect(next.preview).not.toHaveProperty("origin");
   });
@@ -318,6 +323,7 @@ describe("run presentation reducer", () => {
       status: "failed",
       runId: "run-library",
       error: "ingress refused",
+      verificationStatus: "unverified",
     });
   });
 });

@@ -25,11 +25,11 @@ import { Message, MessageContent, MessageResponse } from "@/components/ai-elemen
 import { PromptInput, PromptInputFooter, PromptInputSubmit, PromptInputTextarea, PromptInputTools } from "@/components/ai-elements/prompt-input";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { RoleTimeline } from "@/components/workbench/role-timeline";
+import { RunTimeline } from "@/components/workbench/role-timeline";
 import { SpecToProof, specSlotsFromArtifacts, type SpecSlot } from "@/components/workbench/spec-proof";
 import { Workspace } from "@/components/workbench/workspace";
 import { ApiProblem, controlPlane, controlPlaneUrl } from "@/lib/api/client";
-import type { AgentUIMessage, ArtifactDetail, ArtifactLoadState, ArtifactRef, DomainEvent, FileContent, FileManifestEntry, ProjectMessage, ProjectSnapshot, ProjectSummary, RunPresentation, VersionSummary } from "@/lib/contracts";
+import { artifactKinds, type AgentUIMessage, type ArtifactDetail, type ArtifactLoadState, type ArtifactRef, type DomainEvent, type FileContent, type FileManifestEntry, type ProjectMessage, type ProjectSnapshot, type ProjectSummary, type RunPresentation, type VersionSummary } from "@/lib/contracts";
 import { createDemoRunPresentation, demoFiles, demoProjectId, demoProjectSnapshot } from "@/lib/demo/library-project";
 import { submitChatMessage } from "@/lib/chat/submit-message";
 import { createRunPresentation, hydrateRunPresentationFromSnapshot, reduceDomainEvent } from "@/lib/events/reducer";
@@ -75,9 +75,9 @@ export function useArtifactDetailLoader(
 
   useEffect(() => {
     for (const ref of artifacts) {
-      if (ref.kind !== "product_spec" && ref.kind !== "technical_spec") continue;
+      if (!artifactKinds.includes(ref.kind as (typeof artifactKinds)[number])) continue;
+      if (!ref.runId) continue;
       const runId = ref.runId;
-      if (!runId) continue;
       const key = artifactDetailKey(runId, ref.id);
       const promise = artifactDetailPromises.get(key) ?? controlPlane.getArtifact(runId, ref.id);
       artifactDetailPromises.set(key, promise);
@@ -390,8 +390,8 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
       <div className="grid min-h-0 flex-1 lg:grid-cols-[16rem_minmax(22rem,0.9fr)_minmax(32rem,1.25fr)]">
         <ProjectSidebar currentProjectId={projectId} currentProjectName={currentProjectName} currentStatus={currentStatus} isDemo={isDemo} projects={projects} run={presentation} />
         <section className={cn("min-h-0 border-r bg-background lg:flex lg:flex-col", mobileSurface === "chat" ? "flex flex-col" : "hidden")} aria-label="Agent conversation">
-          <header className="flex shrink-0 items-center justify-between border-b bg-card px-4 py-3"><div className="min-w-0"><p className="truncate text-sm font-semibold">{currentProjectName}</p><p className="mt-0.5 text-xs text-muted-foreground">Product → Architecture → Implementation → Proof</p></div><RunStatusBadge status={presentation.status} /></header>
-          <Conversation className="min-h-0 flex-1"><ConversationContent className="gap-5 p-4">{visibleMessages.length > 0 ? visibleMessages.map((message) => <ReadableMessage key={message.id} message={message} />) : <div className="rounded-xl border border-dashed p-5 text-sm text-muted-foreground">Submit a request to start the first run.</div>}<RoleTimeline roles={presentation.roles} /><SpecToProof onFileSelect={selectFile} slots={specSlots} trace={presentation.trace} /></ConversationContent><ConversationScrollButton /></Conversation>
+          <header className="flex shrink-0 items-center justify-between border-b bg-card px-4 py-3"><div className="min-w-0"><p className="truncate text-sm font-semibold">{currentProjectName}</p><p className="mt-0.5 text-xs text-muted-foreground">Plan → Build → Verify → Repair</p></div><RunStatusBadge status={presentation.status} /></header>
+          <Conversation className="min-h-0 flex-1"><ConversationContent className="gap-5 p-4">{visibleMessages.length > 0 ? visibleMessages.map((message) => <ReadableMessage key={message.id} message={message} />) : <div className="rounded-xl border border-dashed p-5 text-sm text-muted-foreground">Submit a request to start the first run.</div>}<RunTimeline stages={presentation.stages} /><SpecToProof onFileSelect={selectFile} slots={specSlots} trace={presentation.trace} /></ConversationContent><ConversationScrollButton /></Conversation>
           <div className="shrink-0 border-t bg-card p-3">
             <PromptInput onSubmit={(message) => submitPrompt(message.text)}>
               <PromptInputTextarea disabled={isDemo} placeholder={isDemo ? "Demo fixture is read-only" : "Describe a change, bug fix, or next capability…"} />

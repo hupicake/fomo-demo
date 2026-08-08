@@ -40,7 +40,12 @@ async def test_guest_project_idempotent_message_and_persistent_event_replay(repo
         assert snapshot_payload["files"] == []
         assert snapshot_payload["versions"] == []
         assert snapshot_payload["trace"]["acceptanceTrace"] == []
-        assert snapshot_payload["preview"] == {"status": "unavailable", "url": None, "runId": None}
+        assert snapshot_payload["preview"] == {
+            "status": "unavailable",
+            "url": None,
+            "runId": None,
+            "verificationStatus": None,
+        }
         duplicate = await client.post(
             f"/v1/projects/{project_id}/messages",
             headers={**headers, "Idempotency-Key": "msg-1"},
@@ -231,7 +236,12 @@ async def test_versioned_file_edits_restore_download_and_acceptance_projection(r
         assert snapshot["files"][0]["path"] == "src/books.ts"
         assert [item["number"] for item in snapshot["versions"]] == [3, 2, 1]
         assert snapshot["trace"]["acceptanceTrace"][0]["status"] == "passed"
-        assert snapshot["preview"] == {"status": "expired", "url": None, "runId": run_id}
+        assert snapshot["preview"] == {
+            "status": "expired",
+            "url": None,
+            "runId": run_id,
+            "verificationStatus": None,
+        }
 
 
 @pytest.mark.asyncio
@@ -262,6 +272,7 @@ async def test_preview_endpoint_returns_typed_ready_url_and_requires_project_own
             "status": "ready",
             "url": "https://preview.example.test/app",
             "runId": run_id,
+            "verificationStatus": "unverified",
         }
         assert preview.headers["content-type"].startswith("application/json")
 
@@ -271,6 +282,7 @@ async def test_preview_endpoint_returns_typed_ready_url_and_requires_project_own
             "status": "ready",
             "url": "https://preview.example.test/app",
             "runId": run_id,
+            "verificationStatus": "unverified",
         }
 
         # Ownership is enforced before any preview data is disclosed.

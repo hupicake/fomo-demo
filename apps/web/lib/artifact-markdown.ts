@@ -231,11 +231,65 @@ function technicalSpecSections(content: Record<string, unknown>): Section[] {
   return sections;
 }
 
+function directArtifactSections(detail: ArtifactDetail): Section[] {
+  const content = detail.content;
+  if (detail.kind === "run_input") {
+    const requirement = bounded(content.requirement);
+    const capabilities = items(content.starterCapabilities).map((entry) => `- ${escapeMarkdown(entry)}`).join("\n");
+    return [
+      ...(requirement ? [{ title: "Requirement", body: escapeMarkdown(requirement) }] : []),
+      ...(capabilities ? [{ title: "Golden starter capabilities", body: capabilities }] : []),
+    ];
+  }
+  if (detail.kind === "build_plan") {
+    const summary = bounded(content.summary);
+    const routes = items(content.routes).map((entry) => `- ${escapeMarkdown(entry)}`).join("\n");
+    const files = listLines(items(content.files), (item) => {
+      const path = bounded(item.path);
+      if (!path) return "";
+      const purpose = bounded(item.purpose);
+      const acceptanceIds = items(item.acceptanceIds).map((entry) => escapeMarkdown(entry)).join(", ");
+      return `- ${escapeMarkdown(path)}${purpose ? ` — ${escapeMarkdown(purpose)}` : ""}${acceptanceIds ? ` (${acceptanceIds})` : ""}`;
+    });
+    return [
+      ...(summary ? [{ title: "Outcome", body: escapeMarkdown(summary) }] : []),
+      ...(routes ? [{ title: "Routes", body: routes }] : []),
+      ...(files ? [{ title: "Implementation files", body: files }] : []),
+    ];
+  }
+  if (detail.kind === "acceptance_contract") {
+    const criteria = listLines(items(content.criteria), (item) => {
+      const id = bounded(item.id);
+      if (!id) return "";
+      return `- **${escapeMarkdown(id)}** — ${escapeMarkdown(bounded(item.title, bounded(item.then, "Acceptance workflow")))}`;
+    });
+    const tests = listLines(items(content.tests), (item) => {
+      const acceptanceId = bounded(item.acceptanceId);
+      const title = bounded(item.title);
+      return acceptanceId ? `- ${escapeMarkdown(acceptanceId)} → ${escapeMarkdown(title || "Playwright workflow")}` : "";
+    });
+    return [
+      ...(criteria ? [{ title: "Frozen criteria", body: criteria }] : []),
+      ...(tests ? [{ title: "FOMO-owned tests", body: tests }] : []),
+    ];
+  }
+  const gates = listLines(items(content.gates), (item) => {
+    const gate = bounded(item.gate);
+    if (!gate) return "";
+    const status = bounded(item.status);
+    const summary = bounded(item.summary);
+    return `- ${escapeMarkdown(gate)}${status ? ` — ${escapeMarkdown(status)}` : ""}${summary ? `: ${escapeMarkdown(summary)}` : ""}`;
+  });
+  return gates ? [{ title: "Deterministic gates", body: gates }] : [];
+}
+
 export function formatArtifactDetail(detail: ArtifactDetail): string {
   const title = bounded(detail.title, detail.kind.replace("_", " "));
   const sections = detail.kind === "product_spec"
     ? productSpecSections(detail.content)
-    : technicalSpecSections(detail.content);
+    : detail.kind === "technical_spec"
+      ? technicalSpecSections(detail.content)
+      : directArtifactSections(detail);
   const lines: string[] = [`# ${escapeMarkdown(title)}`];
   for (const section of sections) {
     lines.push("", `## ${escapeMarkdown(section.title)}`, "", section.body.trim());

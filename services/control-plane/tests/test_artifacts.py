@@ -176,6 +176,7 @@ async def test_snapshot_refs_use_display_run_newest_per_kind_and_canonical_order
                 "runId",
                 "kind",
                 "role",
+                "stage",
                 "schemaVersion",
                 "title",
                 "summary",
@@ -185,6 +186,7 @@ async def test_snapshot_refs_use_display_run_newest_per_kind_and_canonical_order
         product_ref = refs[0]
         assert product_ref["runId"] == run.id
         assert product_ref["role"] == "product_manager"
+        assert product_ref["stage"] == "product"
         assert product_ref["schemaVersion"] == 1
         assert product_ref["createdAt"] is not None
         # Deterministic bounded title/summary; the stored content is untouched.
@@ -195,6 +197,7 @@ async def test_snapshot_refs_use_display_run_newest_per_kind_and_canonical_order
 
         assert refs[1]["id"] == technical
         assert refs[1]["role"] == "architect"
+        assert refs[1]["stage"] == "architecture"
         assert refs[1]["title"] == "Tech"
         assert refs[1]["summary"] == "Next.js"
 

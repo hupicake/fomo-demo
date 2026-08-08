@@ -124,11 +124,21 @@ beforeEach(() => {
 });
 
 function refFixture(id: string, kind: ArtifactKind, runId = "run-1"): VisibleArtifactRef {
+  const ownership = {
+    run_input: ["user", "input"],
+    build_plan: ["pi", "planning"],
+    acceptance_contract: ["fomo", "acceptance"],
+    diagnostic_report: ["fomo", "verification"],
+    product_spec: ["product_manager", "product"],
+    technical_spec: ["architect", "architecture"],
+  } as const;
+  const [role, stage] = ownership[kind];
   return {
     id,
     runId,
     kind,
-    role: kind === "product_spec" ? "product_manager" : "architect",
+    role,
+    stage,
     schemaVersion: 1,
     title: `${kind.replaceAll("_", " ")} ${id}`,
     summary: `Summary ${id}`,

@@ -2,11 +2,14 @@ import type { UIMessageChunk } from "ai";
 
 import {
   agentRoles,
+  agentStages,
+  artifactKinds,
   toRunStatus,
   type AcceptanceTrace,
   type AgentDataParts,
   type AgentMessageMetadata,
   type AgentRole,
+  type AgentStage,
   type ArtifactRef,
   type CommandLog,
   type DomainEvent,
@@ -17,6 +20,7 @@ import {
   type RoleStatus,
   type RunPresentation,
   type RunSnapshot,
+  type StageActivity,
   type VerificationResult,
   type VersionSummary,
 } from "@/lib/contracts";
@@ -28,6 +32,27 @@ const roleLabels: Record<AgentRole, string> = {
   architect: "Architect",
   engineer: "Engineer",
   reviewer: "Reviewer",
+};
+
+const stageLabels: Record<AgentStage, string> = {
+  planning: "Plan",
+  building: "Build",
+  verifying: "Verify",
+  repairing: "Repair",
+};
+
+const phaseStages: Record<string, AgentStage | undefined> = {
+  preparing: "planning",
+  planning: "planning",
+  product_analysis: "planning",
+  architecture: "planning",
+  building: "building",
+  implementation: "building",
+  verifying: "verifying",
+  verification: "verifying",
+  publishing: "verifying",
+  repairing: "repairing",
+  repair: "repairing",
 };
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -72,6 +97,51 @@ function defaultRoles(): Record<AgentRole, RoleActivity> {
   ) as Record<AgentRole, RoleActivity>;
 }
 
+function defaultStages(): Record<AgentStage, StageActivity> {
+  return Object.fromEntries(
+    agentStages.map((stage) => [stage, { stage, status: "idle", title: stageLabels[stage] }]),
+  ) as Record<AgentStage, StageActivity>;
+}
+
+function advanceStages(
+  current: Record<AgentStage, StageActivity>,
+  phase: string,
+  updatedAt?: string,
+): Record<AgentStage, StageActivity> {
+  const next = Object.fromEntries(
+    agentStages.map((stage) => [stage, { ...current[stage] }]),
+  ) as Record<AgentStage, StageActivity>;
+  if (phase === "ready") {
+    for (const stage of agentStages) {
+      if (stage !== "repairing" || next[stage].status !== "idle") {
+        next[stage] = { ...next[stage], status: "completed", updatedAt };
+      }
+    }
+    return next;
+  }
+  const target = phaseStages[phase];
+  if (!target) return next;
+  for (const stage of agentStages) {
+    if (next[stage].status === "working") {
+      next[stage] = { ...next[stage], status: "completed", updatedAt };
+    }
+  }
+  const targetIndex = agentStages.indexOf(target);
+  for (let index = 0; index < targetIndex; index += 1) {
+    const stage = agentStages[index];
+    if (stage !== "repairing") {
+      next[stage] = { ...next[stage], status: "completed", updatedAt };
+    }
+  }
+  next[target] = {
+    ...next[target],
+    status: "working",
+    detail: phase.replaceAll("_", " "),
+    updatedAt,
+  };
+  return next;
+}
+
 export function createRunPresentation(input: {
   projectId: string;
   run?: RunSnapshot;
@@ -79,12 +149,14 @@ export function createRunPresentation(input: {
   versions?: VersionSummary[];
   preview?: PreviewRef;
 }): RunPresentation {
+  const stages = advanceStages(defaultStages(), input.run?.phase || "", input.run?.updatedAt);
   return {
     runId: input.run?.id || "",
     projectId: input.projectId,
     status: input.run?.status || "queued",
     lastSeq: input.run?.lastSeq || 0,
     roles: defaultRoles(),
+    stages,
     artifacts: [],
     trace: input.trace || [],
     fileChanges: [],
@@ -130,7 +202,7 @@ export function hydrateRunPresentationFromSnapshot(input: {
 
 export function activityFromEvent(event: DomainEvent): RoleActivity | undefined {
   const payload = event.payload;
-  const role = event.role || asRole(payload.role);
+  const role = asRole(event.role) || asRole(payload.role);
   if (!role) {
     return undefined;
   }
@@ -153,7 +225,7 @@ export function activityFromEvent(event: DomainEvent): RoleActivity | undefined 
 function artifactRefFromEvent(event: DomainEvent): ArtifactRef | undefined {
   const payload = event.payload;
   const kind = asText(payload.kind);
-  if (kind !== "product_spec" && kind !== "technical_spec") {
+  if (!artifactKinds.includes(kind as (typeof artifactKinds)[number])) {
     return undefined;
   }
   const id = asText(payload.artifactId || payload.artifact_id);
@@ -218,7 +290,7 @@ function fileChangeFromEvent(event: DomainEvent): FileChange {
 
 function commandFromEvent(event: DomainEvent, previous?: CommandLog): CommandLog {
   const payload = event.payload;
-  const id = asText(payload.commandId || payload.command_id || payload.id, event.eventId);
+  const id = asText(payload.operationId || payload.operation_id || payload.commandId || payload.command_id || payload.id, event.eventId);
   const eventOutput = asText(payload.output || payload.chunk || payload.text);
   const nextOutput = event.kind === "command.output" ? `${previous?.output || ""}${eventOutput}` : eventOutput || previous?.output || "";
   return {
@@ -233,6 +305,30 @@ function commandFromEvent(event: DomainEvent, previous?: CommandLog): CommandLog
           ? "completed"
           : previous?.status || "running",
     exitCode: asNumber(payload.exitCode ?? payload.exit_code) ?? previous?.exitCode,
+  };
+}
+
+function piToolFromEvent(event: DomainEvent, previous?: CommandLog): CommandLog {
+  const payload = event.payload;
+  const id = `pi:${asText(payload.toolCallId, event.eventId)}`;
+  const toolName = asText(payload.toolName, previous?.command || "Pi tool");
+  const args = payload.args && typeof payload.args === "object"
+    ? JSON.stringify(payload.args)
+    : "";
+  return {
+    id,
+    command: previous?.command || `${toolName}${args ? ` ${args}` : ""}`,
+    output: event.kind === "pi.tool.output"
+      ? asText(payload.text)
+      : previous?.output || "",
+    status: event.kind === "pi.tool.started"
+      ? "running"
+      : event.kind === "pi.tool.completed" && payload.isError === true
+        ? "failed"
+        : event.kind === "pi.tool.completed"
+          ? "completed"
+          : previous?.status || "running",
+    exitCode: event.kind === "pi.tool.completed" ? (payload.isError === true ? 1 : 0) : previous?.exitCode,
   };
 }
 
@@ -260,10 +356,19 @@ function verificationFromEvent(event: DomainEvent): VerificationResult | undefin
 function previewFromEvent(event: DomainEvent): PreviewRef {
   const payload = event.payload;
   return {
-    status: event.kind === "preview.ready" ? "ready" : "failed",
+    status: event.kind === "preview.expired"
+      ? "expired"
+      : event.kind === "preview.failed"
+        ? "failed"
+        : "ready",
     url: asText(payload.url) || undefined,
     runId: event.runId,
     error: asText(payload.error || payload.detail) || undefined,
+    verificationStatus: event.kind === "preview.verified"
+      ? "verified"
+      : asText(payload.verificationStatus) === "verified"
+        ? "verified"
+        : "unverified",
   };
 }
 
@@ -327,12 +432,20 @@ export function reduceDomainEvent(state: RunPresentation, event: DomainEvent): R
     case "run.created":
     case "run.status_changed":
       next.status = toRunStatus(event.payload.status, state.status);
+      next.stages = advanceStages(state.stages, asText(event.payload.phase), event.occurredAt);
       break;
     case "run.completed":
       next.status = "completed";
+      next.stages = advanceStages(state.stages, "ready", event.occurredAt);
       break;
     case "run.failed":
-      next.status = "failed";
+      next.status = toRunStatus(event.payload.status, "failed");
+      next.stages = Object.fromEntries(agentStages.map((stage) => [
+        stage,
+        state.stages[stage].status === "working"
+          ? { ...state.stages[stage], status: "failed", updatedAt: event.occurredAt }
+          : state.stages[stage],
+      ])) as Record<AgentStage, StageActivity>;
       next.problems = [...state.problems, ...problemsFromEvent(event)].slice(-maxActivityItems);
       break;
     case "run.cancelled":
@@ -359,9 +472,17 @@ export function reduceDomainEvent(state: RunPresentation, event: DomainEvent): R
     case "command.started":
     case "command.output":
     case "command.completed": {
-      const id = asText(event.payload.commandId || event.payload.command_id || event.payload.id, event.eventId);
+      const id = asText(event.payload.operationId || event.payload.operation_id || event.payload.commandId || event.payload.command_id || event.payload.id, event.eventId);
       const previous = state.commands.find((command) => command.id === id);
       next.commands = replaceById(state.commands, commandFromEvent(event, previous));
+      break;
+    }
+    case "pi.tool.started":
+    case "pi.tool.output":
+    case "pi.tool.completed": {
+      const id = `pi:${asText(event.payload.toolCallId, event.eventId)}`;
+      const previous = state.commands.find((command) => command.id === id);
+      next.commands = replaceById(state.commands, piToolFromEvent(event, previous));
       break;
     }
     case "verification.updated": {
@@ -376,6 +497,9 @@ export function reduceDomainEvent(state: RunPresentation, event: DomainEvent): R
       break;
     }
     case "preview.ready":
+    case "preview.available":
+    case "preview.verified":
+    case "preview.expired":
     case "preview.failed":
       next.preview = previewFromEvent(event);
       break;
@@ -419,7 +543,7 @@ export function domainEventToMessageChunks(
   switch (event.kind) {
     case "artifact.upserted": {
       const ref = artifactRefFromEvent(event);
-      if (!ref) {
+      if (!ref || (ref.kind !== "product_spec" && ref.kind !== "technical_spec")) {
         return [];
       }
       // The only place snake_case backend kinds convert to hyphenated AI

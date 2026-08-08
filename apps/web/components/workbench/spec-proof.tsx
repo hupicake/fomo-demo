@@ -25,8 +25,8 @@ export interface SpecSlot {
 
 /**
  * Pure refs + load states -> canonical SpecSlot projection. Kinds outside the
- * closed set are never surfaced, slots follow the canonical Product then
- * Architect order, and a ref can only ever be absent, loading, error or ready
+ * closed set are never surfaced, slots follow the canonical run-artifact
+ * order, and a ref can only ever be absent, loading, error or ready
  * — there is no fallback to demo, old-run or other-run content.
  */
 export function specSlotsFromArtifacts(
@@ -35,17 +35,20 @@ export function specSlotsFromArtifacts(
 ): SpecSlot[] {
   const byKind = new Map<ArtifactKind, ArtifactRef>();
   for (const ref of artifacts) {
-    if (ref.kind !== "product_spec" && ref.kind !== "technical_spec") {
+    if (!artifactKinds.includes(ref.kind as ArtifactKind)) {
       continue;
     }
     // Multiple refs of the same canonical kind resolve to the last one in
     // input order, which is deterministically the newest.
-    byKind.set(ref.kind, ref);
+    byKind.set(ref.kind as ArtifactKind, ref);
   }
   return artifactKinds.map((kind) => {
     const ref = byKind.get(kind);
     if (!ref) {
       return { kind, state: "absent" };
+    }
+    if (ref.markdown) {
+      return { kind, state: "ready", title: ref.title, markdown: ref.markdown };
     }
     const load = loads[ref.id];
     if (load?.status === "ready") {
@@ -113,10 +116,10 @@ function ImplementationBadge({ status }: { status?: AcceptanceTrace["implementat
 }
 
 export function SpecToProof({ slots, onFileSelect, trace }: { slots: SpecSlot[]; onFileSelect: (path: string) => void; trace: AcceptanceTrace[] }) {
-  const specs = slots.filter((slot) => slot.kind === "product_spec" || slot.kind === "technical_spec");
+  const specs = slots.filter((slot) => slot.state !== "absent");
   return (
     <section className="space-y-3" aria-label="Specification to proof graph">
-      <div className="flex items-center justify-between"><h2 className="text-sm font-medium">Spec-to-Proof</h2><span className="font-mono text-[11px] text-muted-foreground">AC → evidence</span></div>
+      <div className="flex items-center justify-between"><h2 className="text-sm font-medium">Contract-to-Proof</h2><span className="font-mono text-[11px] text-muted-foreground">plan → AC → evidence</span></div>
       <div className="space-y-2">{specs.map((slot) => <SpecSlotCard key={slot.kind} slot={slot} />)}</div>
       <div className="space-y-2">
         {trace.map((item) => (

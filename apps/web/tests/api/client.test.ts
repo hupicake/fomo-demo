@@ -376,6 +376,7 @@ describe("control plane client contract", () => {
         status: "ready",
         url: "https://preview.example.test/app",
         runId: "run-9",
+        verificationStatus: "verified",
         origin: "https://untrusted-origin.example.test",
       },
     }));
@@ -386,18 +387,25 @@ describe("control plane client contract", () => {
       status: "ready",
       url: "https://preview.example.test/app",
       runId: "run-9",
+      verificationStatus: "verified",
     });
     expect(snapshot.preview).not.toHaveProperty("origin");
   });
 
   it("normalizes the preview endpoint response to the typed preview ref", async () => {
     process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
-    installFetch(jsonResponse({ status: "ready", url: "https://preview.example.test/app", runId: "run-9" }));
+    installFetch(jsonResponse({
+      status: "ready",
+      url: "https://preview.example.test/app",
+      runId: "run-9",
+      verificationStatus: "unverified",
+    }));
 
     await expect(controlPlane.getPreview("project-1")).resolves.toEqual({
       status: "ready",
       url: "https://preview.example.test/app",
       runId: "run-9",
+      verificationStatus: "unverified",
     });
   });
 });
@@ -408,6 +416,7 @@ describe("artifact ref and detail contract", () => {
     runId: "run-1",
     kind: "product_spec",
     role: "product_manager",
+    stage: "product",
     schemaVersion: 1,
     title: "Library product spec",
     summary: "Readers can manage books.",
@@ -422,7 +431,7 @@ describe("artifact ref and detail contract", () => {
       runs: [],
       artifactRefs: [
         ref,
-        { ...ref, id: "artifact-2", kind: "technical_spec", role: "architect" },
+        { ...ref, id: "artifact-2", kind: "technical_spec", role: "architect", stage: "architecture" },
         { ...ref, id: "artifact-3", kind: "diagnostic_report", role: "reviewer" },
         { ...ref, id: "artifact-4", summary: "" },
         { ...ref, id: "artifact-5", schemaVersion: "one" },
@@ -434,7 +443,7 @@ describe("artifact ref and detail contract", () => {
 
     expect(snapshot.artifactRefs).toEqual([
       ref,
-      { ...ref, id: "artifact-2", kind: "technical_spec", role: "architect" },
+      { ...ref, id: "artifact-2", kind: "technical_spec", role: "architect", stage: "architecture" },
     ]);
     const refs = snapshot.artifactRefs;
     expect(refs).toBeDefined();
@@ -456,6 +465,7 @@ describe("artifact ref and detail contract", () => {
         run_id: "run-1",
         kind: "technical_spec",
         role: "architect",
+        stage: "architecture",
         schema_version: 2,
         title: "Tech spec",
         summary: "Next.js",
@@ -470,6 +480,7 @@ describe("artifact ref and detail contract", () => {
       runId: "run-1",
       kind: "technical_spec",
       role: "architect",
+      stage: "architecture",
       schemaVersion: 2,
       title: "Tech spec",
       summary: "Next.js",
