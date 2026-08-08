@@ -41,6 +41,20 @@ Use `docker compose --env-file .env.local logs -f api worker web` for runtime
 logs, and `docker compose --env-file .env.local down` to stop the stack without
 deleting persistent volumes.
 
+### Optional official DeepSeek Flash route
+
+FOMO registers the official LiteLLM alias `deepseek-flash` for
+`deepseek/deepseek-v4-flash`; no DeepSeek Pro model is registered. Put a real
+`DEEPSEEK_API_KEY` only in `.env.local`, then set all four roles to this alias
+when you want to use it:
+
+```bash
+MODEL_PM=deepseek-flash
+MODEL_ARCHITECT=deepseek-flash
+MODEL_ENGINEER=deepseek-flash
+MODEL_REVIEWER=deepseek-flash
+```
+
 ### Engineer file-size policy
 
 Engineer source files use a 12,000-character split target and a 20,000-character
