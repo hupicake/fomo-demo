@@ -173,6 +173,7 @@ def _responses() -> dict[str, Any]:
         },
         "architect": {
             "framework": "nextjs",
+            "starterCapabilities": [],
             "routes": [{"path": "/", "rendering": "client", "description": "library"}],
             "components": [
                 {
@@ -3866,11 +3867,8 @@ async def test_blocking_typecheck_routes_one_repair_to_engineer(repository, sett
         "reviewer",
     ]
     commands = next(iter(sandbox.sandboxes.values())).commands
-    assert commands.count("pnpm install --frozen-lockfile") == 1
-    assert commands.count("pnpm install --no-frozen-lockfile") == 1
-    assert "pnpm install --frozen-lockfile" not in commands[
-        commands.index("pnpm install --no-frozen-lockfile") + 1 :
-    ]
+    assert commands.count("pnpm install --frozen-lockfile") == 2
+    assert "pnpm install --no-frozen-lockfile" not in commands
 
 
 def test_state_machine_and_failure_router() -> None:

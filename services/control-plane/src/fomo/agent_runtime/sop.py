@@ -2410,15 +2410,11 @@ class SOPRunner:
                 )
             ]
 
-        run = await self.repository.get_run(context.run_id)
-        if run.repair_round > 0:
-            install_command = "pnpm install --no-frozen-lockfile"
-        else:
-            install_command = "pnpm install --frozen-lockfile"
-            try:
-                await self.sandbox.read_file(context.sandbox, "pnpm-lock.yaml")
-            except FileNotFoundError:
-                install_command = "pnpm install"
+        install_command = "pnpm install --frozen-lockfile"
+        try:
+            await self.sandbox.read_file(context.sandbox, "pnpm-lock.yaml")
+        except FileNotFoundError:
+            install_command = "pnpm install"
         gates.append(await self._gate_command(context, "dependencies", install_command))
         for gate_name, script_name in (("typecheck", "typecheck"), ("build", "build")):
             if not isinstance(scripts, dict) or script_name not in scripts:

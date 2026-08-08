@@ -7,6 +7,7 @@ FROM node:22-bookworm-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0
 ARG PNPM_VERSION=10.17.1
 
 ENV PNPM_HOME=/opt/fomo/pnpm \
+    npm_config_store_dir=/opt/fomo/pnpm/store \
     COREPACK_HOME=/opt/fomo/corepack \
     COREPACK_DEFAULT_TO_LATEST=0 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
@@ -34,18 +35,18 @@ RUN apt-get update \
     && chown -R node:node /workspace "${PNPM_HOME}" "${COREPACK_HOME}" /ms-playwright \
     && rm -rf /var/lib/apt/lists/*
 
-# PNPM_HOME is image-global, so root's fetch and the runtime node user resolve
-# the same documented default store at $PNPM_HOME/store. This layer receives
-# only the immutable dependency manifest and lockfile, so non-dependency starter
-# source changes do not invalidate its warm store.
+# npm_config_store_dir forces root's fetch and the runtime node user's installs
+# to use the same controlled store. This layer receives only the immutable
+# dependency manifest and lockfile, so non-dependency starter source changes do
+# not invalidate its warm store.
 COPY --from=fomo-control-plane --chown=node:node \
     src/fomo/starter_assets/fomo-next-radix-v2/base/package.json \
     src/fomo/starter_assets/fomo-next-radix-v2/base/pnpm-lock.yaml \
     /opt/fomo/starter-prefetch/
 RUN cd /opt/fomo/starter-prefetch \
-    && pnpm fetch --frozen-lockfile --store-dir="${PNPM_HOME}/store" \
+    && pnpm fetch --frozen-lockfile --store-dir="${npm_config_store_dir}" \
     && rm -rf -- /opt/fomo/starter-prefetch \
-    && chown -R node:node "${PNPM_HOME}/store"
+    && chown -R node:node "${npm_config_store_dir}"
 
 # `fomo-control-plane` is a named Compose build context. This seed is read
 # only; OpenSandbox copies it into a newly-created writable workspace before

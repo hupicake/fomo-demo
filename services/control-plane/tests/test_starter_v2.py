@@ -22,6 +22,7 @@ from fomo.starter import (
 def _minimal_technical_spec(**overrides: object) -> dict[str, object]:
     payload: dict[str, object] = {
         "framework": "Next.js",
+        "starterCapabilities": [],
         "componentDecisions": [
             {
                 "component": "GeneratedComposition",
@@ -143,6 +144,10 @@ def test_technical_spec_exposes_only_the_fixed_capability_enum() -> None:
         "local-persistence",
     ]
 
+    omitted_selection = _minimal_technical_spec()
+    omitted_selection.pop("starterCapabilities")
+    with pytest.raises(ValidationError):
+        TechnicalSpec.model_validate(omitted_selection)
     with pytest.raises(ValidationError):
         TechnicalSpec.model_validate(_minimal_technical_spec(starterCapabilities=["npm-install"]))
     with pytest.raises(ValidationError, match="duplicate"):

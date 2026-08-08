@@ -213,7 +213,7 @@ class TestPlanItem(SchemaModel):
 
 class TechnicalSpec(SchemaModel):
     framework: str
-    starter_capabilities: list[StarterCapabilityId] = Field(default_factory=list)
+    starter_capabilities: list[StarterCapabilityId]
     routes: list[RouteSpec] = Field(default_factory=list)
     components: list[ComponentSpec] = Field(default_factory=list)
     component_decisions: list[ComponentDecision] = Field(min_length=1)
