@@ -32,6 +32,7 @@ from fomo.persistence import (
     Repository,
 )
 from fomo.schemas import (
+    ArtifactDetailResponse,
     FileContentResponse,
     FileContentUpdate,
     GuestSessionResponse,
@@ -170,6 +171,7 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
                 acceptance_trace=trace["acceptance_trace"],
             ),
             preview=snapshot["preview"],
+            artifact_refs=snapshot["artifact_refs"],
         )
 
     @app.patch("/v1/projects/{project_id}", response_model=ProjectResponse)
@@ -206,6 +208,15 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
     @app.get("/v1/runs/{run_id}", response_model=RunResponse)
     async def get_run(run_id: str, owner_session_id: SessionId) -> RunResponse:
         return await _owned_run(run_id, owner_session_id)
+
+    @app.get(
+        "/v1/runs/{run_id}/artifacts/{artifact_id}",
+        response_model=ArtifactDetailResponse,
+    )
+    async def get_artifact_detail(
+        run_id: str, artifact_id: str, owner_session_id: SessionId
+    ) -> ArtifactDetailResponse:
+        return await repository.get_artifact_detail(run_id, artifact_id, owner_session_id)
 
     @app.get("/v1/runs/{run_id}/events")
     async def run_events(

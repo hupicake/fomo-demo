@@ -248,3 +248,146 @@ describe("control plane client contract", () => {
     });
   });
 });
+
+describe("artifact ref and detail contract", () => {
+  const ref = {
+    id: "artifact-1",
+    runId: "run-1",
+    kind: "product_spec",
+    role: "product_manager",
+    schemaVersion: 1,
+    title: "Library product spec",
+    summary: "Readers can manage books.",
+    createdAt: "2026-08-07T12:00:00.000Z",
+  };
+
+  it("normalizes valid snapshot refs and fails closed on hidden kinds and malformed required fields", async () => {
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    installFetch(jsonResponse({
+      project: { id: "project-1", title: "Library" },
+      messages: [],
+      runs: [],
+      artifactRefs: [
+        ref,
+        { ...ref, id: "artifact-2", kind: "technical_spec", role: "architect" },
+        { ...ref, id: "artifact-3", kind: "diagnostic_report", role: "reviewer" },
+        { ...ref, id: "artifact-4", summary: "" },
+        { ...ref, id: "artifact-5", schemaVersion: "one" },
+        { ...ref, id: "artifact-6", runId: undefined },
+      ],
+    }));
+
+    const snapshot = await controlPlane.getProject("project-1");
+
+    expect(snapshot.artifactRefs).toEqual([
+      ref,
+      { ...ref, id: "artifact-2", kind: "technical_spec", role: "architect" },
+    ]);
+    expect(snapshot.artifactRefs[0]).not.toHaveProperty("content");
+  });
+
+  it("normalizes snake_case refs identically to camelCase refs", async () => {
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    installFetch(jsonResponse({
+      project: { id: "project-1", title: "Library" },
+      messages: [],
+      runs: [],
+      artifact_refs: [{
+        id: "artifact-1",
+        run_id: "run-1",
+        kind: "technical_spec",
+        role: "architect",
+        schema_version: 2,
+        title: "Tech spec",
+        summary: "Next.js",
+        created_at: "2026-08-07T12:00:00.000Z",
+      }],
+    }));
+
+    const snapshot = await controlPlane.getProject("project-1");
+
+    expect(snapshot.artifactRefs).toEqual([{
+      id: "artifact-1",
+      runId: "run-1",
+      kind: "technical_spec",
+      role: "architect",
+      schemaVersion: 2,
+      title: "Tech spec",
+      summary: "Next.js",
+      createdAt: "2026-08-07T12:00:00.000Z",
+    }]);
+  });
+
+  it("returns detail content as a strict JSON object", async () => {
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    const content = { problem: "Readers cannot manage books.", visualDirection: { tone: "calm" } };
+    installFetch(jsonResponse({ ...ref, content }));
+
+    await expect(controlPlane.getArtifact("run-1", "artifact-1")).resolves.toEqual({
+      ...ref,
+      content,
+    });
+  });
+
+  it("fails closed when detail content is not a JSON object", async () => {
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    installFetch(jsonResponse({ ...ref, content: JSON.stringify({ problem: "x" }) }));
+
+    await expect(controlPlane.getArtifact("run-1", "artifact-1")).rejects.toMatchObject({ status: 502 });
+  });
+
+  it("fails closed on null or array detail content", async () => {
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    installFetch(jsonResponse({ ...ref, content: null }));
+    await expect(controlPlane.getArtifact("run-1", "artifact-1")).rejects.toMatchObject({ status: 502 });
+
+    installFetch(jsonResponse({ ...ref, content: ["not", "an", "object"] }));
+    await expect(controlPlane.getArtifact("run-1", "artifact-1")).rejects.toMatchObject({ status: 502 });
+  });
+
+  it("fails closed when the response run or artifact id does not match the request", async () => {
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    installFetch(jsonResponse({ ...ref, runId: "run-other" }));
+    await expect(controlPlane.getArtifact("run-1", "artifact-1")).rejects.toMatchObject({ status: 502 });
+
+    installFetch(jsonResponse({ ...ref, id: "artifact-other" }));
+    await expect(controlPlane.getArtifact("run-1", "artifact-1")).rejects.toMatchObject({ status: 502 });
+  });
+
+  it("fails closed on hidden kinds and malformed refs in detail responses", async () => {
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    installFetch(jsonResponse({ ...ref, kind: "implementation_plan", role: "engineer" }));
+    await expect(controlPlane.getArtifact("run-1", "artifact-1")).rejects.toMatchObject({ status: 502 });
+
+    installFetch(jsonResponse({ ...ref, summary: "" }));
+    await expect(controlPlane.getArtifact("run-1", "artifact-1")).rejects.toMatchObject({ status: 502 });
+  });
+
+  it("fails closed on snapshot refs whose role mismatches the fixed kind mapping", async () => {
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    installFetch(jsonResponse({
+      project: { id: "project-1", title: "Library" },
+      messages: [],
+      runs: [],
+      artifactRefs: [
+        ref,
+        { ...ref, id: "artifact-2", kind: "technical_spec", role: "product_manager" },
+        { ...ref, id: "artifact-3", kind: "product_spec", role: "architect" },
+        { ...ref, id: "artifact-4", kind: "product_spec", role: "engineer" },
+      ],
+    }));
+
+    const snapshot = await controlPlane.getProject("project-1");
+
+    expect(snapshot.artifactRefs).toEqual([ref]);
+  });
+
+  it("fails closed on detail responses whose role mismatches the fixed kind mapping", async () => {
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    installFetch(jsonResponse({ ...ref, role: "architect" }));
+    await expect(controlPlane.getArtifact("run-1", "artifact-1")).rejects.toMatchObject({ status: 502 });
+
+    installFetch(jsonResponse({ ...ref, kind: "technical_spec", role: "product_manager" }));
+    await expect(controlPlane.getArtifact("run-1", "artifact-1")).rejects.toMatchObject({ status: 502 });
+  });
+});

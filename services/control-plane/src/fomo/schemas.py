@@ -11,7 +11,7 @@ from enum import StrEnum
 from typing import Any, Literal
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
 
 def _camel(value: str) -> str:
@@ -476,6 +476,44 @@ class TraceResponse(SchemaModel):
     acceptance_trace: list[AcceptanceTraceItem] = Field(default_factory=list)
 
 
+VisibleArtifactKind = Literal["product_spec", "technical_spec"]
+
+# The fixed role for every visible kind. The persisted artifact record carries
+# no role, so the workspace role is derived from the kind alone.
+VisibleArtifactRole = Literal["product_manager", "architect"]
+
+# The one closed set of artifact kinds surfaced by the workspace. The order is
+# the canonical presentation order (Product then Architect) and the kind->role
+# mapping is fixed because the persisted artifact record carries no role.
+VISIBLE_ARTIFACT_KIND_ORDER: tuple[VisibleArtifactKind, ...] = (
+    "product_spec",
+    "technical_spec",
+)
+ARTIFACT_KIND_TO_ROLE: dict[VisibleArtifactKind, VisibleArtifactRole] = {
+    "product_spec": "product_manager",
+    "technical_spec": "architect",
+}
+
+
+class ArtifactRefResponse(SchemaModel):
+    """A lightweight visible-artifact reference; never carries content."""
+
+    id: str
+    run_id: str
+    kind: VisibleArtifactKind
+    role: VisibleArtifactRole
+    schema_version: int
+    title: str
+    summary: str
+    created_at: datetime
+
+
+class ArtifactDetailResponse(ArtifactRefResponse):
+    """A visible artifact plus the original JSON content object."""
+
+    content: dict[str, JsonValue]
+
+
 class PreviewResponse(SchemaModel):
     """The sole preview-location contract: a ready status must carry an
     absolute http(s) URL and a run id, and any non-ready status must not carry
@@ -516,3 +554,4 @@ class ProjectSnapshotResponse(SchemaModel):
     versions: list[VersionResponse] = Field(default_factory=list)
     trace: TraceResponse
     preview: PreviewResponse
+    artifact_refs: list[ArtifactRefResponse] = Field(default_factory=list)

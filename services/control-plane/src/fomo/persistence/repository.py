@@ -17,6 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from fomo.ids import utcnow, uuid7
 from fomo.schemas import (
+    ARTIFACT_KIND_TO_ROLE,
+    VISIBLE_ARTIFACT_KIND_ORDER,
     EventEnvelope,
     MessageResponse,
     ProjectResponse,
@@ -140,6 +142,46 @@ def _version_response(record: VersionRecord) -> VersionResponse:
         qa_status=record.qa_status,
         created_at=record.created_at,
     )
+
+
+def _bounded_text(value: object, fallback: str, limit: int = 120) -> str:
+    """A deterministic, bounded single-line value; never mutates the source."""
+    if isinstance(value, str) and value.strip():
+        collapsed = " ".join(value.split())
+        if len(collapsed) <= limit:
+            return collapsed
+        # ``limit`` is the final-output hard cap: the ellipsis is part of it,
+        # so a long value never exceeds ``limit`` characters.
+        return f"{collapsed[:limit - 1].rstrip()}…"
+    return fallback
+
+
+def _artifact_title(kind: str, content: dict[str, Any]) -> str:
+    if kind == "product_spec":
+        return _bounded_text(content.get("title"), "Product Specification")
+    return _bounded_text(content.get("title"), "Technical Specification")
+
+
+def _artifact_summary(kind: str, content: dict[str, Any]) -> str:
+    if kind == "product_spec":
+        return _bounded_text(content.get("problem"), "Product Specification")
+    return _bounded_text(content.get("framework"), "Technical Specification")
+
+
+def _artifact_ref_response(record: ArtifactRecord) -> dict[str, Any]:
+    """A visible-artifact reference; title/summary are derived, never content."""
+    kind = record.kind
+    content = dict(record.content)
+    return {
+        "id": record.id,
+        "runId": record.run_id,
+        "kind": kind,
+        "role": ARTIFACT_KIND_TO_ROLE[kind],
+        "schemaVersion": record.schema_version,
+        "title": _artifact_title(kind, content),
+        "summary": _artifact_summary(kind, content),
+        "createdAt": record.created_at,
+    }
 
 
 class Repository:
@@ -300,6 +342,9 @@ class Repository:
             versions = await self._list_versions_in_session(session, project_id)
             trace = await self._get_trace_in_session(session, project_id, trace_run_id)
             preview = await self._get_preview_in_session(session, project)
+            artifact_refs = await self._artifact_refs_in_session(
+                session, display_record.id if display_record is not None else None
+            )
             return {
                 "project": _project_response(project),
                 "messages": [_message_response(item) for item in messages],
@@ -315,6 +360,7 @@ class Repository:
                 "versions": versions,
                 "trace": trace,
                 "preview": preview,
+                "artifact_refs": artifact_refs,
             }
 
     async def get_run(self, run_id: str) -> RunResponse:
@@ -767,6 +813,51 @@ class Repository:
                 .order_by(ArtifactRecord.created_at.desc())
             )
             return None if record is None else dict(record.content)
+
+    async def _artifact_refs_in_session(
+        self, session: AsyncSession, run_id: str | None
+    ) -> list[dict[str, Any]]:
+        """Newest visible artifact per kind in the canonical Product then
+        Architect order, for the snapshot's display run.
+        """
+        if run_id is None:
+            return []
+        refs: list[dict[str, Any]] = []
+        for kind in VISIBLE_ARTIFACT_KIND_ORDER:
+            record = await session.scalar(
+                select(ArtifactRecord)
+                .where(ArtifactRecord.run_id == run_id, ArtifactRecord.kind == kind)
+                .order_by(ArtifactRecord.created_at.desc(), ArtifactRecord.id.desc())
+                .limit(1)
+            )
+            if record is not None:
+                refs.append(_artifact_ref_response(record))
+        return refs
+
+    async def get_artifact_detail(
+        self, run_id: str, artifact_id: str, owner_session_id: str
+    ) -> dict[str, Any]:
+        """Return one visible artifact detail, or 404 for every failure.
+
+        Ownership and visibility are checked inside this single operation so a
+        cross-user, cross-run, hidden-kind, unknown-run or unknown-artifact
+        request all fail closed with the same non-disclosing 404.
+        """
+        async with self.database.session_factory() as session:
+            run = await session.get(RunRecord, run_id)
+            if run is None:
+                raise NotFoundError("artifact not found")
+            project = await session.get(ProjectRecord, run.project_id)
+            if project is None or project.owner_session_id != owner_session_id:
+                raise NotFoundError("artifact not found")
+            record = await session.get(ArtifactRecord, artifact_id)
+            if record is None or record.run_id != run_id:
+                raise NotFoundError("artifact not found")
+            if record.kind not in VISIBLE_ARTIFACT_KIND_ORDER:
+                raise NotFoundError("artifact not found")
+            detail = _artifact_ref_response(record)
+            detail["content"] = dict(record.content)
+            return detail
 
     async def upsert_acceptance_items(
         self,

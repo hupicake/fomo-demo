@@ -1,22 +1,101 @@
 "use client";
 
-import { CheckIcon, CircleAlertIcon, CircleDotIcon, Link2Icon } from "lucide-react";
+import { CheckIcon, CircleAlertIcon, CircleDotIcon, Link2Icon, LoaderCircleIcon } from "lucide-react";
 
 import { MessageResponse } from "@/components/ai-elements/message";
 import { Plan, PlanContent, PlanDescription, PlanHeader, PlanTitle, PlanTrigger } from "@/components/ai-elements/plan";
 import { Badge } from "@/components/ui/badge";
+import { formatArtifactDetail } from "@/lib/artifact-markdown";
+import {
+  artifactKinds,
+  type AcceptanceTrace,
+  type ArtifactKind,
+  type ArtifactLoadState,
+  type ArtifactRef,
+} from "@/lib/contracts";
 import { cn } from "@/lib/utils";
-import type { AcceptanceTrace, Artifact } from "@/lib/contracts";
 
-function ArtifactPlan({ artifact }: { artifact: Artifact }) {
+export interface SpecSlot {
+  kind: ArtifactKind;
+  state: "absent" | "loading" | "error" | "ready";
+  title?: string;
+  markdown?: string;
+  error?: string;
+}
+
+/**
+ * Pure refs + load states -> canonical SpecSlot projection. Kinds outside the
+ * closed set are never surfaced, slots follow the canonical Product then
+ * Architect order, and a ref can only ever be absent, loading, error or ready
+ * — there is no fallback to demo, old-run or other-run content.
+ */
+export function specSlotsFromArtifacts(
+  artifacts: ArtifactRef[],
+  loads: Record<string, ArtifactLoadState>,
+): SpecSlot[] {
+  const byKind = new Map<ArtifactKind, ArtifactRef>();
+  for (const ref of artifacts) {
+    if (ref.kind !== "product_spec" && ref.kind !== "technical_spec") {
+      continue;
+    }
+    // Multiple refs of the same canonical kind resolve to the last one in
+    // input order, which is deterministically the newest.
+    byKind.set(ref.kind, ref);
+  }
+  return artifactKinds.map((kind) => {
+    const ref = byKind.get(kind);
+    if (!ref) {
+      return { kind, state: "absent" };
+    }
+    const load = loads[ref.id];
+    if (load?.status === "ready") {
+      return {
+        kind,
+        state: "ready",
+        title: load.detail.title,
+        markdown: formatArtifactDetail(load.detail),
+      };
+    }
+    if (load?.status === "error") {
+      return { kind, state: "error", title: ref.title, error: load.message };
+    }
+    return { kind, state: "loading", title: ref.title };
+  });
+}
+
+function SpecSlotCard({ slot }: { slot: SpecSlot }) {
+  const label = slot.title || slot.kind.replaceAll("_", " ");
+  if (slot.state === "ready") {
+    return (
+      <Plan defaultOpen>
+        <PlanHeader className="gap-3 p-3">
+          <div><PlanTitle>{label}</PlanTitle><PlanDescription>{slot.kind.replaceAll("_", " ")}</PlanDescription></div>
+          <PlanTrigger />
+        </PlanHeader>
+        <PlanContent className="border-t p-3"><MessageResponse className="prose-sm max-w-none text-sm">{slot.markdown || ""}</MessageResponse></PlanContent>
+      </Plan>
+    );
+  }
+  const icon = slot.state === "loading"
+    ? <LoaderCircleIcon className="size-4 animate-spin text-muted-foreground" />
+    : slot.state === "error"
+      ? <CircleAlertIcon className="size-4 text-destructive" />
+      : <CircleDotIcon className="size-4 text-muted-foreground" />;
+  const hint = slot.state === "loading"
+    ? "Loading spec content…"
+    : slot.state === "error"
+      ? slot.error || "Could not load this spec."
+      : "No structured spec received yet.";
   return (
-    <Plan defaultOpen>
-      <PlanHeader className="gap-3 p-3">
-        <div><PlanTitle>{artifact.title}</PlanTitle><PlanDescription>{artifact.kind.replaceAll("-", " ")}</PlanDescription></div>
-        <PlanTrigger />
-      </PlanHeader>
-      <PlanContent className="border-t p-3"><MessageResponse className="prose-sm max-w-none text-sm">{artifact.markdown}</MessageResponse></PlanContent>
-    </Plan>
+    <article className="rounded-xl border bg-card p-4">
+      <div className="flex items-center gap-2">
+        {icon}
+        <div className="min-w-0">
+          <p className="text-sm font-medium">{label}</p>
+          <p className="mt-0.5 text-xs text-muted-foreground">{hint}</p>
+        </div>
+      </div>
+    </article>
   );
 }
 
@@ -26,12 +105,12 @@ function TraceStatus({ status }: { status: AcceptanceTrace["status"] }) {
   return <CircleDotIcon className="size-3.5" />;
 }
 
-export function SpecToProof({ artifacts, onFileSelect, trace }: { artifacts: Artifact[]; onFileSelect: (path: string) => void; trace: AcceptanceTrace[] }) {
-  const specs = artifacts.filter((artifact) => artifact.kind === "product-spec" || artifact.kind === "technical-spec");
+export function SpecToProof({ slots, onFileSelect, trace }: { slots: SpecSlot[]; onFileSelect: (path: string) => void; trace: AcceptanceTrace[] }) {
+  const specs = slots.filter((slot) => slot.kind === "product_spec" || slot.kind === "technical_spec");
   return (
     <section className="space-y-3" aria-label="Specification to proof graph">
       <div className="flex items-center justify-between"><h2 className="text-sm font-medium">Spec-to-Proof</h2><span className="font-mono text-[11px] text-muted-foreground">AC → evidence</span></div>
-      {specs.length > 0 ? <div className="space-y-2">{specs.map((artifact) => <ArtifactPlan artifact={artifact} key={artifact.id} />)}</div> : <div className="rounded-xl border border-dashed p-4 text-sm text-muted-foreground">Structured specs will appear after Product and Architect complete their handoff.</div>}
+      <div className="space-y-2">{specs.map((slot) => <SpecSlotCard key={slot.kind} slot={slot} />)}</div>
       <div className="space-y-2">
         {trace.map((item) => (
           <article className="rounded-xl border bg-card p-3" key={item.id}>

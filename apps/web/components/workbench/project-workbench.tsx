@@ -26,10 +26,10 @@ import { PromptInput, PromptInputFooter, PromptInputSubmit, PromptInputTextarea,
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { RoleTimeline } from "@/components/workbench/role-timeline";
-import { SpecToProof } from "@/components/workbench/spec-proof";
+import { SpecToProof, specSlotsFromArtifacts, type SpecSlot } from "@/components/workbench/spec-proof";
 import { Workspace } from "@/components/workbench/workspace";
 import { ApiProblem, controlPlane, controlPlaneUrl } from "@/lib/api/client";
-import type { AgentUIMessage, DomainEvent, FileContent, FileManifestEntry, ProjectMessage, ProjectSnapshot, ProjectSummary, RunPresentation, VersionSummary } from "@/lib/contracts";
+import type { AgentUIMessage, ArtifactDetail, ArtifactLoadState, ArtifactRef, DomainEvent, FileContent, FileManifestEntry, ProjectMessage, ProjectSnapshot, ProjectSummary, RunPresentation, VersionSummary } from "@/lib/contracts";
 import { createDemoRunPresentation, demoFiles, demoProjectId, demoProjectSnapshot } from "@/lib/demo/library-project";
 import { submitChatMessage } from "@/lib/chat/submit-message";
 import { createRunPresentation, hydrateRunPresentationFromSnapshot, reduceDomainEvent } from "@/lib/events/reducer";
@@ -47,6 +47,58 @@ function isTerminal(status: RunPresentation["status"]): boolean {
 function isTerminalEvent(event: DomainEvent): boolean {
   return ["run.completed", "run.failed", "run.cancelled"].includes(event.kind)
     || ["succeeded", "completed", "failed", "cancelled", "needs_attention"].includes(String(event.payload.status));
+}
+
+export function artifactDetailKey(runId: string, artifactId: string): string {
+  return `${runId}/${artifactId}`;
+}
+
+/**
+ * Module-level immutable promise cache keyed by runId + artifactId so each
+ * visible artifact detail is fetched exactly once across rerenders, React
+ * StrictMode remounts and snapshot refreshes. Rejected promises stay cached:
+ * failures are surfaced once and never auto-retried in this change.
+ */
+const artifactDetailPromises = new Map<string, Promise<ArtifactDetail>>();
+
+export function clearArtifactDetailCache(): void {
+  artifactDetailPromises.clear();
+}
+
+export function useArtifactDetailLoader(
+  artifacts: ArtifactRef[],
+  currentRunId?: string,
+): Record<string, ArtifactLoadState> {
+  const [loads, setLoads] = useState<Record<string, ArtifactLoadState>>({});
+  const currentRunRef = useRef(currentRunId);
+  currentRunRef.current = currentRunId;
+
+  useEffect(() => {
+    for (const ref of artifacts) {
+      if (ref.kind !== "product_spec" && ref.kind !== "technical_spec") continue;
+      const runId = ref.runId;
+      if (!runId) continue;
+      const key = artifactDetailKey(runId, ref.id);
+      const promise = artifactDetailPromises.get(key) ?? controlPlane.getArtifact(runId, ref.id);
+      artifactDetailPromises.set(key, promise);
+      setLoads((previous) => (previous[ref.id] ? previous : { ...previous, [ref.id]: { status: "loading" } }));
+      promise.then(
+        (detail) => {
+          if (currentRunRef.current !== runId) return;
+          setLoads((previous) => ({ ...previous, [ref.id]: { status: "ready", detail } }));
+        },
+        (failure) => {
+          if (currentRunRef.current !== runId) return;
+          setLoads((previous) => ({
+            ...previous,
+            [ref.id]: { status: "error", message: failure instanceof Error ? failure.message : "Could not load this spec." },
+          }));
+        },
+      );
+    }
+  }, [artifacts]);
+
+  return loads;
 }
 
 function projectMessages(messages: ProjectMessage[], projectId: string): AgentUIMessage[] {
@@ -132,6 +184,12 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
   const setDevice = useWorkbenchStore((state) => state.setDevice);
   const setLastSeq = useWorkbenchStore((state) => state.setLastSeq);
 
+  const artifactLoads = useArtifactDetailLoader(isDemo ? [] : presentation.artifacts, presentation.runId || undefined);
+  const specSlots = useMemo<SpecSlot[]>(
+    () => specSlotsFromArtifacts(presentation.artifacts, artifactLoads),
+    [artifactLoads, presentation.artifacts],
+  );
+
   useEffect(() => {
     presentationRef.current = presentation;
     if (presentation.runId) setLastSeq(presentation.runId, presentation.lastSeq);
@@ -159,7 +217,8 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
   useEffect(() => {
     if (!snapshot) return;
     const run = snapshot.activeRun;
-    const signature = `${run?.id || initialRunId || "none"}:${snapshot.lastSeq}:${snapshot.messages.length}`;
+    const artifactSignature = (snapshot.artifactRefs || []).map((ref) => `${ref.kind}:${ref.id}`).join(",");
+    const signature = `${run?.id || initialRunId || "none"}:${snapshot.lastSeq}:${snapshot.messages.length}:${artifactSignature}`;
     if (hydratedSnapshotRef.current !== signature) {
       hydratedSnapshotRef.current = signature;
       setMessages(projectMessages(snapshot.messages, projectId));
@@ -176,6 +235,7 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
             run,
             trace: snapshot.trace,
             versions: snapshot.versions,
+            artifactRefs: snapshot.artifactRefs,
           });
         if (sameRun) {
           for (const event of [...snapshot.events].sort((left, right) => left.seq - right.seq)) next = reduceDomainEvent(next, event);
@@ -186,6 +246,7 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
           trace: snapshot.trace && snapshot.trace.length > 0 ? snapshot.trace : next.trace,
           versions: snapshot.versions && snapshot.versions.length > 0 ? snapshot.versions : next.versions,
           preview: snapshot.preview || next.preview,
+          artifacts: snapshot.artifactRefs && snapshot.artifactRefs.length > 0 ? snapshot.artifactRefs : next.artifacts,
         };
       });
     }
@@ -330,7 +391,7 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
         <ProjectSidebar currentProjectId={projectId} currentProjectName={currentProjectName} currentStatus={currentStatus} isDemo={isDemo} projects={projects} run={presentation} />
         <section className={cn("min-h-0 border-r bg-background lg:flex lg:flex-col", mobileSurface === "chat" ? "flex flex-col" : "hidden")} aria-label="Agent conversation">
           <header className="flex shrink-0 items-center justify-between border-b bg-card px-4 py-3"><div className="min-w-0"><p className="truncate text-sm font-semibold">{currentProjectName}</p><p className="mt-0.5 text-xs text-muted-foreground">Product → Architecture → Implementation → Proof</p></div><RunStatusBadge status={presentation.status} /></header>
-          <Conversation className="min-h-0 flex-1"><ConversationContent className="gap-5 p-4">{visibleMessages.length > 0 ? visibleMessages.map((message) => <ReadableMessage key={message.id} message={message} />) : <div className="rounded-xl border border-dashed p-5 text-sm text-muted-foreground">Submit a request to start the first run.</div>}<RoleTimeline roles={presentation.roles} /><SpecToProof artifacts={presentation.artifacts} onFileSelect={selectFile} trace={presentation.trace} /></ConversationContent><ConversationScrollButton /></Conversation>
+          <Conversation className="min-h-0 flex-1"><ConversationContent className="gap-5 p-4">{visibleMessages.length > 0 ? visibleMessages.map((message) => <ReadableMessage key={message.id} message={message} />) : <div className="rounded-xl border border-dashed p-5 text-sm text-muted-foreground">Submit a request to start the first run.</div>}<RoleTimeline roles={presentation.roles} /><SpecToProof onFileSelect={selectFile} slots={specSlots} trace={presentation.trace} /></ConversationContent><ConversationScrollButton /></Conversation>
           <div className="shrink-0 border-t bg-card p-3">
             <PromptInput onSubmit={(message) => submitPrompt(message.text)}>
               <PromptInputTextarea disabled={isDemo} placeholder={isDemo ? "Demo fixture is read-only" : "Describe a change, bug fix, or next capability…"} />
