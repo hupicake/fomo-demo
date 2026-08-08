@@ -815,7 +815,7 @@ def test_default_starter_manifest_is_digest_pinned_and_exposes_approved_primitiv
 
     assert manifest.id == "fomo-next-radix-v2"
     assert manifest.version == "2.0.0"
-    assert manifest.tree_sha256 == "10b1b82decf7bc7e44efb5905feb0814ee5e87bec294062433f6be1f37766367"
+    assert manifest.tree_sha256 == "86fe356645eef1ccb45fb824e46324dc718c67d022b538f65a4828c8f1935987"
     canonical_base_tree = "".join(
         f"{entry.path}\0{entry.sha256}\0{entry.size}\n"
         for entry in sorted(manifest.files, key=lambda entry: entry.path)

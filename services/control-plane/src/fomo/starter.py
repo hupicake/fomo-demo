@@ -26,7 +26,7 @@ _CAPABILITY_ASSET_DIRECTORY = "capabilities"
 # a trust decision. They are filled from the checked-in files below; changing
 # any base/capability asset therefore requires an explicit versioned update.
 _EXPECTED_BASE_TREE_SHA256 = (
-    "2eff45f3b13e95cc7562d6d4249027064487ae51979a0fe18c40656d70014f4a"
+    "ce33b22afb0ef9285c15d6547852c10ac7593d91f26898d2d8b07670b5e684b5"
 )
 _EXPECTED_CAPABILITY_TREE_SHA256 = {
     "crud": "1d1bb2d5e289051e8b1d812215da5bb8965b9454f48205787f7eebb72ea2cbad",
