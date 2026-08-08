@@ -711,3 +711,36 @@ def test_gpt55_role_routes_use_xhigh_reasoning_effort_without_pro_models() -> No
         assert "reasoning_effort: xhigh" in match.group("body")
 
     assert all("pro" not in model.lower() for model in re.findall(r"^      model: (.+)$", config, re.M))
+
+
+def test_deepseek_flash_alias_is_unique_litellm_scoped_and_documented() -> None:
+    repository_root = Path(__file__).resolve().parents[3]
+    config = (repository_root / "infra" / "litellm" / "config.yaml").read_text(encoding="utf-8")
+    alias_matches = list(
+        re.finditer(
+            r"(?ms)^  - model_name: deepseek-flash\n(?P<body>.*?)(?=^  - model_name:|\Z)", config
+        )
+    )
+    assert len(alias_matches) == 1
+    alias = alias_matches[0].group("body")
+    assert "model: deepseek/deepseek-v4-flash" in alias
+    assert "api_key: os.environ/DEEPSEEK_API_KEY" in alias
+    assert "api_base: https://api.deepseek.com" in alias
+    assert "deepseek-v4-pro" not in config.lower()
+
+    compose = (repository_root / "compose.yaml").read_text(encoding="utf-8")
+    services = compose.split("\nservices:\n", 1)[1]
+    litellm_service = re.search(
+        r"(?ms)^  litellm:\n(?P<body>.*?)(?=^  [a-z0-9-]+:|\Z)", services
+    )
+    assert litellm_service is not None
+    assert "DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}" in litellm_service.group("body")
+    assert len(re.findall(r"(?m)^\s+DEEPSEEK_API_KEY:", compose)) == 1
+
+    env_example = (repository_root / ".env.example").read_text(encoding="utf-8")
+    assert re.search(r"(?m)^DEEPSEEK_API_KEY=$", env_example)
+    readme = (repository_root / "README.md").read_text(encoding="utf-8")
+    assert "`deepseek-flash`" in readme
+    assert "`.env.local`" in readme
+    for role_variable in ("MODEL_PM", "MODEL_ARCHITECT", "MODEL_ENGINEER", "MODEL_REVIEWER"):
+        assert f"{role_variable}=deepseek-flash" in readme
