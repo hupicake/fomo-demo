@@ -14,11 +14,14 @@ import type { ArtifactDetail, ArtifactKind, ArtifactRef } from "@/lib/contracts"
 
 const h = vi.hoisted(() => ({
   getArtifact: vi.fn(),
+  mutate: vi.fn(),
+  emptyArray: Object.freeze([]),
+  emptyObject: Object.freeze({}),
   snapshot: { project: undefined as unknown },
   chat: {
     clearError: vi.fn(),
     error: undefined,
-    messages: [],
+    messages: Object.freeze([]),
     resumeStream: vi.fn(),
     sendMessage: vi.fn(),
     setMessages: vi.fn(),
@@ -47,15 +50,15 @@ vi.mock("swr", () => ({
   default: (key: unknown) => {
     const first = Array.isArray(key) ? key[0] : key;
     if (first === "project") {
-      return { data: h.snapshot.project, error: undefined, isLoading: false, mutate: vi.fn() };
+      return { data: h.snapshot.project, error: undefined, isLoading: false, mutate: h.mutate };
     }
-    if (first === "projects") return { data: [], error: undefined, isLoading: false, mutate: vi.fn() };
-    if (first === "versions") return { data: [], error: undefined, isLoading: false, mutate: vi.fn() };
-    if (first === "trace") return { data: [], error: undefined, isLoading: false, mutate: vi.fn() };
-    if (first === "preview") return { data: undefined, error: undefined, isLoading: false, mutate: vi.fn() };
-    if (first === "files") return { data: [], error: undefined, isLoading: false, mutate: vi.fn() };
-    if (first === "file") return { data: undefined, error: undefined, isLoading: false, mutate: vi.fn() };
-    return { data: undefined, error: undefined, isLoading: false, mutate: vi.fn() };
+    if (first === "projects") return { data: h.emptyArray, error: undefined, isLoading: false, mutate: h.mutate };
+    if (first === "versions") return { data: h.emptyArray, error: undefined, isLoading: false, mutate: h.mutate };
+    if (first === "trace") return { data: h.emptyArray, error: undefined, isLoading: false, mutate: h.mutate };
+    if (first === "preview") return { data: undefined, error: undefined, isLoading: false, mutate: h.mutate };
+    if (first === "files") return { data: h.emptyArray, error: undefined, isLoading: false, mutate: h.mutate };
+    if (first === "file") return { data: undefined, error: undefined, isLoading: false, mutate: h.mutate };
+    return { data: undefined, error: undefined, isLoading: false, mutate: h.mutate };
   },
 }));
 
@@ -116,9 +119,7 @@ beforeEach(() => {
     selectedFile: undefined,
     selectedTab: "preview",
   });
-  h.getArtifact.mockReset();
-  h.chat.resumeStream.mockClear();
-  h.snapshot.project = undefined;
+  vi.clearAllMocks();
   clearArtifactDetailCache();
 });
 
