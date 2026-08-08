@@ -1,8 +1,8 @@
 # FOMO 多角色 Coding Agent V1 技术设计
 
-> 状态：Implementation Ready  
-> 版本：1.1  
-> 日期：2026-08-07  
+> 状态：核心设计 Implementation Ready；Pi Engineer Adapter 为 Proposed / A-B gated，未默认启用<br>
+> 版本：1.2<br>
+> 日期：2026-08-08（最近更新）<br>
 > 适用范围：笔试项目第一版；里程碑按能力划分，不绑定 6–8 小时工期
 
 ## 1. 结论
@@ -20,13 +20,14 @@ V1 做成一个真正可运行、可迭代、可恢复的 Web Coding Agent，而
 | 控制面 API | FastAPI + Pydantic + SQLAlchemy | 命令 API、SSE、鉴权、持久化、运行查询 |
 | 异步执行 | Celery worker + Redis | 执行长任务、取消、重试和并发控制 |
 | Agent 编排 | MetaGPT 自定义 SOP | 四角色、结构化交接、自愈循环；不直接调用 `generate_repo()` |
+| Engineer 执行内核 | legacy 结构化 Engineer（冻结、当前默认）；`@earendil-works/pi-coding-agent@0.84.1` RPC 为候选（Proposed / A-B gated，非默认） | 经 FOMO 自有 EngineerExecutor 适配层替换 Engineer 执行；不参与 PM/Architect/Reviewer 编排、状态机与发布 |
 | 模型网关 | LiteLLM Proxy | 角色模型别名、跨供应商降级、用量和调用日志 |
 | 沙箱 | OpenSandbox（本地 Docker，公开环境 Docker + gVisor），经 `SandboxProvider` 抽象 | 运行不可信代码、终端、独立预览、网络策略和可选快照；E2B 仅作云端备选 |
 | 持久化 | PostgreSQL + Redis + MinIO/S3 | 业务真相、实时唤醒、代码包/截图/二进制工件 |
 | 版本 | 沙箱内 Git + 数据库版本索引 + Git bundle | 每轮 checkpoint、回滚、下载和可审计历史 |
 | 部署 | Web 在 Vercel；API/worker/LiteLLM 在容器平台 | 避免把长任务放进 Serverless 请求生命周期 |
 
-一句话边界：**v0-clone 只提供可选的界面参考和组件候选，AI SDK 提供前端流式协议，MetaGPT 提供后端角色协作，OpenSandbox 提供可自托管的真实执行环境；需求—证据图、持久状态机、自愈和版本语义由本项目实现。**
+一句话边界：**v0-clone 只提供可选的界面参考和组件候选，AI SDK 提供前端流式协议，MetaGPT 负责 PM/Architect/Reviewer 角色编排与 SOP 流转，FOMO 拥有 QA、Git、Preview、持久化与发布语义，OpenSandbox 提供可自托管的真实执行环境；需求—证据图、持久状态机、自愈和版本语义由本项目实现。Pi 仅在 A/B 门禁通过后、经 FOMO 自有适配层替换 Engineer 执行内核，其余职责边界不变。**
 
 ## 2. 目标与非目标
 
@@ -110,6 +111,15 @@ UserRequest → Requirement/AC → ArchitectureDecision → FileChange
 
 这一层的 schema、关联规则、查询和交互全部由本项目实现，不属于 MetaGPT、v0、AI SDK 或 OpenSandbox 的能力。
 
+### 3.7 为什么 Pi 不替换 MetaGPT，也不成为第二个产品状态机
+
+Pi（`@earendil-works/pi-coding-agent@0.84.1`）是候选的 Engineer 执行内核（Proposed / A-B gated，未实现、非默认），不是编排框架，更不是产品状态机；legacy 结构化 Engineer 保持默认实现（冻结），Pi 仅在 A/B 门禁通过后才可能启用：
+
+- **只替换“执行”这一格**：SOP、角色流转与状态转换仍由 `SOPRunner`（FOMO 自研 + MetaGPT 原语）独占；Pi 只承担 legacy Engineer 的“读计划 → 在沙箱内改代码 → 自检 → 产出 ImplementationReport”这一段。
+- **不引入第二套状态机**：Pi 有自己的 agent loop 与 settle 语义，但适配层把它视为一次不可信、可丢弃的执行会话；run/phase/repair/version 状态只存在于 PostgreSQL 中的 FOMO 状态机，Pi 会话不参与版本发布、回滚或恢复决策。
+- **上游职责不动**：PM、Architect、Reviewer 角色、结构化产物（ProductSpec/TechnicalSpec/DiagnosticReport）、Spec-to-Proof Graph、QA 门禁、Git 提交、Preview 与发布权限全部留在 FOMO。
+- **单一写路径**：与 3.2 禁止双后端 Agent loop 的原则一致，同一项目同一时刻只有一个写执行内核（legacy 或 Pi），绝不并行。
+
 ## 4. 系统架构
 
 ```mermaid
@@ -126,15 +136,26 @@ flowchart LR
     MG --> L["LiteLLM Proxy"]
     L --> M1["Primary models"]
     L --> M2["Fallback models"]
-    MG --> SP["SandboxProvider"]
+    MG --> EX["EngineerExecutor<br/>FOMO 自有适配层，SOP 唯一可见类型"]
+    EX --> LEG["legacy 结构化 Engineer<br/>当前默认 / 冻结基线"]
+    EX -. "Proposed / A-B gated，未默认启用" .-> PI["Pi RPC 候选<br/>pi-coding-agent@0.84.1"]
+    LEG --> SP["SandboxProvider"]
+    EX -.->|"Proposed：经 SandboxProvider 创建 G / V"| SP
     SP --> OS["OpenSandbox control plane"]
     OS --> SR["Docker runtime<br/>gVisor in public demo"]
     WK --> PG
     WK --> R
     WK --> O
     SR --> P["Generated app preview<br/>separate registrable origin"]
+    OS -.-> G["一次性生成沙箱 G<br/>Proposed / A-B gated"]
+    PI -.->|"Pi 仅运行于 G 内，不拥有沙箱生命周期"| G
+    OS -.-> V["干净校验沙箱 V<br/>QA / Reviewer / Git commit / Preview 仅在此"]
+    G -.->|"agent_settled 后 FOMO 文件系统审计<br/>仅拷贝已校验 FileChange"| V
+    V -.-> P
     P -->|"iframe + postMessage"| W
 ```
+
+> Pi 当前状态说明：仅为 Proposed——未实现集成、未运行 A/B，不声明任何 Pi 集成或对比结果；图中 Pi、G、V 的虚线路径表达候选拓扑，不代表已有能力。
 
 ### 4.1 服务边界
 
@@ -159,6 +180,14 @@ flowchart LR
 - 连接/恢复沙箱，运行 MetaGPT SOP 和工具调用。
 - 把角色产物、命令、文件变化、验证结果和状态都写为持久事件。
 - 检查取消标记，负责 checkpoint、打包、暂停沙箱和失败清理。
+- 不感知 Pi：Pi 类型与事件只存在于 EngineerExecutor 边界内；Pi 路径的 G/V 分离为 Proposed（未实现），V 保持 QA/Git/Preview 唯一权威。
+
+**EngineerExecutor（FOMO 自有适配层；Pi 路径 Proposed / A-B gated，未实现）**
+
+- SOP 只认识这一个 Engineer 类型。输入是稳定的 FOMO ProductSpec/TechnicalSpec、SourceRef、StarterManifest/能力集、计划可写文件、预算与关联元数据；输出是已审计的 FileChange/ImplementationReport。
+- 当前默认实现是冻结的 legacy 结构化 Engineer（见 6.4），行为不再扩展；保留一个运行时开关即可整体回退。
+- 候选实现为 Pi RPC（`@earendil-works/pi-coding-agent@0.84.1`），Proposed / A-B gated、未实现、非默认；Pi 类型、事件与配置不泄漏到 EngineerExecutor 之外（SOP、工件 schema、持久化 schema、Spec-to-Proof Graph、前端均不感知 Pi）。
+- Pi 候选路径的 G → 审计 → V 拓扑为 Proposed（未实现）：Pi 只在一次性生成沙箱 G 内执行；settle 后 FOMO 以实际文件系统 diff 为准审计，仅把通过校验的 UTF-8 FileChange 拷入干净校验沙箱 V；V 是 QA、Reviewer、Git commit 与 Preview 的唯一权威，G 不接触这些职责。
 
 **LiteLLM Proxy**
 
@@ -173,6 +202,7 @@ flowchart LR
 - worker 只调用 OpenSandbox API，不持有 Docker socket 或宿主容器权限。
 - 本地开发使用 Docker Runtime；公开接受任意 prompt 的环境使用 Linux + gVisor `runsc`。
 - 通过 OpenSandbox Ingress 暴露预览，生成项目的网络请求和 iframe 与宿主应用隔离在不同 registrable origin。
+- Pi 候选的 G/V 分离为 Proposed（未实现）：Pi 只在一次性生成沙箱 G 内执行，G 不承载 QA、Git 或 Preview；校验沙箱 V 保持 QA/Git/Preview 唯一权威。OpenSandbox 服务不感知 Pi 类型，Pi 类型不得泄漏到 EngineerExecutor 之外。
 
 ## 5. 前端设计
 
@@ -435,7 +465,60 @@ Engineer 只能通过以下应用工具操作，所有实现最终落到沙箱�
   缺少能力必须记录为风险，由后续受控 starter 版本演进处理。
 - 模型不能直接写 `.env*`、Git hooks、宿主配置或沙箱外路径。
 
-### 6.5 QA 与自愈
+### 6.5 Pi Engineer Adapter（Proposed / A-B gated）
+
+> 本节全部内容为 FOMO 提案：Pi 适配器当前未实现、未接入、未运行任何 A/B 对照，不构成任何“Pi 集成已完成”或“A/B 已有结果”的声明；legacy 结构化 Engineer 仍是唯一默认实现。
+
+#### 6.5.1 稳定所有权契约
+
+- FOMO 自有的 `EngineerExecutor` 是 SOP 唯一可见的 Engineer 类型。输入是稳定的 FOMO ProductSpec/TechnicalSpec、SourceRef、StarterManifest/能力集、计划可写文件、预算与关联元数据；输出是已审计的 FileChange/ImplementationReport。
+- Pi RPC 类型、事件与配置不得泄漏到 SOP、工件 schema、持久化 schema、Spec-to-Proof Graph 或前端。
+- SourceRef + Git commit/version_files + workspace manifest 是版本真相；Pi 会话/转录只是瞬时执行与缓存，可随时丢弃，绝不作为恢复或版本真相。
+- legacy 实现保持冻结且为默认，仅保留一个运行时开关即可整体回滚；A/B 期间不扩展也不删除 legacy 行为。
+
+#### 6.5.2 官方 Pi 事实与 FOMO 提案的区分
+
+官方事实只有以下条目：
+
+- 固定 `@earendil-works/pi-coding-agent@0.84.1`，要求 Node `>=22.19.0`。
+- `pi --mode rpc` 使用 LF 分隔的 JSONL 作为 stdin/stdout 协议。
+- prompt 成功（preflight 确认）只是受理，不代表完成；`agent_settled` 才是稳定终点。
+- stdin EOF 会关闭 Pi 进程。
+
+除上述事实外，本节所有事件映射、wrapper 信封与生命周期均明确标记为 **FOMO 提案**，不是官方 Pi 协议；官方文档链接见第 22 节参考资料。
+
+#### 6.5.3 FOMO 提案的 RPC / wrapper 契约
+
+- 版本化 FOMO wrapper 信封包含 schemaVersion、requestId、correlationId/runId、单调递增 seq 和 start/ready/cancel/timeout/exit 生命周期消息。
+- stdout 是严格有界的 JSONL 协议通道；stderr 只是有界、脱敏的诊断输出，永远不作为协议输入。
+- 未知/畸形/乱序事件、`agent_settled` 之前的 EOF、缺失 exit 消息或 request/correlation 不匹配，一律 fail closed。
+- 生命周期覆盖 start 就绪确认、cancel/timeout、进程组终止和恢复清理。
+- 到 FOMO 事件的语义映射明确约定：Pi 的隐藏思考/推理内容一律丢弃，不持久化、不展示（与第 21 节禁止项一致）。
+
+#### 6.5.4 G → 审计 → V 完整性边界
+
+- G 是一次性生成沙箱；Pi 只允许在 G 内使用工具。
+- 每个路径先规范化；只允许 TechnicalSpec 计划内、model-owned 的扩展根；受保护核心/系统与已选能力文件保持只读。
+- 拒绝：绝对路径、`..`、符号链接、特殊/二进制文件、`.env*`、`.git/hooks`、context/resource 文件、mode 变更、未知/已删除/未计划文件，以及锁文件/依赖漂移。
+- 记录变更前后的 manifest hash 与实际 Git/文件系统 diff；不信任 Pi 的自然语言报告。
+- 执行文件数、单文件/总字节、命令数、输出量和变更预算。
+- 销毁 G；只把已审计的 UTF-8 FileChange 拷入干净校验沙箱 V；确定性 QA、Reviewer 修复范围、Git 候选提交与 Preview 保持不变，且只在 V 中运行。
+
+#### 6.5.5 凭据 / 网络 / 预算
+
+- 凭据只存在于进程环境，绝不写入 workspace、Pi 会话、事件、prompt 工件、日志或命令文本。
+- 只签发短时、run/batch 范围的推理 token，绑定 model/endpoint/TTL/request/token/spend 限额；不使用 provider/global/admin key。
+- 网络默认关闭，只显式放行内部推理端点；当前 OpenSandbox `network_policy=false` 是阻塞项：在真正 deny-by-default 的出口出现之前，Pi 拿不到可用 token。
+- 硬上限：最大墙钟时间、轮次/工具调用数、模型 token/spend、命令时间/输出、CPU/内存/PID/磁盘。cancel/timeout 时先 abort、再 grace、杀掉整棵进程树并销毁 G；恢复流程绝不 resume 不受信任的孤儿进程。
+
+#### 6.5.6 公平 A/B 与切换门禁
+
+- 冻结完全相同的模型快照/路由、ProductSpec、TechnicalSpec、AC 集、Starter/能力/hash、SourceRef 基线、计划文件、环境、总时间/token/spend、修复轮数与 QA/发布门禁。
+- 每个变体使用独立 G/V；记录成功、首次/最终 QA、修复、墙钟、token、spend、工具/命令数、受保护违规、被拒变更和盲审质量。
+- 单一库内 demo 不能成为 Pi 转正依据。切换门禁：至少两个独立全新项目在相同条件下全绿，外加一个独立 baseVersion 增量修改且保持既有行为不变；受保护路径违规为零；随后在预算内质量/验证完成度实质性更优。
+- 门禁通过前 legacy 保持默认，Pi 仅 opt-in A/B；一个配置开关即可立即回滚。
+
+### 6.6 QA 与自愈
 
 QA 使用确定性工具和独立 Reviewer 判断，按顺序运行：
 
@@ -496,6 +579,11 @@ V1 只实现 `OpenSandboxProvider`：
 - 依赖安装阶段只放行受信包源；运行阶段默认断开外网，按项目显式需求增加 egress allowlist。
 - 公开 Demo 不允许使用普通 Docker runtime 承载任意用户代码；必须使用 gVisor/Kata/Firecracker 之一，V1 部署基线为 gVisor。
 
+Pi 适配器相关（Proposed / A-B gated，未实现）：
+
+- 基础镜像不把 Pi 装入 Golden Starter；提案将固定版本 `@earendil-works/pi-coding-agent@0.84.1` 与兼容 Node 作为 root 拥有的不可变工具预装在 OpenSandbox runner/基础镜像内，位于 Golden Starter 与生成应用依赖之外；G 继承该工具，不在每次创建 G 时动态安装，模型 manifest 也不能选择安装路径。
+- G/V 拓扑（见 6.5.4）为提案：G 只承载 Pi 执行，V 只承载 QA/Reviewer/Git/Preview；当前不创建、不启用任何 Pi 相关沙箱。
+
 生命周期：
 
 1. 新项目由 OpenSandbox 从锁定基础镜像创建；历史项目先连接已记录的 sandbox。
@@ -504,6 +592,7 @@ V1 只实现 `OpenSandboxProvider`：
 4. 开发服务健康后，通过 OpenSandbox Ingress 获得 `PreviewRef`；宿主只保存短期 URL、精确 origin 和过期时间。
 5. run 成功后先提交 Git、上传 bundle 和文件清单，再根据 capability 创建可选 runtime snapshot。
 6. 空闲时根据 capability 执行 pause 或 kill；恢复/重建前发 `sandbox.reconnecting`，完成后重启事件采集、开发服务和 preview health check。
+7. （Proposed / A-B gated，未实现）Pi 变体仅在 A/B 开关启用时创建一次性生成沙箱 G；Pi settle 并经 6.5.4 审计后销毁 G，QA、Reviewer、Git 候选提交与 Preview 只在 V 中运行，legacy 默认路径不变。
 
 ### 7.3 Git 版本规则
 
@@ -666,7 +755,8 @@ run.waiting_for_user | run.completed | run.failed | run.cancelled
 - 规范化并校验文件路径，拒绝绝对路径、`..`、符号链接逃逸和敏感文件名。
 - 命令有超时、输出上限、进程组取消和资源上限。
 - 上传内容和仓库文本都视为不可信数据，不能覆盖 system policy 或获取宿主工具。
-- 沙箱网络默认只满足包安装和应用运行；后续可增加 egress allowlist。
+- 沙箱网络默认只满足包安装和应用运行；后续可增加 egress allowlist。Pi 适配器（Proposed）要求 deny-by-default 出口后才可发放推理 token，当前 OpenSandbox `network_policy=false` 是阻塞项。
+- Pi 自身不提供沙箱隔离，其“项目信任”机制不是安全边界；因此 Pi 只能在生成沙箱 G 内运行。无人值守运行时禁用 context 文件、extensions、skills、templates、themes、session、telemetry 与 startup 网络；这些开关只缩小攻击面，单独使用不构成安全边界。
 - 日志和错误对密钥、cookie、Authorization header 做统一脱敏。
 
 ### 11.3 会话
@@ -703,6 +793,8 @@ run.waiting_for_user | run.completed | run.failed | run.cancelled
 | 故障测试 | worker 在每个 phase 崩溃、SSE 重连、重复 POST、OpenSandbox 重启/sandbox 丢失、模型 fallback |
 | 浏览器 E2E | 创建项目、看到四角色、真实预览、刷新恢复、二次修改、自愈、版本回滚 |
 | 安全测试 | 越权项目 ID、路径穿越、恶意 iframe message、敏感日志脱敏、CORS/CSRF |
+| Adapter 契约测试（Proposed，Pi 路径） | `EngineerExecutor` 双实现同一套输入/输出契约；Pi RPC 解析器、wrapper 信封 schema、乱序/畸形/提前 EOF 的 fail-closed、manifest 篡改检测、进程树清理与恢复清理 |
+| A/B 门禁测试（Proposed，Pi 路径） | 受控 legacy-vs-Pi 对照：冻结输入下记录质量/验证完成度/预算/违规计数，作为 6.5.6 切换门禁的验收依据 |
 
 CI 默认使用确定性的 fake model 和 fixture，不把真实 LLM 的随机性作为合并门槛；保留手动/定时 real-model smoke workflow。
 
@@ -892,6 +984,15 @@ API/worker 使用同一镜像分别启动；迁移作为单独 release command�
 
 验收：陌生评审者无需口头指导即可完成创建、观察、预览、修改和回滚。
 
+### M6：Pi Engineer Adapter A/B（Proposed / gated，非默认）
+
+仅在 M2（spec 契约）、M3（证据契约）与 M4（Preview/版本/恢复契约）关闭后才允许启动；M0–M5 顺序保持不变，P0 产品契约闭合约在先。
+
+- 冻结 E2B、新 Provider、新 starter、模型路由与平台扩展；A/B 期间不做平台或依赖面扩张。
+- 按 6.5.6 公平对照执行 legacy vs Pi：至少两个独立全新项目在相同条件下全绿 + 一个独立 baseVersion 增量修改且保持既有行为不变 + 受保护路径违规为零 + 预算内质量/验证完成度实质性更优。
+- 门禁通过前 legacy 保持默认，Pi 仅 opt-in；单一配置开关即时回滚。
+- 验收：A/B 报告包含 6.5.6 要求的全部记录项；未通过时 Pi 不得进入默认路径。当前状态为 Proposed，不声称任何 Pi 集成或 A/B 结果。
+
 ## 18. 面试演示脚本
 
 推荐用一个视觉和交互都明显、但边界可控的需求，例如：
@@ -924,6 +1025,10 @@ API/worker 使用同一镜像分别启动；迁移作为单独 release command�
 | 自动修复无限循环 | 严格状态机、默认三轮、问题指纹去重、无进展即 needs_attention |
 | 选择性移植 v0-clone 时带入不必要耦合 | 建立参考/移植/不引入清单；只移植无业务数据依赖的小组件，以本项目契约和测试为准 |
 | 依赖升级破坏 AI SDK/AI Elements 类型 | 锁版本、仅安装所需 Elements、升级单独提交并跑 typecheck/E2E |
+| Pi 变成第二套产品状态机 | EngineerExecutor 把 Pi 会话当作可丢弃执行；run/phase/version 状态只由 FOMO 状态机持有，Pi 事件不进入版本/恢复决策 |
+| Pi 会话被当作版本真相 | SourceRef + Git commit/version_files + manifest 是唯一真相；Pi 转录仅作瞬时缓存，可随时丢弃 |
+| 出口网络 / 推理 token 暴露 | deny-by-default 出口先行（当前 `network_policy=false` 为阻塞项）；短时 run 范围 token、最小权限、进程环境注入、全链路脱敏 |
+| A/B 基准过拟合 | 冻结同模型/同输入；至少两个独立全新项目 + 一个独立增量修改；盲审与受保护违规计数；单一 demo 不转正 |
 
 ## 20. 开工顺序
 
@@ -934,6 +1039,7 @@ API/worker 使用同一镜像分别启动；迁移作为单独 release command�
 5. 用相同接口把固定生成器替换成 MetaGPT 四角色 SOP。
 6. 接入确定性 QA、自愈、Git 版本和故障恢复。
 7. 最后做视觉打磨、Atoms 辅助的局部 UI 变体和公开部署；Atoms 产物只作为视觉参考或组件候选，不覆盖已经可运行的前端架构。
+8. （Proposed / gated，未实现）仅在 Preview/spec/证据契约关闭后，才按 6.5.6 启动 legacy vs Pi A/B；A/B 期间冻结 E2B、新 Provider、新 starter、模型路由与平台扩展。当前不声称任何 Pi 集成或 A/B 结果。
 
 ## 21. 禁止项
 
@@ -961,3 +1067,8 @@ API/worker 使用同一镜像分别启动；迁移作为单独 release command�
 - [E2B 开源仓库（可选 Provider）](https://github.com/e2b-dev/e2b)
 - [Vercel Sandbox（可选 Provider）](https://vercel.com/docs/sandbox)
 - [Vercel 商标政策](https://vercel.com/legal/trademark-policy)
+- [Pi coding-agent：package.json（v0.84.1）](https://github.com/earendil-works/pi/blob/v0.84.1/packages/coding-agent/package.json)
+- [Pi coding-agent：containerization（v0.84.1）](https://github.com/earendil-works/pi/blob/v0.84.1/packages/coding-agent/docs/containerization.md)
+- [Pi coding-agent：RPC（v0.84.1）](https://github.com/earendil-works/pi/blob/v0.84.1/packages/coding-agent/docs/rpc.md)
+- [Pi coding-agent：security（v0.84.1）](https://github.com/earendil-works/pi/blob/v0.84.1/packages/coding-agent/docs/security.md)
+- [Pi coding-agent：models（v0.84.1）](https://github.com/earendil-works/pi/blob/v0.84.1/packages/coding-agent/docs/models.md)
