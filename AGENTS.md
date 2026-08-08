@@ -8,9 +8,9 @@
 
 ## 委派与模型
 
-- 调研和实现默认委派给 `gpt-5.6-terra`，`reasoning_effort=max`。
-- 简单、低风险、机械任务可使用 Claude CLI 配置的 DeepSeek Flash，以速度优先；思考强度可为 `max`。
-- Claude CLI 或 DeepSeek Flash 不可用时，直接回退到 Terra Max，不得因此阻塞。
+- 调研默认委派给 `gpt-5.6-terra`，`reasoning_effort=max`。
+- 开发实现统一使用 Pi CLI 的 `deepseek/deepseek-v4-flash`，`thinking=max`，不再使用 WorkBuddy/CodeBuddy CLI 的 DeepSeek。
+- Pi 或 DeepSeek Flash 不可用时，直接回退到 Terra Max，不得因此阻塞。
 - 严禁使用任何 Pro 模型。
 
 ## 子任务要求
