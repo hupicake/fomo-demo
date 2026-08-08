@@ -77,6 +77,8 @@ def test_v2_bare_manifest_is_digest_pinned_and_keeps_a_generic_buildable_boundar
     assert 'reporter: "line"' in files["playwright.config.ts"]._content.decode("utf-8")
     tsconfig = json.loads(files["tsconfig.json"]._content.decode("utf-8"))
     assert tsconfig["compilerOptions"]["jsx"] == "react-jsx"
+    assert tsconfig["compilerOptions"]["incremental"] is True
+    assert tsconfig["compilerOptions"]["tsBuildInfoFile"] == ".next/cache/tsconfig.tsbuildinfo"
     assert tsconfig["include"] == [
         "next-env.d.ts",
         "**/*.ts",
