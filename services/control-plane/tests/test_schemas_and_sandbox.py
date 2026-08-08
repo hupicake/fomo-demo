@@ -13,7 +13,7 @@ from fomo.sandbox.base import Command, FileChange, SandboxPathError, SourceRef
 from fomo.sandbox.fake import FakeSandboxProvider
 from fomo.sandbox.opensandbox import OpenSandboxProvider, _OutputCollector
 from fomo.sandbox.process import ProcessSandboxProvider
-from fomo.schemas import ProductSpec
+from fomo.schemas import PreviewResponse, ProductSpec
 
 
 def test_product_spec_requires_unique_acceptance_ids() -> None:
@@ -28,6 +28,49 @@ def test_product_spec_requires_unique_acceptance_ids() -> None:
                     {"id": "AC-1", "given": "d", "when": "e", "then": "f"},
                 ],
             }
+        )
+
+
+def test_preview_ready_requires_run_id_and_absolute_http_url() -> None:
+    PreviewResponse.model_validate(
+        {"status": "ready", "url": "https://preview.example.test/app", "runId": "run-1"}
+    )
+    PreviewResponse.model_validate(
+        {"status": "ready", "url": "http://localhost:3000/app", "runId": "run-1"}
+    )
+    PreviewResponse.model_validate(
+        {"status": "ready", "url": "https://preview.example.test:8443/app?x=1", "runId": "run-1"}
+    )
+
+    with pytest.raises(ValidationError, match="runId"):
+        PreviewResponse.model_validate({"status": "ready", "url": "https://preview.example.test/app"})
+    with pytest.raises(ValidationError, match="url"):
+        PreviewResponse.model_validate({"status": "ready", "url": None, "runId": "run-1"})
+    with pytest.raises(ValidationError, match="absolute"):
+        PreviewResponse.model_validate({"status": "ready", "url": "/relative/path", "runId": "run-1"})
+    with pytest.raises(ValidationError, match="absolute"):
+        PreviewResponse.model_validate({"status": "ready", "url": "app/page", "runId": "run-1"})
+    with pytest.raises(ValidationError, match="absolute"):
+        PreviewResponse.model_validate({"status": "ready", "url": "javascript:alert(1)", "runId": "run-1"})
+    with pytest.raises(ValidationError, match="absolute"):
+        PreviewResponse.model_validate({"status": "ready", "url": "ftp://preview.example.test/app", "runId": "run-1"})
+    with pytest.raises(ValidationError, match="userinfo"):
+        PreviewResponse.model_validate(
+            {"status": "ready", "url": "https://user:pass@preview.example.test/app", "runId": "run-1"}
+        )
+
+
+def test_preview_non_ready_status_requires_null_url() -> None:
+    PreviewResponse.model_validate({"status": "expired", "url": None, "runId": "run-1"})
+    PreviewResponse.model_validate({"status": "unavailable", "url": None, "runId": None})
+
+    with pytest.raises(ValidationError, match="url null"):
+        PreviewResponse.model_validate(
+            {"status": "expired", "url": "https://preview.example.test/app", "runId": "run-1"}
+        )
+    with pytest.raises(ValidationError, match="url null"):
+        PreviewResponse.model_validate(
+            {"status": "unavailable", "url": "https://preview.example.test/app", "runId": None}
         )
 
 

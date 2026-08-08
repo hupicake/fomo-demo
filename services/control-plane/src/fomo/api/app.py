@@ -41,6 +41,7 @@ from fomo.schemas import (
     ProjectPatch,
     ProjectResponse,
     ProjectSnapshotResponse,
+    PreviewResponse,
     RunResponse,
     TraceResponse,
     VersionResponse,
@@ -346,8 +347,8 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
             acceptance_trace=trace["acceptance_trace"],
         )
 
-    @app.get("/v1/projects/{project_id}/preview")
-    async def get_preview(project_id: str, owner_session_id: SessionId) -> dict[str, Any]:
+    @app.get("/v1/projects/{project_id}/preview", response_model=PreviewResponse)
+    async def get_preview(project_id: str, owner_session_id: SessionId) -> PreviewResponse:
         await repository.require_project(project_id, owner_session_id)
         return await repository.get_preview(project_id)
 

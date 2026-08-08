@@ -39,7 +39,7 @@ async def test_guest_project_idempotent_message_and_persistent_event_replay(repo
         assert snapshot_payload["files"] == []
         assert snapshot_payload["versions"] == []
         assert snapshot_payload["trace"]["acceptanceTrace"] == []
-        assert snapshot_payload["preview"]["status"] == "unavailable"
+        assert snapshot_payload["preview"] == {"status": "unavailable", "url": None, "runId": None}
         duplicate = await client.post(
             f"/v1/projects/{project_id}/messages",
             headers={**headers, "Idempotency-Key": "msg-1"},
@@ -210,4 +210,50 @@ async def test_versioned_file_edits_restore_download_and_acceptance_projection(r
         assert snapshot["files"][0]["path"] == "src/books.ts"
         assert [item["number"] for item in snapshot["versions"]] == [3, 2, 1]
         assert snapshot["trace"]["acceptanceTrace"][0]["status"] == "passed"
-        assert snapshot["preview"]["status"] == "expired"
+        assert snapshot["preview"] == {"status": "expired", "url": None, "runId": run_id}
+
+
+@pytest.mark.asyncio
+async def test_preview_endpoint_returns_typed_ready_url_and_requires_project_ownership(
+    repository, settings
+) -> None:
+    app = create_app(settings, repository)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        session_id = (await client.post("/v1/sessions/guest")).json()["id"]
+        headers = {"X-FOMO-Session": session_id}
+        project_id = (
+            await client.post("/v1/projects", headers=headers, json={"title": "Library"})
+        ).json()["id"]
+        run_id = (
+            await client.post(
+                f"/v1/projects/{project_id}/messages",
+                headers={**headers, "Idempotency-Key": "preview-message"},
+                json={"clientMessageId": "preview-message", "content": "Serve the library"},
+            )
+        ).json()["run"]["id"]
+
+        await repository.set_preview_url(run_id, "https://preview.example.test/app")
+
+        preview = await client.get(f"/v1/projects/{project_id}/preview", headers=headers)
+        assert preview.status_code == 200
+        assert preview.json() == {
+            "status": "ready",
+            "url": "https://preview.example.test/app",
+            "runId": run_id,
+        }
+        assert preview.headers["content-type"].startswith("application/json")
+
+        # The project snapshot keeps the same typed preview contract.
+        snapshot = await client.get(f"/v1/projects/{project_id}", headers=headers)
+        assert snapshot.json()["preview"] == {
+            "status": "ready",
+            "url": "https://preview.example.test/app",
+            "runId": run_id,
+        }
+
+        # Ownership is enforced before any preview data is disclosed.
+        other_session_id = (await client.post("/v1/sessions/guest")).json()["id"]
+        other_headers = {"X-FOMO-Session": other_session_id}
+        forbidden = await client.get(f"/v1/projects/{project_id}/preview", headers=other_headers)
+        assert forbidden.status_code == 403

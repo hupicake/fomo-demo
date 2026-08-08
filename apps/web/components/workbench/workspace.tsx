@@ -84,6 +84,7 @@ import { Button } from "@/components/ui/button";
 import { LazyMonacoEditor } from "@/components/workbench/monaco-editor";
 import type { DeviceViewport, WorkspaceTab } from "@/lib/store/workbench-store";
 import type { FileContent, FileManifestEntry, PreviewRef, RunPresentation, VersionSummary } from "@/lib/contracts";
+import { validatePreviewUrl } from "@/lib/preview";
 import { cn } from "@/lib/utils";
 
 const tabs: Array<{ icon: typeof MonitorIcon; id: WorkspaceTab; label: string }> = [
@@ -103,19 +104,6 @@ function sourceLanguage(file?: FileManifestEntry): string {
   return extension === "tsx" || extension === "jsx" ? "typescript" : extension === "ts" ? "typescript" : extension || "plaintext";
 }
 
-function previewUrl(preview?: PreviewRef): string | undefined {
-  if (!(preview?.url && preview.origin && preview.status === "ready")) return undefined;
-  try {
-    const url = new URL(preview.url);
-    const origin = new URL(preview.origin);
-    const localhost = url.hostname === "localhost" || url.hostname === "127.0.0.1";
-    if (url.origin !== origin.origin || !(url.protocol === "https:" || (localhost && url.protocol === "http:"))) return undefined;
-    return url.toString();
-  } catch {
-    return undefined;
-  }
-}
-
 function groupFiles(files: FileManifestEntry[]): Array<{ name: string; files: FileManifestEntry[] }> {
   const groups = new Map<string, FileManifestEntry[]>();
   for (const file of files) {
@@ -127,26 +115,14 @@ function groupFiles(files: FileManifestEntry[]): Array<{ name: string; files: Fi
     .map(([name, entries]) => ({ name, files: entries }));
 }
 
-function PreviewDemo() {
-  return (
-    <div className="grid min-h-[32rem] place-items-center bg-[linear-gradient(135deg,#f8fafc,#e7eefb)] p-7">
-      <div className="w-full max-w-lg overflow-hidden rounded-2xl border bg-white shadow-xl">
-        <div className="flex items-center justify-between border-b px-5 py-4"><div><p className="text-xs text-slate-500">Northstar Library</p><h3 className="text-lg font-semibold text-slate-900">图书目录</h3></div><span className="rounded-md bg-slate-900 px-3 py-1.5 text-xs font-medium text-white">新增图书</span></div>
-        <div className="p-5"><div className="h-9 rounded-lg border bg-slate-50 px-3 py-2 text-xs text-slate-400">搜索书名、作者或 ISBN…</div><div className="mt-4 overflow-hidden rounded-lg border"><div className="grid grid-cols-[1.4fr_1fr_.5fr] bg-slate-50 px-3 py-2 text-[10px] font-medium uppercase tracking-wider text-slate-500"><span>图书</span><span>作者</span><span>库存</span></div>{["人类简史", "百年孤独", "The Design of Everyday Things"].map((book, index) => <div className="grid grid-cols-[1.4fr_1fr_.5fr] border-t px-3 py-3 text-xs text-slate-700" key={book}><span className="font-medium">{book}</span><span>{["尤瓦尔·赫拉利", "加西亚·马尔克斯", "Don Norman"][index]}</span><span className="text-emerald-700">{[3, 1, 6][index]} 可借</span></div>)}</div></div>
-      </div>
-      <p className="mt-4 text-center text-xs text-slate-500">Demo fixture preview — not an OpenSandbox runtime.</p>
-    </div>
-  );
-}
-
-function PreviewPanel({ device, isDemo, onDeviceChange, preview }: { device: DeviceViewport; isDemo: boolean; onDeviceChange: (value: DeviceViewport) => void; preview?: PreviewRef }) {
+function PreviewPanel({ device, onDeviceChange, preview }: { device: DeviceViewport; onDeviceChange: (value: DeviceViewport) => void; preview?: PreviewRef }) {
   const [refreshKey, setRefreshKey] = useState(0);
   const [logs, setLogs] = useState<Array<{ level: "log" | "warn" | "error"; message: string; timestamp: Date }>>([]);
-  const url = previewUrl(preview);
+  const valid = useMemo(() => validatePreviewUrl(preview?.url), [preview?.url]);
 
   useEffect(() => {
-    if (!(url && preview?.origin && preview.runId)) return;
-    const expectedOrigin = preview.origin;
+    if (!(preview?.status === "ready" && preview?.runId && valid)) return;
+    const expectedOrigin = valid.expectedOrigin;
     const runId = preview.runId;
     const onMessage = (event: MessageEvent<unknown>) => {
       if (event.origin !== expectedOrigin || !event.data || typeof event.data !== "object") return;
@@ -161,18 +137,17 @@ function PreviewPanel({ device, isDemo, onDeviceChange, preview }: { device: Dev
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [preview?.origin, preview?.runId, url]);
+  }, [preview?.runId, preview?.status, valid]);
 
   const viewportClass = device === "desktop" ? "w-full" : device === "tablet" ? "mx-auto max-w-[768px]" : "mx-auto max-w-[390px]";
-  if (isDemo) {
-    return <div className="h-full overflow-auto"><div className="border-b bg-amber-500/5 px-4 py-2 text-xs text-amber-800">Demo fixture: this is not a sandbox health check or a successful production preview.</div><PreviewDemo /></div>;
-  }
   if (preview?.status === "reconnecting") {
     return <div className="grid h-full place-items-center p-8 text-center"><RefreshCwIcon className="size-5 animate-spin text-primary" /><p className="mt-3 text-sm font-medium">Reconnecting preview sandbox</p><p className="mt-1 max-w-sm text-xs leading-5 text-muted-foreground">FOMO retains the last version and waits for the runtime to recover; it does not display an empty success state.</p></div>;
   }
-  if (!url) {
+  const target = preview?.status === "ready" && Boolean(preview.runId) ? valid : undefined;
+  if (!target) {
     return <div className="grid h-full place-items-center p-8 text-center"><MonitorIcon className="size-6 text-muted-foreground" /><p className="mt-3 text-sm font-medium">Preview is not ready</p><p className="mt-1 max-w-sm text-xs leading-5 text-muted-foreground">A verified OpenSandbox ingress URL appears here only after the worker reports it. {preview?.error || "No preview URL was received yet."}</p></div>;
   }
+  const url = target.href;
   return (
     <div className="flex h-full min-h-0 flex-col bg-muted/30">
       <div className="flex items-center justify-between border-b bg-card px-3 py-2"><div className="flex items-center gap-1">{([ ["desktop", MonitorIcon], ["tablet", TabletIcon], ["mobile", SmartphoneIcon] ] as const).map(([id, Icon]) => <button aria-label={`${id} viewport`} className={cn("grid size-7 place-items-center rounded-md", device === id ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:bg-muted")} key={id} onClick={() => onDeviceChange(id)} type="button"><Icon className="size-3.5" /></button>)}</div><div className="flex items-center gap-2"><Badge className="font-mono text-[10px]" variant="outline">isolated origin</Badge><Button onClick={() => window.open(url, "_blank", "noopener,noreferrer")} size="icon-sm" title="Open preview in new window" variant="ghost"><ExternalLinkIcon className="size-3.5" /></Button></div></div>
@@ -233,7 +208,7 @@ export function Workspace({ device, downloadHref, file, files, isDemo, onDeviceC
   return (
     <section className="flex min-h-0 flex-col overflow-hidden rounded-2xl border bg-card shadow-sm" aria-label="Workspace">
       <nav className="flex shrink-0 items-center gap-1 overflow-x-auto border-b bg-card px-2" aria-label="Workspace tabs"><div className="flex">{tabs.map((tab) => { const Icon = tab.icon; return <button className={cn("inline-flex h-11 items-center gap-1.5 border-b-2 px-3 text-xs font-medium transition-colors", selectedTab === tab.id ? "border-primary text-primary" : "border-transparent text-muted-foreground hover:text-foreground")} key={tab.id} onClick={() => setSelectedTab(tab.id)} type="button"><Icon className="size-3.5" />{tab.label}</button>; })}</div><div className="ml-auto flex shrink-0 items-center gap-1.5 py-1"><label className="sr-only" htmlFor="workspace-version">Version</label><select className="h-7 max-w-32 rounded-md border bg-background px-2 text-[11px] outline-none focus:ring-2 focus:ring-primary/30" id="workspace-version" onChange={(event) => onVersionChange(event.target.value || undefined)} value={selectedVersionId || ""}><option value="">Current workspace</option>{presentation.versions.map((version) => <option key={version.id} value={version.id}>{version.hash?.slice(0, 7) || version.id.slice(0, 7)}</option>)}</select>{downloadHref ? <Button asChild size="icon-sm" title="Download selected source version" variant="ghost"><a href={downloadHref}><DownloadIcon className="size-3.5" /><span className="sr-only">Download source</span></a></Button> : null}</div></nav>
-      <div className="min-h-0 flex-1">{selectedTab === "preview" ? <PreviewPanel device={device} isDemo={isDemo} onDeviceChange={onDeviceChange} preview={presentation.preview} /> : null}{selectedTab === "code" ? <CodePanel file={file} files={files} isDemo={isDemo} onSave={onSave} onSelect={onSelectFile} saveError={saveError} saving={saving} selectedPath={selectedFile} /> : null}{selectedTab === "terminal" ? <TerminalPanel presentation={presentation} /> : null}{selectedTab === "problems" ? <ProblemsPanel onSelectFile={onSelectFile} presentation={presentation} /> : null}{selectedTab === "versions" ? <VersionPanel isDemo={isDemo} onRestore={onRestore} selectedVersionId={selectedVersionId} versions={presentation.versions} /> : null}</div>
+      <div className="min-h-0 flex-1">{selectedTab === "preview" ? <PreviewPanel device={device} onDeviceChange={onDeviceChange} preview={presentation.preview} /> : null}{selectedTab === "code" ? <CodePanel file={file} files={files} isDemo={isDemo} onSave={onSave} onSelect={onSelectFile} saveError={saveError} saving={saving} selectedPath={selectedFile} /> : null}{selectedTab === "terminal" ? <TerminalPanel presentation={presentation} /> : null}{selectedTab === "problems" ? <ProblemsPanel onSelectFile={onSelectFile} presentation={presentation} /> : null}{selectedTab === "versions" ? <VersionPanel isDemo={isDemo} onRestore={onRestore} selectedVersionId={selectedVersionId} versions={presentation.versions} /> : null}</div>
     </section>
   );
 }

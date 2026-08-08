@@ -91,9 +91,8 @@ export interface VersionSummary {
 }
 
 export interface PreviewRef {
-  status: "ready" | "reconnecting" | "failed" | "pending" | "demo";
+  status: "ready" | "reconnecting" | "failed" | "pending" | "demo" | "expired" | "unavailable";
   url?: string;
-  origin?: string;
   runId?: string;
   error?: string;
 }
