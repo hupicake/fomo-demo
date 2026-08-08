@@ -113,14 +113,37 @@ export interface AcceptanceTrace {
   evidence: TraceEvidence[];
 }
 
-export interface Artifact {
+export const artifactKinds = ["product_spec", "technical_spec"] as const;
+export type ArtifactKind = (typeof artifactKinds)[number];
+
+export interface ArtifactRef {
   id: string;
-  kind: "product-spec" | "technical-spec" | "implementation-report" | "diagnostic-report" | string;
-  title: string;
-  markdown: string;
-  role?: AgentRole;
-  updatedAt?: string;
+  runId?: string;
+  kind: string;
+  role?: string;
+  schemaVersion?: number;
+  title?: string;
+  summary?: string;
+  createdAt?: string;
+  /** Demo fixture only; real refs never carry pre-rendered markdown. */
+  markdown?: string;
 }
+
+export interface ArtifactDetail extends ArtifactRef {
+  runId: string;
+  kind: ArtifactKind;
+  role: string;
+  schemaVersion: number;
+  title: string;
+  summary: string;
+  createdAt: string;
+  content: Record<string, unknown>;
+}
+
+export type ArtifactLoadState =
+  | { status: "loading" }
+  | { status: "error"; message: string }
+  | { status: "ready"; detail: ArtifactDetail };
 
 export interface RoleActivity {
   role: AgentRole;
@@ -187,6 +210,7 @@ export interface ProjectSnapshot {
   versions?: VersionSummary[];
   trace?: AcceptanceTrace[];
   preview?: PreviewRef;
+  artifactRefs?: ArtifactRef[];
 }
 
 export interface RunPresentation {
@@ -195,7 +219,7 @@ export interface RunPresentation {
   status: RunStatus;
   lastSeq: number;
   roles: Record<AgentRole, RoleActivity>;
-  artifacts: Artifact[];
+  artifacts: ArtifactRef[];
   trace: AcceptanceTrace[];
   fileChanges: FileChange[];
   commands: CommandLog[];
@@ -216,8 +240,8 @@ export type AgentMessageMetadata = {
 
 export type AgentDataParts = {
   "agent-role": RoleActivity;
-  "product-spec": Artifact;
-  "technical-spec": Artifact;
+  "product-spec": ArtifactRef;
+  "technical-spec": ArtifactRef;
   "acceptance-trace": AcceptanceTrace[];
   "file-change": FileChange;
   command: CommandLog;

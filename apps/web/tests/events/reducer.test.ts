@@ -91,15 +91,139 @@ describe("run presentation reducer", () => {
     expect(snapshot.roles.architect.status).toBe("completed");
   });
 
-  it("maps a product artifact to the typed AI SDK data part", () => {
+  it("maps a canonical artifact.upserted to the hyphenated typed AI data part", () => {
     const chunks = domainEventToMessageChunks(event(1, "artifact.upserted", {
+      artifactId: "spec-1",
+      kind: "product_spec",
+    }, "product_manager"));
+
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0]).toEqual({
+      type: "data-product-spec",
+      id: "artifact-spec-1",
+      data: {
+        id: "spec-1",
+        kind: "product_spec",
+        runId: "run-library",
+        role: "product_manager",
+      },
+    });
+  });
+
+  it("maps a technical_spec artifact to the technical-spec data part", () => {
+    const chunks = domainEventToMessageChunks(event(1, "artifact.upserted", {
+      artifactId: "spec-2",
+      kind: "technical_spec",
+    }, "architect"));
+
+    expect(chunks).toEqual([expect.objectContaining({ type: "data-technical-spec", id: "artifact-spec-2" })]);
+  });
+
+  it("never maps a legacy artifactType payload or a hidden kind to a data part", () => {
+    expect(domainEventToMessageChunks(event(1, "artifact.upserted", {
       artifactType: "product-spec",
       artifactId: "spec-1",
       title: "Library product specification",
       markdown: "# Scope",
+    }, "product_manager"))).toEqual([]);
+    expect(domainEventToMessageChunks(event(2, "artifact.upserted", {
+      artifactId: "spec-2",
+      kind: "implementation_plan",
+    }, "engineer"))).toEqual([]);
+    expect(domainEventToMessageChunks(event(3, "artifact.upserted", {
+      kind: "product_spec",
+    }, "product_manager"))).toEqual([]);
+  });
+
+  it("creates a lightweight loading ref from artifact.upserted without inventing fields", () => {
+    const initial = createRunPresentation({
+      projectId: "project-library",
+      run: { id: "run-library", projectId: "project-library", status: "running", lastSeq: 0 },
+    });
+
+    const next = reduceDomainEvent(initial, event(1, "artifact.upserted", {
+      artifactId: "spec-1",
+      kind: "product_spec",
     }, "product_manager"));
 
-    expect(chunks).toEqual([expect.objectContaining({ type: "data-product-spec", id: "artifact-spec-1" })]);
+    expect(next.artifacts).toEqual([{
+      id: "spec-1",
+      kind: "product_spec",
+      runId: "run-library",
+      role: "product_manager",
+    }]);
+    expect(next.artifacts[0]).not.toHaveProperty("title");
+    expect(next.artifacts[0]).not.toHaveProperty("summary");
+    expect(next.artifacts[0]).not.toHaveProperty("schemaVersion");
+    expect(next.artifacts[0]).not.toHaveProperty("createdAt");
+    expect(next.artifacts[0]).not.toHaveProperty("content");
+  });
+
+  it("ignores artifact events from an older run after a run switch", () => {
+    const initial = createRunPresentation({
+      projectId: "project-library",
+      run: { id: "run-new", projectId: "project-library", status: "running", lastSeq: 0 },
+    });
+    const stale: DomainEvent = {
+      schemaVersion: 1,
+      eventId: "event-stale",
+      seq: 9,
+      projectId: "project-library",
+      runId: "run-old",
+      kind: "artifact.upserted",
+      role: "product_manager",
+      occurredAt: "2026-08-07T12:00:00.000Z",
+      payload: { artifactId: "spec-old", kind: "product_spec" },
+    };
+
+    const next = reduceDomainEvent(initial, stale);
+
+    expect(next).toBe(initial);
+    expect(next.artifacts).toEqual([]);
+  });
+
+  it("replaces event-derived loading refs with snapshot refs during hydration", () => {
+    const hydrated = hydrateRunPresentationFromSnapshot({
+      events: [event(1, "artifact.upserted", { artifactId: "spec-1", kind: "product_spec" }, "product_manager")],
+      lastSeq: 1,
+      projectId: "project-library",
+      run: { id: "run-library", projectId: "project-library", status: "completed", lastSeq: 1 },
+      artifactRefs: [{
+        id: "spec-1",
+        runId: "run-library",
+        kind: "product_spec",
+        role: "product_manager",
+        schemaVersion: 1,
+        title: "Library product specification",
+        summary: "Readers can manage books.",
+        createdAt: "2026-08-07T12:00:00.000Z",
+      }],
+    });
+
+    expect(hydrated.artifacts).toEqual([expect.objectContaining({
+      id: "spec-1",
+      schemaVersion: 1,
+      title: "Library product specification",
+      summary: "Readers can manage books.",
+    })]);
+    expect(hydrated.artifacts[0]).not.toHaveProperty("markdown");
+    expect(hydrated.artifacts[0]).not.toHaveProperty("content");
+  });
+
+  it("keeps event-derived loading refs when the snapshot carried no refs", () => {
+    const hydrated = hydrateRunPresentationFromSnapshot({
+      events: [event(1, "artifact.upserted", { artifactId: "spec-1", kind: "technical_spec" }, "architect")],
+      lastSeq: 1,
+      projectId: "project-library",
+      run: { id: "run-library", projectId: "project-library", status: "completed", lastSeq: 1 },
+    });
+
+    expect(hydrated.artifacts).toEqual([{
+      id: "spec-1",
+      kind: "technical_spec",
+      runId: "run-library",
+      role: "architect",
+    }]);
   });
 
   it("derives preview.ready runId from the trusted event envelope and consumes url and status only", () => {

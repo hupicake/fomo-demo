@@ -7,7 +7,7 @@ import {
   type AgentDataParts,
   type AgentMessageMetadata,
   type AgentRole,
-  type Artifact,
+  type ArtifactRef,
   type CommandLog,
   type DomainEvent,
   type FileChange,
@@ -106,6 +106,7 @@ export function hydrateRunPresentationFromSnapshot(input: {
   run?: RunSnapshot;
   trace?: AcceptanceTrace[];
   versions?: VersionSummary[];
+  artifactRefs?: ArtifactRef[];
 }): RunPresentation {
   const replayRun = input.run ? { ...input.run, lastSeq: 0 } : undefined;
   let presentation = createRunPresentation({
@@ -120,6 +121,9 @@ export function hydrateRunPresentationFromSnapshot(input: {
   }
   return {
     ...presentation,
+    // The snapshot's refs are authoritative for the display run; event-derived
+    // loading refs only remain when the snapshot carried none.
+    artifacts: input.artifactRefs && input.artifactRefs.length > 0 ? input.artifactRefs : presentation.artifacts,
     lastSeq: Math.max(presentation.lastSeq, input.lastSeq, input.run?.lastSeq || 0),
   };
 }
@@ -146,17 +150,20 @@ export function activityFromEvent(event: DomainEvent): RoleActivity | undefined 
   };
 }
 
-function artifactFromEvent(event: DomainEvent): Artifact {
+function artifactRefFromEvent(event: DomainEvent): ArtifactRef | undefined {
   const payload = event.payload;
-  const kind = asText(payload.kind || payload.artifactType || payload.artifact_type, "implementation-report");
-  return {
-    id: asText(payload.id || payload.artifactId || payload.artifact_id, event.eventId),
-    kind,
-    title: asText(payload.title, kind.replaceAll("-", " ")),
-    markdown: asText(payload.markdown || payload.content || payload.summary),
-    role: event.role || asRole(payload.role),
-    updatedAt: event.occurredAt,
-  };
+  const kind = asText(payload.kind);
+  if (kind !== "product_spec" && kind !== "technical_spec") {
+    return undefined;
+  }
+  const id = asText(payload.artifactId || payload.artifact_id);
+  if (!id) {
+    return undefined;
+  }
+  // A deliberately lightweight loading ref: runId comes only from the trusted
+  // event envelope, and no title/summary/schemaVersion/createdAt/content is
+  // invented here; the workspace loads the real detail on demand.
+  return { id, kind, runId: event.runId, role: event.role || asRole(payload.role) };
 }
 
 function traceFromPayload(payload: Record<string, unknown>): AcceptanceTrace[] {
@@ -329,8 +336,10 @@ export function reduceDomainEvent(state: RunPresentation, event: DomainEvent): R
       next.status = "waiting_for_user";
       break;
     case "artifact.upserted": {
-      const artifact = artifactFromEvent(event);
-      next.artifacts = replaceById(state.artifacts, artifact);
+      const ref = artifactRefFromEvent(event);
+      if (ref) {
+        next.artifacts = replaceById(state.artifacts, ref);
+      }
       break;
     }
     case "trace.updated": {
@@ -400,11 +409,16 @@ export function domainEventToMessageChunks(
 
   switch (event.kind) {
     case "artifact.upserted": {
-      const artifact = artifactFromEvent(event);
-      const dataName: "product-spec" | "technical-spec" = artifact.kind === "product-spec"
+      const ref = artifactRefFromEvent(event);
+      if (!ref) {
+        return [];
+      }
+      // The only place snake_case backend kinds convert to hyphenated AI
+      // data-part names.
+      const dataName: "product-spec" | "technical-spec" = ref.kind === "product_spec"
         ? "product-spec"
         : "technical-spec";
-      return [dataChunk(dataName, artifact, `artifact-${artifact.id}`)];
+      return [dataChunk(dataName, ref, `artifact-${ref.id}`)];
     }
     case "trace.updated":
       return [dataChunk("acceptance-trace", traceFromPayload(event.payload), `trace-${event.runId}`)];

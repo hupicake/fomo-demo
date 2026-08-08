@@ -1,6 +1,9 @@
-import { toProjectStatus, toRunStatus } from "@/lib/contracts";
+import { artifactKinds, toProjectStatus, toRunStatus } from "@/lib/contracts";
 import type {
   AcceptanceTrace,
+  ArtifactDetail,
+  ArtifactKind,
+  ArtifactRef,
   DomainEvent,
   FileContent,
   FileManifestEntry,
@@ -342,6 +345,44 @@ function normalizePreview(value: unknown): PreviewRef | undefined {
   };
 }
 
+function normalizeArtifactRef(value: unknown): ArtifactRef | undefined {
+  const source = record(value);
+  const id = text(source.id || source.artifactId || source.artifact_id);
+  const runId = text(source.runId || source.run_id);
+  const kind = text(source.kind);
+  const role = text(source.role);
+  const schemaVersion = numberValue(source.schemaVersion ?? source.schema_version, -1);
+  const title = text(source.title);
+  const summary = text(source.summary);
+  const createdAt = text(source.createdAt || source.created_at);
+  if (!id || !runId || !kind || !role || schemaVersion < 0 || !title || !summary || !createdAt) {
+    return undefined;
+  }
+  if (!artifactKinds.includes(kind as ArtifactKind)) {
+    return undefined;
+  }
+  // The kind->role mapping is fixed: a ref whose role does not match its kind
+  // is malformed and fails closed.
+  const expectedRole = kind === "product_spec" ? "product_manager" : "architect";
+  if (role !== expectedRole) {
+    return undefined;
+  }
+  return { id, runId, kind, role, schemaVersion, title, summary, createdAt };
+}
+
+function normalizeArtifactDetail(value: unknown): ArtifactDetail | undefined {
+  const source = record(value);
+  const ref = normalizeArtifactRef(source);
+  if (!ref) {
+    return undefined;
+  }
+  const content = source.content;
+  if (!content || typeof content !== "object" || Array.isArray(content)) {
+    return undefined;
+  }
+  return { ...ref, kind: ref.kind as ArtifactKind, content: content as Record<string, unknown> };
+}
+
 async function responseProblem(response: Response): Promise<ApiProblem> {
   let body: JsonRecord = {};
   try {
@@ -477,6 +518,10 @@ export const controlPlane = {
       }),
       trace: normalizeTraceResponse(source.trace || source.acceptanceTrace || source.acceptance_trace),
       preview: normalizePreview(source.preview),
+      artifactRefs: toArray(source.artifactRefs || source.artifact_refs).flatMap((item) => {
+        const normalized = normalizeArtifactRef(item);
+        return normalized ? [normalized] : [];
+      }),
     };
   },
 
@@ -573,6 +618,17 @@ export const controlPlane = {
   async getPreview(projectId: string): Promise<PreviewRef | undefined> {
     const response = await request<unknown>(`/projects/${encodeURIComponent(projectId)}/preview`);
     return normalizePreview(record(response).preview || response);
+  },
+
+  async getArtifact(runId: string, artifactId: string): Promise<ArtifactDetail> {
+    const response = await request<unknown>(
+      `/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(artifactId)}`,
+    );
+    const detail = normalizeArtifactDetail(record(response).artifact || response);
+    if (!detail || detail.runId !== runId || detail.id !== artifactId) {
+      throw new ApiProblem({ status: 502, title: "Artifact detail did not match the requested run or artifact" });
+    }
+    return detail;
   },
 
   async restoreVersion(projectId: string, versionId: string): Promise<VersionSummary | undefined> {
