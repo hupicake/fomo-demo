@@ -112,6 +112,8 @@ _PLAYWRIGHT_NETWORK_CONTRACT = (
     "http://127.0.0.1:<port>. Never use a container hostname, os.hostname(), process.env.HOSTNAME, "
     "or any other dynamic hostname."
 )
+_PLAYWRIGHT_SMOKE_TEST_SUFFIX = ".smoke.spec.ts"
+_PLAYWRIGHT_NO_TESTS_FOUND = "Error: No tests found"
 _TECHNICAL_SPEC_REPAIR_INSTRUCTIONS = MappingProxyType(
     {
         "technical_spec.component_decisions.duplicate": "Use each componentDecisions.component value at most once.",
@@ -141,6 +143,10 @@ _TECHNICAL_SPEC_REPAIR_INSTRUCTIONS = MappingProxyType(
         "technical_spec.file_plan.path_duplicate": "Use each TechnicalSpec.filePlan path at most once.",
         "technical_spec.file_plan.capacity_exceeded": (
             "Reduce TechnicalSpec.filePlan to the configured Engineer capacity."
+        ),
+        "technical_spec.playwright_smoke.file_plan_required": (
+            "When testPlan includes Playwright, include a model-owned create or modify filePlan path matching "
+            "tests/**/*.smoke.spec.ts."
         ),
         "technical_spec.dependencies.starter_only": (
             "Do not declare additional dependencies; use the immutable starter baseline or record a risk."
@@ -612,7 +618,10 @@ class SOPRunner:
                         "or dependencies. If a required capability is absent, record it in risks instead of installing "
                         "or scaffolding it. Put normal generated routes under app/(generated)/** (or app/page.tsx for "
                         "the root route), business compositions under components/features/**, domain state/types under "
-                        "lib/domain/**, and smoke tests under tests/**. "
+                        "lib/domain/**, and smoke tests under tests/**. When testPlan includes Playwright, filePlan must "
+                        "include at least one model-owned create or modify smoke test path matching "
+                        "tests/**/*.smoke.spec.ts, including a direct tests/<name>.smoke.spec.ts file; do not use a "
+                        "hyphen in place of the required .smoke.spec.ts suffix. "
                         "Return concise componentDecisions only for decision-bearing UI primitives, composed feature "
                         "surfaces, or custom strategies—not a component inventory. Leave ordinary business composition "
                         "components in components, filePlan, and publicApiContracts without requiring a same-name decision. "
@@ -1090,6 +1099,10 @@ class SOPRunner:
         if technical.dependencies:
             raise ArtifactContractViolation(code="technical_spec.dependencies.starter_only")
         self._technical_file_plan_paths(technical)
+        if any(item.method == "playwright" for item in technical.test_plan) and not self._playwright_smoke_paths(
+            technical
+        ):
+            raise ArtifactContractViolation(code="technical_spec.playwright_smoke.file_plan_required")
         decision_names = [decision.component for decision in technical.component_decisions]
         if len(decision_names) != len(set(decision_names)):
             raise ArtifactContractViolation(
@@ -1123,6 +1136,48 @@ class SOPRunner:
         public_api_keys = set(contract_keys)
         self._validate_persistent_state_domain_slices(technical, planned_files, public_api_keys)
         self._validate_feature_surface_slices(technical, planned_files, public_api_keys)
+
+    def _playwright_smoke_paths(self, technical: TechnicalSpec) -> list[str]:
+        """Return only model-owned non-delete file-plan paths runnable by the fixed starter."""
+        if not any(item.method == "playwright" for item in technical.test_plan):
+            return []
+        paths: list[str] = []
+        for item in technical.file_plan:
+            if item.operation == "delete":
+                continue
+            try:
+                path = str(validate_workspace_path(item.path))
+            except ValueError:
+                continue
+            if (
+                path.startswith("tests/")
+                and path.endswith(_PLAYWRIGHT_SMOKE_TEST_SUFFIX)
+                and self.starter.is_model_owned_path(path)
+                and path not in paths
+            ):
+                paths.append(path)
+        return paths
+
+    def _add_no_tests_smoke_affected_files(
+        self,
+        gates: list[GateResult],
+        technical: TechnicalSpec,
+    ) -> list[GateResult]:
+        """Scope Playwright discovery failures to already validated smoke-test paths only."""
+        smoke_paths = self._playwright_smoke_paths(technical)
+        if not smoke_paths:
+            return gates
+        enriched: list[GateResult] = []
+        for gate in gates:
+            if (
+                gate.gate == "smoke"
+                and gate.status == GateStatus.failed
+                and gate.summary.strip() == _PLAYWRIGHT_NO_TESTS_FOUND
+            ):
+                enriched.append(gate.model_copy(update={"affected_files": smoke_paths}))
+            else:
+                enriched.append(gate)
+        return enriched
 
     def _validate_diagnostic_repair_scope(
         self,
@@ -1646,7 +1701,10 @@ class SOPRunner:
         await self._transition(context, RunPhase.verification)
         if context.sandbox is None:
             raise SOPExecutionError("reviewer was invoked without a sandbox")
-        gates = await self._run_quality_gates(context)
+        gates = self._add_no_tests_smoke_affected_files(
+            await self._run_quality_gates(context),
+            technical,
+        )
         candidate_commit = await self._create_candidate_commit(context)
         draft = await self._role(
             context,
@@ -1783,7 +1841,13 @@ class SOPRunner:
     async def _gate_command(self, context: _Context, gate: str, command: str) -> GateResult:
         result = await self._command(context, command, role="reviewer")
         status = GateStatus.passed if result.exit_code == 0 and not result.timed_out else GateStatus.failed
-        summary = "passed" if status == GateStatus.passed else self._failure_summary(result)
+        summary = "passed"
+        if status == GateStatus.failed:
+            summary = (
+                _PLAYWRIGHT_NO_TESTS_FOUND
+                if gate == "smoke" and self._is_exact_playwright_no_tests_failure(result.stdout, result.stderr)
+                else self._failure_summary(result)
+            )
         return GateResult(
             gate=gate,
             status=status,
@@ -2439,6 +2503,14 @@ class SOPRunner:
     def _failure_summary(result: Any) -> str:
         text = f"{result.stdout}\n{result.stderr}".strip().replace("\n", " ") or "command failed"
         return SOPRunner._redact(text)[:1000]
+
+    @staticmethod
+    def _is_exact_playwright_no_tests_failure(stdout: str, stderr: str) -> bool:
+        return any(
+            line.strip() == _PLAYWRIGHT_NO_TESTS_FOUND
+            for output in (stdout, stderr)
+            for line in output.splitlines()
+        )
 
     @staticmethod
     def _affected_workspace_paths(stdout: str, stderr: str) -> list[str]:

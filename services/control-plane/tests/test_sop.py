@@ -26,6 +26,7 @@ from fomo.agent_runtime.sop import (
 from fomo.agent_runtime.state import FailureRouter, SOPStateMachine
 from fomo.sandbox.base import ExecResult
 from fomo.sandbox.fake import FakeSandboxProvider
+from fomo.sandbox.opensandbox import _OutputCollector
 from fomo.schemas import (
     DiagnosticReport,
     FileBatchReport,
@@ -238,6 +239,22 @@ def _responses() -> dict[str, Any]:
             "findings": [],
         },
     }
+
+
+def _architect_response_with_playwright_smoke_path(
+    path: str = "tests/library.smoke.spec.ts",
+    operation: str = "create",
+) -> dict[str, Any]:
+    response = _responses()["architect"]
+    response["filePlan"].append(
+        {
+            "path": path,
+            "operation": operation,
+            "reason": "Playwright smoke coverage",
+        }
+    )
+    response["testPlan"] = [{"acceptanceId": "AC-1", "method": "playwright", "steps": ["smoke"]}]
+    return response
 
 
 def _architect_response_with_file_plan_count(count: int) -> dict[str, Any]:
@@ -1619,6 +1636,103 @@ async def test_gate_command_extracts_concatenated_paths_and_bounds_reviewer_scop
             [gate],
         )
     assert violation.value.code == "diagnostic_report.location_files.not_affected"
+
+
+def test_affected_workspace_paths_keep_hidden_and_dot_relative_files() -> None:
+    assert SOPRunner._affected_workspace_paths(
+        "./components/features/library.tsx(1,2): error\n.hidden/keep.ts(3,4): error",
+        "",
+    ) == ["components/features/library.tsx", ".hidden/keep.ts"]
+
+
+@pytest.mark.asyncio
+async def test_collector_newlines_keep_typecheck_locations_unprefixed() -> None:
+    async def sink(_stream: str, _text: str) -> None:
+        return None
+
+    collector = _OutputCollector(sink, limit_bytes=4_096)
+    await collector.emit(
+        "stdout",
+        "components/features/dashboard/dashboard-page.tsx(326,12): error TS2769: invalid aria-hidden.",
+    )
+    await collector.emit("stdout", "Type 'undefined'.")
+    await collector.emit(
+        "stdout",
+        "components/features/readers/readers-controller.tsx(104,58): error TS2741: pending missing.",
+    )
+    await collector.emit(
+        "stdout",
+        "lib/domain/books-store.ts(60,18): error TS2352: invalid cast.",
+    )
+    await collector.emit(
+        "stdout",
+        "lib/domain/readers-store.ts(35,18): error TS2352: invalid cast.",
+    )
+
+    assert SOPRunner._affected_workspace_paths(collector.stdout, "") == [
+        "components/features/dashboard/dashboard-page.tsx",
+        "components/features/readers/readers-controller.tsx",
+        "lib/domain/books-store.ts",
+        "lib/domain/readers-store.ts",
+    ]
+
+
+def test_playwright_test_plan_requires_matching_model_owned_smoke_file_plan(repository, settings) -> None:
+    runner = SOPRunner(repository, ScriptedModelClient({}), FakeSandboxProvider(), settings)
+
+    runner._validate_technical_file_plan(TechnicalSpec.model_validate(_responses()["architect"]))
+    accepted = TechnicalSpec.model_validate(_architect_response_with_playwright_smoke_path())
+    runner._validate_technical_file_plan(accepted)
+
+    for response in (
+        _architect_response_with_playwright_smoke_path("tests/library-smoke.spec.ts"),
+        _architect_response_with_playwright_smoke_path(operation="delete"),
+    ):
+        with pytest.raises(ArtifactContractViolation) as violation:
+            runner._validate_technical_file_plan(TechnicalSpec.model_validate(response))
+        assert violation.value.code == "technical_spec.playwright_smoke.file_plan_required"
+
+
+def test_no_tests_smoke_gate_uses_exact_evidence_and_bounded_reviewer_scope(repository, settings) -> None:
+    runner = SOPRunner(repository, ScriptedModelClient({}), FakeSandboxProvider(), settings)
+    technical = TechnicalSpec.model_validate(_architect_response_with_playwright_smoke_path())
+    runner._validate_technical_file_plan(technical)
+    smoke_path = "tests/library.smoke.spec.ts"
+    assert SOPRunner._is_exact_playwright_no_tests_failure("\nError: No tests found\n", "1")
+    assert not SOPRunner._is_exact_playwright_no_tests_failure(
+        "Error: No tests found after an unrelated failure",
+        "",
+    )
+
+    gates = runner._add_no_tests_smoke_affected_files(
+        [
+            GateResult(
+                gate="smoke",
+                status=GateStatus.failed,
+                summary="Error: No tests found",
+                affected_files=["components/features/library.tsx"],
+            )
+        ],
+        technical,
+    )
+    assert gates[0].affected_files == [smoke_path]
+    runner._validate_diagnostic_repair_scope(
+        DiagnosticReport(blocking_issues=["smoke failed"], location_files=[smoke_path]),
+        technical,
+        gates,
+    )
+
+    extended = runner._add_no_tests_smoke_affected_files(
+        [
+            GateResult(
+                gate="smoke",
+                status=GateStatus.failed,
+                summary="Error: No tests found after an unrelated failure",
+            )
+        ],
+        technical,
+    )
+    assert extended[0].affected_files == []
 
 
 @pytest.mark.asyncio
