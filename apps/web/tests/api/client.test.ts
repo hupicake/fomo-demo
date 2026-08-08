@@ -212,4 +212,39 @@ describe("control plane client contract", () => {
     expect(snapshot.project.status).toBe("idle");
     expect(snapshot.activeRun).toEqual(expect.objectContaining({ id: "run-failed", status: "failed" }));
   });
+
+  it("normalizes a ready preview from the snapshot without preserving a second origin field", async () => {
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    installFetch(jsonResponse({
+      project: { id: "project-1", title: "Library" },
+      messages: [],
+      runs: [],
+      preview: {
+        status: "ready",
+        url: "https://preview.example.test/app",
+        runId: "run-9",
+        origin: "https://untrusted-origin.example.test",
+      },
+    }));
+
+    const snapshot = await controlPlane.getProject("project-1");
+
+    expect(snapshot.preview).toEqual({
+      status: "ready",
+      url: "https://preview.example.test/app",
+      runId: "run-9",
+    });
+    expect(snapshot.preview).not.toHaveProperty("origin");
+  });
+
+  it("normalizes the preview endpoint response to the typed preview ref", async () => {
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    installFetch(jsonResponse({ status: "ready", url: "https://preview.example.test/app", runId: "run-9" }));
+
+    await expect(controlPlane.getPreview("project-1")).resolves.toEqual({
+      status: "ready",
+      url: "https://preview.example.test/app",
+      runId: "run-9",
+    });
+  });
 });

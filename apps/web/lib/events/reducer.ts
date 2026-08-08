@@ -249,7 +249,6 @@ function previewFromEvent(event: DomainEvent): PreviewRef {
   return {
     status: event.kind === "preview.ready" ? "ready" : "failed",
     url: asText(payload.url) || undefined,
-    origin: asText(payload.origin) || undefined,
     runId: event.runId,
     error: asText(payload.error || payload.detail) || undefined,
   };

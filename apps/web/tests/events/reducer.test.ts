@@ -101,4 +101,38 @@ describe("run presentation reducer", () => {
 
     expect(chunks).toEqual([expect.objectContaining({ type: "data-product-spec", id: "artifact-spec-1" })]);
   });
+
+  it("derives preview.ready runId from the trusted event envelope and consumes url and status only", () => {
+    const initial = createRunPresentation({
+      projectId: "project-library",
+      run: { id: "run-library", projectId: "project-library", status: "running", lastSeq: 0 },
+    });
+
+    const next = reduceDomainEvent(initial, event(1, "preview.ready", {
+      url: "https://preview.example.test/app",
+      origin: "https://untrusted-origin.example.test",
+    }));
+
+    expect(next.preview).toEqual({
+      status: "ready",
+      url: "https://preview.example.test/app",
+      runId: "run-library",
+    });
+    expect(next.preview).not.toHaveProperty("origin");
+  });
+
+  it("marks preview.failed without a url and surfaces the worker error", () => {
+    const initial = createRunPresentation({
+      projectId: "project-library",
+      run: { id: "run-library", projectId: "project-library", status: "running", lastSeq: 0 },
+    });
+
+    const next = reduceDomainEvent(initial, event(1, "preview.failed", { error: "ingress refused" }));
+
+    expect(next.preview).toEqual({
+      status: "failed",
+      runId: "run-library",
+      error: "ingress refused",
+    });
+  });
 });

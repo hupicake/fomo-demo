@@ -337,7 +337,6 @@ function normalizePreview(value: unknown): PreviewRef | undefined {
   return {
     status: (status || "pending") as PreviewRef["status"],
     url: text(source.url) || undefined,
-    origin: text(source.origin) || undefined,
     runId: text(source.runId || source.run_id) || undefined,
     error: text(source.error || source.detail) || undefined,
   };

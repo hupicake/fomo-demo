@@ -9,8 +9,9 @@ from __future__ import annotations
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
+from urllib.parse import urlparse
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def _camel(value: str) -> str:
@@ -476,9 +477,30 @@ class TraceResponse(SchemaModel):
 
 
 class PreviewResponse(SchemaModel):
+    """The sole preview-location contract: a ready status must carry an
+    absolute http(s) URL and a run id, and any non-ready status must not carry
+    a URL at all.
+    """
+
     status: Literal["ready", "expired", "unavailable"]
     url: str | None = None
     run_id: str | None = None
+
+    @model_validator(mode="after")
+    def _enforce_preview_contract(self) -> PreviewResponse:
+        if self.status == "ready":
+            if not self.run_id:
+                raise ValueError("ready preview requires a nonempty runId")
+            if not self.url:
+                raise ValueError("ready preview requires a url")
+            parsed = urlparse(self.url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValueError("preview url must be an absolute http(s) URL")
+            if parsed.username is not None or parsed.password is not None:
+                raise ValueError("preview url must not contain userinfo")
+        elif self.url is not None:
+            raise ValueError("expired or unavailable preview must have url null")
+        return self
 
 
 class ProjectSnapshotResponse(SchemaModel):
