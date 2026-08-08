@@ -5,13 +5,18 @@
 FROM node:22-bookworm-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436
 
 ARG PNPM_VERSION=10.17.1
+ARG PI_VERSION=0.84.1
 
 ENV PNPM_HOME=/opt/fomo/pnpm \
     npm_config_store_dir=/opt/fomo/pnpm/store \
+    NPM_CONFIG_PREFIX=/opt/fomo/pi \
     COREPACK_HOME=/opt/fomo/corepack \
     COREPACK_DEFAULT_TO_LATEST=0 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
-    PATH=/opt/fomo/pnpm:${PATH} \
+    PATH=/opt/fomo/pi/bin:/opt/fomo/pnpm:${PATH} \
+    PI_OFFLINE=1 \
+    PI_SKIP_VERSION_CHECK=1 \
+    PI_TELEMETRY=0 \
     CI=true
 
 USER root
@@ -28,12 +33,24 @@ RUN apt-get update \
         git \
         openssh-client \
         python3 \
-    && mkdir -p /workspace "${PNPM_HOME}" "${COREPACK_HOME}" \
+    && node -e 'const [major, minor] = process.versions.node.split(".").map(Number); if (major < 22 || (major === 22 && minor < 19)) process.exit(1)' \
+    && mkdir -p /workspace "${PNPM_HOME}" "${COREPACK_HOME}" /opt/fomo/bin /var/lib/fomo-pi \
     && corepack enable \
     && corepack prepare "pnpm@${PNPM_VERSION}" --activate \
+    && npm install --global --ignore-scripts "@earendil-works/pi-coding-agent@${PI_VERSION}" \
+    && /opt/fomo/pi/bin/pi --version \
     && pnpm dlx playwright@1.55.1 install --with-deps chromium \
-    && chown -R node:node /workspace "${PNPM_HOME}" "${COREPACK_HOME}" /ms-playwright \
+    && chown -R root:root /opt/fomo/pi /opt/fomo/bin \
+    && chmod -R a-w /opt/fomo/pi \
+    && chown -R node:node /workspace "${PNPM_HOME}" "${COREPACK_HOME}" /ms-playwright /var/lib/fomo-pi \
+    && chmod 0700 /var/lib/fomo-pi \
     && rm -rf /var/lib/apt/lists/*
+
+# This bridge is infrastructure, not part of the generated application or its
+# dependency graph. Keep it root-owned and immutable while the sandbox runs as
+# the unprivileged node user.
+COPY --chown=root:root fomo-pi-rpc-bridge.mjs /opt/fomo/bin/fomo-pi-rpc-bridge.mjs
+RUN chmod 0555 /opt/fomo/bin/fomo-pi-rpc-bridge.mjs
 
 # npm_config_store_dir forces root's fetch and the runtime node user's installs
 # to use the same controlled store. This layer receives only the immutable
@@ -50,7 +67,7 @@ RUN cd /opt/fomo/starter-prefetch \
 
 # `fomo-control-plane` is a named Compose build context. This seed is read
 # only; OpenSandbox copies it into a newly-created writable workspace before
-# an Architect/Engineer pair sees the project.
+# fomo-pi-ds sees the project.
 COPY --from=fomo-control-plane --chown=node:node src/fomo/starter_assets/fomo-next-radix-v2/base /opt/fomo/starters/fomo-next-radix-v2/base
 COPY --from=fomo-control-plane --chown=node:node src/fomo/starter_assets/fomo-next-radix-v2/capabilities/crud /opt/fomo/starters/fomo-next-radix-v2/capabilities/crud
 COPY --from=fomo-control-plane --chown=node:node src/fomo/starter_assets/fomo-next-radix-v2/capabilities/local-persistence /opt/fomo/starters/fomo-next-radix-v2/capabilities/local-persistence
