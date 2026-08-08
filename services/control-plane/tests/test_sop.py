@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -814,7 +815,12 @@ def test_default_starter_manifest_is_digest_pinned_and_exposes_approved_primitiv
 
     assert manifest.id == "fomo-next-radix-v2"
     assert manifest.version == "2.0.0"
-    assert manifest.tree_sha256 == "acae2845e79415b6c75a5aeee6057a63333ceddfd7f55921c32a02615832302a"
+    assert manifest.tree_sha256 == "10b1b82decf7bc7e44efb5905feb0814ee5e87bec294062433f6be1f37766367"
+    canonical_base_tree = "".join(
+        f"{entry.path}\0{entry.sha256}\0{entry.size}\n"
+        for entry in sorted(manifest.files, key=lambda entry: entry.path)
+    ).encode("utf-8")
+    assert hashlib.sha256(canonical_base_tree).hexdigest() == manifest.base_tree_sha256
     assert "@/components/ui/button" in manifest.available_imports
     assert "@/components/ui/card" in manifest.available_imports
     assert "package.json" in manifest.protected_paths
