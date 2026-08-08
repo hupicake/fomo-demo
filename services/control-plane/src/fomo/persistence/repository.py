@@ -311,7 +311,9 @@ class Repository:
             )
             runs = list(
                 await session.scalars(
-                    select(RunRecord).where(RunRecord.project_id == project_id).order_by(RunRecord.created_at.desc())
+                    select(RunRecord)
+                    .where(RunRecord.project_id == project_id)
+                    .order_by(RunRecord.created_at.desc(), RunRecord.id.desc())
                 )
             )
             run_responses = [await self._run_with_seq(session, item) for item in runs]
