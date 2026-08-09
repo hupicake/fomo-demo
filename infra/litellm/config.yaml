@@ -1,0 +1,85 @@
+model_list:
+  - model_name: pm
+    litellm_params:
+      model: anthropic/claude-sonnet-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+  - model_name: pm-fallback
+    litellm_params:
+      model: openai/gpt-5.5
+      api_key: os.environ/OPENAI_API_KEY
+      api_base: os.environ/OPENAI_API_BASE
+      reasoning_effort: xhigh
+
+  - model_name: architect
+    litellm_params:
+      model: anthropic/claude-sonnet-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+  - model_name: architect-fallback
+    litellm_params:
+      model: openai/gpt-5.5
+      api_key: os.environ/OPENAI_API_KEY
+      api_base: os.environ/OPENAI_API_BASE
+      reasoning_effort: xhigh
+
+  - model_name: engineer
+    litellm_params:
+      model: openai/gpt-5.5
+      api_key: os.environ/OPENAI_API_KEY
+      api_base: os.environ/OPENAI_API_BASE
+      reasoning_effort: xhigh
+  - model_name: engineer-fallback
+    litellm_params:
+      model: anthropic/claude-sonnet-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  - model_name: reviewer
+    litellm_params:
+      model: anthropic/claude-sonnet-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+  - model_name: reviewer-fallback
+    litellm_params:
+      model: openai/gpt-5.5
+      api_key: os.environ/OPENAI_API_KEY
+      api_base: os.environ/OPENAI_API_BASE
+      reasoning_effort: xhigh
+
+  - model_name: deepseek-flash
+    litellm_params:
+      model: deepseek/deepseek-v4-flash
+      api_key: os.environ/DEEPSEEK_API_KEY
+      api_base: https://api.deepseek.com
+      thinking:
+        type: disabled
+
+  # Direct Pi route. Keep this separate from the legacy structured-JSON alias:
+  # Pi uses reasoning and the virtual key restricts every run to this model.
+  - model_name: fomo-pi-flash
+    litellm_params:
+      model: deepseek/deepseek-v4-flash
+      api_key: os.environ/DEEPSEEK_API_KEY
+      api_base: https://api.deepseek.com
+      thinking:
+        type: enabled
+
+  # Default Direct Pi implementation/repair route. Planning remains on the
+  # fast DeepSeek route; code-producing turns favor GPT-5.5 tool reliability.
+  - model_name: fomo-pi-build
+    litellm_params:
+      model: openai/gpt-5.5
+      api_key: os.environ/OPENAI_API_KEY
+      api_base: os.environ/OPENAI_API_BASE
+
+router_settings:
+  num_retries: 1
+  fallbacks:
+    - pm: [pm-fallback]
+    - architect: [architect-fallback]
+    - engineer: [engineer-fallback]
+    - reviewer: [reviewer-fallback]
+
+litellm_settings:
+  drop_params: true
+  request_timeout: 300
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

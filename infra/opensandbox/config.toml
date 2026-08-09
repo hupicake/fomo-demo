@@ -1,0 +1,44 @@
+# Local-only OpenSandbox Server configuration.
+#
+# Docker Desktop on macOS runs Linux containers with runc. This configuration is
+# intentionally a development runtime, not a public untrusted-code boundary.
+
+[server]
+host = "0.0.0.0"
+port = 8080
+# Browser-facing endpoints must resolve on the Mac host. The server itself uses
+# docker.host_ip below when it needs to reach sibling sandbox containers.
+eip = "localhost"
+# Generation sandboxes still start with a six-hour TTL. A successfully verified
+# preview may be renewed once to the seven-day retention ceiling.
+max_sandbox_timeout_seconds = 604800
+
+[log]
+level = "INFO"
+
+[runtime]
+type = "docker"
+# The server injects execd into sandbox images; application images must not
+# pre-install execd themselves.
+execd_image = "opensandbox/execd:v1.0.21"
+
+[docker]
+network_mode = "bridge"
+# OpenSandbox runs in Compose while it creates sibling containers through the
+# Docker socket. This hostname lets its internal proxy reach their published
+# host ports on Docker Desktop for macOS.
+host_ip = "host.docker.internal"
+port_range_min = 40000
+port_range_max = 60000
+drop_capabilities = ["AUDIT_WRITE", "MKNOD", "NET_ADMIN", "NET_RAW", "SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE", "SYS_TIME", "SYS_TTY_CONFIG"]
+no_new_privileges = true
+pids_limit = 4096
+
+[ingress]
+# Docker runtime supports direct endpoints only. The generated application is
+# served on container port 8080; port 44772 remains execd-only.
+mode = "direct"
+
+[store]
+type = "sqlite"
+path = "/var/lib/opensandbox/opensandbox.db"
