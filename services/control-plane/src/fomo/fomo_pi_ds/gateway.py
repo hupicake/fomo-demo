@@ -1,7 +1,8 @@
 """Run-scoped LiteLLM virtual-key management for Direct Pi.
 
 Only the control plane may hold the LiteLLM master key. Generation sandbox G
-receives the opaque :class:`RunVirtualKey` secret and can call one model alias;
+receives the opaque :class:`RunVirtualKey` secret and can call only the two
+stage-specific Direct Pi aliases;
 provider credentials never cross this module's boundary.
 """
 
@@ -17,6 +18,11 @@ import httpx
 from .invocation import IDENTIFIER_PATTERN, MAX_IDENTIFIER_LENGTH, MAX_VIRTUAL_KEY_LENGTH
 
 FOMO_PI_LITELLM_ALIAS = "fomo-pi-flash"
+FOMO_PI_BUILD_LITELLM_ALIAS = "fomo-pi-build"
+FOMO_PI_LITELLM_ALIASES = (
+    FOMO_PI_LITELLM_ALIAS,
+    FOMO_PI_BUILD_LITELLM_ALIAS,
+)
 _KEY_ALIAS_PREFIX = "fomo-run-"
 
 
@@ -32,7 +38,7 @@ class RunVirtualKey:
     key_alias: str
     duration_seconds: int
     secret: str = field(repr=False)
-    model_alias: str = FOMO_PI_LITELLM_ALIAS
+    model_aliases: tuple[str, ...] = FOMO_PI_LITELLM_ALIASES
 
     def __post_init__(self) -> None:
         if not self.secret or len(self.secret) > MAX_VIRTUAL_KEY_LENGTH:
@@ -84,7 +90,7 @@ class LiteLLMRunKeyClient:
         key_alias = f"{_KEY_ALIAS_PREFIX}{run_id}"
         payload = {
             "key_alias": key_alias,
-            "models": [FOMO_PI_LITELLM_ALIAS],
+            "models": list(FOMO_PI_LITELLM_ALIASES),
             "duration": f"{duration_seconds}s",
             "max_budget": max_budget,
             "max_parallel_requests": 1,

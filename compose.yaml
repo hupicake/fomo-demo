@@ -12,6 +12,9 @@ x-control-plane-environment: &control-plane-environment
   AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-fomo}
   AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-fomo-minio-local-only-0123456789}
   LITELLM_BASE_URL: ${LITELLM_BASE_URL_DOCKER:-http://litellm:4000}
+  # Pi runs in an OpenSandbox-created container outside the Compose network;
+  # it reaches the published LiteLLM port through the Docker host.
+  SANDBOX_LITELLM_BASE_URL: ${SANDBOX_LITELLM_BASE_URL:-http://host.docker.internal:4000}
   LITELLM_API_KEY: ${LITELLM_MASTER_KEY:-sk-local-fomo-development-only}
   FOMO_INFERENCE_TOKEN_TTL: ${FOMO_INFERENCE_TOKEN_TTL:-4200}
   INFERENCE_MANAGEMENT_TIMEOUT_SECONDS: ${INFERENCE_MANAGEMENT_TIMEOUT_SECONDS:-15}
@@ -35,6 +38,10 @@ x-control-plane-environment: &control-plane-environment
   OPENSANDBOX_API_KEY: ${OPENSANDBOX_API_KEY:-fomo-opensandbox-local-development-only}
   OPENSANDBOX_IMAGE: ${OPENSANDBOX_IMAGE:-fomo-sandbox-node:2026-08-08}
   OPENSANDBOX_LIFETIME_SECONDS: ${OPENSANDBOX_LIFETIME_SECONDS:-21600}
+  OPENSANDBOX_READY_TIMEOUT_SECONDS: ${OPENSANDBOX_READY_TIMEOUT_SECONDS:-120}
+  VERIFIED_PREVIEW_LIFETIME_SECONDS: ${VERIFIED_PREVIEW_LIFETIME_SECONDS:-604800}
+  PUBLIC_PREVIEW_BASE_DOMAIN: ${PUBLIC_PREVIEW_BASE_DOMAIN:-}
+  PI_CONTEXT_WINDOW: ${PI_CONTEXT_WINDOW:-200000}
   # Generated-code sandboxes never inherit generic container proxy variables.
   # These are the only explicit, non-secret egress values passed to
   # OpenSandbox's Sandbox.create(env=...).
@@ -45,6 +52,8 @@ x-control-plane-environment: &control-plane-environment
 x-control-plane-depends-on: &control-plane-depends-on
   postgres:
     condition: service_healthy
+  migrate:
+    condition: service_completed_successfully
   redis:
     condition: service_healthy
   minio-init:
@@ -62,7 +71,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-fomo}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fomo-local-only}
     ports:
-      - "${POSTGRES_HOST_PORT:-5432}:5432"
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -95,7 +104,7 @@ services:
     image: redis:7.4-alpine
     command: ["redis-server", "--appendonly", "yes"]
     ports:
-      - "${REDIS_HOST_PORT:-6379}:6379"
+      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
     volumes:
       - redis-data:/data
     healthcheck:
@@ -112,8 +121,8 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-fomo}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-fomo-minio-local-only-0123456789}
     ports:
-      - "${MINIO_API_HOST_PORT:-9000}:9000"
-      - "${MINIO_CONSOLE_HOST_PORT:-9001}:9001"
+      - "127.0.0.1:${MINIO_API_HOST_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_HOST_PORT:-9001}:9001"
     volumes:
       - minio-data:/data
     healthcheck:
@@ -213,6 +222,22 @@ services:
     entrypoint: ["/bin/true"]
     restart: "no"
 
+  migrate:
+    build:
+      context: ./services/control-plane
+      dockerfile: Dockerfile
+      args:
+        HTTP_PROXY: ${DOCKER_HTTP_PROXY:-}
+        HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-}
+        NO_PROXY: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,::1,postgres}
+    image: fomo-control-plane:local
+    command: ["fomo-migrate"]
+    environment: *control-plane-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
   api:
     build:
       context: ./services/control-plane
@@ -229,6 +254,45 @@ services:
       - "127.0.0.1:${API_HOST_PORT:-8000}:8000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  # Optional host-based proxy for verified generated previews. A named
+  # wildcard DNS/TLS ingress should route *.PUBLIC_PREVIEW_BASE_DOMAIN here;
+  # the gateway itself stays bound to loopback and never receives the Docker
+  # socket or forwards account/model credentials into generated applications.
+  preview-gateway:
+    profiles: ["public-preview"]
+    image: fomo-control-plane:local
+    command: ["fomo-preview-gateway"]
+    # Deliberately do not inherit *control-plane-environment.  The public
+    # request path needs persistence plus OpenSandbox endpoint discovery only;
+    # it must never receive model, object-store, or Redis credentials.
+    environment:
+      DATABASE_URL: ${DATABASE_URL_DOCKER:-postgresql+asyncpg://fomo:fomo-local-only@postgres:5432/fomo}
+      OPENSANDBOX_BASE_URL: ${OPENSANDBOX_BASE_URL_DOCKER:-http://opensandbox:8080}
+      OPENSANDBOX_API_KEY: ${OPENSANDBOX_API_KEY:-fomo-opensandbox-local-development-only}
+      # Local profile placeholder only.  It must not share the localhost site
+      # with WEB_ORIGIN; production supplies a real independent preview root.
+      PUBLIC_PREVIEW_BASE_DOMAIN: ${PUBLIC_PREVIEW_BASE_DOMAIN:-fomo-previews.test}
+      PREVIEW_UPSTREAM_HOST_OVERRIDE: ${PREVIEW_UPSTREAM_HOST_OVERRIDE:-host.docker.internal}
+      PREVIEW_GATEWAY_PORT: "8001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      opensandbox:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:${PREVIEW_GATEWAY_HOST_PORT:-8001}:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/_fomo_gateway/healthz', timeout=3).read()"]
       interval: 5s
       timeout: 5s
       retries: 20

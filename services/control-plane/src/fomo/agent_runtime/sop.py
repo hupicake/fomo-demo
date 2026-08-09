@@ -50,7 +50,6 @@ from fomo.starter import (
 )
 
 from .llm import ModelClient, ModelError, ModelRequestError, ModelRetry
-from .metagpt_adapter import MetaGPTAdapter
 from .state import FailureRouter, SOPStateMachine
 
 Artifact = TypeVar(
@@ -510,8 +509,6 @@ class SOPRunner:
         model: ModelClient,
         sandbox: SandboxProvider,
         settings: Settings,
-        *,
-        agent_adapter: MetaGPTAdapter | None = None,
     ) -> None:
         self.repository = repository
         self.model = model
@@ -521,14 +518,8 @@ class SOPRunner:
         # its selected overlays once into ``context.starter`` before sandbox
         # creation; never mutate this shared catalog based on a model response.
         self.starter: StarterManifest = default_starter_manifest()
-        if settings.agent_framework == "metagpt":
-            self.agent_adapter = agent_adapter or MetaGPTAdapter(model)
-        elif settings.agent_framework == "native":
-            if agent_adapter is not None:
-                raise ValueError("native agent framework cannot receive a MetaGPT adapter")
-            self.agent_adapter = None
-        else:
-            raise ValueError("AGENT_FRAMEWORK must be either 'metagpt' or 'native'")
+        if settings.agent_framework != "native":
+            raise ValueError("SOPRunner requires AGENT_FRAMEWORK=native")
         self.state_machine = SOPStateMachine()
         self.failure_router = FailureRouter()
 
@@ -660,13 +651,6 @@ class SOPRunner:
             lease_token=context.lease_token,
         )
         context.product_artifact_id = artifact_id
-        if self.agent_adapter is not None:
-            self.agent_adapter.register_artifact(
-                run_id=context.run_id,
-                role="product_manager",
-                artifact_id=artifact_id,
-                artifact=product,
-            )
         acceptance_items = [item.model_dump(mode="json", by_alias=True) for item in product.acceptance_criteria]
         await self.repository.upsert_acceptance_items(
             context.project_id,
@@ -833,13 +817,6 @@ class SOPRunner:
             lease_token=context.lease_token,
         )
         context.technical_artifact_id = artifact_id
-        if self.agent_adapter is not None:
-            self.agent_adapter.register_artifact(
-                run_id=context.run_id,
-                role="architect",
-                artifact_id=artifact_id,
-                artifact=technical,
-            )
         if context.product_artifact_id:
             await self.repository.append_trace_link(
                 context.run_id,
@@ -1059,7 +1036,6 @@ class SOPRunner:
             validate_artifact=lambda candidate: self._validate_implementation_plan(
                 candidate, implementation_technical, product
             ),
-            persist_handoff=False,
         )
         context.implementation_plan_artifact_id = await self.repository.store_artifact(
             context.run_id,
@@ -1137,7 +1113,6 @@ class SOPRunner:
                 validate_artifact=lambda report, expected=batch: self._validate_file_batch_report(
                     report, expected, starter=starter
                 ),
-                persist_handoff=False,
             )
             changes = [
                 FileChange(path=item.path, content=item.content, operation=item.operation)
@@ -2554,13 +2529,6 @@ class SOPRunner:
             role="reviewer",
             lease_token=context.lease_token,
         )
-        if self.agent_adapter is not None:
-            self.agent_adapter.register_artifact(
-                run_id=context.run_id,
-                role="reviewer",
-                artifact_id=artifact_id,
-                artifact=report,
-            )
         # Evidence is written only after the DiagnosticReport artifact is
         # durably stored, so every playwright_smoke record points at the real
         # artifact. Infrastructure failures never write AC evidence.
@@ -3214,13 +3182,6 @@ class SOPRunner:
                 role="engineer",
                 lease_token=context.lease_token,
             )
-            if self.agent_adapter is not None:
-                self.agent_adapter.register_artifact(
-                    run_id=context.run_id,
-                    role="engineer",
-                    artifact_id=artifact_id,
-                    artifact=context.implementation,
-                )
             if context.technical_artifact_id:
                 await self.repository.append_trace_link(
                     context.run_id,
@@ -3272,7 +3233,6 @@ class SOPRunner:
         schema: type[Artifact],
         messages: list[dict[str, str]],
         validate_artifact: Callable[[Artifact], None] | None = None,
-        persist_handoff: bool = True,
     ) -> Artifact:
         await self._check_cancelled(context)
         schema_contract = json.dumps(
@@ -3320,32 +3280,16 @@ class SOPRunner:
         attempts = self.settings.structured_output_retries + 1
         for attempt in range(attempts):
             try:
-                if self.agent_adapter is None:
-                    payload = await self._await_cancellable(
-                        context,
-                        self.model.complete_json(
-                            model_alias,
-                            messages,
-                            schema.__name__,
-                            on_retry=record_transport_retry,
-                        ),
-                    )
-                    artifact = schema.model_validate(payload)
-                else:
-                    artifact = await self._await_cancellable(
-                        context,
-                        self.agent_adapter.run_action(
-                            run_id=context.run_id,
-                            role=role,
-                            model_alias=model_alias,
-                            schema=schema,
-                            messages=messages,
-                            persist_handoff=persist_handoff,
-                            on_retry=record_transport_retry,
-                        ),
-                    )
-                    if not isinstance(artifact, schema):
-                        raise TypeError(f"MetaGPT {role} returned the wrong artifact type")
+                payload = await self._await_cancellable(
+                    context,
+                    self.model.complete_json(
+                        model_alias,
+                        messages,
+                        schema.__name__,
+                        on_retry=record_transport_retry,
+                    ),
+                )
+                artifact = schema.model_validate(payload)
                 if validate_artifact is not None:
                     validate_artifact(artifact)
                 await self.repository.append_event(
@@ -3472,7 +3416,7 @@ class SOPRunner:
         raise AssertionError("unreachable")
 
     async def _await_cancellable(self, context: _Context, operation: Awaitable[Awaited]) -> Awaited:
-        """Await a model/MetaGPT call while polling the durable cancel flag.
+        """Await a model call while polling the durable cancel flag.
 
         Transport timeouts are intentionally generous for normal generations.
         A cancellation request must not inherit the configured model timeout: cancel

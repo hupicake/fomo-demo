@@ -7,15 +7,22 @@ secret injection; neither the API nor the worker reads or logs local secret file
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
+from ipaddress import ip_address
 from math import isfinite
 from pathlib import Path
 from urllib.parse import urlparse
+from uuid import UUID
 
 DEFAULT_OPENSANDBOX_IMAGE = "fomo-sandbox-node:2026-08-08"
 DEFAULT_OPENSANDBOX_LIFETIME_SECONDS = 21_600
+DEFAULT_OPENSANDBOX_READY_TIMEOUT_SECONDS = 120
+DEFAULT_VERIFIED_PREVIEW_LIFETIME_SECONDS = 604_800
 MAX_ENGINEER_FILE_CHARACTERS = 24_000
 INFERENCE_TOKEN_EXPIRY_GRACE_SECONDS = 600
+_DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_COOKIE_NAME = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 
 
 def _bool(name: str, default: bool = False) -> bool:
@@ -27,6 +34,78 @@ def _opensandbox_lifetime_seconds(default: int) -> int:
     if not 0 < value <= DEFAULT_OPENSANDBOX_LIFETIME_SECONDS:
         raise ValueError("OPENSANDBOX_LIFETIME_SECONDS must be between 1 and 21600 seconds")
     return value
+
+
+def _verified_preview_lifetime_seconds(default: int) -> int:
+    value = int(os.getenv("VERIFIED_PREVIEW_LIFETIME_SECONDS", str(default)))
+    if not 0 < value <= DEFAULT_VERIFIED_PREVIEW_LIFETIME_SECONDS:
+        raise ValueError("VERIFIED_PREVIEW_LIFETIME_SECONDS must be between 1 and 604800 seconds")
+    return value
+
+
+def _public_preview_base_domain(value: str | None) -> str | None:
+    if value is None or not value.strip():
+        return None
+    domain = value.strip().lower().rstrip(".")
+    labels = domain.split(".")
+    try:
+        ip_address(domain)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("PUBLIC_PREVIEW_BASE_DOMAIN must be a DNS domain without a scheme or port")
+    if (
+        len(domain) > 253
+        or len(labels) < 2
+        or any(not _DNS_LABEL.fullmatch(label) for label in labels)
+    ):
+        raise ValueError("PUBLIC_PREVIEW_BASE_DOMAIN must be a DNS domain without a scheme or port")
+    return domain
+
+
+def _registrable_site(hostname: str) -> str:
+    candidate = hostname.lower().rstrip(".")
+    if candidate == "localhost" or candidate.endswith(".localhost"):
+        return "localhost"
+    try:
+        ip_address(candidate)
+    except ValueError:
+        labels = candidate.split(".")
+        return ".".join(labels[-2:]) if len(labels) >= 2 else candidate
+    return candidate
+
+
+def _web_origin_site(value: str) -> str:
+    parsed = urlparse(value.strip())
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(
+            "WEB_ORIGIN must be an absolute http(s) origin when public previews are enabled"
+        ) from exc
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+        or port is not None
+        and not 1 <= port <= 65_535
+    ):
+        raise ValueError(
+            "WEB_ORIGIN must be an absolute http(s) origin when public previews are enabled"
+        )
+    return _registrable_site(parsed.hostname)
+
+
+def _validated_session_cookie_name(value: str) -> str:
+    candidate = value.strip()
+    if not candidate or not _COOKIE_NAME.fullmatch(candidate) or candidate == "__Host-":
+        raise ValueError("SESSION_COOKIE_NAME must be a valid cookie name")
+    return candidate
 
 
 def _positive_int_environment_value(name: str, default: int) -> int:
@@ -115,7 +194,8 @@ def _sandbox_proxy_url(name: str) -> str | None:
         or parsed.params
         or parsed.query
         or parsed.fragment
-        or port is not None and not 1 <= port <= 65_535
+        or port is not None
+        and not 1 <= port <= 65_535
     ):
         raise ValueError(f"{name} must be an http(s) proxy URL without userinfo")
     return value
@@ -137,6 +217,10 @@ class Settings:
     web_origin: str = "http://localhost:3000"
     session_cookie_name: str = "fomo_session"
     litellm_base_url: str = "http://localhost:4000/v1"
+    # The worker calls LiteLLM's management API from the control-plane host,
+    # while Pi calls the OpenAI-compatible endpoint from inside OpenSandbox.
+    # Those are different network namespaces in local Docker development.
+    sandbox_litellm_base_url: str | None = None
     litellm_api_key: str | None = None
     # Direct Pi receives only a short-lived LiteLLM virtual key. The master key
     # stays in the control plane and provider credentials stay inside LiteLLM.
@@ -150,6 +234,10 @@ class Settings:
     run_max_tokens: int = 400_000
     pi_max_file_characters: int = 20_000
     pi_max_changed_files: int = 24
+    # Explicit logical context window passed to the bridge. The active model
+    # supports a larger provider window; FOMO intentionally compacts within
+    # this 200K product budget.
+    pi_context_window: int = 200_000
     # Model calls are intentionally decoupled from sandbox command timeouts.
     # Smaller Engineer batches should complete well within this bound.
     model_request_timeout_seconds: int = 300
@@ -169,9 +257,12 @@ class Settings:
     engineer_max_files_per_batch: int = 1
     engineer_target_file_characters: int = 12_000
     engineer_max_file_characters: int = 20_000
-    # Direct Pi is the production path. MetaGPT/native remain loadable only
-    # while historical runs and focused compatibility tests are retired.
+    # Direct Pi is the production path. Native remains only for legacy SOP
+    # compatibility while historical runs and focused tests are retired.
     agent_framework: str = "direct_pi"
+    # True-default P1 rollout. Setting this false preserves the graph-less P0
+    # Direct Pi contract for controlled rollback and historical test fixtures.
+    direct_pi_goal_graph_enabled: bool = True
     sandbox_provider: str = "opensandbox"
     opensandbox_base_url: str = "http://localhost:8080"
     opensandbox_api_key: str | None = None
@@ -185,6 +276,14 @@ class Settings:
     # Git. Deployments may override it through OPENSANDBOX_IMAGE.
     opensandbox_image: str = DEFAULT_OPENSANDBOX_IMAGE
     opensandbox_lifetime_seconds: int = DEFAULT_OPENSANDBOX_LIFETIME_SECONDS
+    opensandbox_ready_timeout_seconds: int = DEFAULT_OPENSANDBOX_READY_TIMEOUT_SECONDS
+    # When configured, verified preview URLs use an isolated wildcard HTTPS
+    # origin and are served by fomo-preview-gateway. Unset keeps local direct
+    # OpenSandbox endpoints unchanged.
+    public_preview_base_domain: str | None = None
+    # Successful, fully verified previews outlive their build sandboxes. The
+    # OpenSandbox server hard limit is kept in sync with this bounded value.
+    verified_preview_lifetime_seconds: int = DEFAULT_VERIFIED_PREVIEW_LIFETIME_SECONDS
     allow_unsafe_process_sandbox: bool = False
     dev_sandbox_root: Path = Path("/tmp/fomo-dev-sandboxes")
     worker_poll_interval_seconds: float = 0.5
@@ -198,7 +297,38 @@ class Settings:
     max_repair_rounds: int = 3
 
     def __post_init__(self) -> None:
+        normalized_preview_domain = _public_preview_base_domain(self.public_preview_base_domain)
+        object.__setattr__(self, "public_preview_base_domain", normalized_preview_domain)
+        object.__setattr__(
+            self,
+            "session_cookie_name",
+            _validated_session_cookie_name(self.session_cookie_name),
+        )
+        if normalized_preview_domain:
+            if (
+                self.sandbox_provider != "opensandbox"
+                or self.agent_framework != "direct_pi"
+                or not self.direct_pi_goal_graph_enabled
+            ):
+                raise ValueError(
+                    "PUBLIC_PREVIEW_BASE_DOMAIN requires SANDBOX_PROVIDER=opensandbox, "
+                    "AGENT_FRAMEWORK=direct_pi, and DIRECT_PI_GOAL_GRAPH_ENABLED=true"
+                )
+            preview_site = _registrable_site(normalized_preview_domain)
+            web_site = _web_origin_site(self.web_origin)
+            if preview_site == web_site:
+                if preview_site == "localhost":
+                    raise ValueError(
+                        "PUBLIC_PREVIEW_BASE_DOMAIN must not share the localhost site "
+                        "with WEB_ORIGIN"
+                    )
+                raise ValueError(
+                    "PUBLIC_PREVIEW_BASE_DOMAIN must use a different registrable site "
+                    "from WEB_ORIGIN"
+                )
         _litellm_endpoints(self.litellm_base_url)
+        if self.sandbox_litellm_base_url:
+            _litellm_endpoints(self.sandbox_litellm_base_url)
         positive_values = {
             "inference_token_ttl_seconds": self.inference_token_ttl_seconds,
             "inference_management_timeout_seconds": self.inference_management_timeout_seconds,
@@ -209,21 +339,28 @@ class Settings:
             "run_max_tokens": self.run_max_tokens,
             "pi_max_file_characters": self.pi_max_file_characters,
             "pi_max_changed_files": self.pi_max_changed_files,
+            "pi_context_window": self.pi_context_window,
+            "model_request_timeout_seconds": self.model_request_timeout_seconds,
+            "opensandbox_ready_timeout_seconds": self.opensandbox_ready_timeout_seconds,
+            "verified_preview_lifetime_seconds": self.verified_preview_lifetime_seconds,
         }
         for name, value in positive_values.items():
             if value <= 0:
                 raise ValueError(f"{name} must be greater than 0")
+        if self.pi_context_window > 8_000_000:
+            raise ValueError("pi_context_window must not exceed 8000000")
         if self.pi_max_file_characters > 24_000:
             raise ValueError("pi_max_file_characters must not exceed 24000")
         if self.pi_max_changed_files > 24:
             raise ValueError("pi_max_changed_files must not exceed 24")
+        if self.verified_preview_lifetime_seconds > DEFAULT_VERIFIED_PREVIEW_LIFETIME_SECONDS:
+            raise ValueError("verified_preview_lifetime_seconds must not exceed 604800")
         if not isfinite(self.run_max_spend) or self.run_max_spend <= 0:
             raise ValueError("run_max_spend must be greater than 0")
         minimum_ttl = self.run_max_wall_seconds + INFERENCE_TOKEN_EXPIRY_GRACE_SECONDS
         if self.inference_token_ttl_seconds < minimum_ttl:
             raise ValueError(
-                "inference_token_ttl_seconds must be at least "
-                "run_max_wall_seconds + 600 seconds"
+                "inference_token_ttl_seconds must be at least run_max_wall_seconds + 600 seconds"
             )
 
     @property
@@ -232,7 +369,7 @@ class Settings:
 
     @property
     def pi_provider_base_url(self) -> str:
-        return _litellm_endpoints(self.litellm_base_url)[1]
+        return _litellm_endpoints(self.sandbox_litellm_base_url or self.litellm_base_url)[1]
 
     @property
     def sandbox_proxy_environment(self) -> dict[str, str]:
@@ -245,6 +382,31 @@ class Settings:
             )
             if value
         }
+
+    @property
+    def session_cookie_secure(self) -> bool:
+        return self.app_env not in {"development", "test"} or self.session_cookie_name.startswith(
+            "__Host-"
+        )
+
+    @property
+    def session_cookie_key(self) -> str:
+        if self.session_cookie_secure and not self.session_cookie_name.startswith("__Host-"):
+            return f"__Host-{self.session_cookie_name}"
+        return self.session_cookie_name
+
+    def published_preview_url(self, sandbox_id: str) -> str | None:
+        """Return the isolated public URL only after verification is complete."""
+
+        if not self.public_preview_base_domain:
+            return None
+        try:
+            canonical_id = str(UUID(sandbox_id))
+        except ValueError as exc:
+            raise ValueError("public preview requires a canonical sandbox UUID") from exc
+        if canonical_id != sandbox_id:
+            raise ValueError("public preview requires a canonical sandbox UUID")
+        return f"https://{canonical_id}.{self.public_preview_base_domain}/"
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -263,6 +425,9 @@ class Settings:
             web_origin=os.getenv("WEB_ORIGIN", defaults.web_origin),
             session_cookie_name=os.getenv("SESSION_COOKIE_NAME", defaults.session_cookie_name),
             litellm_base_url=os.getenv("LITELLM_BASE_URL", defaults.litellm_base_url).rstrip("/"),
+            sandbox_litellm_base_url=(
+                os.getenv("SANDBOX_LITELLM_BASE_URL", "").strip().rstrip("/") or None
+            ),
             # This is only a LiteLLM gateway credential. Provider keys stay inside LiteLLM.
             litellm_api_key=(
                 os.getenv("LITELLM_API_KEY") or os.getenv("LITELLM_MASTER_KEY") or None
@@ -298,8 +463,11 @@ class Settings:
             pi_max_changed_files=_positive_int_environment_value(
                 "PI_MAX_CHANGED_FILES", defaults.pi_max_changed_files
             ),
-            model_request_timeout_seconds=int(
-                os.getenv("MODEL_REQUEST_TIMEOUT_SECONDS", str(defaults.model_request_timeout_seconds))
+            pi_context_window=_positive_int_environment_value(
+                "PI_CONTEXT_WINDOW", defaults.pi_context_window
+            ),
+            model_request_timeout_seconds=_positive_int_environment_value(
+                "MODEL_REQUEST_TIMEOUT_SECONDS", defaults.model_request_timeout_seconds
             ),
             model_network_retries=int(
                 os.getenv("MODEL_NETWORK_RETRIES", str(defaults.model_network_retries))
@@ -330,11 +498,14 @@ class Settings:
                 os.getenv("ENGINEER_MAX_BATCHES", str(defaults.engineer_max_batches))
             ),
             engineer_max_files_per_batch=int(
-                os.getenv("ENGINEER_MAX_FILES_PER_BATCH", str(defaults.engineer_max_files_per_batch))
+                os.getenv(
+                    "ENGINEER_MAX_FILES_PER_BATCH", str(defaults.engineer_max_files_per_batch)
+                )
             ),
             engineer_target_file_characters=engineer_target_file_characters,
             engineer_max_file_characters=engineer_max_file_characters,
             agent_framework=os.getenv("AGENT_FRAMEWORK", defaults.agent_framework).strip().lower(),
+            direct_pi_goal_graph_enabled=_bool("DIRECT_PI_GOAL_GRAPH_ENABLED", True),
             sandbox_provider=os.getenv("SANDBOX_PROVIDER", defaults.sandbox_provider).lower(),
             opensandbox_base_url=os.getenv("OPENSANDBOX_BASE_URL", defaults.opensandbox_base_url),
             opensandbox_api_key=os.getenv("OPENSANDBOX_API_KEY") or None,
@@ -348,12 +519,28 @@ class Settings:
             opensandbox_lifetime_seconds=_opensandbox_lifetime_seconds(
                 defaults.opensandbox_lifetime_seconds
             ),
-            allow_unsafe_process_sandbox=_bool("ALLOW_UNSAFE_PROCESS_SANDBOX"),
-            dev_sandbox_root=Path(os.getenv("FOMO_DEV_SANDBOX_ROOT", str(defaults.dev_sandbox_root))),
-            worker_poll_interval_seconds=float(
-                os.getenv("WORKER_POLL_INTERVAL_SECONDS", str(defaults.worker_poll_interval_seconds))
+            opensandbox_ready_timeout_seconds=_positive_int_environment_value(
+                "OPENSANDBOX_READY_TIMEOUT_SECONDS",
+                defaults.opensandbox_ready_timeout_seconds,
             ),
-            worker_lease_seconds=int(os.getenv("WORKER_LEASE_SECONDS", str(defaults.worker_lease_seconds))),
+            public_preview_base_domain=_public_preview_base_domain(
+                os.getenv("PUBLIC_PREVIEW_BASE_DOMAIN")
+            ),
+            verified_preview_lifetime_seconds=_verified_preview_lifetime_seconds(
+                defaults.verified_preview_lifetime_seconds
+            ),
+            allow_unsafe_process_sandbox=_bool("ALLOW_UNSAFE_PROCESS_SANDBOX"),
+            dev_sandbox_root=Path(
+                os.getenv("FOMO_DEV_SANDBOX_ROOT", str(defaults.dev_sandbox_root))
+            ),
+            worker_poll_interval_seconds=float(
+                os.getenv(
+                    "WORKER_POLL_INTERVAL_SECONDS", str(defaults.worker_poll_interval_seconds)
+                )
+            ),
+            worker_lease_seconds=int(
+                os.getenv("WORKER_LEASE_SECONDS", str(defaults.worker_lease_seconds))
+            ),
             command_timeout_seconds=int(
                 os.getenv("COMMAND_TIMEOUT_SECONDS", str(defaults.command_timeout_seconds))
             ),
@@ -361,7 +548,9 @@ class Settings:
                 os.getenv("COMMAND_OUTPUT_LIMIT_BYTES", str(defaults.command_output_limit_bytes))
             ),
             preview_start_timeout_seconds=int(
-                os.getenv("PREVIEW_START_TIMEOUT_SECONDS", str(defaults.preview_start_timeout_seconds))
+                os.getenv(
+                    "PREVIEW_START_TIMEOUT_SECONDS", str(defaults.preview_start_timeout_seconds)
+                )
             ),
             preview_base_port=int(os.getenv("PREVIEW_BASE_PORT", str(defaults.preview_base_port))),
             structured_output_retries=int(

@@ -361,6 +361,10 @@ class GateResult(SchemaModel):
     # Bounded command exit code; required for a passed/failed acceptance gate
     # so evidence can carry it without persisting full logs.
     exit_code: int | None = None
+    # Command-level timeout flag. Project gates record it so a timed-out
+    # dependency install is classified as infrastructure while an ordinary
+    # non-zero install stays repairable.
+    timed_out: bool = False
 
     @model_validator(mode="after")
     def _enforce_gate_scope_contract(self) -> GateResult:
@@ -462,6 +466,58 @@ class GuestSessionResponse(SchemaModel):
     expires_at: datetime
 
 
+class AccountCredentials(SchemaModel):
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=8, max_length=128)
+
+    @field_validator("email")
+    @classmethod
+    def valid_email(cls, value: str) -> str:
+        normalized = value.strip().casefold()
+        local, separator, domain = normalized.partition("@")
+        if (
+            not separator
+            or not local
+            or not domain
+            or "@" in domain
+            or "." not in domain
+            or any(character.isspace() for character in normalized)
+        ):
+            raise ValueError("email must be a valid address")
+        return normalized
+
+
+class UserRegister(AccountCredentials):
+    display_name: str | None = Field(default=None, max_length=100)
+
+    @field_validator("display_name")
+    @classmethod
+    def non_blank_display_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = " ".join(value.split())
+        if not normalized:
+            raise ValueError("displayName must be non-blank")
+        return normalized
+
+
+class UserLogin(AccountCredentials):
+    pass
+
+
+class UserResponse(SchemaModel):
+    id: str
+    email: str
+    display_name: str
+    created_at: datetime
+
+
+class AuthSessionResponse(SchemaModel):
+    session_id: str
+    expires_at: datetime
+    user: UserResponse
+
+
 class ProjectCreate(SchemaModel):
     title: str = Field(min_length=1, max_length=200)
 
@@ -475,6 +531,66 @@ class MessageCreate(SchemaModel):
     content: str = Field(min_length=1, max_length=50_000)
     base_version_id: str | None = None
     attachments: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class UserInputRequestDraft(SchemaModel):
+    """Strict public form emitted only by Pi's trusted virtual tool."""
+
+    question: str = Field(min_length=1, max_length=2_000)
+    choices: list[str] = Field(default_factory=list, max_length=8)
+    allow_freeform: bool
+    # A short public rationale may help the control plane audit why execution
+    # paused, but it is never projected to clients or SSE.
+    reason: str | None = Field(default=None, max_length=1_000)
+
+    @field_validator("question")
+    @classmethod
+    def _bounded_question(cls, value: str) -> str:
+        normalized = " ".join(value.split())
+        if not normalized:
+            raise ValueError("question must be non-blank")
+        return normalized
+
+    @field_validator("choices")
+    @classmethod
+    def _bounded_choices(cls, values: list[str]) -> list[str]:
+        normalized = [" ".join(value.split()) for value in values]
+        if any(not value or len(value) > 200 for value in normalized):
+            raise ValueError("choices must be bounded non-blank values")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("choices must be unique")
+        return normalized
+
+    @model_validator(mode="after")
+    def _answerable(self) -> UserInputRequestDraft:
+        if not self.allow_freeform and not self.choices:
+            raise ValueError("a request must allow freeform input or provide choices")
+        return self
+
+
+class UserInputRequestResponse(SchemaModel):
+    id: str
+    run_id: str
+    question: str
+    choices: list[str] = Field(default_factory=list)
+    allow_freeform: bool
+    status: Literal["pending", "answered", "cancelled", "expired"]
+    stage: Literal["planning", "building", "repairing"]
+    goal_id: str | None = None
+    created_at: datetime
+    answered_at: datetime | None = None
+
+
+class UserInputAnswerCreate(SchemaModel):
+    client_message_id: str = Field(min_length=1, max_length=128)
+    answer: str = Field(min_length=1, max_length=50_000)
+
+    @field_validator("answer")
+    @classmethod
+    def _non_blank_answer(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("answer must be non-blank")
+        return value
 
 
 class ProjectResponse(SchemaModel):
@@ -508,12 +624,20 @@ class RunResponse(SchemaModel):
     cancel_requested_at: datetime | None = None
     error_code: str | None = None
     preview_url: str | None = None
+    pending_input_request: UserInputRequestResponse | None = None
+    execution_started_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 
 
 class MessageRunResponse(SchemaModel):
     message: MessageResponse
+    run: RunResponse
+
+
+class UserInputAnswerResponse(SchemaModel):
+    message: MessageResponse
+    request: UserInputRequestResponse
     run: RunResponse
 
 
@@ -671,6 +795,36 @@ class PreviewResponse(SchemaModel):
         return self
 
 
+class GoalAcceptanceProjection(SchemaModel):
+    acceptance_id: str
+    title: str
+    priority: Literal["must", "should"]
+    status: Literal["unverified", "passed"]
+
+
+class GoalNodeProjection(SchemaModel):
+    id: str
+    title: str
+    user_visible: bool
+    depends_on: list[str] = Field(default_factory=list)
+    status: Literal["pending", "active", "claimed", "verified", "failed", "superseded"]
+    checkpoint_id: str | None = None
+    claimed_at: datetime | None = None
+    verified_at: datetime | None = None
+    acceptance: list[GoalAcceptanceProjection] = Field(default_factory=list)
+    evidence_count: int = 0
+
+
+class GoalGraphReadProjection(SchemaModel):
+    graph_id: str
+    run_id: str
+    revision: int
+    status: Literal["active", "verified", "failed", "cancelled", "superseded"]
+    product_outcome: str
+    active_goal_id: str | None = None
+    goals: list[GoalNodeProjection] = Field(default_factory=list)
+
+
 class ProjectSnapshotResponse(SchemaModel):
     """Refresh-safe project baseline; events continue from ``lastSeq``."""
 
@@ -685,3 +839,5 @@ class ProjectSnapshotResponse(SchemaModel):
     trace: TraceResponse
     preview: PreviewResponse
     artifact_refs: list[ArtifactRefResponse] = Field(default_factory=list)
+    goal_graph: GoalGraphReadProjection | None = None
+    pending_input_request: UserInputRequestResponse | None = None

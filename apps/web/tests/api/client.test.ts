@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { controlPlane, normalizeApiBase } from "@/lib/api/client";
+import { controlPlane, normalizeApiBase, normalizeUserInputRequest } from "@/lib/api/client";
 
 const originalApiUrl = process.env.NEXT_PUBLIC_API_URL;
 const originalFetch = globalThis.fetch;
@@ -213,6 +213,158 @@ describe("control plane client contract", () => {
     expect(snapshot.activeRun).toEqual(expect.objectContaining({ id: "run-failed", status: "failed" }));
   });
 
+  it("normalizes only the public pending-input fields from project and run snapshots", async () => {
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    const pendingInputRequest = {
+      id: "input-1",
+      runId: "run-1",
+      question: "Which catalogue layout should we use?",
+      choices: ["Grid", "List"],
+      allowFreeform: true,
+      status: "pending",
+      stage: "building",
+      goalId: "G-2",
+      createdAt: "2026-08-09T10:00:00.000Z",
+      reason: "private model rationale",
+      sessionId: "private-session",
+      sandboxId: "private-sandbox",
+      context: { hidden: true },
+    };
+    installFetch(jsonResponse({
+      project: { activeRunId: "run-1", id: "project-1", title: "Library" },
+      messages: [],
+      runs: [{
+        id: "run-1",
+        projectId: "project-1",
+        status: "waiting_for_user",
+        lastSeq: 7,
+        pendingInputRequest,
+      }],
+      pendingInputRequest,
+    }));
+
+    const snapshot = await controlPlane.getProject("project-1");
+
+    expect(snapshot.pendingInputRequest).toEqual({
+      id: "input-1",
+      runId: "run-1",
+      question: "Which catalogue layout should we use?",
+      choices: ["Grid", "List"],
+      allowFreeform: true,
+      status: "pending",
+      stage: "building",
+      goalId: "G-2",
+      createdAt: "2026-08-09T10:00:00.000Z",
+      answeredAt: undefined,
+    });
+    expect(snapshot.activeRun?.pendingInputRequest).toEqual(snapshot.pendingInputRequest);
+    expect(JSON.stringify(snapshot.pendingInputRequest)).not.toMatch(/reason|session|sandbox|context/i);
+  });
+
+  it("fails closed on malformed or impossible pending-input projections", () => {
+    const valid = {
+      id: "input-1",
+      runId: "run-1",
+      question: "Choose a layout",
+      choices: ["Grid"],
+      allowFreeform: false,
+      status: "pending",
+      stage: "planning",
+    };
+
+    expect(normalizeUserInputRequest(valid)).toBeDefined();
+    expect(normalizeUserInputRequest({ ...valid, question: "q".repeat(2_001) })).toBeUndefined();
+    expect(normalizeUserInputRequest({ ...valid, choices: ["x".repeat(201)] })).toBeUndefined();
+    expect(normalizeUserInputRequest({ ...valid, choices: [] })).toBeUndefined();
+    expect(normalizeUserInputRequest({ ...valid, allowFreeform: "false" })).toBeUndefined();
+  });
+
+  it("answers the same run idempotently and preserves the key through guest-session retry", async () => {
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    const fetchMock = installFetch(
+      jsonResponse({ detail: "guest session required" }, 401),
+      jsonResponse({ id: "guest-1" }, 201),
+      jsonResponse({
+        message: { id: "message-1", role: "user", content: "Grid" },
+        request: {
+          id: "input-1",
+          runId: "run-1",
+          question: "Choose a layout",
+          choices: ["Grid", "List"],
+          allowFreeform: false,
+          status: "answered",
+          stage: "planning",
+          answeredAt: "2026-08-09T10:01:00.000Z",
+          reason: "must stay private",
+        },
+        run: { id: "run-1", projectId: "project-1", status: "queued", lastSeq: 9 },
+      }, 202),
+    );
+
+    const result = await controlPlane.answerRunInputRequest("run-1", "input-1", {
+      clientMessageId: "client-answer-1",
+      answer: "Grid",
+    });
+
+    expect(requestUrl(fetchMock, 0).pathname).toBe("/v1/runs/run-1/input-requests/input-1/answer");
+    expect(requestUrl(fetchMock, 2).pathname).toBe("/v1/runs/run-1/input-requests/input-1/answer");
+    for (const call of [0, 2]) {
+      const init = fetchMock.mock.calls[call]?.[1] as RequestInit;
+      expect(new Headers(init.headers).get("Idempotency-Key")).toBe("client-answer-1");
+      expect(JSON.parse(String(init.body))).toEqual({ clientMessageId: "client-answer-1", answer: "Grid" });
+    }
+    expect(result.run.status).toBe("queued");
+    expect(result.request).toEqual(expect.objectContaining({ id: "input-1", status: "answered" }));
+    expect(result.request).not.toHaveProperty("reason");
+  });
+
+  it("hydrates the GoalGraph server projection and maps legacy snapshots to null", async () => {
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    installFetch(
+      jsonResponse({
+        project: { id: "project-1", title: "Library" },
+        messages: [],
+        runs: [{ id: "run-1", projectId: "project-1", status: "running", lastSeq: 4 }],
+        goal_graph: {
+          graph_id: "graph-1",
+          run_id: "run-1",
+          revision: 2,
+          status: "active",
+          product_outcome: "Readers can borrow books.",
+          active_goal_id: "G-2",
+          goals: [{
+            goal_id: "G-2",
+            title: "Borrowing flow",
+            user_visible: true,
+            depends_on: ["G-1"],
+            status: "claimed",
+            checkpoint_id: "checkpoint-2",
+            claimed_at: "2026-08-09T10:00:00.000Z",
+            acceptance: [{ acceptance_id: "AC-2", title: "Borrowing persists", priority: "must", status: "pending" }],
+            evidence_count: 1,
+          }],
+        },
+      }),
+      jsonResponse({ project: { id: "project-p0", title: "Legacy" }, messages: [], runs: [] }),
+    );
+
+    const current = await controlPlane.getProject("project-1");
+    const legacy = await controlPlane.getProject("project-p0");
+
+    expect(current.goalGraph).toEqual(expect.objectContaining({
+      graphId: "graph-1",
+      activeGoalId: "G-2",
+      goals: [expect.objectContaining({
+        goalId: "G-2",
+        status: "claimed",
+        checkpointId: "checkpoint-2",
+        evidenceCount: 1,
+        acceptance: [expect.objectContaining({ acceptanceId: "AC-2", status: "pending" })],
+      })],
+    }));
+    expect(legacy.goalGraph).toBeNull();
+  });
+
   it("maps unverified validation and link-derived implementation status from the trace", async () => {
     process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
     installFetch(jsonResponse({
@@ -249,7 +401,7 @@ describe("control plane client contract", () => {
     })]);
   });
 
-  it("derives not_implemented from the absence of implemented_in links in the graph fallback", async () => {
+  it("keeps implementation unknown when the graph fallback has no implemented_in proof", async () => {
     process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
     installFetch(jsonResponse({
       project: { id: "project-1", title: "Library" },
@@ -263,10 +415,47 @@ describe("control plane client contract", () => {
 
     const snapshot = await controlPlane.getProject("project-1");
 
+    expect(snapshot.trace).toEqual([expect.objectContaining({ id: "AC-1" })]);
+    expect(snapshot.trace?.[0]).not.toHaveProperty("implementationStatus");
+  });
+
+  it("projects the successful Direct Pi verified_in response without inventing implementation proof", async () => {
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    installFetch(jsonResponse({
+      project: { id: "project-1", title: "Library" },
+      messages: [],
+      runs: [{ id: "run-success", projectId: "project-1", status: "succeeded", lastSeq: 42 }],
+      trace: {
+        acceptanceTrace: [],
+        links: [{
+          id: "verified-version",
+          sourceKind: "acceptance_criterion",
+          sourceRef: "AC-1",
+          relation: "verified_in",
+          targetKind: "version",
+          targetRef: "version-1",
+        }],
+        evidence: [{
+          id: "evidence-1",
+          acceptanceId: "AC-1",
+          kind: "playwright_smoke",
+          status: "passed",
+          summary: "verified interaction",
+        }],
+      },
+    }));
+
+    const snapshot = await controlPlane.getProject("project-1");
+
     expect(snapshot.trace).toEqual([expect.objectContaining({
       id: "AC-1",
-      implementationStatus: "not_implemented",
+      status: "passed",
+      evidence: expect.arrayContaining([
+        expect.objectContaining({ id: "verified-version", type: "version", status: "passed" }),
+        expect.objectContaining({ id: "evidence-1", type: "test", status: "passed" }),
+      ]),
     })]);
+    expect(snapshot.trace?.[0]).not.toHaveProperty("implementationStatus");
   });
 
   it("does not mark implemented from a test-file implemented_in link in the graph fallback", async () => {
@@ -283,10 +472,8 @@ describe("control plane client contract", () => {
 
     const snapshot = await controlPlane.getProject("project-1");
 
-    expect(snapshot.trace).toEqual([expect.objectContaining({
-      id: "AC-1",
-      implementationStatus: "not_implemented",
-    })]);
+    expect(snapshot.trace).toEqual([expect.objectContaining({ id: "AC-1" })]);
+    expect(snapshot.trace?.[0]).not.toHaveProperty("implementationStatus");
   });
 
   it("does not mark implemented from a malformed implemented_in link in the graph fallback", async () => {
@@ -306,10 +493,8 @@ describe("control plane client contract", () => {
 
     const snapshot = await controlPlane.getProject("project-1");
 
-    expect(snapshot.trace).toEqual([expect.objectContaining({
-      id: "AC-1",
-      implementationStatus: "not_implemented",
-    })]);
+    expect(snapshot.trace).toEqual([expect.objectContaining({ id: "AC-1" })]);
+    expect(snapshot.trace?.[0]).not.toHaveProperty("implementationStatus");
   });
 
   it("marks implemented only from a well-formed business-file implemented_in link", async () => {
@@ -359,11 +544,10 @@ describe("control plane client contract", () => {
 
     const snapshot = await controlPlane.getProject("project-1");
 
-    expect(snapshot.trace).toEqual([
-      expect.objectContaining({ id: "AC-1", implementationStatus: "not_implemented" }),
-      // Explicit backend implementationStatus wins over link-derived fallback.
-      expect.objectContaining({ id: "AC-2", implementationStatus: "implemented" }),
-    ]);
+    expect(snapshot.trace?.[0]).toEqual(expect.objectContaining({ id: "AC-1" }));
+    expect(snapshot.trace?.[0]).not.toHaveProperty("implementationStatus");
+    // Explicit backend implementationStatus wins over link-derived fallback.
+    expect(snapshot.trace?.[1]).toEqual(expect.objectContaining({ id: "AC-2", implementationStatus: "implemented" }));
   });
 
   it("normalizes a ready preview from the snapshot without preserving a second origin field", async () => {

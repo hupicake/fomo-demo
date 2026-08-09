@@ -9,6 +9,7 @@ import useSWR from "swr";
 import { PromptInput, PromptInputFooter, PromptInputSubmit, PromptInputTextarea, PromptInputTools } from "@/components/ai-elements/prompt-input";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { AccountEntry } from "@/components/workbench/account-entry";
 import { controlPlane } from "@/lib/api/client";
 import type { ProjectSummary } from "@/lib/contracts";
 import { demoProjectId } from "@/lib/demo/library-project";
@@ -71,27 +72,30 @@ export function HomeScreen() {
 
   return (
     <main className="min-h-screen px-5 py-6 sm:px-8 lg:px-12">
-      <header className="mx-auto flex max-w-6xl items-center justify-between">
+      <header className="mx-auto flex max-w-6xl items-center justify-between gap-3">
         <Link className="flex items-center gap-2 font-semibold tracking-tight" href="/">
           <span className="grid size-8 place-items-center rounded-lg bg-slate-950 font-mono text-sm text-white">F</span>
           FOMO
         </Link>
-        <Link className="text-sm text-muted-foreground transition-colors hover:text-foreground" href={`/projects/${demoProjectId}`}>
-          Open explicit demo
-        </Link>
+        <div className="flex items-center gap-3">
+          <AccountEntry connection={error ? "degraded" : "online"} />
+          <Link className="text-sm text-muted-foreground transition-colors hover:text-foreground" href={`/projects/${demoProjectId}`}>
+            Open explicit demo
+          </Link>
+        </div>
       </header>
 
       <section className="mx-auto grid max-w-6xl gap-12 pb-14 pt-16 lg:grid-cols-[minmax(0,1fr)_20rem] lg:pt-24">
         <div>
           <Badge className="rounded-full border-primary/20 bg-primary/10 px-3 py-1 text-primary" variant="secondary">
             <SparklesIcon className="mr-1.5 size-3.5" />
-            Spec-to-Proof coding workbench
+            AI coding-agent workbench
           </Badge>
           <h1 className="mt-6 max-w-3xl text-4xl font-semibold tracking-[-0.04em] text-balance sm:text-5xl">
             Build software with a team you can inspect.
           </h1>
           <p className="mt-5 max-w-2xl text-base leading-7 text-muted-foreground sm:text-lg">
-            FOMO turns one request into product, architecture, implementation and verification artifacts — then links every must-have requirement to evidence.
+            FOMO turns one request into a running app — an agent plans, builds, verifies, and repairs while you follow the work log and open a real preview.
           </p>
 
           <div className="mt-8 max-w-3xl rounded-2xl border bg-card p-2 shadow-[0_20px_70px_-35px_rgba(15,23,42,0.38)]">
@@ -125,8 +129,8 @@ export function HomeScreen() {
         <aside className="rounded-2xl border bg-card/70 p-5 shadow-sm">
           <p className="text-sm font-medium">What stays visible</p>
           <ul className="mt-5 space-y-5 text-sm text-muted-foreground">
-            <li className="flex gap-3"><BoxesIcon className="mt-0.5 size-4 shrink-0 text-primary" /><span>One persistent Direct Pi session plans, builds, and repairs against FOMO-owned proof.</span></li>
-            <li className="flex gap-3"><BookOpenCheckIcon className="mt-0.5 size-4 shrink-0 text-primary" /><span>Every must AC maps to files, tests, screenshots or versions.</span></li>
+            <li className="flex gap-3"><BoxesIcon className="mt-0.5 size-4 shrink-0 text-primary" /><span>One agent plans, builds, and repairs your app against a live preview.</span></li>
+            <li className="flex gap-3"><BookOpenCheckIcon className="mt-0.5 size-4 shrink-0 text-primary" /><span>Every change is recorded in a work log you can follow.</span></li>
             <li className="flex gap-3"><PlusIcon className="mt-0.5 size-4 shrink-0 text-primary" /><span>Each successful run produces a recoverable version.</span></li>
           </ul>
         </aside>

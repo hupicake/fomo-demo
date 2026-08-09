@@ -1,9 +1,27 @@
 # FOMO Control Plane
 
-FastAPI control plane plus an independent durable worker for FOMO's four-role
-coding workflow:
+FastAPI control plane plus an independent durable worker for FOMO's coding
+agent runtime. The production path is **Direct Pi**
+(`AGENT_FRAMEWORK=direct_pi`): `WorkerRunner → DirectPiOrchestrator →
+fomo-pi-ds`, where Pi runs inside an OpenSandbox generation sandbox with its
+official builtin tools and full project permission. The runtime now contains
+the **P0 native Pi baseline** and the **P1-A GoalGraph vertical slice**.
 
-`Product Manager → Architect → Engineer → Reviewer`.
+**Status (honest): P0 and P1-A code are landed.** The latest concentrated code
+regression is green: 385 backend tests, 134 Web Vitest tests, 18 Pi bridge
+tests, 2/2 local Web Playwright tests, Web typecheck/build, and Ruff. The real
+local fixed-runner canary has passed. The ten-run lifecycle matrix is unfinished,
+must not be counted as passed, and is not a release condition for the current
+take-home Demo. Same-condition A/B validation, Context OS, and public HTTPS
+acceptance remain incomplete, so nothing here is claimed as
+environment-accepted or security-converged. GoalGraph, goal-scoped acceptance,
+durable checkpoints, and recovery are implemented; Verified Reuse remains
+planned (`DESIGN.md`) and is **not implemented**.
+
+The Preview Gateway's unit/integration tests are included in the 385-test
+backend suite. Real local OpenSandbox and Chrome/Gateway checks are separate
+runtime evidence. Neither level proves public DNS, TLS, Tunnel routing, or an
+external-network browser flow.
 
 The database owns sessions, projects, runs, durable SSE events, structured
 artifacts, trace links, evidence, versions, and text file snapshots. The API
@@ -12,86 +30,102 @@ run in the worker through a `SandboxProvider`.
 
 ## Runtime
 
-- Python is deliberately pinned to **3.11** (`>=3.11,<3.12`), matching the
-  optional MetaGPT compatibility range.
-- LiteLLM is called through its OpenAI-compatible endpoint with logical aliases
-  (`MODEL_PM`, `MODEL_ARCHITECT`, `MODEL_ENGINEER`, `MODEL_REVIEWER`). Provider
-  credentials stay in LiteLLM and are never read from `.env` files by this app;
-  the worker accepts a gateway credential injected as `LITELLM_API_KEY` (or the
-  local `LITELLM_MASTER_KEY` compatibility variable) without logging it.
-- Each model request has a separate, bounded transport-recovery budget: by
-  default it makes two additional attempts for `408`, `429`, `500`, `502`,
-  `503`, `504`, connection/read timeouts, or protocol resets. It uses capped
-  exponential backoff and a reasonable `Retry-After` value when supplied.
-  Configure it with `MODEL_NETWORK_RETRIES`,
-  `MODEL_NETWORK_RETRY_BASE_DELAY_SECONDS`,
-  `MODEL_NETWORK_RETRY_MAX_DELAY_SECONDS`, and
-  `MODEL_RETRY_AFTER_MAX_SECONDS`. This is independent from
-  `STRUCTURED_OUTPUT_RETRIES`, which is reserved for model JSON/schema repair;
-  exhausted gateway failures do not spend that schema-repair budget, and
-  ordinary 4xx responses are not transport-retried. Safe `agent.activity`
-  retry events expose only attempt count, bounded delay, and HTTP/transport
-  class—never request URLs, headers, bodies, or keys. Model request timeout is
-  separately configured with `MODEL_REQUEST_TIMEOUT_SECONDS` (default `300`),
-  rather than sharing the sandbox command timeout.
-- Engineer implementation is deliberately bounded: a real Engineer
-  `Role`/`Action` first produces an `ImplementationPlan`, then emits complete
-  files in `implementation_batch` artifacts (defaults: at most 24 batches, 1
-  file, a 12,000-character split target, and a 20,000-character hard limit per
-  create/modify file). Architect and Engineer prompts favor splitting at the
-  target; only content above the hard limit is rejected. A successfully
-  persisted batch over the target but within the hard limit emits one safe
-  `file_batch_over_target` activity with aggregate counts only. Tune the
-  limits with `ENGINEER_MAX_BATCHES`, `ENGINEER_MAX_FILES_PER_BATCH`,
-  `ENGINEER_TARGET_FILE_CHARACTERS`, and `ENGINEER_MAX_FILE_CHARACTERS`; both
-  file-character values must be positive, target must not exceed hard, and hard
-  must not exceed 24,000.
-  Batches are durable evidence within the current run, not cross-run resume
-  checkpoints: terminal failure/cancellation still safely destroys the sandbox.
-- `AGENT_FRAMEWORK=metagpt` is the default production coordination layer and
-  uses the VCS-SHA-pinned MetaGPT extra. It instantiates four real custom
-  `Role`/`Action` pairs (`FomoProductManagerRole` /
-  `FomoProductManagerAction`, `FomoArchitectRole` /
-  `FomoArchitectAction`, `FomoEngineerRole` / `FomoEngineerAction`, and
-  `FomoReviewerRole` / `FomoReviewerAction`) and real MetaGPT `Message`
-  hand-offs.
-  Each action calls FOMO's `ModelClient` and immediately Pydantic-validates its
-  assigned artifact; it never calls MetaGPT's configured model or `Team` /
-  repository-generation helpers.
-- Before importing MetaGPT, FOMO bootstraps an internal, non-secret minimal
-  `config2.yaml` so the pinned package can construct `Role` and `Action`
-  safely. This is not a user configuration requirement and no provider request
-  is made through it; LiteLLM remains the only generation path.
-- MetaGPT owns collaboration primitives only. FOMO's `SOPRunner` remains the
-  authority for phase transitions, retry policy, artifact and evidence
-  persistence, sandbox/tool permissions, deterministic QA, Git commits, and
-  version publishing. Inter-role MetaGPT messages carry only a persisted
-  artifact ID, kind, role, and bounded summary—never raw artifact JSON.
-- MetaGPT's diagnostic Loguru sinks are disabled because their traceback mode
-  can serialize frame locals. A structured model failure returns a controlled
-  MetaGPT message first, then is re-raised at FOMO's retry boundary; request
-  headers, bodies, and gateway keys are never emitted by that path.
-- The MetaGPT extra is mandatory when the default framework is selected. A
-  missing or unloadable extra fails worker construction with an install command;
-  there is no silent fake/native fallback. `AGENT_FRAMEWORK=native` is an
-  explicit test or diagnostic mode only.
-- Production/default sandbox selection is `opensandbox`, implemented against
-  **OpenSandbox Server v0.2.2** with the pinned **Python SDK v0.1.15**. It
-  creates an arm64 workspace from the curated
-  `fomo-sandbox-node:2026-08-08` base image (or `OPENSANDBOX_IMAGE`), streams execd command
-  output, supports file reads/writes, lifecycle pause/kill, and maps previews
-  to `get_endpoint(8080)`. Port `44772` is `execd`, is never a preview, and is
-  never returned to a browser. FOMO intentionally uses Git commits plus its
-  file manifest for versions; server snapshot rollback is not enabled yet.
-- Generated-code sandboxes do not inherit the worker's `HTTP_PROXY` /
-  `HTTPS_PROXY`. To allow package installation through a local proxy, set only
-  `SANDBOX_HTTP_PROXY`, `SANDBOX_HTTPS_PROXY`, and/or `SANDBOX_NO_PROXY`; they
-  become the sandbox's `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` only when
-  nonempty. Proxy URLs must be `http(s)` without userinfo. Model, platform,
-  and gateway credentials are never injected into sandbox environments.
+- Python is pinned to **3.11** (`>=3.11,<3.12`).
+- Direct Pi model egress goes through LiteLLM with a per-run opaque virtual
+  key (`LiteLLMRunKeyClient`); only `fomo-pi-flash` (planning) and
+  `fomo-pi-build` (building/repairing) aliases are allowed, with explicit
+  thinking levels and **no silent fallback**. The bridge's model selection is
+  fail-closed. Provider credentials stay in LiteLLM and never enter a sandbox.
+- An uninterrupted run reuses one `fomo-pi-ds` session across planning,
+  multiple GoalGraph goals, and repair turns. Recovery never trusts an orphan
+  process: it creates a fresh session from the latest verified checkpoint and
+  persisted usage balance. GoalGraph is authoritative when enabled; the legacy
+  BuildPlan is **advisory/read-only compatibility data**. BUILDING uses Pi's native
+  `read/write/edit/bash` tools and **no business-file write allowlist**. The
+  Base Snapshot (starter base + capabilities + prior verified state) is
+  mutable: package.json, lockfiles, config, routes, app shell, components, and
+  ordinary tests may all be added, moved, modified, or deleted.
+- The settle audit (`direct_pi/workspace.py`) enforces only real safety
+  invariants: normalized in-workspace paths; `.env*` files are rejected
+  outright; `.git/**` (the G-internal checkpoint) is excluded; no
+  symlinks/devices or non-regular files; only real changed/new files enter
+  the candidate diff (`pnpm-lock.yaml` allowed up to the 512 KiB persistence
+  limit); bounded changed-file counts; FOMO-owned roots
+  (`tests/fomo-acceptance/**`, `tests/harness/**` — present-and-unchanged
+  files are excluded, any add/modify/delete fails) and the system
+  `.gitignore`. There is no full-content secret scanner (only `.env*` path
+  rejection plus event redaction). Base deletions persist across runs: the
+  version manifest is the complete candidate truth, and starter files absent
+  from it are deleted on seed.
+- Deterministic QA runs only in a clean verification sandbox V seeded from the
+  same Base Snapshot, with the complete audited diff applied and
+  `tests/fomo-acceptance/**` injected by FOMO. Immediately after the initial
+  candidate commit, FOMO freezes the V manifest (published files == commit
+  == gate input; bound by a HEAD + clean-worktree check before candidate
+  processes start). Gates use a fixed PATH composed only of root-owned
+  directories and directly execute absolute, pnpm-generated `#!/bin/sh`
+  wrappers for `tsc`, `next`, and `playwright` from the image runtime cache.
+  Those wrappers are root-owned mode `0555` and resolve the trusted system
+  Node; FOMO never resolves runners from the candidate's `node_modules/.bin`
+  or model-editable package scripts. Dependency setup uses `pnpm install
+  --offline --frozen-lockfile --ignore-scripts` (candidate lifecycle scripts
+  are blocked). GoalGraph QA scope is server-selected: a non-final Goal uses
+  focused QA, skips `next build`, and runs only the current Goal's acceptance
+  tests. Full QA keeps the build gate and runs all verified Goals plus the
+  current Goal's acceptance tests; it is forced for the final Goal,
+  project-level configuration changes, files changed again after an earlier
+  Goal, legacy checkpoints without `goalChangedPathsByGoal`, and verified-graph
+  recovery. After
+  candidate code executed, FOMO-owned acceptance tests and the harness are
+  re-injected/restored and hash-verified before Playwright. Publication
+  requires a final consistency check (live V source hashes must equal the
+  frozen snapshot) plus a final preview health recheck; the version persists
+  only the frozen manifest with an explicit tag at the frozen commit, and
+  `preview.verified` fires only after the consistency check, health recheck,
+  and version creation all succeed (a dead dev server fails closed without a
+  version). This is hardening, not a host-level anti-tamper
+  boundary: a same-user adversarial race that tampers with the writable
+  acceptance/harness files and restores them is not solved (external QA
+  runner / read-only mounts remain the public-deployment release blocker).
+  Dependencies are limited to FOMO's prefetched offline store; a package not
+  in the store fails the install gate honestly and goes to repair (an
+  ordinary non-zero install is a repairable source/package problem; only
+  timeouts, missing runners, or restore failures are infrastructure).
+- A/B telemetry is emitted by production events (bridge `pi.tool.*`/
+  `pi.completed` telemetry, `preview.available/verified` elapsedSeconds);
+  there is no benchmark runner. A/B execution is part of the upcoming
+  central verification matrix and has not been executed yet.
+- `SandboxProvider` defaults to `opensandbox` (OpenSandbox Server v0.2.2, SDK
+  v0.1.15): arm64 workspace from `fomo-sandbox-node:2026-08-08`, execd command
+  streaming, file reads/writes, pause/kill, previews via `get_endpoint(8080)`.
+  A fully verified Preview is renewed to the bounded seven-day retention
+  window before version publication; renewal failure fails closed without a
+  version or `preview.verified` event.
+  Port `44772` is execd, never a preview. **Egress isolation is not
+  implemented**: the local OpenSandbox config has no authenticated `dns+nft`
+  sidecar, the policy API is unauthenticated, and host-only rules would still
+  allow other host-gateway ports — so no network-policy switch is shipped.
+  Local trusted development is fine; public untrusted deployment is a release
+  blocker until an authenticated egress path is implemented and verified.
+- Generated-code sandboxes never inherit worker proxy variables. Only
+  `SANDBOX_HTTP_PROXY` / `SANDBOX_HTTPS_PROXY` / `SANDBOX_NO_PROXY` cross the
+  boundary when set, and only the run-scoped virtual key is injected as a
+  credential.
 - `ProcessSandboxProvider` is **only** for trusted local development/CI and
   requires `ALLOW_UNSAFE_PROCESS_SANDBOX=true`; it is not a fallback for
   OpenSandbox and is not safe for public user input.
+
+## Legacy native SOP path
+
+The MetaGPT integration has been retired; `AGENT_FRAMEWORK` accepts only
+`direct_pi` and `native`.
+
+The four-role chain (Product Manager → Architect → Engineer → Reviewer) is
+retained while historical runs and focused compatibility tests are retired.
+It is not the production default and is not read-only: explicitly selecting
+`AGENT_FRAMEWORK=native` makes it a fully writable compatibility
+path, and its Engineer batch/file-size policy and Reviewer repair-scope rules
+apply only there. No new features are added to it.
 
 ## Local development
 
@@ -99,7 +133,7 @@ Use a Python 3.11 interpreter:
 
 ```bash
 cd services/control-plane
-uv sync --extra metagpt --extra dev
+uv sync --extra dev
 ```
 
 For API-only work, SQLite is sufficient:
@@ -124,17 +158,42 @@ uv run fomo-worker
 ```
 
 The worker never starts a host process unless that explicit opt-in is present.
-Generated projects must provide `pnpm` scripts named `typecheck`, `build`, and
-`dev`; preview is started with:
+The FOMO system `.gitignore` baseline is owned by the control plane and cannot
+be weakened by agent output.
 
-```text
-pnpm dev --hostname 0.0.0.0 --port 8080
-```
+For a controlled public deployment, set `PUBLIC_PREVIEW_BASE_DOMAIN` and run
+`fomo-preview-gateway` (the Compose `public-preview` profile exposes it only on
+loopback port 8001). Final publication stores the wildcard HTTPS URL, while QA
+continues to verify the direct internal endpoint first. The gateway accepts
+only canonical sandbox UUID hosts backed by a current, uncleaned verified
+resource, strips control-plane credentials/cookies, and maps confirmed provider
+expiry to durable `preview.expired` state. It is an HTTP proxy; generated apps
+that require WebSocket, SSE, or streaming transport are outside the current
+demo contract.
 
-Before every candidate commit, the SOP owns a baseline `.gitignore` (including
-`node_modules`, `.next`, build output, coverage, and Playwright artifacts) and
-the persisted file manifest applies the same exclusions. Agent output cannot
-delete or weaken that safety baseline.
+The gateway service must use a minimal environment: `DATABASE_URL`,
+`OPENSANDBOX_BASE_URL`, `OPENSANDBOX_API_KEY`,
+`PUBLIC_PREVIEW_BASE_DOMAIN`, `PREVIEW_UPSTREAM_HOST_OVERRIDE`, and
+`PREVIEW_GATEWAY_PORT` only. It must not inherit the API/worker environment or
+receive LiteLLM/model, Redis, MinIO, or AWS credentials.
+
+The named-Tunnel example in
+[`deploy/cloudflared/config.example.yml`](../../deploy/cloudflared/config.example.yml)
+keeps the workbench and generated Preview on different eTLD+1 sites:
+`app.example.com` and `*.fomo-previews.example.net`. Preserve the incoming
+Preview Host, bypass edge caching for that wildcard, provision TLS for the
+exact wildcard depth, and leave the final `http_status:404` ingress rule in
+place. The production origin exposes no inbound port when using Tunnel; at
+most, a non-Tunnel deployment exposes its TLS ingress. OpenSandbox `8080`,
+LiteLLM `4000`, random Preview host ports including `40000-60000`, PostgreSQL,
+Redis, and MinIO must never be publicly reachable.
+
+Retention is a single bounded seven-day renewal, not indefinite hosting. Keep
+the host services and Tunnel alive and renew or rerun before the review window
+expires. A local OpenSandbox/gateway Playwright pass is not public evidence;
+public acceptance additionally requires an external-network HTTPS run through
+DNS/TLS/Tunnel, account authentication, API SSE, generated Preview assets,
+interaction, and reload persistence.
 
 ## API slice
 
@@ -163,5 +222,8 @@ uv run pytest
 uv run ruff check src tests
 ```
 
-Tests use `ScriptedModelClient` and `FakeSandboxProvider`, so they make no
-network/model calls and execute no generated host code.
+Tests use `ScriptedModelClient`, `FakeSandboxProvider`, and a fake Pi bridge,
+so they make no network/model calls and execute no generated host code. Per
+`AGENTS.md`, there is no pre-approval gate: verification is designed as one
+minimal sufficient matrix per big module and executed centrally, with
+necessary targeted regression for high-risk fixes.

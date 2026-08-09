@@ -5,7 +5,11 @@ import json
 import httpx
 import pytest
 
-from fomo.fomo_pi_ds import InferenceGatewayError, LiteLLMRunKeyClient
+from fomo.fomo_pi_ds import (
+    FOMO_PI_LITELLM_ALIASES,
+    InferenceGatewayError,
+    LiteLLMRunKeyClient,
+)
 
 
 @pytest.mark.asyncio
@@ -37,7 +41,7 @@ async def test_run_key_is_least_privilege_and_blocked_by_exact_secret() -> None:
     generate = json.loads(requests[0].content)
     assert generate == {
         "key_alias": "fomo-run-run-123",
-        "models": ["fomo-pi-flash"],
+        "models": list(FOMO_PI_LITELLM_ALIASES),
         "duration": "4200s",
         "max_budget": 2.0,
         "max_parallel_requests": 1,
@@ -46,6 +50,8 @@ async def test_run_key_is_least_privilege_and_blocked_by_exact_secret() -> None:
         "metadata": {"fomo_run_id": "run-123", "scope": "fomo-pi-ds"},
     }
     assert json.loads(requests[1].content) == {"key": "sk-run-secret"}
+    assert FOMO_PI_LITELLM_ALIASES == ("fomo-pi-flash", "fomo-pi-build")
+    assert virtual_key.model_aliases == FOMO_PI_LITELLM_ALIASES
     assert all(request.headers["authorization"] == "Bearer master-secret" for request in requests)
     assert "sk-run-secret" not in repr(virtual_key)
     assert "master-secret" not in repr(client)

@@ -105,6 +105,14 @@ class PreviewSandboxProvider(SandboxProvider, Protocol):
     ) -> PreviewRef: ...
 
 
+class RetainedPreviewSandboxProvider(SandboxProvider, Protocol):
+    """Optional lifecycle extension for a durable verified preview."""
+
+    async def renew_preview(self, ref: SandboxRef, lifetime_seconds: int) -> str: ...
+
+    async def probe_preview(self, ref: SandboxRef) -> bool: ...
+
+
 SENSITIVE_NAMES = {".env", ".env.local", ".env.production", ".git/hooks", ".gitconfig"}
 
 

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import socket
 from typing import Protocol
+from urllib.parse import urlparse
 
-from fomo.agent_runtime import MetaGPTAdapter, ModelClient, OpenAICompatibleClient, SOPRunner
+from fomo.agent_runtime import ModelClient, OpenAICompatibleClient, SOPRunner
 from fomo.config import Settings
 from fomo.direct_pi import DirectPiOrchestrator
 from fomo.fomo_pi_ds import LiteLLMRunKeyClient, OpenSandboxPiTransport
@@ -21,6 +23,43 @@ class RunOrchestrator(Protocol):
     async def run(self, run_id: str, *, lease_token: str | None = None) -> None: ...
 
 
+def _is_loopback_host(hostname: str | None) -> bool:
+    """Return whether a provider host resolves only to the caller's namespace."""
+    if not hostname:
+        return False
+    normalized = hostname.rstrip(".").lower()
+    if (
+        normalized == "localhost"
+        or normalized.endswith(".localhost")
+        or normalized == "localhost.localdomain"
+    ):
+        return True
+    # ``ipaddress`` intentionally rejects abbreviated IPv4 forms such as
+    # 127.1 even though URL clients may normalize them to loopback.
+    if normalized.startswith("127.") and all(
+        part.isdigit() for part in normalized.split(".")
+    ):
+        return True
+    try:
+        address = ipaddress.ip_address(normalized.split("%", 1)[0])
+    except ValueError:
+        return False
+    if address.is_loopback:
+        return True
+    mapped = getattr(address, "ipv4_mapped", None)
+    return mapped is not None and mapped.is_loopback
+
+
+def _validate_opensandbox_pi_provider_url(settings: Settings) -> None:
+    hostname = urlparse(settings.pi_provider_base_url).hostname
+    if _is_loopback_host(hostname):
+        raise ValueError(
+            "OpenSandbox cannot reach the Direct Pi provider through a loopback host; "
+            "set SANDBOX_LITELLM_BASE_URL to an http(s) address reachable from the "
+            "sandbox (for local Docker, http://host.docker.internal:4000)"
+        )
+
+
 class WorkerRunner:
     def __init__(
         self,
@@ -29,20 +68,26 @@ class WorkerRunner:
         *,
         model: ModelClient | None = None,
         sandbox: SandboxProvider | None = None,
-        agent_adapter: MetaGPTAdapter | None = None,
         direct_orchestrator: RunOrchestrator | None = None,
         worker_id: str | None = None,
     ) -> None:
         if settings.worker_lease_seconds <= 0:
             raise ValueError("WORKER_LEASE_SECONDS must be positive")
+        if (
+            settings.agent_framework == "direct_pi"
+            and settings.sandbox_provider == "opensandbox"
+        ):
+            _validate_opensandbox_pi_provider_url(settings)
         self.repository = repository
         self.settings = settings
         self.sandbox = sandbox or create_sandbox_provider(settings)
         self.direct_orchestrator: RunOrchestrator | None = None
         self.model: ModelClient | None = None
         if settings.agent_framework == "direct_pi":
-            if agent_adapter is not None or model is not None:
-                raise ValueError("direct_pi does not accept a legacy model or MetaGPT adapter")
+            if model is not None:
+                raise ValueError("direct_pi does not accept a legacy model")
+            if direct_orchestrator is None and not settings.opensandbox_api_key:
+                raise ValueError("direct_pi requires OPENSANDBOX_API_KEY")
             if direct_orchestrator is not None:
                 self.direct_orchestrator = direct_orchestrator
             else:
@@ -63,8 +108,7 @@ class WorkerRunner:
                 self.direct_orchestrator = DirectPiOrchestrator(
                     repository, self.sandbox, settings, gateway, transport
                 )
-            self.agent_adapter = None
-        elif settings.agent_framework in {"metagpt", "native"}:
+        elif settings.agent_framework == "native":
             if direct_orchestrator is not None:
                 raise ValueError("legacy agent framework cannot receive a Direct Pi orchestrator")
             self.model = model or OpenAICompatibleClient(
@@ -77,16 +121,7 @@ class WorkerRunner:
                 retry_after_max_seconds=settings.model_retry_after_max_seconds,
             )
         else:
-            raise ValueError("AGENT_FRAMEWORK must be direct_pi, metagpt, or native")
-        if settings.agent_framework == "metagpt":
-            assert self.model is not None
-            # Fail at worker construction when the explicitly selected default
-            # is unavailable; never run a fake native fallback in production.
-            self.agent_adapter = agent_adapter or MetaGPTAdapter(self.model)
-        elif settings.agent_framework == "native":
-            if agent_adapter is not None:
-                raise ValueError("native agent framework cannot receive a MetaGPT adapter")
-            self.agent_adapter = None
+            raise ValueError("AGENT_FRAMEWORK must be direct_pi or native")
         self.worker_id = worker_id or f"{socket.gethostname()}:{id(self)}"
 
     async def run_once(self) -> bool:
@@ -104,7 +139,6 @@ class WorkerRunner:
                 self.model,
                 self.sandbox,
                 self.settings,
-                agent_adapter=self.agent_adapter,
             )
             task_name = f"fomo-legacy-sop:{run.id}"
         lease_token = run.lease_owner
@@ -165,6 +199,11 @@ class WorkerRunner:
                     run_task.cancel()
                 return
             if not renewed:
+                if await self.repository.is_user_input_suspended(run_id):
+                    # The Pi turn settled and atomically released its lease at
+                    # a durable clarification boundary. Let the orchestrator
+                    # unwind without treating this expected handoff as loss.
+                    return
                 lease_lost.set()
                 if not run_task.done():
                     run_task.cancel()
@@ -172,17 +211,20 @@ class WorkerRunner:
 
     async def _recover_expired_runs(self) -> None:
         """Converge abandoned work before accepting new work for the project."""
-        recovered = await self.repository.recover_expired_running_runs()
-        pending_cleanup = await self.repository.list_terminal_sandbox_cleanup_targets()
-        seen: set[tuple[str, str]] = set()
-        for target in [*recovered, *pending_cleanup]:
+        recovered, registered_cleanup, pending_cleanup = await asyncio.gather(
+            self.repository.recover_expired_running_runs(),
+            self.repository.list_sandbox_cleanup_targets(),
+            self.repository.list_terminal_sandbox_cleanup_targets(),
+        )
+        attempted: set[tuple[str, str]] = set()
+        for target in [*recovered, *registered_cleanup, *pending_cleanup]:
             key = (target.run_id, target.sandbox_id)
-            if key in seen:
+            if key in attempted:
                 continue
-            seen.add(key)
+            attempted.add(key)
             await self._destroy_stale_sandbox(target)
 
-    async def _destroy_stale_sandbox(self, target: SandboxCleanupTarget) -> None:
+    async def _destroy_stale_sandbox(self, target: SandboxCleanupTarget) -> bool:
         """Destroy through the provider so remote handles are reconnected if needed."""
         ref = SandboxRef(id=target.sandbox_id, project_id=target.project_id)
         try:
@@ -195,8 +237,10 @@ class WorkerRunner:
                 "FOMO stale sandbox cleanup failed",
                 extra={"run_id": target.run_id, "sandbox_id": target.sandbox_id},
             )
-            return
+            return False
         try:
+            if target.resource_id is not None:
+                await self.repository.acknowledge_sandbox_cleanup(target.resource_id)
             await self.repository.clear_sandbox_id(target.run_id, target.sandbox_id)
         except Exception:
             # The provider resource is already gone. Retaining the reference
@@ -205,6 +249,8 @@ class WorkerRunner:
                 "FOMO stale sandbox cleanup acknowledgement failed",
                 extra={"run_id": target.run_id, "sandbox_id": target.sandbox_id},
             )
+            return False
+        return True
 
     async def run_forever(self) -> None:
         await self.repository.initialize()

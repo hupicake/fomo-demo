@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +14,10 @@ from fomo.sandbox.fake import FakeSandboxProvider
 from fomo.sandbox.opensandbox import OpenSandboxProvider, _OutputCollector
 from fomo.sandbox.process import ProcessSandboxProvider
 from fomo.schemas import PreviewResponse, ProductSpec
+
+
+def test_opensandbox_exit_code_minus_one_is_a_timeout_without_sdk_error() -> None:
+    assert OpenSandboxProvider._execution_timed_out(None, exit_code=-1)
 
 
 def test_product_spec_requires_unique_acceptance_ids() -> None:
@@ -99,6 +103,22 @@ def test_opensandbox_lifetime_defaults_stays_overridable_and_rejects_invalid_val
             Settings.from_env()
 
 
+def test_verified_preview_lifetime_defaults_to_seven_days_and_is_bounded(monkeypatch) -> None:
+    monkeypatch.delenv("VERIFIED_PREVIEW_LIFETIME_SECONDS", raising=False)
+    assert Settings.from_env().verified_preview_lifetime_seconds == 604_800
+
+    monkeypatch.setenv("VERIFIED_PREVIEW_LIFETIME_SECONDS", "86400")
+    assert Settings.from_env().verified_preview_lifetime_seconds == 86_400
+
+    for value in ("0", "-1", "604801"):
+        monkeypatch.setenv("VERIFIED_PREVIEW_LIFETIME_SECONDS", value)
+        with pytest.raises(ValueError, match="VERIFIED_PREVIEW_LIFETIME_SECONDS"):
+            Settings.from_env()
+
+    with pytest.raises(ValueError, match="must not exceed 604800"):
+        Settings(verified_preview_lifetime_seconds=604_801)
+
+
 def test_opensandbox_lifetime_is_forwarded_by_factory(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
@@ -108,9 +128,12 @@ def test_opensandbox_lifetime_is_forwarded_by_factory(monkeypatch) -> None:
 
     monkeypatch.setattr("fomo.sandbox.OpenSandboxProvider", CapturingOpenSandboxProvider)
 
-    create_sandbox_provider(Settings(opensandbox_lifetime_seconds=1234))
+    create_sandbox_provider(
+        Settings(opensandbox_lifetime_seconds=1234, opensandbox_ready_timeout_seconds=90)
+    )
 
     assert captured["lifetime_seconds"] == 1234
+    assert captured["ready_timeout_seconds"] == 90
 
 
 def test_sandbox_proxy_settings_are_explicit_and_do_not_inherit_host_proxy(monkeypatch) -> None:
@@ -322,10 +345,19 @@ async def test_opensandbox_provider_uses_pinned_sdk_contract_and_application_por
             self.commands = Commands()
             self.paused = False
             self.destroyed = False
+            self.renewals: list[timedelta] = []
 
         async def get_endpoint(self, port: int):
             assert port == 8080
             return SimpleNamespace(endpoint="preview.example.test:45678", headers={})
+
+        async def get_info(self):
+            state = "Paused" if self.paused else "Running"
+            return SimpleNamespace(status=SimpleNamespace(state=state))
+
+        async def renew(self, timeout: timedelta):
+            self.renewals.append(timeout)
+            return SimpleNamespace(expires_at=datetime(2026, 8, 17, 1, 2, 3, tzinfo=UTC))
 
         async def pause(self) -> None:
             self.paused = True
@@ -361,6 +393,8 @@ async def test_opensandbox_provider_uses_pinned_sdk_contract_and_application_por
     assert create_kwargs["platform"].arch == "arm64"
     assert create_kwargs["metadata"]["fomo.source_version_id"] == "version-1"
     assert create_kwargs["timeout"] == timedelta(seconds=21_600)
+    assert create_kwargs["ready_timeout"] == timedelta(seconds=120)
+    assert create_kwargs["connection_config"].request_timeout == timedelta(seconds=120)
     assert "env" not in create_kwargs
     assert SDK.handle.files.directories == ["/workspace"]
     assert [entry.mode for entry in SDK.handle.files.directory_entries] == [755]
@@ -407,8 +441,15 @@ async def test_opensandbox_provider_uses_pinned_sdk_contract_and_application_por
     assert starter_copy.exit_code == 0
     assert SDK.handle.commands.runs[1][0] == (
         "cp -R --no-preserve=mode,ownership -- "
-        "/opt/fomo/starters/fomo-next-radix-v2/base/. /workspace/"
+        "/opt/fomo/starters/fomo-next-radix-v2/base/. /workspace/ && "
+        "test -L /workspace/node_modules && "
+        "rm -- /workspace/node_modules && "
+        "cp -a --no-preserve=ownership -- "
+        "/opt/fomo/runtime-cache/fomo-next-radix-v2/node_modules "
+        "/workspace/node_modules && "
+        "chmod -R u+rwX -- /workspace/node_modules"
     )
+    assert SDK.handle.commands.runs[1][1].timeout == timedelta(seconds=120)
     with pytest.raises(ValueError, match="unsupported immutable starter"):
         await provider.copy_starter(ref, "unapproved-starter")
 
@@ -416,10 +457,14 @@ async def test_opensandbox_provider_uses_pinned_sdk_contract_and_application_por
     assert preview.url == "http://preview.example.test:45678"
     assert SDK.handle.commands.runs[2][1].background is True
     assert SDK.handle.commands.runs[2][1].working_directory == "/workspace"
+    assert await provider.probe_preview(ref) is True
+    assert await provider.renew_preview(ref, 604_800) == "2026-08-17T01:02:03+00:00"
+    assert SDK.handle.renewals == [timedelta(seconds=604_800)]
     manifest = await provider.list_files(ref)
     assert [item["path"] for item in manifest] == ["package.json", "src/app.ts"]
     await provider.pause(ref)
     assert SDK.handle.paused is True
+    assert await provider.probe_preview(ref) is False
     with pytest.raises(ValueError):
         await provider.expose(ref, 44772)
     with pytest.raises(NotImplementedError):
@@ -430,6 +475,52 @@ async def test_opensandbox_provider_uses_pinned_sdk_contract_and_application_por
     assert SDK.connected_ids == ["server-sandbox-1"]
     await reconnected.kill(ref)
     assert SDK.handle.destroyed is True
+
+
+@pytest.mark.asyncio
+async def test_opensandbox_preview_probe_evicts_only_confirmed_missing_resource() -> None:
+    class Files:
+        async def create_directories(self, _entries) -> None:
+            return None
+
+    class Handle:
+        id = "server-sandbox-expired"
+        files = Files()
+
+        def __init__(self) -> None:
+            self.status_code = 404
+            self.closed = False
+
+        async def get_info(self):
+            raise SandboxApiException("probe failed", status_code=self.status_code)
+
+        async def close(self) -> None:
+            self.closed = True
+
+        async def destroy(self) -> None:
+            return None
+
+    class SDK:
+        handle = Handle()
+
+        @classmethod
+        async def create(cls, _image, **_kwargs):
+            return cls.handle
+
+    provider = OpenSandboxProvider("http://sandbox.test", sandbox_class=SDK)
+    ref = await provider.create("project-expired")
+
+    assert await provider.probe_preview(ref) is False
+    assert SDK.handle.closed is True
+    assert ref.id not in provider._sandboxes
+
+    SDK.handle = Handle()
+    SDK.handle.status_code = 503
+    ref = await provider.create("project-transient")
+    with pytest.raises(SandboxApiException):
+        await provider.probe_preview(ref)
+    assert SDK.handle.closed is False
+    assert ref.id in provider._sandboxes
 
 
 @pytest.mark.asyncio

@@ -9,8 +9,9 @@ port = 8080
 # Browser-facing endpoints must resolve on the Mac host. The server itself uses
 # docker.host_ip below when it needs to reach sibling sandbox containers.
 eip = "localhost"
-# Server-side hard lifetime limit; keep it aligned with the control-plane setting.
-max_sandbox_timeout_seconds = 21600
+# Generation sandboxes still start with a six-hour TTL. A successfully verified
+# preview may be renewed once to the seven-day retention ceiling.
+max_sandbox_timeout_seconds = 604800
 
 [log]
 level = "INFO"

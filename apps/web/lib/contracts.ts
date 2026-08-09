@@ -62,6 +62,46 @@ export interface ProjectMessage {
   createdAt?: string;
 }
 
+export const userInputRequestStatuses = ["pending", "answered", "cancelled", "expired"] as const;
+export type UserInputRequestStatus = (typeof userInputRequestStatuses)[number];
+export const userInputRequestStages = ["planning", "building", "repairing"] as const;
+export type UserInputRequestStage = (typeof userInputRequestStages)[number];
+
+/**
+ * Deliberately small public projection of a clarification request. Private
+ * agent continuation data (including reasons, sessions and sandbox/context
+ * state) is never part of the browser contract.
+ */
+export interface UserInputRequest {
+  id: string;
+  runId: string;
+  question: string;
+  choices: string[];
+  allowFreeform: boolean;
+  status: UserInputRequestStatus;
+  stage: UserInputRequestStage;
+  goalId?: string;
+  createdAt?: string;
+  answeredAt?: string;
+  /** Client-only ordering cursor copied from run.input_requested. */
+  requestedSeq?: number;
+  /** Client-only ordering cursor copied from the resolution event. */
+  resolvedSeq?: number;
+  /** Public message reference returned by the answer endpoint. */
+  answerMessageId?: string;
+}
+
+export interface UserInputAnswerInput {
+  clientMessageId: string;
+  answer: string;
+}
+
+export interface UserInputAnswerResponse {
+  message: ProjectMessage;
+  request: UserInputRequest;
+  run: RunSnapshot;
+}
+
 export interface RunSnapshot {
   id: string;
   projectId: string;
@@ -70,6 +110,7 @@ export interface RunSnapshot {
   lastSeq: number;
   createdAt?: string;
   updatedAt?: string;
+  pendingInputRequest?: UserInputRequest;
 }
 
 export interface FileManifestEntry {
@@ -115,7 +156,11 @@ export interface AcceptanceTrace {
   priority: "must" | "should" | "could";
   /** Derived only from the latest deterministic playwright_smoke evidence. */
   status: "unverified" | "pending" | "passed" | "failed" | "blocked";
-  /** Derived only from real implemented_in trace links. */
+  /**
+   * "implemented" requires an explicit server projection or a real
+   * implemented_in business-file link. Undefined means the trace is unlinked;
+   * absence of a link is not proof that implementation is absent.
+   */
   implementationStatus?: "implemented" | "not_implemented";
   evidence: TraceEvidence[];
 }
@@ -214,6 +259,33 @@ export interface Problem {
   stack?: string;
 }
 
+export type AgentWorklogKind = "progress" | "tool" | "file" | "verification" | "goal" | "system";
+export type AgentWorklogStatus = "running" | "completed" | "failed" | "info";
+
+/**
+ * A deliberately public, bounded projection of agent activity. It contains
+ * model-authored progress messages and safe action summaries, never private
+ * chain-of-thought or raw tool arguments.
+ */
+export interface AgentWorklogItem {
+  id: string;
+  kind: AgentWorklogKind;
+  status: AgentWorklogStatus;
+  title: string;
+  detail?: string;
+  stage?: AgentStage;
+  occurredAt: string;
+  seq: number;
+}
+
+/** Latest real context-usage snapshot emitted at a Coding Agent turn boundary. */
+export interface ContextUsageSnapshot {
+  contextTokens?: number;
+  contextWindow?: number;
+  boundary: "turn_started" | "turn_completed";
+  capturedAt: string;
+}
+
 export interface DomainEvent {
   schemaVersion: number;
   eventId: string;
@@ -224,6 +296,42 @@ export interface DomainEvent {
   role?: string;
   occurredAt: string;
   payload: Record<string, unknown>;
+}
+
+export type GoalGraphStatus = "active" | "verified" | "completed" | "failed" | "cancelled" | "superseded";
+export type GoalStatus = "pending" | "active" | "claimed" | "verified" | "failed" | "superseded";
+export type GoalAcceptanceStatus = "pending" | "passed" | "failed" | "blocked" | "unverified";
+export type GoalAcceptancePriority = "must" | "should" | "could";
+
+export interface GoalAcceptanceProjection {
+  acceptanceId: string;
+  title: string;
+  priority: GoalAcceptancePriority;
+  status: GoalAcceptanceStatus;
+}
+
+export interface GoalProjection {
+  goalId: string;
+  title: string;
+  userVisible: boolean;
+  dependsOn: string[];
+  status: GoalStatus;
+  checkpointId?: string;
+  claimedAt?: string;
+  verifiedAt?: string;
+  acceptance: GoalAcceptanceProjection[];
+  evidenceCount: number;
+}
+
+/** Read-only server projection. Lifecycle and acceptance states are never inferred by the UI. */
+export interface GoalGraphProjection {
+  graphId: string;
+  runId: string;
+  revision: number;
+  status: GoalGraphStatus;
+  productOutcome: string;
+  activeGoalId: string | null;
+  goals: GoalProjection[];
 }
 
 export interface ProjectSnapshot {
@@ -238,6 +346,9 @@ export interface ProjectSnapshot {
   trace?: AcceptanceTrace[];
   preview?: PreviewRef;
   artifactRefs?: VisibleArtifactRef[];
+  pendingInputRequest?: UserInputRequest;
+  /** Null for legacy P0 runs and responses that predate GoalGraph. */
+  goalGraph: GoalGraphProjection | null;
 }
 
 export interface RunPresentation {
@@ -256,6 +367,12 @@ export interface RunPresentation {
   versions: VersionSummary[];
   preview?: PreviewRef;
   summaries: string[];
+  worklog: AgentWorklogItem[];
+  inputRequests: UserInputRequest[];
+  /** Reducer cursor used only to coalesce one streamed public message. */
+  activePublicMessageId?: string;
+  goalGraph: GoalGraphProjection | null;
+  contextUsage?: ContextUsageSnapshot;
   disconnected?: boolean;
 }
 

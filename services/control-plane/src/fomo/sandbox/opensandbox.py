@@ -13,7 +13,7 @@ import hashlib
 import mimetypes
 from collections.abc import Mapping
 from contextlib import suppress
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
 from typing import Any
 from urllib.parse import urlparse
@@ -23,9 +23,13 @@ from opensandbox.config import ConnectionConfig
 from opensandbox.exceptions import SandboxApiException
 from opensandbox.models.execd import ExecutionHandlers, RunCommandOpts
 from opensandbox.models.filesystem import SearchEntry, WriteEntry
-from opensandbox.models.sandboxes import PlatformSpec
+from opensandbox.models.sandboxes import PlatformSpec, SandboxState
 
-from fomo.config import DEFAULT_OPENSANDBOX_IMAGE, DEFAULT_OPENSANDBOX_LIFETIME_SECONDS
+from fomo.config import (
+    DEFAULT_OPENSANDBOX_IMAGE,
+    DEFAULT_OPENSANDBOX_LIFETIME_SECONDS,
+    DEFAULT_OPENSANDBOX_READY_TIMEOUT_SECONDS,
+)
 
 from .base import (
     Command,
@@ -44,6 +48,7 @@ from .base import (
 _APPLICATION_PORT = 8080
 _WORKSPACE = "/workspace"
 _STARTER_ROOT = "/opt/fomo/starters"
+_RUNTIME_CACHE_ROOT = "/opt/fomo/runtime-cache"
 _SUPPORTED_STARTER_ID = "fomo-next-radix-v2"
 _SUPPORTED_STARTER_CAPABILITIES = {
     "crud": "crud",
@@ -58,6 +63,9 @@ _OPENSANDBOX_FILE_WIRE_MODE = 644
 _DEFAULT_IMAGE = DEFAULT_OPENSANDBOX_IMAGE
 _MAX_PERSISTED_TEXT_BYTES = 512 * 1024
 _SANDBOX_PROXY_ENV_NAMES = frozenset({"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"})
+# Keep enough headroom for Docker Desktop and OpenSandbox execd overhead while
+# copying the baked starter and capability layers.
+_STARTER_COPY_TIMEOUT_SECONDS = 120
 _IGNORED_MANIFEST_DIRECTORIES = {
     ".git",
     ".next",
@@ -175,16 +183,20 @@ class OpenSandboxProvider:
         *,
         sandbox_class: Any | None = None,
         lifetime_seconds: int = DEFAULT_OPENSANDBOX_LIFETIME_SECONDS,
+        ready_timeout_seconds: int = DEFAULT_OPENSANDBOX_READY_TIMEOUT_SECONDS,
         proxy_environment: Mapping[str, str] | None = None,
     ) -> None:
         if lifetime_seconds <= 0:
             raise ValueError("OpenSandbox lifetime must be positive")
+        if ready_timeout_seconds <= 0:
+            raise ValueError("OpenSandbox ready timeout must be positive")
         self.base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._image = image or _DEFAULT_IMAGE
         self._preview_scheme = urlparse(self.base_url).scheme or "http"
         self._sandbox_class = sandbox_class or Sandbox
         self._lifetime_seconds = lifetime_seconds
+        self._ready_timeout_seconds = ready_timeout_seconds
         self._proxy_environment = _validated_proxy_environment(proxy_environment)
         self._sandboxes: dict[str, Any] = {}
         self._preview_execution_ids: dict[str, str] = {}
@@ -193,6 +205,9 @@ class OpenSandboxProvider:
         # OpenSandbox v0.2.2 supports pause/kill. Snapshot persistence is left
         # disabled intentionally until the version rollback workflow consumes
         # server snapshots instead of its authoritative Git/file manifest.
+        # Egress policy stays disabled: the local config.toml has no
+        # authenticated dns+nft sidecar, so no fail-closed network policy can
+        # be claimed (see DESIGN: public untrusted deployment is blocked).
         return SandboxCapabilities(
             snapshot=False,
             pause_resume=True,
@@ -209,6 +224,7 @@ class OpenSandboxProvider:
 
         create_kwargs: dict[str, Any] = {
             "timeout": timedelta(seconds=self._lifetime_seconds),
+            "ready_timeout": timedelta(seconds=self._ready_timeout_seconds),
             "metadata": metadata,
             "platform": PlatformSpec(os="linux", arch="arm64"),
             "connection_config": self._connection_config(),
@@ -281,7 +297,11 @@ class OpenSandboxProvider:
             exit_code=int(exit_code),
             stdout=collector.stdout,
             stderr=collector.stderr,
-            timed_out=self._execution_timed_out(error),
+            # OpenSandbox reports a command deadline as exit_code=-1 even
+            # when the SDK omits an error object. Preserve that provider
+            # convention instead of misclassifying the result as a normal
+            # source-code failure.
+            timed_out=self._execution_timed_out(error, exit_code=int(exit_code)),
         )
 
     async def read_file(self, ref: SandboxRef, path: str) -> bytes:
@@ -326,18 +346,31 @@ class OpenSandboxProvider:
         unknown = sorted(set(requested) - set(_SUPPORTED_STARTER_CAPABILITIES))
         if unknown:
             raise ValueError("unsupported starter capability")
-        source_directories = [f"{_STARTER_ROOT}/{_SUPPORTED_STARTER_ID}/base"]
-        source_directories.extend(
+        base_directory = f"{_STARTER_ROOT}/{_SUPPORTED_STARTER_ID}/base"
+        runtime_node_modules = (
+            f"{_RUNTIME_CACHE_ROOT}/{_SUPPORTED_STARTER_ID}/node_modules"
+        )
+        commands = [
+            f"cp -R --no-preserve=mode,ownership -- {base_directory}/. {_WORKSPACE}/",
+            # The image-level starter uses a symlink only to avoid duplicating
+            # its cache layer. A generated workspace must be self-contained:
+            # preserve pnpm's internal symlink/hardlink graph and executable
+            # modes without leaving node_modules pointed outside the project.
+            f"test -L {_WORKSPACE}/node_modules",
+            f"rm -- {_WORKSPACE}/node_modules",
             (
-                f"{_STARTER_ROOT}/{_SUPPORTED_STARTER_ID}/capabilities/"
-                f"{_SUPPORTED_STARTER_CAPABILITIES[capability_id]}"
-            )
+                "cp -a --no-preserve=ownership -- "
+                f"{runtime_node_modules} {_WORKSPACE}/node_modules"
+            ),
+            f"chmod -R u+rwX -- {_WORKSPACE}/node_modules",
+        ]
+        commands.extend(
+            "cp -R --no-preserve=mode,ownership -- "
+            f"{_STARTER_ROOT}/{_SUPPORTED_STARTER_ID}/capabilities/"
+            f"{_SUPPORTED_STARTER_CAPABILITIES[capability_id]}/. {_WORKSPACE}/"
             for capability_id in sorted(requested)
         )
-        return " && ".join(
-            f"cp -R --no-preserve=mode,ownership -- {source_directory}/. {_WORKSPACE}/"
-            for source_directory in source_directories
-        )
+        return " && ".join(commands)
 
     async def copy_starter(
         self,
@@ -358,7 +391,7 @@ class OpenSandboxProvider:
             ref,
             Command(
                 command=command,
-                timeout_seconds=30,
+                timeout_seconds=_STARTER_COPY_TIMEOUT_SECONDS,
             ),
             discard_output,
         )
@@ -372,6 +405,48 @@ class OpenSandboxProvider:
                 "OpenSandbox preview endpoint requires request headers; configure browser-reachable direct ingress"
             )
         return PreviewRef(url=self._endpoint_url(endpoint), status="ready")
+
+    async def renew_preview(self, ref: SandboxRef, lifetime_seconds: int) -> str:
+        """Extend one verified preview and return its authoritative expiry."""
+        if lifetime_seconds <= 0:
+            raise ValueError("verified preview lifetime must be positive")
+        sandbox = None
+        try:
+            sandbox = await self.connect(ref)
+            info = await sandbox.get_info()
+            state = str(getattr(getattr(info, "status", None), "state", ""))
+            if state != SandboxState.RUNNING:
+                raise RuntimeError("OpenSandbox verified preview is not running")
+            response = await sandbox.renew(timedelta(seconds=lifetime_seconds))
+        except SandboxApiException as exc:
+            if self._is_missing_sandbox(exc):
+                await self._evict_cached_sandbox(ref.id, sandbox)
+            raise
+        expires_at = getattr(response, "expires_at", None)
+        if not isinstance(expires_at, datetime):
+            raise RuntimeError("OpenSandbox renew response did not include an expiry")
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+        return expires_at.astimezone(UTC).isoformat()
+
+    async def probe_preview(self, ref: SandboxRef) -> bool:
+        """Return False only for a confirmed missing or non-running resource.
+
+        ``Sandbox.is_healthy`` deliberately swallows transport errors, so it
+        cannot distinguish an expired preview from a transient control-plane
+        outage. ``get_info`` preserves that distinction for callers.
+        """
+        sandbox = None
+        try:
+            sandbox = await self.connect(ref)
+            info = await sandbox.get_info()
+        except SandboxApiException as exc:
+            if not self._is_missing_sandbox(exc):
+                raise
+            await self._evict_cached_sandbox(ref.id, sandbox)
+            return False
+        state = str(getattr(getattr(info, "status", None), "state", ""))
+        return state == SandboxState.RUNNING
 
     async def start_preview(
         self, ref: SandboxRef, command: Command, port: int, sink: OutputSink
@@ -481,10 +556,17 @@ class OpenSandboxProvider:
         # The SDK also supports OPEN_SANDBOX_API_KEY. Passing the configured
         # value explicitly keeps FOMO's OPENSANDBOX_* configuration namespace
         # self-contained without reading any dotenv file.
-        return ConnectionConfig(api_key=self._api_key, domain=self.base_url, protocol="http")
+        return ConnectionConfig(
+            api_key=self._api_key,
+            domain=self.base_url,
+            protocol="http",
+            request_timeout=timedelta(seconds=self._ready_timeout_seconds),
+        )
 
     @staticmethod
-    def _execution_timed_out(error: Any) -> bool:
+    def _execution_timed_out(error: Any, *, exit_code: int | None = None) -> bool:
+        if exit_code == -1:
+            return True
         if error is None:
             return False
         text = " ".join(
@@ -510,6 +592,15 @@ class OpenSandboxProvider:
         close = getattr(sandbox, "close", None)
         if close is not None:
             await close()
+
+    async def _evict_cached_sandbox(self, sandbox_id: str, sandbox: Any | None) -> None:
+        """Forget a server-confirmed missing sandbox without issuing destroy."""
+        self._preview_execution_ids.pop(sandbox_id, None)
+        self._sandboxes.pop(sandbox_id, None)
+        close = getattr(sandbox, "close", None) if sandbox is not None else None
+        if close is not None:
+            with suppress(Exception):
+                await close()
 
     @staticmethod
     def _workspace_path(path: str) -> str:

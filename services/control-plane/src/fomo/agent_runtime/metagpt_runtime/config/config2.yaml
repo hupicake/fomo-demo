@@ -1,8 +1,0 @@
-# MetaGPT needs a syntactically valid provider config to instantiate Role/Action.
-# FOMO's custom actions never call this provider: all generation goes through the
-# injected FOMO ModelClient and LiteLLM aliases instead.
-llm:
-  api_type: openai
-  model: fomo-metagpt-coordination-placeholder
-  base_url: http://127.0.0.1:9/v1
-  api_key: fomo-metagpt-placeholder-not-used

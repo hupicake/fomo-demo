@@ -23,7 +23,7 @@ async def settings(tmp_path: Path) -> Settings:
         app_env="test",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'fomo-test.db'}",
         # Native is a deliberately explicit test-mode diagnostic path. Runtime
-        # defaults remain the real MetaGPT coordination adapter.
+        # defaults remain Direct Pi.
         agent_framework="native",
         sandbox_provider="fake",
         allow_unsafe_process_sandbox=False,

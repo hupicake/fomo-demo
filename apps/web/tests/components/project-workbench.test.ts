@@ -3,16 +3,20 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createElement, StrictMode } from "react";
 import type { HTMLAttributes, ReactNode } from "react";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 
 import {
   ProjectWorkbench,
   clearArtifactDetailCache,
   useArtifactDetailLoader,
 } from "@/components/workbench/project-workbench";
+import { ApiProblem } from "@/lib/api/client";
 import { useWorkbenchStore } from "@/lib/store/workbench-store";
 import type { ArtifactDetail, ArtifactKind, ArtifactRef, VisibleArtifactRef } from "@/lib/contracts";
 
 const h = vi.hoisted(() => ({
+  answerRunInputRequest: vi.fn(),
+  cancelRun: vi.fn(),
   getArtifact: vi.fn(),
   mutate: vi.fn(),
   emptyArray: Object.freeze([]),
@@ -42,7 +46,11 @@ vi.mock("@/lib/api/client", () => ({
       this.title = input.title;
     }
   },
-  controlPlane: { getArtifact: h.getArtifact },
+  controlPlane: {
+    answerRunInputRequest: h.answerRunInputRequest,
+    cancelRun: h.cancelRun,
+    getArtifact: h.getArtifact,
+  },
   controlPlaneUrl: (path: string) => path,
 }));
 
@@ -89,8 +97,17 @@ vi.mock("@/components/ai-elements/plan", () => ({
 vi.mock("@/components/ai-elements/prompt-input", () => ({
   PromptInput: ({ children }: { children?: ReactNode }) => createElement("form", null, children),
   PromptInputFooter: ({ children }: { children?: ReactNode }) => createElement("div", null, children),
-  PromptInputSubmit: () => createElement("button"),
-  PromptInputTextarea: () => createElement("textarea"),
+  PromptInputSubmit: ({ disabled, onStop, status }: { disabled?: boolean; onStop?: () => void; status?: string }) => createElement("button", {
+    "aria-label": status === "streaming" || status === "submitted" ? "Stop" : "Submit",
+    disabled,
+    onClick: onStop,
+    type: "button",
+  }),
+  PromptInputTextarea: ({ disabled, placeholder }: { disabled?: boolean; placeholder?: string }) => createElement("textarea", {
+    "aria-label": "Project prompt",
+    disabled,
+    placeholder,
+  }),
   PromptInputTools: ({ children }: { children?: ReactNode }) => createElement("div", null, children),
 }));
 
@@ -120,6 +137,10 @@ beforeEach(() => {
     selectedTab: "preview",
   });
   vi.clearAllMocks();
+  h.answerRunInputRequest.mockReset();
+  h.cancelRun.mockReset().mockResolvedValue(undefined);
+  h.mutate.mockReset().mockResolvedValue(undefined);
+  h.chat.status = "ready";
   clearArtifactDetailCache();
 });
 
@@ -152,6 +173,7 @@ function detailFixture(ref: VisibleArtifactRef, problem: string): ArtifactDetail
 
 function snapshotFixture(refs: ArtifactRef[], lastSeq = 12): Record<string, unknown> {
   return {
+    goalGraph: null,
     project: { id: "project-1", name: "Library", status: "idle" },
     activeRun: { id: "run-1", projectId: "project-1", status: "completed", lastSeq },
     lastSeq,
@@ -162,6 +184,30 @@ function snapshotFixture(refs: ArtifactRef[], lastSeq = 12): Record<string, unkn
     trace: [],
     preview: { status: "unavailable" },
     artifactRefs: refs,
+  };
+}
+
+function waitingSnapshotFixture(): Record<string, unknown> {
+  const pendingInputRequest = {
+    id: "input-1",
+    runId: "run-1",
+    question: "Which catalogue layout should we use?",
+    choices: ["Grid", "List"],
+    allowFreeform: false,
+    status: "pending",
+    stage: "building",
+    createdAt: "2026-08-09T10:00:00.000Z",
+  };
+  return {
+    ...snapshotFixture([], 8),
+    activeRun: {
+      id: "run-1",
+      projectId: "project-1",
+      status: "waiting_for_user",
+      lastSeq: 8,
+      pendingInputRequest,
+    },
+    pendingInputRequest,
   };
 }
 
@@ -261,60 +307,115 @@ describe("useArtifactDetailLoader", () => {
   });
 });
 
-describe("ProjectWorkbench artifact loading", () => {
-  it("hydrates snapshot refs and loads each detail exactly once across StrictMode, rerender and refresh", async () => {
+describe("ProjectWorkbench runtime overview", () => {
+  it("shows the bounded run overview without contract proof or artifact detail loading", () => {
+    h.snapshot.project = snapshotFixture([]);
+
+    render(createElement(ProjectWorkbench, { projectId: "project-1" }));
+
+    const workLog = screen.getByLabelText("Work log");
+    const activity = screen.getByRole("region", { name: "Agent activity" });
+    const taskSummary = screen.getByRole("region", { name: "Current task" });
+    const composer = screen.getByRole("textbox");
+    expect(screen.getByRole("region", { name: "Agent work log" })).toBeTruthy();
+    expect(screen.getByRole("region", { name: "Run stages" })).toBeTruthy();
+    expect(screen.getByRole("region", { name: "Run metrics" })).toBeTruthy();
+    expect(workLog.contains(activity)).toBe(true);
+    expect(workLog.contains(taskSummary)).toBe(false);
+    expect(workLog.compareDocumentPosition(taskSummary) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(taskSummary.compareDocumentPosition(composer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getByRole("region", { name: "Workspace" })).toBeTruthy();
+    expect(screen.queryByText("Contract-to-Proof")).toBeNull();
+    expect(h.getArtifact).not.toHaveBeenCalled();
+  });
+
+  it("keeps spec artifacts out of the main UI across hydration and refresh", () => {
     const product = refFixture("product-1", "product_spec");
     const technical = refFixture("technical-1", "technical_spec");
     h.snapshot.project = snapshotFixture([product, technical], 12);
-    h.getArtifact.mockImplementation(async (runId: string, artifactId: string) => {
-      const kind: ArtifactKind = artifactId.startsWith("technical") ? "technical_spec" : "product_spec";
-      return detailFixture(refFixture(artifactId, kind, runId), "Readers cannot manage books.");
-    });
 
     const { rerender } = render(createElement(StrictMode, null, createElement(ProjectWorkbench, { projectId: "project-1" })));
-    await waitFor(() => expect(h.getArtifact).toHaveBeenCalledTimes(2));
-    await waitFor(() => expect(screen.getByText(/Readers cannot manage books/)).toBeTruthy());
+    expect(h.getArtifact).not.toHaveBeenCalled();
+    expect(screen.queryByText("Contract-to-Proof")).toBeNull();
 
-    // A plain rerender with the same snapshot must not refetch.
     rerender(createElement(StrictMode, null, createElement(ProjectWorkbench, { projectId: "project-1" })));
-    expect(h.getArtifact).toHaveBeenCalledTimes(2);
+    expect(h.getArtifact).not.toHaveBeenCalled();
 
-    // A terminal refresh with a new snapshot signature must not refetch known refs.
     h.snapshot.project = snapshotFixture([product, technical], 99);
     rerender(createElement(StrictMode, null, createElement(ProjectWorkbench, { projectId: "project-1" })));
-    await waitFor(() => expect(h.getArtifact).toHaveBeenCalledTimes(2));
-    expect(screen.getByText(/Readers cannot manage books/)).toBeTruthy();
+    expect(h.getArtifact).not.toHaveBeenCalled();
+    expect(screen.queryByText("Contract-to-Proof")).toBeNull();
   });
 
-  it("fetches a ref that appears only after a terminal refresh exactly once", async () => {
-    const product = refFixture("product-1", "product_spec");
-    h.snapshot.project = snapshotFixture([product], 12);
-    h.getArtifact.mockImplementation(async (runId: string, artifactId: string) => {
-      const kind: ArtifactKind = artifactId.startsWith("technical") ? "technical_spec" : "product_spec";
-      return detailFixture(refFixture(artifactId, kind, runId), "Readers cannot manage books.");
+  it("disables ordinary prompting while answering through the idempotent clarification endpoint", async () => {
+    const user = userEvent.setup();
+    h.snapshot.project = waitingSnapshotFixture();
+    h.answerRunInputRequest.mockResolvedValue({
+      message: { id: "message-1", role: "user", content: "Grid" },
+      request: {
+        id: "input-1",
+        runId: "run-1",
+        question: "Which catalogue layout should we use?",
+        choices: ["Grid", "List"],
+        allowFreeform: false,
+        status: "answered",
+        stage: "building",
+        answeredAt: "2026-08-09T10:01:00.000Z",
+      },
+      run: { id: "run-1", projectId: "project-1", status: "queued", lastSeq: 10 },
     });
 
-    const { rerender } = render(createElement(ProjectWorkbench, { projectId: "project-1" }));
-    await waitFor(() => expect(h.getArtifact).toHaveBeenCalledTimes(1));
+    render(createElement(ProjectWorkbench, { projectId: "project-1" }));
 
-    const technical = refFixture("technical-1", "technical_spec");
-    h.snapshot.project = snapshotFixture([product, technical], 13);
-    rerender(createElement(ProjectWorkbench, { projectId: "project-1" }));
+    const composer = screen.getByRole("textbox", { name: "Project prompt" });
+    expect((composer as HTMLTextAreaElement).disabled).toBe(true);
+    expect((composer as HTMLTextAreaElement).placeholder).toBe("Answer the question in the work log to continue");
+    expect(screen.getByText("Answer the question in the work log to continue this run.")).toBeTruthy();
 
-    await waitFor(() => expect(h.getArtifact).toHaveBeenCalledTimes(2));
-    expect(h.getArtifact).toHaveBeenCalledWith("run-1", "technical-1");
+    await user.click(screen.getByRole("button", { name: "Grid" }));
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+
+    await waitFor(() => expect(h.answerRunInputRequest).toHaveBeenCalledTimes(1));
+    expect(h.answerRunInputRequest).toHaveBeenCalledWith("run-1", "input-1", {
+      clientMessageId: expect.any(String),
+      answer: "Grid",
+    });
+    expect(h.chat.sendMessage).not.toHaveBeenCalled();
+    expect(h.chat.resumeStream).toHaveBeenCalledTimes(1);
+    expect(h.mutate).toHaveBeenCalled();
+    expect(await screen.findByText("Answered")).toBeTruthy();
   });
 
-  it("shows an explicit failure in the spec UI without retrying or falling back", async () => {
-    h.snapshot.project = snapshotFixture([refFixture("product-1", "product_spec")], 12);
-    h.getArtifact.mockRejectedValue(new Error("artifact fetch failed"));
+  it("keeps cancel available for a refreshed waiting run before useChat reports streaming", async () => {
+    const user = userEvent.setup();
+    h.snapshot.project = waitingSnapshotFixture();
+    h.chat.status = "ready";
 
-    const { rerender } = render(createElement(ProjectWorkbench, { projectId: "project-1" }));
-    await waitFor(() => expect(screen.getByText("artifact fetch failed")).toBeTruthy());
-    expect(screen.queryByText(/Readers cannot manage books/)).toBeNull();
-    expect(screen.queryByText("Loading spec content…")).toBeNull();
+    render(createElement(ProjectWorkbench, { projectId: "project-1" }));
 
-    rerender(createElement(ProjectWorkbench, { projectId: "project-1" }));
-    expect(h.getArtifact).toHaveBeenCalledTimes(1);
+    const stopButton = screen.getByRole("button", { name: "Stop" });
+    expect((stopButton as HTMLButtonElement).disabled).toBe(false);
+    await user.click(stopButton);
+
+    await waitFor(() => expect(h.cancelRun).toHaveBeenCalledWith("run-1"));
+    expect(h.chat.stop).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText("Cancelled")).toBeTruthy();
+  });
+
+  it("refreshes a stale clarification after a conflict and leaves the selected answer retryable", async () => {
+    const user = userEvent.setup();
+    h.snapshot.project = waitingSnapshotFixture();
+    h.answerRunInputRequest.mockRejectedValue(new ApiProblem({ status: 409, title: "Conflict" }));
+
+    render(createElement(ProjectWorkbench, { projectId: "project-1" }));
+
+    const grid = screen.getByRole("button", { name: "Grid" });
+    await user.click(grid);
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+
+    expect((await screen.findByRole("alert")).textContent).toContain("already answered");
+    expect(grid.getAttribute("aria-pressed")).toBe("true");
+    expect(h.mutate).toHaveBeenCalled();
+    expect(h.chat.sendMessage).not.toHaveBeenCalled();
   });
 });

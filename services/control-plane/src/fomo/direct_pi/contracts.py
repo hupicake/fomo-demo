@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
-from pathlib import PurePosixPath
 from typing import Annotated, Literal
 
 from pydantic import Field, StringConstraints, field_validator, model_validator
@@ -19,8 +17,13 @@ Identifier = Annotated[
 ]
 
 _LOCAL_PATH = re.compile(r"^/[A-Za-z0-9/_-]*$")
+_PLAN_ROUTE = re.compile(
+    r"^/$|^/(?:[A-Za-z0-9_-]+|\[[A-Za-z][A-Za-z0-9_-]*\])"
+    r"(?:/(?:[A-Za-z0-9_-]+|\[[A-Za-z][A-Za-z0-9_-]*\]))*$"
+)
 _ALLOWED_ROLES = {
     "alert",
+    "alertdialog",
     "button",
     "checkbox",
     "columnheader",
@@ -37,6 +40,7 @@ _ALLOWED_ROLES = {
     "radio",
     "row",
     "searchbox",
+    "spinbutton",
     "status",
     "switch",
     "tab",
@@ -76,7 +80,7 @@ class BuildPlan(SchemaModel):
         normalized: list[str] = []
         for value in values:
             value = value.strip()
-            if len(value) > 200 or not _LOCAL_PATH.fullmatch(value):
+            if len(value) > 200 or not _PLAN_ROUTE.fullmatch(value):
                 raise ValueError("routes must be bounded local paths")
             normalized.append(value)
         if len(normalized) != len(set(normalized)):
@@ -139,6 +143,10 @@ class SelectAction(SchemaModel):
 
 class ReloadAction(SchemaModel):
     kind: Literal["reload"]
+    # Models often keep a uniform ``target`` slot across action variants.
+    # Explicit null is unambiguous for reload; every non-null value remains
+    # forbidden by the strict schema.
+    target: None = None
 
 
 AcceptanceAction = Annotated[
@@ -229,12 +237,3 @@ class PlanningBundle(SchemaModel):
         if criterion_ids != referenced:
             raise ValueError("every acceptance criterion must map to an implementation file")
         return self
-
-
-def validate_plan_write_scope(plan: BuildPlan, *, model_owned: Callable[[str], bool]) -> None:
-    """Reject plans that name anything outside the immutable starter extensions."""
-    for item in plan.files:
-        if not model_owned(item.path):
-            raise ValueError(f"planned file is outside model-owned roots: {item.path}")
-        if PurePosixPath(item.path).suffix not in {".ts", ".tsx"}:
-            raise ValueError(f"planned file must be TypeScript source: {item.path}")

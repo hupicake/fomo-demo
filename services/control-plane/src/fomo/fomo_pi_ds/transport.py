@@ -38,6 +38,11 @@ class PiTransportResult:
     stderr: str
 
 
+# Extra headroom beyond bridge grace so the bridge can clean up and emit its
+# terminal envelope before the sandbox command deadline fires.
+_OUTER_TIMEOUT_MARGIN_SECONDS = 5
+
+
 class OpenSandboxPiTransport:
     """Run one Pi turn in generation sandbox G and reduce its strict JSONL stream."""
 
@@ -71,6 +76,8 @@ class OpenSandboxPiTransport:
             request_id=request.request_id,
             correlation_id=request.correlation_id,
             session_id=request.session_id,
+            thinking_level=request.thinking,
+            model_ref=request.model,
         )
         execution_id: str | None = None
         init_ready = asyncio.Event()
@@ -151,7 +158,16 @@ class OpenSandboxPiTransport:
         cancel_task = (
             asyncio.create_task(interrupt_when_cancelled()) if cancel_event is not None else None
         )
-        timeout_seconds = request.timeout_seconds or self._default_timeout_seconds
+        # The outer OpenSandbox command timeout must exceed the bridge's own
+        # timeout by the bridge grace period plus a small finalization margin,
+        # so the bridge (not the sandbox) performs cleanup first and reports a
+        # terminal envelope. This is best-effort: the orchestrator still
+        # destroys G and blocks the virtual key on any cancellation/exception.
+        timeout_seconds = self._default_timeout_seconds
+        if request.timeout_seconds is not None:
+            timeout_seconds = (
+                request.timeout_seconds + request.grace_seconds + _OUTER_TIMEOUT_MARGIN_SECONDS
+            )
         command = shlex.join(invocation.command_line())
         try:
             execution = await sandbox.commands.run(

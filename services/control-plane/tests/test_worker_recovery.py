@@ -3,15 +3,73 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from datetime import timedelta
+from unittest.mock import AsyncMock
 
 import pytest
 
 from fomo.agent_runtime import SOPRunner
+from fomo.direct_pi.goalgraph import GoalStatus, parse_goal_graph_draft
 from fomo.ids import utcnow
 from fomo.persistence import RunLeaseLost
 from fomo.sandbox.fake import FakeSandboxProvider
 from fomo.schemas import RunStatus
 from fomo.worker.runner import WorkerRunner
+
+
+def _acceptance(identifier: str):
+    return {
+        "criteria": [
+            {
+                "id": identifier,
+                "title": identifier,
+                "priority": "must",
+                "given": "the app is open",
+                "when": "the flow runs",
+                "then": "the result appears",
+            }
+        ],
+        "tests": [
+            {
+                "id": f"T-{identifier}",
+                "acceptanceId": identifier,
+                "title": identifier,
+                "actions": [{"kind": "goto", "path": "/"}],
+                "assertions": [
+                    {
+                        "kind": "visible",
+                        "target": {"by": "role", "value": "main", "name": "App"},
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def _goal_draft():
+    return parse_goal_graph_draft(
+        {
+            "schemaVersion": 1,
+            "productOutcome": "A recoverable app",
+            "goals": [
+                {
+                    "goalId": "G-1",
+                    "title": "Foundation",
+                    "productOutcome": "Foundation works",
+                    "userVisible": True,
+                    "dependsOn": [],
+                    "acceptance": _acceptance("AC-1"),
+                },
+                {
+                    "goalId": "G-2",
+                    "title": "Experience",
+                    "productOutcome": "Experience works",
+                    "userVisible": True,
+                    "dependsOn": ["G-1"],
+                    "acceptance": _acceptance("AC-2"),
+                },
+            ],
+        }
+    )
 
 
 class _BlockingModel:
@@ -40,6 +98,16 @@ class _TrackingSandbox(FakeSandboxProvider):
     async def kill(self, ref) -> None:
         self.killed_ids.append(ref.id)
         await super().kill(ref)
+
+
+class _FailingCleanupSandbox(FakeSandboxProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    async def kill(self, ref) -> None:
+        self.attempts += 1
+        raise RuntimeError("cleanup unavailable")
 
 
 async def _running_run(repository, *, message_id: str, lease_seconds: int = 60):
@@ -221,3 +289,189 @@ async def test_expired_run_fails_releases_active_project_and_destroys_sandbox(re
     assert final.error_code == "worker_lease_expired"
     assert (await repository.require_project(project.id)).active_run_id is None
     assert sandbox.killed_ids == [ref.id]
+
+
+@pytest.mark.asyncio
+async def test_expired_p1_run_requeues_after_all_sandboxes_are_acknowledged(repository) -> None:
+    project, run = await _running_run(repository, message_id="p1-resume", lease_seconds=60)
+    lease = await repository.get_active_lease_token(run.id)
+    first_claim = await repository.get_run(run.id)
+    assert first_claim.execution_started_at is not None
+    await repository.create_goal_graph(project.id, run.id, _goal_draft(), lease_token=lease)
+    await repository.activate_goal(run.id, "G-1", lease_token=lease)
+    await repository.claim_goal(run.id, "G-1", lease_token=lease)
+    await repository.record_verified_checkpoint(
+        run.id,
+        "G-1",
+        [{"path": "app/page.tsx", "content": "export default function Page() {}\n"}],
+        [
+            {
+                "acceptanceKey": "G-1:AC-1",
+                "kind": "fomo_qa_test",
+                "status": "passed",
+                "summary": "passed",
+            }
+        ],
+        lease_token=lease,
+    )
+    await repository.claim_goal(run.id, "G-2", lease_token=lease)
+    generation_id = await repository.register_sandbox_resource(
+        run.id, "sandbox-g", "generation", lease_token=lease
+    )
+    verification_id = await repository.register_sandbox_resource(
+        run.id, "sandbox-v", "verification", lease_token=lease
+    )
+    await repository.set_sandbox_id(run.id, "sandbox-v", lease_token=lease)
+    await repository.set_preview_url(run.id, "http://preview.test", lease_token=lease)
+
+    cleanup = await repository.recover_expired_running_runs(
+        now=utcnow() + timedelta(seconds=120)
+    )
+    assert {item.resource_id for item in cleanup} == {generation_id, verification_id}
+    requeued = await repository.get_run(run.id)
+    assert requeued.status == RunStatus.queued
+    assert requeued.execution_started_at == first_claim.execution_started_at
+    project_record = await repository.require_project(project.id)
+    assert project_record.active_run_id == run.id
+    assert project_record.status == "queued"
+    assert await repository.claim_next_run("new-worker", 60) is None
+
+    assert await repository.acknowledge_sandbox_cleanup(generation_id)
+    assert await repository.claim_next_run("new-worker", 60) is None
+    assert await repository.acknowledge_sandbox_cleanup(verification_id)
+    reclaimed = await repository.claim_next_run("new-worker", 60)
+    assert reclaimed is not None and reclaimed.id == run.id and reclaimed.lease_owner != lease
+    assert reclaimed.execution_started_at == first_claim.execution_started_at.replace(tzinfo=None)
+    resumed = await repository.resume_goal(
+        run.id, "G-2", lease_token=reclaimed.lease_owner
+    )
+    assert resumed.graph.goals[1].status is GoalStatus.ACTIVE
+    assert (await repository.list_events(run.id))[-1].kind == "goal.resumed"
+
+
+@pytest.mark.asyncio
+async def test_expired_verified_graph_requeues_for_reverification_and_publish(repository) -> None:
+    project, run = await _running_run(repository, message_id="verified-resume", lease_seconds=60)
+    lease = await repository.get_active_lease_token(run.id)
+    await repository.create_goal_graph(project.id, run.id, _goal_draft(), lease_token=lease)
+    await repository.activate_goal(run.id, "G-1", lease_token=lease)
+    await repository.claim_goal(run.id, "G-1", lease_token=lease)
+    for goal_id, acceptance_id in (("G-1", "AC-1"), ("G-2", "AC-2")):
+        if goal_id == "G-2":
+            await repository.claim_goal(run.id, goal_id, lease_token=lease)
+        await repository.record_verified_checkpoint(
+            run.id,
+            goal_id,
+            [{"path": "app/page.tsx", "content": f"// {goal_id}\n"}],
+            [
+                {
+                    "acceptanceKey": f"{goal_id}:{acceptance_id}",
+                    "kind": "fomo_qa_test",
+                    "status": "passed",
+                    "summary": "passed",
+                }
+            ],
+            lease_token=lease,
+        )
+    graph = await repository.get_goal_graph(run.id)
+    assert graph is not None and graph.graph.status.value == "verified"
+
+    assert await repository.recover_expired_running_runs(
+        now=utcnow() + timedelta(seconds=120)
+    ) == []
+    assert (await repository.get_run(run.id)).status == RunStatus.queued
+    event = (await repository.list_events(run.id))[-1]
+    assert event.kind == "goal.resume_scheduled"
+    assert event.payload["graphStatus"] == "verified"
+    assert event.payload["goalId"] == "G-2"
+    assert await repository.claim_next_run("publish-worker", 60) is not None
+
+
+@pytest.mark.asyncio
+async def test_healthy_running_registry_resource_is_not_cleaned(repository, settings) -> None:
+    project, run = await _running_run(repository, message_id="healthy-resource", lease_seconds=60)
+    lease = await repository.get_active_lease_token(run.id)
+    sandbox = _TrackingSandbox()
+    ref = await sandbox.create(project.id)
+    await repository.register_sandbox_resource(
+        run.id, ref.id, "generation", lease_token=lease
+    )
+    worker = WorkerRunner(repository, settings, sandbox=sandbox, worker_id="other-worker")
+
+    assert not await worker.run_once()
+    assert sandbox.killed_ids == []
+    assert (await repository.get_run(run.id)).status == RunStatus.running
+
+
+@pytest.mark.asyncio
+async def test_successful_verified_preview_is_retained_until_invalidated(
+    repository, settings
+) -> None:
+    project, run = await _running_run(
+        repository, message_id="retained-preview", lease_seconds=60
+    )
+    lease = await repository.get_active_lease_token(run.id)
+    sandbox = _TrackingSandbox()
+    ref = await sandbox.create(project.id)
+    resource_id = await repository.register_sandbox_resource(
+        run.id, ref.id, "verification", lease_token=lease
+    )
+    await repository.set_sandbox_id(run.id, ref.id, lease_token=lease)
+    await repository.set_preview_url(
+        run.id, "https://preview.invalid", lease_token=lease
+    )
+    await repository.mark_terminal(
+        run.id, RunStatus.succeeded, lease_token=lease
+    )
+    worker = WorkerRunner(repository, settings, sandbox=sandbox, worker_id="preview-worker")
+
+    assert not await worker.run_once()
+    assert sandbox.killed_ids == []
+    assert await repository.list_sandbox_cleanup_targets(run.id) == []
+
+    # Clearing the durable preview makes the retained verification resource
+    # explicitly reclaimable on the next cleanup sweep.
+    await repository.set_preview_url(run.id, None)
+    assert not await worker.run_once()
+    assert sandbox.killed_ids == [ref.id]
+    assert await repository.list_sandbox_cleanup_targets(run.id) == []
+    assert await repository.acknowledge_sandbox_cleanup(resource_id) is False
+
+
+@pytest.mark.asyncio
+async def test_duplicate_cleanup_does_not_ack_when_first_kill_fails(repository, settings) -> None:
+    project, run = await _running_run(repository, message_id="cleanup-failure", lease_seconds=60)
+    lease = await repository.get_active_lease_token(run.id)
+    await repository.create_goal_graph(project.id, run.id, _goal_draft(), lease_token=lease)
+    await repository.activate_goal(run.id, "G-1", lease_token=lease)
+    await repository.claim_goal(run.id, "G-1", lease_token=lease)
+    await repository.record_verified_checkpoint(
+        run.id,
+        "G-1",
+        [{"path": "app/page.tsx", "content": "// checkpoint\n"}],
+        [
+            {
+                "acceptanceKey": "G-1:AC-1",
+                "kind": "fomo_qa_test",
+                "status": "passed",
+                "summary": "passed",
+            }
+        ],
+        lease_token=lease,
+    )
+    resource_id = await repository.register_sandbox_resource(
+        run.id, "sandbox-duplicate", "generation", lease_token=lease
+    )
+    cleanup = await repository.recover_expired_running_runs(
+        now=utcnow() + timedelta(seconds=120)
+    )
+    assert cleanup[0].resource_id == resource_id
+    repository.recover_expired_running_runs = AsyncMock(return_value=cleanup)
+    sandbox = _FailingCleanupSandbox()
+    worker = WorkerRunner(repository, settings, sandbox=sandbox, worker_id="cleanup-worker")
+
+    assert not await worker.run_once()
+    assert sandbox.attempts == 1
+    pending = await repository.list_sandbox_cleanup_targets(run.id)
+    assert [item.resource_id for item in pending] == [resource_id]
+    assert await repository.claim_next_run("blocked-worker", 60) is None

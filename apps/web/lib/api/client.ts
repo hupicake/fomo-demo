@@ -1,4 +1,10 @@
-import { artifactKinds, toProjectStatus, toRunStatus } from "@/lib/contracts";
+import {
+  artifactKinds,
+  toProjectStatus,
+  toRunStatus,
+  userInputRequestStages,
+  userInputRequestStatuses,
+} from "@/lib/contracts";
 import type {
   AcceptanceTrace,
   ArtifactDetail,
@@ -11,9 +17,13 @@ import type {
   ProjectSnapshot,
   ProjectSummary,
   RunSnapshot,
+  UserInputAnswerInput,
+  UserInputAnswerResponse,
+  UserInputRequest,
   VersionSummary,
   VisibleArtifactRef,
 } from "@/lib/contracts";
+import { normalizeGoalGraph } from "@/lib/goal-graph";
 
 const defaultApiOrigin = "http://localhost:8000";
 const guestSessionPath = "/sessions/guest";
@@ -77,6 +87,19 @@ function toArray(value: unknown): unknown[] {
   return Array.isArray(value) ? value : [];
 }
 
+function boundedChoices(value: unknown): string[] | undefined {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value) || value.length > 8) return undefined;
+  const choices: string[] = [];
+  for (const candidate of value) {
+    if (typeof candidate !== "string") return undefined;
+    const choice = candidate.trim();
+    if (!choice || choice.length > 200 || choices.includes(choice)) return undefined;
+    choices.push(choice);
+  }
+  return choices;
+}
+
 export function normalizeProject(value: unknown): ProjectSummary {
   const source = record(value);
   return {
@@ -90,12 +113,50 @@ export function normalizeProject(value: unknown): ProjectSummary {
   };
 }
 
+/** Explicitly selects the public clarification fields; never spread input. */
+export function normalizeUserInputRequest(value: unknown): UserInputRequest | undefined {
+  const source = record(value);
+  const id = text(source.id || source.requestId || source.request_id);
+  const runId = text(source.runId || source.run_id);
+  const question = text(source.question).trim();
+  const status = text(source.status);
+  const stage = text(source.stage);
+  const allowFreeformValue = source.allowFreeform ?? source.allow_freeform;
+  const choices = boundedChoices(source.choices);
+  if (
+    !id
+    || !runId
+    || !question
+    || question.length > 2_000
+    || choices === undefined
+    || typeof allowFreeformValue !== "boolean"
+    || !userInputRequestStatuses.includes(status as UserInputRequest["status"])
+    || !userInputRequestStages.includes(stage as UserInputRequest["stage"])
+    || (status === "pending" && !allowFreeformValue && choices.length === 0)
+  ) {
+    return undefined;
+  }
+  return {
+    id,
+    runId,
+    question,
+    choices,
+    allowFreeform: allowFreeformValue,
+    status: status as UserInputRequest["status"],
+    stage: stage as UserInputRequest["stage"],
+    goalId: text(source.goalId || source.goal_id) || undefined,
+    createdAt: text(source.createdAt || source.created_at) || undefined,
+    answeredAt: text(source.answeredAt || source.answered_at) || undefined,
+  };
+}
+
 export function normalizeRun(value: unknown): RunSnapshot | undefined {
   const source = record(value);
   const id = text(source.id || source.runId);
   if (!id) {
     return undefined;
   }
+  const pendingInputRequest = normalizeUserInputRequest(source.pendingInputRequest || source.pending_input_request);
   return {
     id,
     projectId: text(source.projectId || source.project_id),
@@ -104,6 +165,7 @@ export function normalizeRun(value: unknown): RunSnapshot | undefined {
     lastSeq: numberValue(source.lastSeq ?? source.last_seq),
     createdAt: text(source.createdAt || source.created_at) || undefined,
     updatedAt: text(source.updatedAt || source.updated_at) || undefined,
+    ...(pendingInputRequest ? { pendingInputRequest } : {}),
   };
 }
 
@@ -173,7 +235,9 @@ function implementationStatus(value: unknown): AcceptanceTrace["implementationSt
 /** Only a well-formed business-file implemented_in link proves implementation:
  * source acceptance_criterion -> target file, with a nonempty targetRef that
  * is not a tests/generated smoke path. Explicit backend implementationStatus
- * stays authoritative and is checked before any link-derived fallback. */
+ * stays authoritative and is checked before any link-derived fallback.
+ * Missing links remain unknown; open-world trace data cannot prove that an
+ * implementation does not exist. */
 function isImplementedInLink(link: JsonRecord): boolean {
   if (text(link.relation) !== "implemented_in") return false;
   const sourceKind = text(link.sourceKind || link.source_kind);
@@ -241,17 +305,16 @@ function normalizeTrace(value: unknown): AcceptanceTrace | undefined {
     return normalized ? [normalized] : [];
   });
   const criterion = record(source.criterion);
+  const normalizedImplementationStatus = implementationStatus(source.implementationStatus || source.implementation_status)
+    || (source.links && Array.isArray(source.links) && toArray(source.links).some((link) => isImplementedInLink(record(link)))
+      ? "implemented"
+      : undefined);
   return {
     id,
     title: traceTitle(source),
     priority: tracePriority(source.priority || criterion.priority),
     status: traceStatus(source.status),
-    implementationStatus: implementationStatus(source.implementationStatus || source.implementation_status)
-      || (source.links && Array.isArray(source.links)
-        ? toArray(source.links).some((link) => isImplementedInLink(record(link)))
-          ? "implemented"
-          : "not_implemented"
-        : undefined),
+    ...(normalizedImplementationStatus ? { implementationStatus: normalizedImplementationStatus } : {}),
     evidence,
   };
 }
@@ -283,7 +346,6 @@ function normalizeTraceResponse(value: unknown): AcceptanceTrace[] {
       title: `Acceptance criterion ${id}`,
       priority: "must",
       status: "pending",
-      implementationStatus: "not_implemented",
       evidence: [],
     };
     byAcceptanceId.set(id, created);
@@ -303,7 +365,9 @@ function normalizeTraceResponse(value: unknown): AcceptanceTrace[] {
         id: text(item.id, `${id}-${targetRef}`),
         type: traceEvidenceType(targetKind === "file" ? "file" : targetKind),
         label: targetRef,
-        status: "pending",
+        // verified_in is a durable publication relation created only after
+        // this AC passes; structural implementation/test links are not gates.
+        status: text(item.relation) === "verified_in" ? "passed" : "pending",
       });
       if (isImplementedInLink(item)) {
         trace.implementationStatus = "implemented";
@@ -326,9 +390,13 @@ function normalizeTraceResponse(value: unknown): AcceptanceTrace[] {
 
   return [...byAcceptanceId.values()].map((trace) => ({
     ...trace,
-    status: trace.evidence.some((item) => item.status === "failed")
+    // Only deterministic acceptance evidence decides the AC result. File,
+    // test-definition and version links remain visible evidence but cannot
+    // downgrade an otherwise passed Playwright result to pending.
+    status: trace.evidence.filter((item) => item.type === "test").some((item) => item.status === "failed")
       ? "failed"
-      : trace.evidence.length > 0 && trace.evidence.every((item) => item.status === "passed")
+      : trace.evidence.filter((item) => item.type === "test").length > 0
+        && trace.evidence.filter((item) => item.type === "test").every((item) => item.status === "passed")
         ? "passed"
         : "pending",
   }));
@@ -564,6 +632,9 @@ export const controlPlane = {
     const activeRun = (project.activeRunId ? runs.find((run) => run.id === project.activeRunId) : undefined)
       || directActiveRun
       || runs[0];
+    const pendingInputRequest = normalizeUserInputRequest(
+      source.pendingInputRequest || source.pending_input_request || activeRun?.pendingInputRequest,
+    );
     return {
       project: { ...project, id: project.id || projectId },
       messages,
@@ -585,6 +656,8 @@ export const controlPlane = {
         const normalized = normalizeArtifactRef(item);
         return normalized ? [normalized] : [];
       }),
+      ...(pendingInputRequest ? { pendingInputRequest } : {}),
+      goalGraph: normalizeGoalGraph(source.goalGraph || source.goal_graph),
     };
   },
 
@@ -608,6 +681,38 @@ export const controlPlane = {
       throw new ApiProblem({ status: 502, title: "Control plane did not return a run ID" });
     }
     return { runId };
+  },
+
+  async answerRunInputRequest(
+    runId: string,
+    requestId: string,
+    input: UserInputAnswerInput,
+  ): Promise<UserInputAnswerResponse> {
+    const response = await request<unknown>(
+      `/runs/${encodeURIComponent(runId)}/input-requests/${encodeURIComponent(requestId)}/answer`,
+      {
+        method: "POST",
+        headers: { "Idempotency-Key": input.clientMessageId },
+        body: JSON.stringify(input),
+      },
+    );
+    const source = record(response);
+    const message = normalizeMessage(source.message);
+    const answeredRequest = normalizeUserInputRequest(source.request);
+    const run = normalizeRun(source.run);
+    if (
+      !message
+      || message.role !== "user"
+      || !answeredRequest
+      || answeredRequest.id !== requestId
+      || answeredRequest.runId !== runId
+      || answeredRequest.status !== "answered"
+      || !run
+      || run.id !== runId
+    ) {
+      throw new ApiProblem({ status: 502, title: "Control plane returned an invalid clarification response" });
+    }
+    return { message, request: answeredRequest, run };
   },
 
   async cancelRun(runId: string): Promise<void> {
@@ -700,5 +805,94 @@ export const controlPlane = {
       { method: "POST", headers: { "Idempotency-Key": idempotencyKey() } },
     );
     return normalizeVersion(record(response).version || response);
+  },
+};
+
+export type AuthUser = {
+  id: string;
+  email: string;
+  displayName?: string;
+  createdAt: string;
+};
+
+export type AuthSession = {
+  sessionId: string;
+  expiresAt: string;
+  user: AuthUser;
+};
+
+export type RegisterInput = {
+  email: string;
+  password: string;
+  displayName?: string;
+};
+
+export type LoginInput = {
+  email: string;
+  password: string;
+};
+
+function toAuthUser(value: unknown): AuthUser {
+  const source = record(value);
+  return {
+    id: text(source.id),
+    email: text(source.email),
+    displayName: text(source.displayName) || undefined,
+    createdAt: text(source.createdAt),
+  };
+}
+
+/** Register/login return a nested `user` object; the session fields
+ * (sessionId, expiresAt) sit at the top level of the envelope. */
+function toAuthSession(value: unknown): AuthSession {
+  const source = record(value);
+  return {
+    sessionId: text(source.sessionId),
+    expiresAt: text(source.expiresAt),
+    user: toAuthUser(source.user),
+  };
+}
+
+/**
+ * Auth endpoints deliberately bypass the generic `request` wrapper so a 401
+ * never bootstraps a guest session or auto-retries. `auth/me` returns a guest
+ * (null) on 401; `/auth/login` returns 401 for bad credentials; register may
+ * 409 on a duplicate email. The browser relies on the HttpOnly `fomo_session`
+ * cookie the server sets and clears — nothing here reads or persists it.
+ */
+export const auth = {
+  async register(input: RegisterInput): Promise<AuthSession> {
+    const body: JsonRecord = { email: input.email, password: input.password };
+    if (input.displayName) body.displayName = input.displayName;
+    const response = await executeRequest("/auth/register", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) throw await responseProblem(response);
+    return toAuthSession(record(await response.json()));
+  },
+
+  async login(input: LoginInput): Promise<AuthSession> {
+    const response = await executeRequest("/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ email: input.email, password: input.password }),
+    });
+    if (!response.ok) throw await responseProblem(response);
+    return toAuthSession(record(await response.json()));
+  },
+
+  /** The signed-in user, or null for a guest / expired / logged-out session.
+   * Never bootstraps a guest: a 401 is the expected guest signal. */
+  async me(): Promise<AuthUser | null> {
+    const response = await executeRequest("/auth/me", { method: "GET" });
+    if (response.status === 401) return null;
+    if (!response.ok) throw await responseProblem(response);
+    return toAuthUser(record(await response.json()));
+  },
+
+  async logout(): Promise<void> {
+    const response = await executeRequest("/auth/logout", { method: "POST" });
+    if (!response.ok) throw await responseProblem(response);
+    // 204: the server clears the `fomo_session` cookie. Nothing to read.
   },
 };

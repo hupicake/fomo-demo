@@ -3,7 +3,59 @@ import { createRunPresentation } from "@/lib/events/reducer";
 
 export const demoProjectId = "demo-library";
 
+const demoGoalGraph: NonNullable<ProjectSnapshot["goalGraph"]> = {
+  graphId: "demo-graph-library",
+  runId: "demo-run-library",
+  revision: 2,
+  status: "completed",
+  productOutcome: "读者可以检索并借还图书，管理员可以维护库存与读者状态。",
+  activeGoalId: null,
+  goals: [
+    {
+      goalId: "G-1",
+      title: "建立目录、检索与分类浏览",
+      userVisible: true,
+      dependsOn: [],
+      status: "verified",
+      checkpointId: "demo-checkpoint-1",
+      verifiedAt: "2026-08-07T10:55:00.000Z",
+      acceptance: [
+        { acceptanceId: "AC-01", title: "按书名、作者、ISBN 和分类检索", priority: "must", status: "passed" },
+      ],
+      evidenceCount: 3,
+    },
+    {
+      goalId: "G-2",
+      title: "实现借阅、归还与库存一致性",
+      userVisible: true,
+      dependsOn: ["G-1"],
+      status: "verified",
+      checkpointId: "demo-checkpoint-2",
+      verifiedAt: "2026-08-07T11:12:00.000Z",
+      acceptance: [
+        { acceptanceId: "AC-02", title: "零库存时阻止借阅并给出反馈", priority: "must", status: "passed" },
+        { acceptanceId: "AC-03", title: "归还后恢复库存并更新借阅状态", priority: "must", status: "passed" },
+      ],
+      evidenceCount: 5,
+    },
+    {
+      goalId: "G-3",
+      title: "交付可预览、可检查的管理页面",
+      userVisible: true,
+      dependsOn: ["G-1", "G-2"],
+      status: "verified",
+      checkpointId: "demo-checkpoint-3",
+      verifiedAt: "2026-08-07T11:21:00.000Z",
+      acceptance: [
+        { acceptanceId: "AC-04", title: "Preview、Code、Terminal 与版本记录可用", priority: "must", status: "passed" },
+      ],
+      evidenceCount: 4,
+    },
+  ],
+};
+
 export const demoProjectSnapshot: ProjectSnapshot = {
+  goalGraph: demoGoalGraph,
   project: {
     id: demoProjectId,
     name: "图书管理系统",
@@ -195,13 +247,20 @@ export function createDemoRunPresentation(): RunPresentation {
     trace: demoProjectSnapshot.trace,
     versions: demoProjectSnapshot.versions,
     preview: demoProjectSnapshot.preview,
+    goalGraph: demoGoalGraph,
   });
   return {
     ...state,
+    contextUsage: {
+      contextTokens: 68_420,
+      contextWindow: 200_000,
+      boundary: "turn_completed",
+      capturedAt: "2026-08-07T11:21:00.000Z",
+    },
     stages: {
-      planning: { stage: "planning", status: "completed", title: "Plan", detail: "BuildPlan 与验收契约已冻结。", updatedAt: "2026-08-07T10:38:00.000Z" },
-      building: { stage: "building", status: "completed", title: "Build", detail: "Direct Pi 在受控目录完成产品实现。", updatedAt: "2026-08-07T11:12:00.000Z" },
-      verifying: { stage: "verifying", status: "completed", title: "Verify", detail: "干净沙箱与浏览器验收均通过。", updatedAt: "2026-08-07T11:21:00.000Z" },
+      planning: { stage: "planning", status: "completed", title: "Plan", detail: "GoalGraph 已形成可执行目标与验收条件。", updatedAt: "2026-08-07T10:38:00.000Z" },
+      building: { stage: "building", status: "completed", title: "Build", detail: "Coding Agent 已完成页面、数据流与交互实现。", updatedAt: "2026-08-07T11:12:00.000Z" },
+      verifying: { stage: "verifying", status: "completed", title: "Verify", detail: "类型、构建与浏览器验收均通过。", updatedAt: "2026-08-07T11:21:00.000Z" },
       repairing: { stage: "repairing", status: "idle", title: "Repair" },
     },
     roles: {
@@ -277,5 +336,36 @@ export function createDemoRunPresentation(): RunPresentation {
     ],
     problems: [],
     summaries: [demoProjectSnapshot.messages[1]?.content || ""],
+    inputRequests: [
+      {
+        id: "demo-input-layout",
+        runId: "demo-run-library",
+        question: "管理工作台优先采用哪种信息密度？",
+        choices: ["紧凑三栏", "宽松双栏"],
+        allowFreeform: false,
+        status: "answered",
+        stage: "planning",
+        createdAt: "2026-08-07T10:35:00.000Z",
+        answeredAt: "2026-08-07T10:36:00.000Z",
+        requestedSeq: 4,
+        resolvedSeq: 5,
+        answerMessageId: "demo-answer-layout",
+      },
+    ],
+    worklog: [
+      { id: "demo-log-01", kind: "system", status: "completed", title: "项目上下文已载入", detail: "已读取需求、现有目录和可复用组件。", stage: "planning", occurredAt: "2026-08-07T10:31:00.000Z", seq: 1 },
+      { id: "demo-log-02", kind: "progress", status: "completed", title: "已梳理主要用户旅程", detail: "覆盖检索、分类、借阅、归还、读者管理和库存状态。", stage: "planning", occurredAt: "2026-08-07T10:34:00.000Z", seq: 2 },
+      { id: "demo-log-03", kind: "goal", status: "completed", title: "GoalGraph 已建立", detail: "3 个交付目标和 4 条可验证标准已进入执行队列。", stage: "planning", occurredAt: "2026-08-07T10:38:00.000Z", seq: 3 },
+      { id: "demo-log-04", kind: "tool", status: "completed", title: "检查现有项目结构", detail: "确认 Next.js 路由、组件目录、数据层和测试入口。", stage: "building", occurredAt: "2026-08-07T10:42:00.000Z", seq: 6 },
+      { id: "demo-log-05", kind: "file", status: "completed", title: "实现图书目录页面", detail: "新增检索、分类筛选和库存状态呈现。", stage: "building", occurredAt: "2026-08-07T10:51:00.000Z", seq: 7 },
+      { id: "demo-log-06", kind: "verification", status: "completed", title: "目录目标通过验证", detail: "检索和筛选行为满足 AC-01。", stage: "verifying", occurredAt: "2026-08-07T10:55:00.000Z", seq: 8 },
+      { id: "demo-log-07", kind: "file", status: "completed", title: "实现借阅事务", detail: "借阅记录和库存扣减在同一事务内提交。", stage: "building", occurredAt: "2026-08-07T11:02:00.000Z", seq: 9 },
+      { id: "demo-log-08", kind: "file", status: "completed", title: "实现归还流程", detail: "归还后同步借阅状态并恢复可借库存。", stage: "building", occurredAt: "2026-08-07T11:08:00.000Z", seq: 10 },
+      { id: "demo-log-09", kind: "verification", status: "completed", title: "借还目标通过验证", detail: "零库存拦截与归还库存恢复均已通过。", stage: "verifying", occurredAt: "2026-08-07T11:12:00.000Z", seq: 11 },
+      { id: "demo-log-10", kind: "tool", status: "completed", title: "运行 TypeScript 检查", detail: "pnpm typecheck 成功，无类型错误。", stage: "verifying", occurredAt: "2026-08-07T11:15:00.000Z", seq: 12 },
+      { id: "demo-log-11", kind: "tool", status: "completed", title: "构建生产版本", detail: "pnpm build 成功完成。", stage: "verifying", occurredAt: "2026-08-07T11:17:00.000Z", seq: 13 },
+      { id: "demo-log-12", kind: "verification", status: "completed", title: "运行浏览器验收", detail: "检索、借阅拦截和归还流程共 3 条用例通过。", stage: "verifying", occurredAt: "2026-08-07T11:20:00.000Z", seq: 14 },
+      { id: "demo-log-13", kind: "system", status: "completed", title: "预览与版本已就绪", detail: "可以在右侧检查 Preview、Code、Terminal、Problems 和 Versions。", stage: "verifying", occurredAt: "2026-08-07T11:21:00.000Z", seq: 15 },
+    ],
   };
 }

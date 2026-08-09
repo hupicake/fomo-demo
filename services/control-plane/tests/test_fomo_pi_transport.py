@@ -197,8 +197,12 @@ async def test_transport_streams_protocol_and_keeps_secrets_out_of_diagnostics(
     assert commands.command == "/opt/fomo/bin/fomo-pi-rpc-bridge.mjs"
     assert commands.opts.background is False
     assert commands.opts.working_directory == "/workspace"
-    assert int(commands.opts.timeout.total_seconds()) == 120
+    # Outer sandbox timeout must exceed the bridge's own timeout by the grace
+    # period plus a small finalization margin so the bridge cleans up first.
+    assert int(commands.opts.timeout.total_seconds()) == 120 + 10 + 5
     assert commands.opts.envs["FOMO_PI_VIRTUAL_KEY"] == "sk-run-secret"
+    assert commands.opts.envs["FOMO_PI_CONTEXT_WINDOW"] == "200000"
+    assert "FOMO_PI_TOOL_POLICY_B64" not in commands.opts.envs
     assert "private prompt" not in result.stderr
     assert "sk-run-secret" not in result.stderr
     assert all("private prompt" not in value for value in diagnostics)

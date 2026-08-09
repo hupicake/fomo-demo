@@ -8,7 +8,9 @@ from typing import Any
 
 from .invocation import (
     FOMO_PI_MODEL,
+    FOMO_PI_MODELS,
     FOMO_PI_THINKING,
+    FOMO_PI_THINKING_LEVELS,
     IDENTIFIER_PATTERN,
     MAX_IDENTIFIER_LENGTH,
     SESSION_ID_PATTERN,
@@ -43,6 +45,8 @@ _PUBLIC_PI_KINDS = frozenset(
         "summarization_retry_attempt_start",
         "summarization_retry_finished",
         "extension_error",
+        "input_request",
+        "inference_heartbeat",
     }
 )
 _FORBIDDEN_KEYS = frozenset({"thinking", "reasoning_content"})
@@ -133,6 +137,48 @@ def _require_identifier(value: Any, name: str) -> str:
     return value
 
 
+def _validated_input_request(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise PiBridgeProtocolError("input request must be an object")
+    allowed = {"requestId", "question", "choices", "allowFreeform", "reason"}
+    if set(value) - allowed or not {"requestId", "question", "choices", "allowFreeform"}.issubset(value):
+        raise PiBridgeProtocolError("input request fields do not match the public contract")
+    request_id = _require_identifier(value.get("requestId"), "inputRequest.requestId")
+    question = value.get("question")
+    choices = value.get("choices")
+    allow_freeform = value.get("allowFreeform")
+    reason = value.get("reason")
+    if (
+        not isinstance(question, str)
+        or not question.strip()
+        or len(question) > 2_000
+        or not isinstance(choices, list)
+        or len(choices) > 8
+        or type(allow_freeform) is not bool
+    ):
+        raise PiBridgeProtocolError("input request content is invalid")
+    normalized_choices: list[str] = []
+    for choice in choices:
+        if not isinstance(choice, str) or not choice.strip() or len(choice) > 200:
+            raise PiBridgeProtocolError("input request choices are invalid")
+        normalized_choices.append(choice)
+    if len(normalized_choices) != len(set(normalized_choices)):
+        raise PiBridgeProtocolError("input request choices must be unique")
+    if not allow_freeform and not normalized_choices:
+        raise PiBridgeProtocolError("input request is not answerable")
+    if reason is not None and (
+        not isinstance(reason, str) or not reason.strip() or len(reason) > 1_000
+    ):
+        raise PiBridgeProtocolError("input request reason is invalid")
+    return {
+        "requestId": request_id,
+        "question": question,
+        "choices": normalized_choices,
+        "allowFreeform": allow_freeform,
+        **({"reason": reason} if reason is not None else {}),
+    }
+
+
 class PiBridgeStreamReducer:
     """Decode byte chunks and reduce one bridge invocation to a terminal result.
 
@@ -141,12 +187,26 @@ class PiBridgeStreamReducer:
     :class:`PiBridgeFailed`; an EOF without either terminal is a protocol error.
     """
 
-    def __init__(self, *, request_id: str, correlation_id: str, session_id: str) -> None:
+    def __init__(
+        self,
+        *,
+        request_id: str,
+        correlation_id: str,
+        session_id: str,
+        thinking_level: str = FOMO_PI_THINKING,
+        model_ref: str = FOMO_PI_MODEL,
+    ) -> None:
         self.request_id = _require_identifier(request_id, "request_id")
         self.correlation_id = _require_identifier(correlation_id, "correlation_id")
         if len(session_id) > MAX_IDENTIFIER_LENGTH or not SESSION_ID_PATTERN.fullmatch(session_id):
             raise ValueError("session_id is not valid")
         self.session_id = session_id
+        if thinking_level not in FOMO_PI_THINKING_LEVELS:
+            raise ValueError("thinking_level is not supported")
+        self.thinking_level = thinking_level
+        if model_ref not in FOMO_PI_MODELS:
+            raise ValueError("model_ref is not supported")
+        self.model_ref = model_ref
         self._buffer = bytearray()
         self._next_seq = 1
         self._state = "waiting"
@@ -155,6 +215,7 @@ class PiBridgeStreamReducer:
         self._failed: dict[str, Any] | None = None
         self._events: list[PiBridgeEnvelope] = []
         self._saw_settled = False
+        self._input_request: dict[str, Any] | None = None
         self._finished = False
 
     def feed(self, chunk: bytes) -> tuple[PiBridgeEnvelope, ...]:
@@ -238,8 +299,8 @@ class PiBridgeStreamReducer:
             raise PiBridgeProtocolError("started must be the first lifecycle envelope")
         if (
             payload.get("sessionId") != self.session_id
-            or payload.get("model") != FOMO_PI_MODEL
-            or payload.get("thinkingLevel") != FOMO_PI_THINKING
+            or payload.get("model") != self.model_ref
+            or payload.get("thinkingLevel") != self.thinking_level
         ):
             raise PiBridgeProtocolError("started payload does not match the invocation contract")
         if not isinstance(payload.get("initialStats"), dict):
@@ -257,6 +318,12 @@ class PiBridgeStreamReducer:
             if self._saw_settled:
                 raise PiBridgeProtocolError("agent_settled was emitted more than once")
             self._saw_settled = True
+        elif kind == "input_request":
+            if self._input_request is not None or self._saw_settled:
+                raise PiBridgeProtocolError("input request was emitted out of order")
+            self._input_request = _validated_input_request(
+                payload.get("inputRequest")
+            )
 
     def _on_completed(self, payload: dict[str, Any]) -> None:
         if self._state != "running" or not self._saw_settled:
@@ -269,6 +336,12 @@ class PiBridgeStreamReducer:
             raise PiBridgeProtocolError("completed payload requires state and stats objects")
         if state.get("sessionId") != self.session_id or stats.get("sessionId") != self.session_id:
             raise PiBridgeProtocolError("completed state or stats belongs to another session")
+        completed_request = payload.get("inputRequest")
+        if self._input_request is None:
+            if completed_request is not None:
+                raise PiBridgeProtocolError("completed contains an unmatched input request")
+        elif _validated_input_request(completed_request) != self._input_request:
+            raise PiBridgeProtocolError("completed input request does not match its event")
         self._completed = payload
         self._state = "completed"
 

@@ -713,7 +713,7 @@ def test_gpt55_role_routes_use_xhigh_reasoning_effort_without_pro_models() -> No
     assert all("pro" not in model.lower() for model in re.findall(r"^      model: (.+)$", config, re.M))
 
 
-def test_deepseek_flash_alias_is_unique_litellm_scoped_and_documented() -> None:
+def test_deepseek_and_direct_pi_aliases_are_unique_scoped_and_documented() -> None:
     repository_root = Path(__file__).resolve().parents[3]
     config = (repository_root / "infra" / "litellm" / "config.yaml").read_text(encoding="utf-8")
     model_aliases = list(
@@ -722,19 +722,37 @@ def test_deepseek_flash_alias_is_unique_litellm_scoped_and_documented() -> None:
             config,
         )
     )
-    alias_matches = [match for match in model_aliases if match.group("name") == "deepseek-flash"]
-    assert len(alias_matches) == 1
-    alias = alias_matches[0].group("body")
-    assert "model: deepseek/deepseek-v4-flash" in alias
-    assert "api_key: os.environ/DEEPSEEK_API_KEY" in alias
-    assert "api_base: https://api.deepseek.com" in alias
-    assert "thinking:\n        type: disabled" in alias
-    assert alias.count("thinking:") == 1
-    assert all(
-        "thinking:" not in match.group("body")
-        for match in model_aliases
-        if match.group("name") != "deepseek-flash"
-    )
+    aliases_by_name = {match.group("name"): match.group("body") for match in model_aliases}
+    assert len(aliases_by_name) == len(model_aliases)
+
+    legacy_flash = aliases_by_name["deepseek-flash"]
+    assert "model: deepseek/deepseek-v4-flash" in legacy_flash
+    assert "api_key: os.environ/DEEPSEEK_API_KEY" in legacy_flash
+    assert "api_base: https://api.deepseek.com" in legacy_flash
+    assert "thinking:\n        type: disabled" in legacy_flash
+    assert legacy_flash.count("thinking:") == 1
+
+    direct_flash = aliases_by_name["fomo-pi-flash"]
+    assert "model: deepseek/deepseek-v4-flash" in direct_flash
+    assert "api_key: os.environ/DEEPSEEK_API_KEY" in direct_flash
+    assert "api_base: https://api.deepseek.com" in direct_flash
+    assert "thinking:\n        type: enabled" in direct_flash
+    assert direct_flash.count("thinking:") == 1
+
+    direct_build = aliases_by_name["fomo-pi-build"]
+    assert "model: openai/gpt-5.5" in direct_build
+    assert "api_key: os.environ/OPENAI_API_KEY" in direct_build
+    assert "api_base: os.environ/OPENAI_API_BASE" in direct_build
+    # Build/repair thinking is selected explicitly by the Pi RPC contract;
+    # this GPT route must not inherit DeepSeek's static `thinking` request body.
+    assert "thinking:" not in direct_build
+
+    deepseek_routes = {
+        name
+        for name, body in aliases_by_name.items()
+        if "model: deepseek/deepseek-v4-flash" in body
+    }
+    assert deepseek_routes == {"deepseek-flash", "fomo-pi-flash"}
     assert "deepseek-v4-pro" not in config.lower()
 
     compose = (repository_root / "compose.yaml").read_text(encoding="utf-8")
@@ -748,8 +766,9 @@ def test_deepseek_flash_alias_is_unique_litellm_scoped_and_documented() -> None:
 
     env_example = (repository_root / ".env.example").read_text(encoding="utf-8")
     assert re.search(r"(?m)^DEEPSEEK_API_KEY=$", env_example)
-    readme = (repository_root / "README.md").read_text(encoding="utf-8")
-    assert "`deepseek-flash`" in readme
-    assert "`.env.local`" in readme
-    for role_variable in ("MODEL_PM", "MODEL_ARCHITECT", "MODEL_ENGINEER", "MODEL_REVIEWER"):
-        assert f"{role_variable}=deepseek-flash" in readme
+    runtime_readme = (repository_root / "services" / "control-plane" / "README.md").read_text(
+        encoding="utf-8"
+    )
+    assert "`fomo-pi-flash` (planning)" in runtime_readme
+    assert "`fomo-pi-build` (building/repairing)" in runtime_readme
+    assert "explicit\n  thinking levels" in runtime_readme

@@ -2,21 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-import subprocess
-import sys
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from fomo.agent_runtime.llm import ModelError, ModelRequestError, ModelRetry, ScriptedModelClient
-from fomo.agent_runtime.metagpt_adapter import (
-    MetaGPTAdapter,
-    MetaGPTAvailability,
-    MetaGPTUnavailable,
-)
+from fomo.agent_runtime.llm import ModelRequestError, ModelRetry, ScriptedModelClient
 from fomo.agent_runtime.sop import (
     _SYSTEM_GITIGNORE,
     ArtifactContractViolation,
@@ -41,7 +33,6 @@ from fomo.schemas import (
     TechnicalSpec,
 )
 from fomo.starter import default_starter_manifest
-from fomo.worker.runner import WorkerRunner
 
 # The fixed project-scope smoke gate executes the protected starter harness by
 # exact path with the structured JSON reporter; tests mirror that command.
@@ -1190,67 +1181,6 @@ class _PermissionAwareGitignoreSandbox(FakeSandboxProvider):
     def tamper_gitignore(self, ref) -> None:
         self._sandbox(ref).files[".gitignore"] = b"model-supplied-content\n"
         self._overwrite_requires_reset = True
-
-
-def test_metagpt_selected_without_extra_fails_instead_of_using_native(monkeypatch) -> None:
-    monkeypatch.setattr(
-        MetaGPTAdapter,
-        "availability",
-        staticmethod(
-            lambda: MetaGPTAvailability(
-                available=False,
-                reason="AGENT_FRAMEWORK=metagpt requires the optional MetaGPT extra. "
-                "Install it with: uv sync --extra metagpt --extra dev.",
-            )
-        ),
-    )
-    with pytest.raises(MetaGPTUnavailable, match="uv sync --extra metagpt --extra dev"):
-        MetaGPTAdapter(ScriptedModelClient({}))
-
-
-def test_pinned_metagpt_classes_import_with_a_temporary_safe_config(tmp_path) -> None:
-    """Prove bare MetaGPT class imports work before FOMO builds a worker."""
-    config_dir = tmp_path / "config"
-    config_dir.mkdir()
-    (config_dir / "config2.yaml").write_text(
-        """llm:
-  api_type: openai
-  model: fomo-test-coordination-placeholder
-  base_url: http://127.0.0.1:9/v1
-  api_key: fomo-test-placeholder-not-used
-""",
-        encoding="utf-8",
-    )
-    environment = os.environ.copy()
-    for name in (
-        "OPENAI_API_KEY",
-        "OPENAI_API_BASE",
-        "ANTHROPIC_API_KEY",
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "all_proxy",
-    ):
-        environment.pop(name, None)
-    environment["METAGPT_PROJECT_ROOT"] = str(tmp_path)
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "from metagpt.actions import Action; from metagpt.roles import Role; "
-            "from metagpt.schema import Message; "
-            "print(Action.__module__, Role.__module__, Message.__module__)",
-        ],
-        cwd=tmp_path,
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "metagpt.actions.action metagpt.roles.role metagpt.schema"
 
 
 @pytest.mark.asyncio
@@ -4723,180 +4653,6 @@ async def test_repeated_system_managed_file_plan_fails_without_sandbox(repositor
         and event.role == "architect"
         and event.payload.get("action") == "structured_retry"
     ) == 1
-
-
-@pytest.mark.asyncio
-async def test_real_metagpt_roles_exchange_persisted_artifact_references(repository, settings) -> None:
-    """Exercise installed MetaGPT classes; no Role/Action/Message is mocked."""
-    session = await repository.create_guest_session()
-    project = await repository.create_project(session.id, "Library")
-    _message, run, _created = await repository.create_message_and_run(
-        project.id, session.id, "message-metagpt", "Create a book management system"
-    )
-    responses = _responses()
-    responses["engineer"] = _two_batch_engineer_cycle()
-    model = ScriptedModelClient(responses)
-    metagpt_settings = replace(settings, agent_framework="metagpt")
-    worker = WorkerRunner(
-        repository,
-        metagpt_settings,
-        model=model,
-        sandbox=_project_gate_sandbox(),
-        worker_id="test-worker",
-    )
-    assert isinstance(worker.agent_adapter, MetaGPTAdapter)
-    adapter = worker.agent_adapter
-
-    assert await worker.run_once()
-
-    final = await repository.get_run(run.id)
-    assert final.status.value == "succeeded"
-    assert [invocation.role for invocation in adapter.invocations] == [
-        "product_manager",
-        "architect",
-        "engineer",
-        "engineer",
-        "engineer",
-        "engineer",
-        "engineer",
-        "reviewer",
-    ]
-    for invocation in adapter.invocations:
-        assert isinstance(invocation.role_instance, adapter.runtime_types.role_base)
-        assert isinstance(invocation.action, adapter.runtime_types.action_base)
-        assert isinstance(invocation.output_message, adapter.runtime_types.message_type)
-
-    product_handoff = adapter.handoff(run.id, "product_manager")
-    assert product_handoff is not None
-    product_reference = product_handoff.metadata["fomo"]["artifact"]
-    assert set(product_reference) == {"artifactId", "artifactKind", "role", "summary"}
-    assert product_reference["artifactKind"] == "product_spec"
-    assert "Readers need to manage books." not in product_handoff.content
-    assert "acceptanceCriteria" not in product_handoff.content
-
-    architect_invocation = next(
-        invocation for invocation in adapter.invocations if invocation.role == "architect"
-    )
-    assert product_reference["artifactId"] in architect_invocation.upstream_artifact_ids
-    assert len(architect_invocation.input_messages) == 1
-    assert architect_invocation.input_messages[0].metadata["fomo"]["artifact"] == product_reference
-
-    architect_request = next(request for request in model.requests if request[0] == "architect")
-    coordination_messages = [
-        message
-        for message in architect_request[1]
-        if message["content"].startswith("MetaGPT coordination envelope")
-    ]
-    assert len(coordination_messages) == 1
-    assert product_reference["artifactId"] in coordination_messages[0]["content"]
-    assert "Readers need to manage books." not in coordination_messages[0]["content"]
-
-    engineer_invocations = [invocation for invocation in adapter.invocations if invocation.role == "engineer"]
-    assert [invocation.action._schema.__name__ for invocation in engineer_invocations] == [
-        "ImplementationPlan",
-        "FileBatchReport",
-        "FileBatchReport",
-        "FileBatchReport",
-        "ImplementationReport",
-    ]
-    assert engineer_invocations[0].output_message.metadata["fomo"]["kind"] == "intermediate_artifact"
-    assert engineer_invocations[1].output_message.metadata["fomo"]["kind"] == "intermediate_artifact"
-    assert engineer_invocations[2].output_message.metadata["fomo"]["kind"] == "intermediate_artifact"
-    engineer_handoff = adapter.handoff(run.id, "engineer")
-    assert engineer_handoff is engineer_invocations[4].output_message
-    assert engineer_handoff.metadata["fomo"]["artifact"]["artifactKind"] == "implementation_report"
-
-
-@pytest.mark.asyncio
-async def test_metagpt_model_failure_uses_controlled_message_and_fomo_retry(
-    repository, settings, monkeypatch
-) -> None:
-    secret_marker = "test-secret-never-log-this"
-    responses = _responses()
-    responses["pm"] = [ModelError(secret_marker), responses["pm"]]
-    model = ScriptedModelClient(responses)
-    metagpt_settings = replace(
-        settings,
-        agent_framework="metagpt",
-        structured_output_retries=1,
-    )
-    session = await repository.create_guest_session()
-    project = await repository.create_project(session.id, "Library")
-    _message, run, _created = await repository.create_message_and_run(
-        project.id, session.id, "message-metagpt-retry", "Create a book management system"
-    )
-    worker = WorkerRunner(
-        repository,
-        metagpt_settings,
-        model=model,
-        sandbox=_project_gate_sandbox(),
-        worker_id="test-worker",
-    )
-    adapter = worker.agent_adapter
-
-    class _GuardLogger:
-        exception_calls = 0
-
-        def exception(self, *args, **kwargs) -> None:
-            self.exception_calls += 1
-
-        def __getattr__(self, _name: str):
-            return lambda *args, **kwargs: None
-
-    guard_logger = _GuardLogger()
-    role_module = sys.modules[adapter.runtime_types.role_base.__module__]
-    monkeypatch.setattr(role_module, "logger", guard_logger)
-    controlled_messages = []
-    original_run = adapter.runtime_types.role_base.run
-
-    async def capture_run(role, *args, **kwargs):
-        message = await original_run(role, *args, **kwargs)
-        if message is not None:
-            controlled_messages.append(message)
-        return message
-
-    monkeypatch.setattr(adapter.runtime_types.role_base, "run", capture_run)
-
-    assert await worker.run_once()
-
-    final = await repository.get_run(run.id)
-    assert final.status.value == "succeeded"
-    assert [alias for alias, _schema in model.calls] == [
-        "pm",
-        "pm",
-        "architect",
-        "engineer",
-        "engineer",
-        "engineer",
-        "engineer",
-        "engineer",
-        "reviewer",
-    ]
-    assert guard_logger.exception_calls == 0
-    assert controlled_messages
-    controlled_failure = controlled_messages[0]
-    assert controlled_failure.metadata["fomo"] == {
-        "kind": "artifact_error",
-        "role": "product_manager",
-    }
-    assert secret_marker not in controlled_failure.content
-    assert secret_marker not in controlled_failure.model_dump_json()
-    events = await repository.list_events(run.id)
-    retry_event = next(
-        event
-        for event in events
-        if event.kind == "agent.activity" and event.payload.get("action") == "structured_retry"
-    )
-    assert "reasonCode" not in retry_event.payload
-    pm_retry_request = [request for request in model.requests if request[0] == "pm"][1]
-    correction_message = next(
-        message["content"]
-        for message in pm_retry_request[1]
-        if message["content"].startswith("Return only a valid ProductSpec JSON object")
-    )
-    assert correction_message == "Return only a valid ProductSpec JSON object matching the declared schema."
-    assert secret_marker not in correction_message
-    assert secret_marker not in json.dumps([event.payload for event in events])
 
 
 @pytest.mark.asyncio

@@ -7,6 +7,7 @@ from .base import (
     ExecResult,
     FileChange,
     PreviewRef,
+    RetainedPreviewSandboxProvider,
     SandboxCapabilities,
     SandboxProvider,
     SandboxRef,
@@ -31,6 +32,7 @@ def create_sandbox_provider(settings: Settings) -> SandboxProvider:
             api_key=settings.opensandbox_api_key,
             image=settings.opensandbox_image,
             lifetime_seconds=settings.opensandbox_lifetime_seconds,
+            ready_timeout_seconds=settings.opensandbox_ready_timeout_seconds,
             proxy_environment=settings.sandbox_proxy_environment,
         )
     if settings.sandbox_provider == "fake":
@@ -45,6 +47,7 @@ __all__ = [
     "FileChange",
     "OpenSandboxProvider",
     "PreviewRef",
+    "RetainedPreviewSandboxProvider",
     "ProcessSandboxProvider",
     "SandboxCapabilities",
     "SandboxProvider",

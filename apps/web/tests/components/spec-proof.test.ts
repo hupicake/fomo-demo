@@ -241,6 +241,13 @@ describe("SpecToProof rendering", () => {
         implementationStatus: "not_implemented",
         evidence: [],
       },
+      {
+        id: "AC-3",
+        title: "Readers can return a book",
+        priority: "must",
+        status: "unverified",
+        evidence: [],
+      },
     ];
     render(createElement(SpecToProof, {
       onFileSelect: () => undefined,
@@ -251,6 +258,8 @@ describe("SpecToProof rendering", () => {
     // implemented · unverified is displayed as two independent signals.
     expect(screen.getAllByText("implemented")).toHaveLength(1);
     expect(screen.getAllByText("not implemented")).toHaveLength(1);
-    expect(screen.getAllByText("unverified · no deterministic playwright evidence yet")).toHaveLength(2);
+    expect(screen.getAllByText("implementation unlinked")).toHaveLength(1);
+    expect(screen.getAllByLabelText("Acceptance status: unverified")).toHaveLength(3);
+    expect(screen.getAllByText("unverified · no deterministic playwright evidence yet")).toHaveLength(3);
   });
 });

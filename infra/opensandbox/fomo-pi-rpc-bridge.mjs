@@ -6,20 +6,70 @@
  * new bridge process with the same session id; the session is only a cache.
  * stdout is reserved for the versioned FOMO JSONL protocol. Secrets and Pi
  * stderr never enter that protocol.
+ *
+ * Scope (P0): transport, event/usage observation, cancellation, total
+ * resource/inactivity/wall-clock budgets, redaction, fail-closed protocol, and
+ * session reuse. Build and repair turns keep Pi's official builtin tools with
+ * full /workspace permission. Planning turns may instead expose one trusted,
+ * schema-backed terminating tool; the bridge never proxies filesystem tool
+ * semantics or enforces business-file write allowlists.
  */
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { TextDecoder } from "node:util";
 
 const SCHEMA_VERSION = 1;
 const PROVIDER_ID = "fomo-litellm";
-const MODEL_ID = "fomo-pi-flash";
-const MODEL_REF = `${PROVIDER_ID}/${MODEL_ID}`;
-const THINKING_LEVEL = "max";
-const ALLOWED_TOOLS = "read,grep,find,ls,edit,write";
+const DEFAULT_MODEL_REF = `${PROVIDER_ID}/fomo-pi-flash`;
+const MODEL_CONFIGS = Object.freeze({
+  [`${PROVIDER_ID}/fomo-pi-flash`]: Object.freeze({
+    id: "fomo-pi-flash",
+    thinkingLevelMap: {
+      minimal: null, low: null, medium: null, high: "high", xhigh: null, max: "max",
+    },
+    compat: {
+      supportsDeveloperRole: false,
+      supportsReasoningEffort: true,
+      requiresReasoningContentOnAssistantMessages: true,
+      thinkingFormat: "deepseek",
+      maxTokensField: "max_tokens",
+    },
+  }),
+  [`${PROVIDER_ID}/fomo-pi-build`]: Object.freeze({
+    id: "fomo-pi-build",
+    thinkingLevelMap: {
+      minimal: null, low: null, medium: "medium", high: "high", xhigh: null, max: null,
+    },
+    compat: {
+      supportsDeveloperRole: false,
+      supportsReasoningEffort: true,
+      requiresReasoningContentOnAssistantMessages: false,
+      thinkingFormat: "openai",
+      maxTokensField: "max_tokens",
+    },
+  }),
+});
+const DEFAULT_THINKING_LEVEL = "max";
+const ALLOWED_THINKING_LEVELS = new Set(["off", "medium", "high", "max"]);
+const DEFAULT_CONTEXT_WINDOW = 200_000;
+const COMPACTION_SETTINGS = Object.freeze({
+  enabled: true,
+  reserveTokens: 32_768,
+  keepRecentTokens: 20_000,
+});
+// Official Pi v0.84.1 builtin tools. The bridge mirrors this list as the
+// fail-closed transport contract; it never intercepts or rewrites tool calls.
+const ALLOWED_TOOLS = "read,write,edit,bash,grep,find,ls";
+const STRUCTURED_OUTPUT_TOOL = "submit_structured_output";
+const MAX_STRUCTURED_OUTPUT_ATTEMPTS = 3;
+const STRUCTURED_OUTPUT_EXTENSION = fileURLToPath(new URL("./fomo-structured-output.ts", import.meta.url));
+const USER_INPUT_TOOL = "request_user_input";
+const MAX_USER_INPUT_ATTEMPTS = 3;
+const USER_INPUT_EXTENSION = fileURLToPath(new URL("./fomo-request-user-input.ts", import.meta.url));
 
 const ENV = Object.freeze({
   prompt: "FOMO_PI_PROMPT_B64",
@@ -31,6 +81,13 @@ const ENV = Object.freeze({
   workspace: "FOMO_PI_WORKSPACE",
   stateDir: "FOMO_PI_STATE_DIR",
   piBin: "FOMO_PI_BIN",
+  thinkingLevel: "FOMO_PI_THINKING_LEVEL",
+  modelRef: "FOMO_PI_MODEL_REF",
+  contextWindow: "FOMO_PI_CONTEXT_WINDOW",
+  activitySilenceSeconds: "FOMO_PI_ACTIVITY_SILENCE_SECONDS",
+  structuredOutputSchema: "FOMO_PI_STRUCTURED_OUTPUT_SCHEMA_B64",
+  userInputEnabled: "FOMO_PI_USER_INPUT_ENABLED",
+  requireResume: "FOMO_PI_REQUIRE_RESUME",
   timeoutSeconds: "FOMO_PI_TIMEOUT_SECONDS",
   graceSeconds: "FOMO_PI_GRACE_SECONDS",
 });
@@ -52,6 +109,12 @@ const LIMITS = Object.freeze({
   publicTextCharacters: 8192,
   publicDeltaCharacters: 4096,
   publicArgumentCharacters: 2048,
+  structuredOutputSchemaBytes: 64 * 1024,
+  structuredOutputArgumentBytes: 1024 * 1024,
+  userInputQuestionCharacters: 2000,
+  userInputChoiceCharacters: 200,
+  userInputChoices: 8,
+  userInputReasonCharacters: 1000,
   arrayItems: 128,
 });
 
@@ -80,6 +143,8 @@ const PUBLIC_PI_KINDS = new Set([
   "summarization_retry_attempt_start",
   "summarization_retry_finished",
   "extension_error",
+  "input_request",
+  "inference_heartbeat",
 ]);
 
 let requestId = safeIdentifier(process.env[ENV.requestId], "invalid-request");
@@ -92,6 +157,19 @@ let providerBaseUrl = "";
 let workspace = DEFAULTS.workspace;
 let stateDir = DEFAULTS.stateDir;
 let piBin = DEFAULTS.piBin;
+let thinkingLevel = DEFAULT_THINKING_LEVEL;
+let modelRef = DEFAULT_MODEL_REF;
+let modelConfig = MODEL_CONFIGS[DEFAULT_MODEL_REF];
+// Explicit FOMO logical context window. The active provider supports a larger
+// window, while this lower product budget bounds latency and compaction.
+let contextWindow = DEFAULT_CONTEXT_WINDOW;
+let activitySilenceSeconds = null;
+let structuredOutputSchemaBase64 = "";
+let structuredOutputMode = false;
+let userInputEnabled = false;
+let requireResume = false;
+let activeTools = ALLOWED_TOOLS;
+let allowedToolNames = new Set(ALLOWED_TOOLS.split(","));
 let timeoutSeconds = null;
 let graceSeconds = DEFAULTS.graceSeconds;
 
@@ -107,12 +185,34 @@ let stdoutBytes = 0;
 let stderrBytes = 0;
 let promptAccepted = false;
 let timeoutHandle = null;
+let activityTimerHandle = null;
+let lastAgentActivityAt = 0;
+let lastInferenceHeartbeatAt = 0;
 let privateAgentDir = null;
 let shuttingDown = false;
 
+// A/B telemetry (persisted through pi.tool.* and pi.completed events):
+// first tool and first edit/write tool relative to the started envelope,
+// per-tool counts, and the final assistant stop reason. This is measured on
+// edit/write tool completions only; the bridge does not interpret tool
+// semantics, so bash-side writes are intentionally not counted.
+let runStartedAt = 0;
+let firstToolElapsedMs = null;
+let firstEditOrWriteToolElapsedMs = null;
+let lastStopReason = "";
+let structuredOutputCalls = 0;
+let structuredOutputSuccesses = 0;
+let userInputCalls = 0;
+let userInputSuccesses = 0;
+let inputRequest = null;
+const toolCounts = {};
+
 const pendingResponses = new Map();
-const initial = { state: null, stats: null };
+const initial = { modelSelected: false, thinkingSelected: false, state: null, stats: null };
 const final = { state: null, stats: null };
+const activeToolCalls = new Map();
+const completedToolCallIds = new Set();
+const userInputArgumentsByCallId = new Map();
 const fatalUtf8 = new TextDecoder("utf-8", { fatal: true });
 
 function safeIdentifier(value, fallback) {
@@ -128,7 +228,7 @@ function bounded(value, limit) {
 
 function redact(value) {
   let text = String(value ?? "");
-  for (const secret of [virtualKey, prompt, promptBase64]) {
+  for (const secret of [virtualKey, prompt, promptBase64, structuredOutputSchemaBase64]) {
     if (secret) text = text.split(secret).join("[redacted]");
   }
   return text;
@@ -170,6 +270,73 @@ function parsePositiveInteger(name, value, maximum = Number.MAX_SAFE_INTEGER) {
 function validateAbsolutePath(name, value) {
   if (!value.startsWith("/") || value.includes("\0")) throw new Error(`${name} must be an absolute path`);
   return value;
+}
+
+function parseStructuredOutputSchema() {
+  structuredOutputSchemaBase64 = process.env[ENV.structuredOutputSchema] || "";
+  if (!structuredOutputSchemaBase64) return;
+
+  const maximumBase64Characters = Math.ceil(LIMITS.structuredOutputSchemaBytes / 3) * 4;
+  if (
+    structuredOutputSchemaBase64.length > maximumBase64Characters ||
+    structuredOutputSchemaBase64.length % 4 !== 0 ||
+    !BASE64.test(structuredOutputSchemaBase64)
+  ) {
+    throw new Error(`${ENV.structuredOutputSchema} must be bounded canonical base64`);
+  }
+
+  const schemaBytes = Buffer.from(structuredOutputSchemaBase64, "base64");
+  if (
+    !schemaBytes.length ||
+    schemaBytes.length > LIMITS.structuredOutputSchemaBytes ||
+    schemaBytes.toString("base64") !== structuredOutputSchemaBase64
+  ) {
+    throw new Error(
+      `${ENV.structuredOutputSchema} must decode to at most ${LIMITS.structuredOutputSchemaBytes} bytes`,
+    );
+  }
+
+  let schemaText;
+  try {
+    schemaText = fatalUtf8.decode(schemaBytes);
+  } catch {
+    throw new Error(`${ENV.structuredOutputSchema} must contain UTF-8 JSON`);
+  }
+
+  let schema;
+  try {
+    schema = JSON.parse(schemaText);
+  } catch {
+    throw new Error(`${ENV.structuredOutputSchema} must contain valid JSON`);
+  }
+  if (!schema || typeof schema !== "object" || Array.isArray(schema) || schema.type !== "object") {
+    throw new Error(`${ENV.structuredOutputSchema} must contain a root object JSON Schema`);
+  }
+  if (!existsSync(STRUCTURED_OUTPUT_EXTENSION) || !statSync(STRUCTURED_OUTPUT_EXTENSION).isFile()) {
+    throw new Error("trusted structured-output extension is unavailable");
+  }
+
+  structuredOutputMode = true;
+  activeTools = STRUCTURED_OUTPUT_TOOL;
+  allowedToolNames = new Set([STRUCTURED_OUTPUT_TOOL]);
+}
+
+function parseFeatureFlag(name) {
+  const value = process.env[name];
+  if (value === undefined || value === "") return false;
+  if (value !== "1") throw new Error(`${name} must be 1 when enabled`);
+  return true;
+}
+
+function configureUserInputTool() {
+  userInputEnabled = parseFeatureFlag(ENV.userInputEnabled);
+  requireResume = parseFeatureFlag(ENV.requireResume);
+  if (!userInputEnabled) return;
+  if (!existsSync(USER_INPUT_EXTENSION) || !statSync(USER_INPUT_EXTENSION).isFile()) {
+    throw new Error("trusted user-input extension is unavailable");
+  }
+  activeTools = `${activeTools},${USER_INPUT_TOOL}`;
+  allowedToolNames.add(USER_INPUT_TOOL);
 }
 
 function parseEnvironment() {
@@ -227,8 +394,32 @@ function parseEnvironment() {
   workspace = validateAbsolutePath(ENV.workspace, process.env[ENV.workspace] || DEFAULTS.workspace);
   stateDir = validateAbsolutePath(ENV.stateDir, process.env[ENV.stateDir] || DEFAULTS.stateDir);
   piBin = validateAbsolutePath(ENV.piBin, process.env[ENV.piBin] || DEFAULTS.piBin);
+  modelRef = process.env[ENV.modelRef] || DEFAULT_MODEL_REF;
+  modelConfig = MODEL_CONFIGS[modelRef];
+  if (!modelConfig) {
+    throw new Error(`${ENV.modelRef} must select a supported FOMO Pi model`);
+  }
+  thinkingLevel = process.env[ENV.thinkingLevel] || DEFAULT_THINKING_LEVEL;
+  if (!ALLOWED_THINKING_LEVELS.has(thinkingLevel)) {
+    throw new Error(`${ENV.thinkingLevel} must be off, medium, high, or max`);
+  }
+  if (modelConfig.thinkingLevelMap[thinkingLevel] === null) {
+    throw new Error(`${ENV.thinkingLevel} is unsupported by ${modelRef}`);
+  }
   if (!existsSync(workspace) || !statSync(workspace).isDirectory()) throw new Error(`${ENV.workspace} is not a directory`);
   if (!existsSync(piBin) || !statSync(piBin).isFile()) throw new Error(`${ENV.piBin} is not a file`);
+
+  if (process.env[ENV.contextWindow]) {
+    // Sane explicit bound: a provider alias must not declare an absurd window.
+    contextWindow = parsePositiveInteger(ENV.contextWindow, process.env[ENV.contextWindow], 8_000_000);
+  }
+  if (process.env[ENV.activitySilenceSeconds]) {
+    activitySilenceSeconds = parsePositiveInteger(
+      ENV.activitySilenceSeconds, process.env[ENV.activitySilenceSeconds], 3_600,
+    );
+  }
+  parseStructuredOutputSchema();
+  configureUserInputTool();
 
   if (process.env[ENV.timeoutSeconds]) {
     timeoutSeconds = parsePositiveInteger(ENV.timeoutSeconds, process.env[ENV.timeoutSeconds]);
@@ -250,34 +441,25 @@ function writePrivateConfiguration() {
         api: "openai-completions",
         apiKey: `$${ENV.virtualKey}`,
         authHeader: true,
-        compat: {
-          supportsDeveloperRole: false,
-          supportsReasoningEffort: true,
-          requiresReasoningContentOnAssistantMessages: true,
-          thinkingFormat: "deepseek",
-          maxTokensField: "max_tokens",
-        },
-        models: [{
-          id: MODEL_ID,
-          name: MODEL_ID,
+        models: Object.values(MODEL_CONFIGS).map((config) => ({
+          id: config.id,
+          name: config.id,
           reasoning: true,
           input: ["text"],
-          contextWindow: 1_000_000,
+          contextWindow,
           maxTokens: 32_768,
-          thinkingLevelMap: {
-            off: null,
-            minimal: null,
-            low: null,
-            medium: null,
-            high: null,
-            xhigh: null,
-            max: "max",
-          },
-        }],
+          thinkingLevelMap: config.thinkingLevelMap,
+          compat: config.compat,
+        })),
       },
     },
   };
   writeFileSync(join(privateAgentDir, "models.json"), `${JSON.stringify(models, null, 2)}\n`, { mode: 0o600 });
+  // This bridge-owned ephemeral agent directory is separate from sessionsDir.
+  // Recreate the same bounded policy for every foreground process; never place
+  // settings in /workspace or the persistent session JSONL directory.
+  const settings = { compaction: COMPACTION_SETTINGS };
+  writeFileSync(join(privateAgentDir, "settings.json"), `${JSON.stringify(settings, null, 2)}\n`, { mode: 0o600 });
   return sessionsDir;
 }
 
@@ -294,21 +476,27 @@ function spawnPi(sessionsDir) {
   environment.PI_SKIP_VERSION_CHECK = "1";
   environment.PI_TELEMETRY = "0";
 
-  child = spawn(piBin, [
+  const arguments_ = [
     "--mode", "rpc",
     "--session-id", sessionId,
     "--session-dir", sessionsDir,
-    "--model", MODEL_REF,
-    "--thinking", THINKING_LEVEL,
-    "--tools", ALLOWED_TOOLS,
+    "--model", modelRef,
+    "--thinking", thinkingLevel,
+    "--tools", activeTools,
     "--no-context-files",
     "--no-extensions",
+  ];
+  if (structuredOutputMode) arguments_.push("--extension", STRUCTURED_OUTPUT_EXTENSION);
+  if (userInputEnabled) arguments_.push("--extension", USER_INPUT_EXTENSION);
+  arguments_.push(
     "--no-skills",
     "--no-prompt-templates",
     "--no-themes",
     "--no-approve",
     "--offline",
-  ], {
+  );
+
+  child = spawn(piBin, arguments_, {
     cwd: workspace,
     env: environment,
     stdio: ["pipe", "pipe", "pipe"],
@@ -322,12 +510,12 @@ function spawnPi(sessionsDir) {
   child.on("exit", onPiExit);
 }
 
-function send(id, type) {
+function send(id, type, payload = {}) {
   if (!child || child.stdin.destroyed || child.stdin.writableEnded) {
     fail("stdin_closed", "Pi stdin is not writable", 1);
     return;
   }
-  const message = { id, type };
+  const message = { id, type, ...payload };
   if (type === "prompt") message.message = prompt;
   pendingResponses.set(id, type);
   child.stdin.write(`${JSON.stringify(message)}\n`);
@@ -421,8 +609,11 @@ function handleResponse(message) {
     fail("command_failed", `Pi command ${expectedCommand} failed or mismatched`, 1);
     return;
   }
+  if (lifecycle === "running") touchAgentActivity();
   if (message.id === "initial-state") initial.state = summarizeState(message.data);
   else if (message.id === "initial-stats") initial.stats = summarizeStats(message.data);
+  else if (message.id === "select-model") initial.modelSelected = true;
+  else if (message.id === "select-thinking") initial.thinkingSelected = true;
   else if (message.id === "prompt") promptAccepted = true;
   else if (message.id === "final-state") final.state = summarizeState(message.data);
   else if (message.id === "final-stats") final.stats = summarizeStats(message.data);
@@ -436,7 +627,11 @@ function summarizeState(data) {
     fail("invalid_state", "Pi state response is invalid", 1);
     return null;
   }
-  if (data.model.provider !== PROVIDER_ID || data.model.id !== MODEL_ID || data.thinkingLevel !== THINKING_LEVEL) {
+  if (
+    data.model.provider !== PROVIDER_ID ||
+    data.model.id !== modelConfig.id ||
+    data.thinkingLevel !== thinkingLevel
+  ) {
     fail("model_mismatch", "Pi selected provider, model, or thinking level does not match the run contract", 1);
     return null;
   }
@@ -507,21 +702,60 @@ function summarizeStats(data) {
 }
 
 function maybeStart() {
-  if (lifecycle !== "booting" || !initial.state || !initial.stats) return;
+  if (
+    lifecycle !== "booting" ||
+    !initial.modelSelected ||
+    !initial.thinkingSelected ||
+    !initial.state ||
+    !initial.stats
+  ) return;
+  if (requireResume && initial.state.messageCount === 0) {
+    fail(
+      "session_resume_unavailable",
+      "the required Pi session has no prior messages; refusing to execute a continuation prompt",
+      1,
+      true,
+    );
+    return;
+  }
   lifecycle = "running";
+  runStartedAt = Date.now();
   emit("started", {
     sessionId,
-    model: MODEL_REF,
-    thinkingLevel: THINKING_LEVEL,
+    model: modelRef,
+    thinkingLevel,
+    contextWindow,
     resumed: initial.state.messageCount > 0,
     initialStats: initial.stats,
   });
+  startActivityTimer();
   send("prompt", "prompt");
 }
 
 function onSettled() {
   if (lifecycle !== "running" || !promptAccepted) {
     fail("invalid_lifecycle", "agent_settled arrived before prompt acceptance or while not running", 1);
+    return;
+  }
+  if (activeToolCalls.size) {
+    fail("invalid_tool_lifecycle", "Pi settled with unfinished tool calls", 1, true);
+    return;
+  }
+  if (
+    structuredOutputMode &&
+    structuredOutputSuccesses !== 1 &&
+    userInputSuccesses !== 1
+  ) {
+    fail(
+      "missing_structured_output",
+      `Pi must complete ${STRUCTURED_OUTPUT_TOOL} or ${USER_INPUT_TOOL} successfully before settling`,
+      1,
+      true,
+    );
+    return;
+  }
+  if (userInputSuccesses === 1 && inputRequest === null) {
+    fail("invalid_user_input_request", "Pi completed user input without a safe request", 1, true);
     return;
   }
   lifecycle = "settled";
@@ -533,6 +767,7 @@ function maybeFinalize() {
   if (lifecycle !== "settled" || !final.state || !final.stats) return;
   lifecycle = "finalizing";
   if (timeoutHandle) clearTimeout(timeoutHandle);
+  clearActivityTimer();
   child.stdin.end();
 }
 
@@ -543,7 +778,18 @@ function maybeComplete() {
     return;
   }
   lifecycle = "completed";
-  emit("completed", { sessionId, state: final.state, stats: final.stats });
+  emit("completed", {
+    sessionId,
+    state: final.state,
+    stats: final.stats,
+    inputRequest,
+    telemetry: {
+      firstToolElapsedMs,
+      firstEditOrWriteToolElapsedMs,
+      toolCounts: { ...toolCounts },
+      lastStopReason,
+    },
+  });
   cleanPrivateConfiguration();
   process.exit(0);
 }
@@ -576,6 +822,111 @@ function sanitizePublic(value, limit = LIMITS.publicArgumentCharacters, depth = 
   return value;
 }
 
+function structuredOutputArguments(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    fail("invalid_structured_output", `${STRUCTURED_OUTPUT_TOOL} arguments must be an object`, 1, true);
+    return null;
+  }
+  let serialized;
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    fail("invalid_structured_output", `${STRUCTURED_OUTPUT_TOOL} arguments must be JSON`, 1, true);
+    return null;
+  }
+  if (!serialized || Buffer.byteLength(serialized) > LIMITS.structuredOutputArgumentBytes) {
+    fail(
+      "structured_output_too_large",
+      `${STRUCTURED_OUTPUT_TOOL} arguments exceed the transport limit`,
+      1,
+      true,
+    );
+    return null;
+  }
+  try {
+    // Unlike ordinary diagnostic tool arguments, this is the machine result;
+    // preserve its complete structure while retaining the bridge's redaction.
+    return JSON.parse(redact(serialized));
+  } catch {
+    fail("invalid_structured_output", `${STRUCTURED_OUTPUT_TOOL} arguments are invalid`, 1, true);
+    return null;
+  }
+}
+
+function normalizeUserInputArguments(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { value: null, error: `${USER_INPUT_TOOL} arguments must be an object` };
+  }
+  const allowedKeys = new Set(["question", "choices", "allowFreeform", "reason"]);
+  if (Object.keys(value).some((key) => !allowedKeys.has(key))) {
+    return { value: null, error: `${USER_INPUT_TOOL} arguments contain unknown fields` };
+  }
+
+  if (typeof value.question !== "string") {
+    return { value: null, error: `${USER_INPUT_TOOL}.question must be a string` };
+  }
+  const question = value.question.trim();
+  if (
+    !question ||
+    question.length > LIMITS.userInputQuestionCharacters ||
+    /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(question)
+  ) {
+    return { value: null, error: `${USER_INPUT_TOOL}.question is empty, oversized, or unsafe` };
+  }
+
+  if (typeof value.allowFreeform !== "boolean") {
+    return { value: null, error: `${USER_INPUT_TOOL}.allowFreeform must be a boolean` };
+  }
+  const rawChoices = value.choices ?? [];
+  if (!Array.isArray(rawChoices) || rawChoices.length > LIMITS.userInputChoices) {
+    return { value: null, error: `${USER_INPUT_TOOL}.choices must be a bounded array` };
+  }
+  const choices = [];
+  for (const rawChoice of rawChoices) {
+    if (typeof rawChoice !== "string") {
+      return { value: null, error: `${USER_INPUT_TOOL}.choices must contain only strings` };
+    }
+    const choice = rawChoice.trim();
+    if (
+      !choice ||
+      choice.length > LIMITS.userInputChoiceCharacters ||
+      /[\u0000-\u001F\u007F]/.test(choice)
+    ) {
+      return { value: null, error: `${USER_INPUT_TOOL}.choices contain an empty, oversized, or unsafe value` };
+    }
+    choices.push(choice);
+  }
+  if (new Set(choices).size !== choices.length) {
+    return { value: null, error: `${USER_INPUT_TOOL}.choices must be unique` };
+  }
+  if (!value.allowFreeform && choices.length === 0) {
+    return { value: null, error: `${USER_INPUT_TOOL} requires choices or free-form input` };
+  }
+
+  let reason;
+  if (Object.hasOwn(value, "reason")) {
+    if (typeof value.reason !== "string") {
+      return { value: null, error: `${USER_INPUT_TOOL}.reason must be a string` };
+    }
+    reason = value.reason.trim();
+    if (
+      !reason ||
+      reason.length > LIMITS.userInputReasonCharacters ||
+      /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(reason)
+    ) {
+      return { value: null, error: `${USER_INPUT_TOOL}.reason is empty, oversized, or unsafe` };
+    }
+  }
+
+  const normalized = {
+    question: redact(question),
+    choices: choices.map((choice) => redact(choice)),
+    allowFreeform: value.allowFreeform,
+  };
+  if (reason !== undefined) normalized.reason = redact(reason);
+  return { value: normalized, error: null };
+}
+
 function emitPi(kind, payload = {}) {
   if (!PUBLIC_PI_KINDS.has(kind)) {
     fail("unknown_public_event", `bridge attempted unknown public Pi event ${kind}`, 1);
@@ -584,51 +935,255 @@ function emitPi(kind, payload = {}) {
   emit("pi.event", { kind, ...payload });
 }
 
+function touchAgentActivity() {
+  lastAgentActivityAt = Date.now();
+}
+
+function beginToolCall(message) {
+  touchAgentActivity();
+  const toolName = String(message.toolName ?? "");
+  const toolCallId = String(message.toolCallId ?? "");
+  if (
+    !toolCallId ||
+    activeToolCalls.has(toolCallId) ||
+    completedToolCallIds.has(toolCallId) ||
+    !allowedToolNames.has(toolName)
+  ) {
+    fail("invalid_tool_lifecycle", "Pi emitted an invalid or duplicate tool start", 1, true);
+    return false;
+  }
+  if (structuredOutputSuccesses !== 0) {
+    fail("invalid_structured_output", `Pi must stop after ${STRUCTURED_OUTPUT_TOOL} succeeds`, 1, true);
+    return false;
+  }
+  if (userInputSuccesses !== 0) {
+    fail("invalid_user_input_request", `Pi must stop after ${USER_INPUT_TOOL} succeeds`, 1, true);
+    return false;
+  }
+  if (userInputArgumentsByCallId.size !== 0) {
+    fail("invalid_user_input_request", `${USER_INPUT_TOOL} must be the only active tool`, 1, true);
+    return false;
+  }
+  if (structuredOutputMode && toolName !== STRUCTURED_OUTPUT_TOOL && toolName !== USER_INPUT_TOOL) {
+    fail(
+      "invalid_structured_output",
+      `Pi may only call ${STRUCTURED_OUTPUT_TOOL} or ${USER_INPUT_TOOL}`,
+      1,
+      true,
+    );
+    return false;
+  }
+  if (toolName === STRUCTURED_OUTPUT_TOOL) {
+    if (!structuredOutputMode) {
+      fail("invalid_structured_output", `${STRUCTURED_OUTPUT_TOOL} is unavailable`, 1, true);
+      return false;
+    }
+    if (activeToolCalls.size !== 0 || structuredOutputCalls >= MAX_STRUCTURED_OUTPUT_ATTEMPTS) {
+      fail(
+        "invalid_structured_output",
+        `Pi may attempt ${STRUCTURED_OUTPUT_TOOL} at most ${MAX_STRUCTURED_OUTPUT_ATTEMPTS} times`,
+        1,
+        true,
+      );
+      return false;
+    }
+    structuredOutputCalls += 1;
+  }
+  if (toolName === USER_INPUT_TOOL) {
+    if (!userInputEnabled) {
+      fail("invalid_user_input_request", `${USER_INPUT_TOOL} is unavailable`, 1, true);
+      return false;
+    }
+    if (activeToolCalls.size !== 0 || userInputCalls >= MAX_USER_INPUT_ATTEMPTS) {
+      fail(
+        "invalid_user_input_request",
+        `Pi may attempt ${USER_INPUT_TOOL} at most ${MAX_USER_INPUT_ATTEMPTS} times`,
+        1,
+        true,
+      );
+      return false;
+    }
+    userInputCalls += 1;
+    userInputArgumentsByCallId.set(toolCallId, normalizeUserInputArguments(message.args));
+  }
+  activeToolCalls.set(toolCallId, toolName);
+  if (firstToolElapsedMs === null && runStartedAt > 0) {
+    firstToolElapsedMs = Date.now() - runStartedAt;
+  }
+  toolCounts[toolName] = (toolCounts[toolName] ?? 0) + 1;
+  return true;
+}
+
+function endToolCall(message, ending) {
+  touchAgentActivity();
+  const toolCallId = String(message.toolCallId ?? "");
+  const toolName = String(message.toolName ?? "");
+  if (!toolCallId || activeToolCalls.get(toolCallId) !== toolName) {
+    fail("invalid_tool_lifecycle", "Pi emitted unmatched tool progress", 1, true);
+    return false;
+  }
+  if (ending) {
+    if (typeof message.isError !== "boolean") {
+      fail("invalid_tool_lifecycle", "Pi emitted a tool end without a boolean result", 1, true);
+      return false;
+    }
+    activeToolCalls.delete(toolCallId);
+    completedToolCallIds.add(toolCallId);
+    if (structuredOutputMode && toolName === STRUCTURED_OUTPUT_TOOL) {
+      if (message.isError !== true) {
+        structuredOutputSuccesses += 1;
+      }
+    }
+    if (toolName === USER_INPUT_TOOL) {
+      const normalized = userInputArgumentsByCallId.get(toolCallId);
+      userInputArgumentsByCallId.delete(toolCallId);
+      if (message.isError !== true) {
+        if (!normalized || normalized.value === null) {
+          fail(
+            "invalid_user_input_request",
+            normalized?.error || `${USER_INPUT_TOOL} arguments are unavailable`,
+            1,
+            true,
+          );
+          return false;
+        }
+        userInputSuccesses += 1;
+        inputRequest = {
+          requestId: `input-${randomUUID()}`,
+          ...normalized.value,
+        };
+      }
+    }
+    if (
+      (toolName === "edit" || toolName === "write") &&
+      message.isError !== true &&
+      firstEditOrWriteToolElapsedMs === null &&
+      runStartedAt > 0
+    ) {
+      firstEditOrWriteToolElapsedMs = Date.now() - runStartedAt;
+    }
+  }
+  return true;
+}
+
+function startActivityTimer() {
+  if (activitySilenceSeconds === null) return;
+  const silenceLimitMs = activitySilenceSeconds * 1000;
+  const heartbeatIntervalMs = Math.min(15_000, Math.max(250, silenceLimitMs / 2));
+  const pollIntervalMs = Math.min(1_000, Math.max(100, heartbeatIntervalMs / 2));
+  lastAgentActivityAt = Date.now();
+  lastInferenceHeartbeatAt = lastAgentActivityAt;
+  activityTimerHandle = setInterval(() => {
+    if (lifecycle !== "running") return;
+    const now = Date.now();
+    const silentForMs = now - lastAgentActivityAt;
+    if (silentForMs >= silenceLimitMs) {
+      fail(
+        "agent_inactivity_timeout",
+        `Pi produced no protocol activity for ${activitySilenceSeconds} seconds`,
+        124,
+        true,
+      );
+      return;
+    }
+    if (now - lastInferenceHeartbeatAt >= heartbeatIntervalMs) {
+      // A heartbeat only proves that the bridge remains alive and is still
+      // awaiting Pi. It never exposes private reasoning or resets the watchdog.
+      emitPi("inference_heartbeat");
+      lastInferenceHeartbeatAt = now;
+    }
+  }, pollIntervalMs);
+}
+
+function clearActivityTimer() {
+  if (!activityTimerHandle) return;
+  clearInterval(activityTimerHandle);
+  activityTimerHandle = null;
+}
+
 function handleEvent(message) {
   if (lifecycle !== "running") {
     fail("invalid_lifecycle", `Pi event ${message.type} arrived while ${lifecycle}`, 1);
     return;
   }
+  // This includes private thinking deltas: their content remains suppressed,
+  // but receipt of a valid Pi event proves a high-thinking turn is not stuck.
+  touchAgentActivity();
   switch (message.type) {
     case "agent_start": emitPi("agent_start"); break;
     case "agent_end": emitPi("agent_end", { willRetry: message.willRetry === true }); break;
     case "agent_settled": emitPi("agent_settled"); onSettled(); break;
     case "turn_start": emitPi("turn_start"); break;
-    case "turn_end": emitPi("turn_end", {
-      role: String(message.message?.role ?? ""),
-      stopReason: String(message.message?.stopReason ?? ""),
-      text: bounded(redact(publicTextBlocks(message.message?.content)), LIMITS.publicTextCharacters),
-      toolResults: Array.isArray(message.toolResults) ? message.toolResults.slice(0, LIMITS.arrayItems).map((result) => ({
-        toolCallId: String(result?.toolCallId ?? ""),
-        toolName: String(result?.toolName ?? ""),
-        isError: result?.isError === true,
-      })) : [],
-    }); break;
+    case "turn_end": {
+      const stopReason = String(message.message?.stopReason ?? "");
+      if (message.message?.role === "assistant" && stopReason) lastStopReason = stopReason;
+      emitPi("turn_end", {
+        role: String(message.message?.role ?? ""),
+        stopReason,
+        text: bounded(redact(publicTextBlocks(message.message?.content)), LIMITS.publicTextCharacters),
+        toolResults: Array.isArray(message.toolResults) ? message.toolResults.slice(0, LIMITS.arrayItems).map((result) => ({
+          toolCallId: String(result?.toolCallId ?? ""),
+          toolName: String(result?.toolName ?? ""),
+          isError: result?.isError === true,
+        })) : [],
+      });
+      break;
+    }
     case "message_start": emitPi("message_start", { role: String(message.message?.role ?? "") }); break;
-    case "message_end": emitPi("message_end", {
-      role: String(message.message?.role ?? ""),
-      stopReason: String(message.message?.stopReason ?? ""),
-    }); break;
+    case "message_end": {
+      const stopReason = String(message.message?.stopReason ?? "");
+      if (message.message?.role === "assistant" && stopReason) lastStopReason = stopReason;
+      emitPi("message_end", {
+        role: String(message.message?.role ?? ""),
+        stopReason,
+      });
+      break;
+    }
     case "message_update": handleMessageDelta(message.assistantMessageEvent); break;
     case "bash_execution_update": emitPi("bash_output", {
       delta: bounded(redact(message.delta), LIMITS.publicDeltaCharacters),
     }); break;
-    case "tool_execution_start": emitPi("tool_start", {
-      toolCallId: String(message.toolCallId ?? ""),
-      toolName: String(message.toolName ?? ""),
-      args: sanitizePublic(message.args),
-    }); break;
-    case "tool_execution_update": emitPi("tool_output", {
-      toolCallId: String(message.toolCallId ?? ""),
-      toolName: String(message.toolName ?? ""),
-      text: bounded(redact(publicTextBlocks(message.partialResult?.content)), LIMITS.publicTextCharacters),
-      cumulative: true,
-    }); break;
-    case "tool_execution_end": emitPi("tool_end", {
-      toolCallId: String(message.toolCallId ?? ""),
-      toolName: String(message.toolName ?? ""),
-      isError: message.isError === true,
-    }); break;
+    case "tool_execution_start":
+      if (beginToolCall(message)) {
+        const toolName = String(message.toolName ?? "");
+        let args;
+        if (toolName === STRUCTURED_OUTPUT_TOOL) {
+          args = structuredOutputArguments(message.args);
+        } else if (toolName === USER_INPUT_TOOL) {
+          args = userInputArgumentsByCallId.get(String(message.toolCallId ?? ""))?.value ?? {};
+        } else {
+          args = sanitizePublic(message.args);
+        }
+        if (args !== null && lifecycle === "running") emitPi("tool_start", {
+          toolCallId: String(message.toolCallId ?? ""),
+          toolName,
+          args,
+          elapsedMs: runStartedAt > 0 ? Date.now() - runStartedAt : null,
+        });
+      }
+      break;
+    case "tool_execution_update":
+      if (endToolCall(message, false)) emitPi("tool_output", {
+        toolCallId: String(message.toolCallId ?? ""),
+        toolName: String(message.toolName ?? ""),
+        text: bounded(redact(publicTextBlocks(message.partialResult?.content)), LIMITS.publicTextCharacters),
+        cumulative: true,
+        elapsedMs: runStartedAt > 0 ? Date.now() - runStartedAt : null,
+      });
+      break;
+    case "tool_execution_end":
+      if (endToolCall(message, true)) {
+        emitPi("tool_end", {
+          toolCallId: String(message.toolCallId ?? ""),
+          toolName: String(message.toolName ?? ""),
+          isError: message.isError === true,
+          elapsedMs: runStartedAt > 0 ? Date.now() - runStartedAt : null,
+        });
+        if (message.toolName === USER_INPUT_TOOL && message.isError === false && inputRequest) {
+          emitPi("input_request", { inputRequest });
+        }
+      }
+      break;
     case "queue_update": emitPi("queue_update", {
       steering: sanitizePublic(message.steering, LIMITS.publicDeltaCharacters),
       followUp: sanitizePublic(message.followUp, LIMITS.publicDeltaCharacters),
@@ -683,13 +1238,15 @@ function killProcessGroup(signal) {
   }
 }
 
-async function shutdown(exitCode) {
+async function shutdown(exitCode, immediate = false) {
   if (shuttingDown) return;
   shuttingDown = true;
   if (timeoutHandle) clearTimeout(timeoutHandle);
+  clearActivityTimer();
   if (child && !childExited) {
     try { child.stdin.write(`${JSON.stringify({ id: "abort", type: "abort" })}\n`); } catch { /* continue */ }
-    await new Promise((resolve) => setTimeout(resolve, graceSeconds * 1000));
+    if (immediate) killProcessGroup("SIGTERM");
+    await new Promise((resolve) => setTimeout(resolve, immediate ? 1000 : graceSeconds * 1000));
     if (!childExited) {
       killProcessGroup("SIGTERM");
       await new Promise((resolve) => setTimeout(resolve, 2000));
@@ -700,12 +1257,12 @@ async function shutdown(exitCode) {
   process.exit(exitCode);
 }
 
-function fail(code, message, exitCode) {
+function fail(code, message, exitCode, immediate = false) {
   if (lifecycle === "failed" || lifecycle === "completed") return;
   const phase = lifecycle;
   lifecycle = "failed";
   emit("failed", { code, message: bounded(redact(message), 4096), phase });
-  void shutdown(exitCode);
+  void shutdown(exitCode, immediate);
 }
 
 function main() {
@@ -714,6 +1271,8 @@ function main() {
     const sessionsDir = writePrivateConfiguration();
     lifecycle = "booting";
     spawnPi(sessionsDir);
+    send("select-model", "set_model", { provider: PROVIDER_ID, modelId: modelConfig.id });
+    send("select-thinking", "set_thinking_level", { level: thinkingLevel });
     send("initial-state", "get_state");
     send("initial-stats", "get_session_stats");
     if (timeoutSeconds !== null) {

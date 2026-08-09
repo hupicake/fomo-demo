@@ -73,8 +73,14 @@ def test_v2_bare_manifest_is_digest_pinned_and_keeps_a_generic_buildable_boundar
     page_source = files["app/page.tsx"]._content.decode("utf-8")
     assert "GeneratedComposition" in page_source
     assert "components/features" not in page_source
-    assert 'testDir: "./tests"' in files["playwright.config.ts"]._content.decode("utf-8")
-    assert 'reporter: "line"' in files["playwright.config.ts"]._content.decode("utf-8")
+    portable_playwright_config = files["playwright.config.ts"]._content.decode("utf-8")
+    portable_harness = files["tests/harness/starter.smoke.spec.ts"]._content.decode("utf-8")
+    assert 'testDir: "./tests"' in portable_playwright_config
+    assert 'reporter: "line"' in portable_playwright_config
+    assert 'from "@playwright/test"' in portable_playwright_config
+    assert 'from "@playwright/test"' in portable_harness
+    assert "/opt/fomo/runtime-cache" not in portable_playwright_config
+    assert "/opt/fomo/runtime-cache" not in portable_harness
     tsconfig = json.loads(files["tsconfig.json"]._content.decode("utf-8"))
     assert tsconfig["compilerOptions"]["jsx"] == "react-jsx"
     assert tsconfig["compilerOptions"]["incremental"] is True
@@ -414,6 +420,12 @@ def test_v2_opensandbox_copy_command_accepts_only_the_fixed_capability_enum() ->
     assert command == (
         "cp -R --no-preserve=mode,ownership -- "
         "/opt/fomo/starters/fomo-next-radix-v2/base/. /workspace/ && "
+        "test -L /workspace/node_modules && "
+        "rm -- /workspace/node_modules && "
+        "cp -a --no-preserve=ownership -- "
+        "/opt/fomo/runtime-cache/fomo-next-radix-v2/node_modules "
+        "/workspace/node_modules && "
+        "chmod -R u+rwX -- /workspace/node_modules && "
         "cp -R --no-preserve=mode,ownership -- "
         "/opt/fomo/starters/fomo-next-radix-v2/capabilities/crud/. /workspace/ && "
         "cp -R --no-preserve=mode,ownership -- "

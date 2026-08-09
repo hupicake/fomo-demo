@@ -12,8 +12,13 @@ from pathlib import Path
 import pytest
 
 from fomo.fomo_pi_ds import (
+    FOMO_PI_BUILD_MODEL,
     FOMO_PI_MODEL,
+    FOMO_PI_PLANNING_MODEL,
+    FOMO_PI_REQUIRE_RESUME,
+    FOMO_PI_STRUCTURED_OUTPUT_SCHEMA_B64,
     FOMO_PI_THINKING,
+    FOMO_PI_USER_INPUT_ENABLED,
     PiBridgeFailed,
     PiBridgeProtocolError,
     PiBridgeStreamReducer,
@@ -101,6 +106,7 @@ def test_invocation_keeps_prompt_and_key_out_of_argv_and_repr(tmp_path: Path) ->
         state_dir=str(tmp_path / "state"),
         bridge_bin=str(BRIDGE),
         pi_bin="/opt/fomo/pi/bin/pi",
+        thinking="high",
     )
     invocation = PiInvocation(request)
 
@@ -116,6 +122,166 @@ def test_invocation_keeps_prompt_and_key_out_of_argv_and_repr(tmp_path: Path) ->
     assert all("dummy-virtual-key" not in part for part in argv)
     assert base64.b64decode(environment["FOMO_PI_PROMPT_B64"]).decode() == "classified prompt"
     assert environment["FOMO_PI_VIRTUAL_KEY"] == "dummy-virtual-key"
+    assert environment["FOMO_PI_THINKING_LEVEL"] == "high"
+    # Explicit context window travels to the bridge; no business tool policy
+    # exists anymore, and an inactivity budget is absent unless requested.
+    assert environment["FOMO_PI_CONTEXT_WINDOW"] == "200000"
+    assert "FOMO_PI_TOOL_POLICY_B64" not in environment
+    assert "FOMO_PI_ACTIVITY_SILENCE_SECONDS" not in environment
+    assert FOMO_PI_STRUCTURED_OUTPUT_SCHEMA_B64 not in environment
+
+
+def test_invocation_passes_a_copied_bounded_structured_output_schema() -> None:
+    schema: dict[str, object] = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": False,
+    }
+    request = PiRequest(
+        request_id="request-1",
+        correlation_id="run-1",
+        session_id="session-1",
+        provider_base_url="http://litellm:4000/v1",
+        prompt="plan",
+        virtual_key="dummy-virtual-key",
+        structured_output_schema=schema,
+    )
+    schema["type"] = "array"
+
+    encoded = PiInvocation(request).fomo_environment()[FOMO_PI_STRUCTURED_OUTPUT_SCHEMA_B64]
+    decoded = json.loads(base64.b64decode(encoded))
+
+    assert decoded["type"] == "object"
+    assert decoded["required"] == ["answer"]
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "array"},
+        {"type": "object", "const": float("nan")},
+        {"type": "object", "description": "x" * (64 * 1024)},
+    ],
+)
+def test_invocation_rejects_invalid_or_oversized_structured_output_schema(
+    schema: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="structured_output_schema"):
+        PiRequest(
+            request_id="request-1",
+            correlation_id="run-1",
+            session_id="session-1",
+            provider_base_url="http://litellm:4000/v1",
+            prompt="plan",
+            virtual_key="dummy-virtual-key",
+            structured_output_schema=schema,
+        )
+
+
+def test_invocation_passes_activity_silence_budget_when_requested(tmp_path: Path) -> None:
+    request = PiRequest(
+        request_id="request-1",
+        correlation_id="run-1",
+        session_id="session-1",
+        provider_base_url="http://litellm:4000/v1",
+        prompt="build",
+        virtual_key="dummy-virtual-key",
+        activity_silence_seconds=90,
+    )
+    environment = PiInvocation(request).fomo_environment()
+    assert environment["FOMO_PI_ACTIVITY_SILENCE_SECONDS"] == "90"
+
+
+def test_invocation_explicitly_enables_user_input_and_fail_closed_resume() -> None:
+    request = PiRequest(
+        request_id="request-1",
+        correlation_id="run-1",
+        session_id="session-1",
+        provider_base_url="http://litellm:4000/v1",
+        prompt="continue with the answer",
+        virtual_key="dummy-virtual-key",
+        user_input_enabled=True,
+        require_resume=True,
+    )
+
+    environment = PiInvocation(request).fomo_environment()
+
+    assert environment[FOMO_PI_USER_INPUT_ENABLED] == "1"
+    assert environment[FOMO_PI_REQUIRE_RESUME] == "1"
+
+
+def test_reducer_binds_input_request_event_to_completed_payload() -> None:
+    reducer = PiBridgeStreamReducer(
+        request_id="request-1",
+        correlation_id="run-1",
+        session_id="session-1",
+    )
+    input_request = {
+        "requestId": "input-123",
+        "question": "Which layout?",
+        "choices": ["Grid", "List"],
+        "allowFreeform": False,
+    }
+    completed = _completed("session-1")
+    completed["inputRequest"] = input_request
+
+    reducer.feed(_line(1, "started", _started("session-1")))
+    reducer.feed(
+        _line(
+            2,
+            "pi.event",
+            {"kind": "input_request", "inputRequest": input_request},
+        )
+    )
+    reducer.feed(_line(3, "pi.event", {"kind": "agent_settled"}))
+    reducer.feed(_line(4, "completed", completed))
+
+    assert reducer.finish().completed["inputRequest"] == input_request
+
+
+@pytest.mark.parametrize(
+    ("model", "thinking"),
+    [
+        (FOMO_PI_BUILD_MODEL, "max"),
+        (FOMO_PI_PLANNING_MODEL, "medium"),
+    ],
+)
+def test_invocation_rejects_unsupported_model_thinking_pairs(model: str, thinking: str) -> None:
+    with pytest.raises(ValueError, match="not supported by"):
+        PiRequest(
+            request_id="request-1",
+            correlation_id="run-1",
+            session_id="session-1",
+            provider_base_url="http://litellm:4000/v1",
+            prompt="build",
+            virtual_key="dummy-key",
+            model=model,
+            thinking=thinking,
+        )
+
+
+@pytest.mark.parametrize(
+    ("model", "thinking"),
+    [
+        (FOMO_PI_PLANNING_MODEL, "max"),
+        (FOMO_PI_BUILD_MODEL, "high"),
+        (FOMO_PI_BUILD_MODEL, "off"),
+    ],
+)
+def test_invocation_accepts_supported_model_thinking_pairs(model: str, thinking: str) -> None:
+    request = PiRequest(
+        request_id="request-1",
+        correlation_id="run-1",
+        session_id="session-1",
+        provider_base_url="http://litellm:4000/v1",
+        prompt="build",
+        virtual_key="dummy-key",
+        model=model,
+        thinking=thinking,
+    )
+    assert request.model == model
+    assert request.thinking == thinking
 
 
 @pytest.mark.parametrize(
@@ -145,8 +311,9 @@ def test_reducer_accepts_chunked_happy_path() -> None:
             _line(1, "started", _started(session_id)),
             _line(2, "pi.event", {"kind": "agent_start"}),
             _line(3, "pi.event", {"kind": "message_delta", "delta": "hello"}),
-            _line(4, "pi.event", {"kind": "agent_settled"}),
-            _line(5, "completed", _completed(session_id)),
+            _line(4, "pi.event", {"kind": "inference_heartbeat"}),
+            _line(5, "pi.event", {"kind": "agent_settled"}),
+            _line(6, "completed", _completed(session_id)),
         ]
     )
     reducer = PiBridgeStreamReducer(
@@ -164,8 +331,45 @@ def test_reducer_accepts_chunked_happy_path() -> None:
         "pi.event",
         "pi.event",
         "pi.event",
+        "pi.event",
         "completed",
     ]
+
+
+def test_reducer_accepts_the_requested_high_thinking_level() -> None:
+    session_id = "session-high"
+    started = _started(session_id)
+    started["thinkingLevel"] = "high"
+    reducer = PiBridgeStreamReducer(
+        request_id="request-1",
+        correlation_id="run-1",
+        session_id=session_id,
+        thinking_level="high",
+    )
+
+    reducer.feed(_line(1, "started", started))
+    reducer.feed(_line(2, "pi.event", {"kind": "agent_settled"}))
+    reducer.feed(_line(3, "completed", _completed(session_id)))
+
+    assert reducer.finish().started["thinkingLevel"] == "high"
+
+
+def test_reducer_accepts_the_requested_off_thinking_level() -> None:
+    session_id = "session-off"
+    started = _started(session_id)
+    started["thinkingLevel"] = "off"
+    reducer = PiBridgeStreamReducer(
+        request_id="request-1",
+        correlation_id="run-1",
+        session_id=session_id,
+        thinking_level="off",
+    )
+
+    reducer.feed(_line(1, "started", started))
+    reducer.feed(_line(2, "pi.event", {"kind": "agent_settled"}))
+    reducer.feed(_line(3, "completed", _completed(session_id)))
+
+    assert reducer.finish().started["thinkingLevel"] == "off"
 
 
 def test_reducer_rejects_sequence_gaps_and_hidden_reasoning() -> None:
@@ -268,7 +472,9 @@ def stats():
 for raw in sys.stdin:
     command = json.loads(raw)
     kind = command["type"]
-    if kind == "get_state":
+    if kind in {{"set_model", "set_thinking_level"}}:
+        send({{"type": "response", "id": command["id"], "command": kind, "success": True}})
+    elif kind == "get_state":
         send({{"type": "response", "id": command["id"], "command": kind, "success": True, "data": state()}})
     elif kind == "get_session_stats":
         send({{"type": "response", "id": command["id"], "command": kind, "success": True, "data": stats()}})
@@ -288,7 +494,11 @@ for raw in sys.stdin:
         send({{"type": "message_update", "assistantMessageEvent": {{"type": "thinking_delta", "delta": "hidden thought"}}}})
         send({{"type": "message_update", "assistantMessageEvent": {{"type": "text_delta", "contentIndex": 0, "delta": "visible"}}}})
         send({{"type": "agent_settled"}})
-"""
+    elif kind == "abort":
+        sys.exit(0)
+    else:
+        raise RuntimeError(f"unexpected fake Pi command: {{kind}}")
+    """
     path.write_text(source, encoding="utf-8")
     path.chmod(0o700)
 
@@ -313,6 +523,9 @@ def _run_bridge(tmp_path: Path, mode: str = "ok", *, timeout_seconds: int | None
         state_dir=str(tmp_path / "state"),
         bridge_bin=str(BRIDGE),
         pi_bin=str(fake_pi),
+        # The canned fake Pi reports fomo-pi-flash with thinking max.
+        model=FOMO_PI_PLANNING_MODEL,
+        thinking="max",
         timeout_seconds=timeout_seconds,
         grace_seconds=1,
     )
@@ -333,6 +546,17 @@ def _run_bridge(tmp_path: Path, mode: str = "ok", *, timeout_seconds: int | None
     return completed, pid_file
 
 
+def _fake_bridge_reducer() -> PiBridgeStreamReducer:
+    """Match the planning/max contract reported by the canned fake Pi."""
+    return PiBridgeStreamReducer(
+        request_id="request-1",
+        correlation_id="run-1",
+        session_id="session-1",
+        thinking_level="max",
+        model_ref=FOMO_PI_PLANNING_MODEL,
+    )
+
+
 def test_bridge_runs_fake_pi_to_clean_completion_without_leaking_secrets(tmp_path: Path) -> None:
     completed, _ = _run_bridge(tmp_path)
     assert completed.returncode == 0, completed.stderr.decode(errors="replace")
@@ -342,9 +566,7 @@ def test_bridge_runs_fake_pi_to_clean_completion_without_leaking_secrets(tmp_pat
     assert b"classified prompt" not in completed.stderr
     assert b"hidden thought" not in completed.stdout
 
-    reducer = PiBridgeStreamReducer(
-        request_id="request-1", correlation_id="run-1", session_id="session-1"
-    )
+    reducer = _fake_bridge_reducer()
     reducer.feed(completed.stdout)
     result = reducer.finish()
     assert result.completed["sessionId"] == "session-1"
@@ -355,9 +577,7 @@ def test_bridge_runs_fake_pi_to_clean_completion_without_leaking_secrets(tmp_pat
 def test_bridge_fails_closed_for_bad_fake_pi_protocol(tmp_path: Path, mode: str) -> None:
     completed, _ = _run_bridge(tmp_path, mode)
     assert completed.returncode != 0
-    reducer = PiBridgeStreamReducer(
-        request_id="request-1", correlation_id="run-1", session_id="session-1"
-    )
+    reducer = _fake_bridge_reducer()
     reducer.feed(completed.stdout)
     with pytest.raises(PiBridgeFailed):
         reducer.finish()

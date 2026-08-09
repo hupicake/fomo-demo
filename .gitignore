@@ -9,6 +9,8 @@ node_modules/
 .next/
 .turbo/
 coverage/
+.coverage
+htmlcov/
 *.tsbuildinfo
 
 # Python
@@ -24,3 +26,13 @@ __pycache__/
 .idea/
 .vscode/
 logs/
+.pi-runs/
+.workbuddy/
+test-results/
+playwright-report/
+blob-report/
+deploy/cloudflared/config.yml
+deploy/cloudflared/*.json
+
+# Local development databases
+services/control-plane/fomo.db

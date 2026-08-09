@@ -1,0 +1,30 @@
+# Copy outside the repository as config.yml and replace only the tunnel values.
+# Keep the tunnel credentials JSON outside Git. The example intentionally uses
+# different eTLD+1 sites for the workbench and generated Preview:
+# app.example.com versus <sandbox-id>.fomo-previews.example.net.
+tunnel: <TUNNEL-UUID>
+credentials-file: <ABSOLUTE-PATH-TO-TUNNEL-CREDENTIALS-JSON>
+
+ingress:
+  # API and SSE share the browser-visible app origin. Rules are evaluated in
+  # order, so these paths must precede the Web catch-all for the same host.
+  - hostname: app.example.com
+    path: ^/v1(/.*)?$
+    service: http://127.0.0.1:8000
+  - hostname: app.example.com
+    path: ^/health$
+    service: http://127.0.0.1:8000
+  - hostname: app.example.com
+    service: http://127.0.0.1:3000
+
+  # Set PUBLIC_PREVIEW_BASE_DOMAIN=fomo-previews.example.net. Delegate that
+  # name as its own Cloudflare zone or explicitly provision TLS coverage for
+  # *.fomo-previews.example.net; a parent-zone Universal SSL certificate does
+  # not normally cover this deeper hostname. Preserve the incoming Host: do
+  # not set originRequest.httpHostHeader on this rule.
+  - hostname: "*.fomo-previews.example.net"
+    service: http://127.0.0.1:8001
+
+  # cloudflared requires a final catch-all. Never replace this with a route to
+  # OpenSandbox, LiteLLM, a database, or Docker's random published-port range.
+  - service: http_status:404

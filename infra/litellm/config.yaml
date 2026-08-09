@@ -61,6 +61,14 @@ model_list:
       thinking:
         type: enabled
 
+  # Default Direct Pi implementation/repair route. Planning remains on the
+  # fast DeepSeek route; code-producing turns favor GPT-5.5 tool reliability.
+  - model_name: fomo-pi-build
+    litellm_params:
+      model: openai/gpt-5.5
+      api_key: os.environ/OPENAI_API_KEY
+      api_base: os.environ/OPENAI_API_BASE
+
 router_settings:
   num_retries: 1
   fallbacks:

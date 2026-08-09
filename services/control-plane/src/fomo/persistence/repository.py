@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import mimetypes
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
@@ -13,9 +14,24 @@ from pathlib import PurePosixPath
 from typing import Any
 from zipfile import ZIP_DEFLATED, ZipFile
 
-from sqlalchemy import case, func, or_, select, update
+from sqlalchemy import and_, case, func, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from fomo.auth import hash_password, new_session_id, normalize_email, verify_password
+from fomo.direct_pi.goalgraph import (
+    Goal,
+    GoalGraph,
+    GoalGraphDraft,
+    GoalStatus,
+    GraphStatus,
+    acceptance_persistence_key,
+    materialize_goal_graph,
+    parse_goal_graph_draft,
+    serialize_goal_graph_draft,
+    transition_goal_status,
+    transition_graph_status,
+)
 from fomo.ids import utcnow, uuid7
 from fomo.schemas import (
     ARTIFACT_KIND_TO_ROLE,
@@ -27,19 +43,31 @@ from fomo.schemas import (
     RunPhase,
     RunResponse,
     RunStatus,
+    UserInputRequestDraft,
+    UserInputRequestResponse,
     VersionResponse,
 )
 
 from .database import Database
 from .models import (
     ArtifactRecord,
+    CheckpointFileRecord,
+    CheckpointRecord,
+    GoalEvidenceRecord,
+    GoalGraphRecord,
+    GoalGraphRevisionRecord,
+    GoalNodeRecord,
     MessageRecord,
     ProjectRecord,
     RunEventRecord,
+    RunInputRequestRecord,
     RunRecord,
+    RunSandboxResourceRecord,
     SessionRecord,
     SpecItemRecord,
     TraceLinkRecord,
+    UsageEntryRecord,
+    UserRecord,
     VerificationEvidenceRecord,
     VersionFileRecord,
     VersionRecord,
@@ -51,6 +79,10 @@ class NotFoundError(LookupError):
 
 
 class OwnershipError(PermissionError):
+    pass
+
+
+class AuthenticationError(PermissionError):
     pass
 
 
@@ -66,6 +98,10 @@ class RunLeaseLost(RuntimeError):
     """A worker attempted a durable write after losing its run lease."""
 
 
+class ManifestIntegrityError(RuntimeError):
+    """A durable checkpoint manifest or file no longer matches its hash."""
+
+
 TERMINAL_STATUSES = {
     RunStatus.succeeded.value,
     RunStatus.failed.value,
@@ -74,12 +110,126 @@ TERMINAL_STATUSES = {
 }
 
 
+def _is_business_implementation_path(path: str) -> bool:
+    """Keep GoalGraph implementation trace limited to product source files."""
+    candidate = PurePosixPath(path)
+    parts = tuple(part.lower() for part in candidate.parts)
+    name = candidate.name.lower()
+    if any(part in {"tests", "test", "__tests__", "e2e"} for part in parts[:-1]):
+        return False
+    if name in {
+        "agents.md",
+        "changelog.md",
+        "claude.md",
+        "contributing.md",
+        "license",
+        "license.md",
+        "readme.md",
+    }:
+        return False
+    if any(marker in name for marker in (".test.", ".spec.", ".stories.")):
+        return False
+    if parts and parts[0] in {".github", ".fomo", "docs"}:
+        return False
+    if len(parts) == 1 and (
+        name in {
+            ".gitignore", ".npmrc", ".nvmrc", "components.json", "next-env.d.ts",
+            "package.json", "package-lock.json", "pnpm-lock.yaml", "pnpm-workspace.yaml",
+            "yarn.lock",
+        }
+        or name.startswith((
+            "eslint.config.", "jest.config.", "next.config.", "playwright.config.",
+            "postcss.config.", "prettier.config.", "tailwind.config.", "tsconfig",
+            "vitest.config.",
+        ))
+    ):
+        return False
+    return True
+
+
 @dataclass(frozen=True, slots=True)
 class SandboxCleanupTarget:
     """A durable sandbox reference that a worker must destroy best-effort."""
 
     run_id: str
     project_id: str
+    sandbox_id: str
+    resource_id: str | None = None
+    kind: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedPreviewTarget:
+    """A live sandbox that backs the published preview of a verified run."""
+
+    run_id: str
+    project_id: str
+    sandbox_id: str
+    preview_url: str
+
+
+@dataclass(frozen=True, slots=True)
+class GoalGraphProjection:
+    graph_id: str
+    project_id: str
+    run_id: str
+    revision: int
+    revision_id: str
+    content_hash: str
+    graph: GoalGraph
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointFile:
+    path: str
+    content_text: str
+    sha256: str
+    size: int
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedCheckpoint:
+    id: str
+    graph_id: str
+    run_id: str
+    goal_id: str
+    ordinal: int
+    manifest_hash: str
+    commit_sha: str | None
+    snapshot_id: str | None
+    capsule: dict[str, Any]
+    files: tuple[CheckpointFile, ...]
+    evidence: tuple[dict[str, Any], ...]
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class UsageLedgerResult:
+    entry_id: str
+    created: bool
+
+
+@dataclass(frozen=True, slots=True)
+class UsageTotals:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    tool_calls: int = 0
+    cost_micros: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class RunContinuation:
+    request_id: str
+    request_status: str
+    continuation_key: str
+    stage: str
+    goal_id: str | None
+    context: dict[str, Any]
+    question: str
+    answer: str | None
+    pi_session_id: str
     sandbox_id: str
 
 
@@ -91,6 +241,10 @@ def _is_expired(value: datetime, *, at: datetime | None = None) -> bool:
     if reference.tzinfo is None:
         reference = reference.replace(tzinfo=UTC)
     return value <= reference
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
 def _project_response(record: ProjectRecord) -> ProjectResponse:
@@ -117,7 +271,26 @@ def _message_response(record: MessageRecord) -> MessageResponse:
     )
 
 
-def _run_response(record: RunRecord, last_seq: int = 0) -> RunResponse:
+def _input_request_response(record: RunInputRequestRecord) -> UserInputRequestResponse:
+    return UserInputRequestResponse(
+        id=record.id,
+        run_id=record.run_id,
+        question=record.question,
+        choices=list(record.choices),
+        allow_freeform=record.allow_freeform,
+        status=record.status,
+        stage=record.stage,
+        goal_id=record.goal_id,
+        created_at=_as_utc(record.created_at),
+        answered_at=_as_utc(record.answered_at) if record.answered_at else None,
+    )
+
+
+def _run_response(
+    record: RunRecord,
+    last_seq: int = 0,
+    pending_input_request: RunInputRequestRecord | None = None,
+) -> RunResponse:
     return RunResponse(
         id=record.id,
         project_id=record.project_id,
@@ -129,6 +302,14 @@ def _run_response(record: RunRecord, last_seq: int = 0) -> RunResponse:
         cancel_requested_at=record.cancel_requested_at,
         error_code=record.error_code,
         preview_url=record.preview_url,
+        pending_input_request=(
+            _input_request_response(pending_input_request)
+            if pending_input_request is not None
+            else None
+        ),
+        execution_started_at=(
+            _as_utc(record.execution_started_at) if record.execution_started_at else None
+        ),
         created_at=record.created_at,
         updated_at=record.updated_at,
     )
@@ -213,7 +394,7 @@ class Repository:
         self.database = database
 
     async def initialize(self) -> None:
-        await self.database.create_all()
+        await self.database.upgrade()
 
     async def create_guest_session(self, ttl_hours: int = 24 * 14) -> SessionRecord:
         record = SessionRecord(
@@ -228,25 +409,124 @@ class Repository:
 
     async def get_session(self, session_id: str) -> SessionRecord:
         async with self.database.session_factory() as session:
-            record = await session.get(SessionRecord, session_id)
-            if record is None or _is_expired(record.expires_at):
-                raise NotFoundError("session not found or expired")
-            return record
+            return await self._active_session_in_session(session, session_id)
+
+    async def register_user(
+        self,
+        email: str,
+        password: str,
+        display_name: str | None = None,
+        *,
+        claim_guest_session_id: str | None = None,
+        ttl_hours: int = 24 * 30,
+    ) -> tuple[UserRecord, SessionRecord]:
+        normalized_email = normalize_email(email)
+        password_hash = await asyncio.to_thread(hash_password, password)
+        name = display_name.strip() if display_name else normalized_email.partition("@")[0]
+        now = utcnow()
+        user = UserRecord(
+            id=uuid7(),
+            email=normalized_email,
+            display_name=name,
+            password_hash=password_hash,
+            created_at=now,
+            updated_at=now,
+        )
+        async with self.database.session_factory() as session:
+            session.add(user)
+            try:
+                await session.flush()
+            except IntegrityError as exc:
+                await session.rollback()
+                raise ConflictError("an account with this email already exists") from exc
+            auth_session = await self._issue_user_session_in_session(
+                session,
+                user.id,
+                claim_guest_session_id=claim_guest_session_id,
+                ttl_hours=ttl_hours,
+            )
+            await session.commit()
+            return user, auth_session
+
+    async def authenticate_user(
+        self,
+        email: str,
+        password: str,
+        *,
+        claim_guest_session_id: str | None = None,
+        ttl_hours: int = 24 * 30,
+    ) -> tuple[UserRecord, SessionRecord]:
+        normalized_email = normalize_email(email)
+        async with self.database.session_factory() as session:
+            user = await session.scalar(select(UserRecord).where(UserRecord.email == normalized_email))
+            valid = await asyncio.to_thread(
+                verify_password,
+                password,
+                user.password_hash if user is not None else None,
+            )
+            if user is None or not valid:
+                raise AuthenticationError("email or password is incorrect")
+            auth_session = await self._issue_user_session_in_session(
+                session,
+                user.id,
+                claim_guest_session_id=claim_guest_session_id,
+                ttl_hours=ttl_hours,
+            )
+            await session.commit()
+            return user, auth_session
+
+    async def get_current_user(self, session_id: str) -> UserRecord:
+        async with self.database.session_factory() as session:
+            auth_session = await self._active_session_in_session(session, session_id)
+            if auth_session.user_id is None or auth_session.kind != "user":
+                raise AuthenticationError("an authenticated account is required")
+            user = await session.get(UserRecord, auth_session.user_id)
+            if user is None:
+                raise AuthenticationError("the session account no longer exists")
+            return user
+
+    async def revoke_session(self, session_id: str) -> None:
+        async with self.database.session_factory() as session:
+            record = await self._active_session_in_session(
+                session,
+                session_id,
+                for_update=True,
+            )
+            record.revoked_at = utcnow()
+            await session.commit()
 
     async def create_project(self, owner_session_id: str, title: str) -> ProjectResponse:
-        await self.get_session(owner_session_id)
-        record = ProjectRecord(id=uuid7(), owner_session_id=owner_session_id, title=title.strip())
         async with self.database.session_factory() as session:
+            await self._active_session_in_session(session, owner_session_id)
+            record = ProjectRecord(
+                id=uuid7(),
+                owner_session_id=owner_session_id,
+                title=title.strip(),
+            )
             session.add(record)
             await session.commit()
             return _project_response(record)
 
     async def list_projects(self, owner_session_id: str) -> list[ProjectResponse]:
         async with self.database.session_factory() as session:
+            requester = await self._active_session_in_session(session, owner_session_id)
+            ownership_filter = ProjectRecord.owner_session_id == owner_session_id
+            statement = select(ProjectRecord)
+            if (
+                requester.kind == "user"
+                and requester.user_id is not None
+                and await session.get(UserRecord, requester.user_id) is not None
+            ):
+                statement = statement.join(
+                    SessionRecord,
+                    ProjectRecord.owner_session_id == SessionRecord.id,
+                )
+                ownership_filter = and_(
+                    SessionRecord.kind == "user",
+                    SessionRecord.user_id == requester.user_id,
+                )
             result = await session.scalars(
-                select(ProjectRecord)
-                .where(ProjectRecord.owner_session_id == owner_session_id)
-                .order_by(ProjectRecord.updated_at.desc())
+                statement.where(ownership_filter).order_by(ProjectRecord.updated_at.desc())
             )
             return [_project_response(record) for record in result]
 
@@ -255,7 +535,11 @@ class Repository:
             record = await session.get(ProjectRecord, project_id)
             if record is None:
                 raise NotFoundError("project not found")
-            if owner_session_id is not None and record.owner_session_id != owner_session_id:
+            if owner_session_id is not None and not await self._session_can_access_project(
+                session,
+                record,
+                owner_session_id,
+            ):
                 raise OwnershipError("project does not belong to this session")
             return record
 
@@ -292,12 +576,21 @@ class Repository:
                     raise RuntimeError("idempotent message points to a missing run")
                 return _message_response(existing_message), await self._run_with_seq(session, existing_run), False
 
+            if project.active_run_id is not None:
+                active = await session.get(RunRecord, project.active_run_id)
+                if active is not None and active.status == RunStatus.waiting_for_user.value:
+                    raise ConflictError(
+                        "the active run is waiting for an answer; use its input-request endpoint"
+                    )
+
+            run_id = uuid7()
             run = RunRecord(
-                id=uuid7(),
+                id=run_id,
                 project_id=project_id,
                 base_version_id=base_version_id or project.head_version_id,
                 status=RunStatus.queued.value,
                 phase=RunPhase.queued.value,
+                pi_session_id=f"fomo-{run_id}",
             )
             message = MessageRecord(
                 id=uuid7(),
@@ -347,6 +640,11 @@ class Repository:
             active_run = (
                 await self._run_with_seq(session, active_record) if active_record is not None else None
             )
+            pending_input_request = (
+                await self._pending_input_request_in_session(session, active_record.id)
+                if active_record is not None
+                else None
+            )
             # `active_run` is deliberately null once a run becomes terminal,
             # but refresh still needs the latest completed run's visible trace
             # to reconstruct role progress in the workbench.
@@ -369,6 +667,11 @@ class Repository:
             artifact_refs = await self._artifact_refs_in_session(
                 session, display_record.id if display_record is not None else None
             )
+            goal_graph = (
+                await self._goal_graph_read_projection_in_session(session, display_record.id)
+                if display_record is not None
+                else None
+            )
             return {
                 "project": _project_response(project),
                 "messages": [_message_response(item) for item in messages],
@@ -385,6 +688,12 @@ class Repository:
                 "trace": trace,
                 "preview": preview,
                 "artifact_refs": artifact_refs,
+                "goal_graph": goal_graph,
+                "pending_input_request": (
+                    _input_request_response(pending_input_request)
+                    if pending_input_request is not None
+                    else None
+                ),
             }
 
     async def get_run(self, run_id: str) -> RunResponse:
@@ -396,10 +705,1296 @@ class Repository:
 
     async def get_run_prompt(self, run_id: str) -> str:
         async with self.database.session_factory() as session:
-            message = await session.scalar(select(MessageRecord).where(MessageRecord.run_id == run_id))
+            message = await session.scalar(
+                select(MessageRecord)
+                .where(MessageRecord.run_id == run_id, MessageRecord.role == "user")
+                .order_by(MessageRecord.created_at.asc(), MessageRecord.id.asc())
+                .limit(1)
+            )
             if message is None:
                 raise NotFoundError("run message not found")
             return message.content
+
+    async def ensure_pi_session_id(
+        self,
+        run_id: str,
+        proposed_session_id: str,
+        *,
+        lease_token: str,
+    ) -> str:
+        if not proposed_session_id or len(proposed_session_id) > 128:
+            raise ValueError("Pi session id must be nonempty and bounded")
+        async with self.database.session_factory() as session:
+            run = await self._run_for_write(session, run_id, lease_token=lease_token)
+            if run.pi_session_id is None:
+                run.pi_session_id = proposed_session_id
+                run.updated_at = utcnow()
+                await session.commit()
+                return proposed_session_id
+            return run.pi_session_id
+
+    async def wait_for_user_input(
+        self,
+        run_id: str,
+        draft: UserInputRequestDraft | Mapping[str, Any],
+        *,
+        continuation_key: str,
+        continuation_context: Mapping[str, Any] | None,
+        stage: str,
+        goal_id: str | None,
+        pi_session_id: str,
+        sandbox_id: str,
+        lease_token: str,
+    ) -> UserInputRequestResponse:
+        """Persist a semantic Pi question and relinquish the worker lease.
+
+        The Pi turn has already settled before this transaction begins. The
+        worker therefore never blocks on user input and the exact continuation
+        identity is durable before the run becomes externally answerable.
+        """
+
+        request = (
+            draft
+            if isinstance(draft, UserInputRequestDraft)
+            else UserInputRequestDraft.model_validate(draft)
+        )
+        if stage not in {"planning", "building", "repairing"}:
+            raise ValueError("input request stage is unsupported")
+        if not continuation_key or len(continuation_key) > 96:
+            raise ValueError("continuation key must be nonempty and bounded")
+        if goal_id is not None and (not goal_id or len(goal_id) > 64):
+            raise ValueError("continuation goal id must be bounded")
+        context = dict(continuation_context or {})
+        try:
+            encoded_context = json.dumps(
+                context,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise ValueError("continuation context must be valid JSON") from exc
+        if len(encoded_context) > 2 * 1024 * 1024:
+            raise ValueError("continuation context exceeds its durable limit")
+
+        async with self.database.session_factory() as session:
+            run = await self._run_for_write(session, run_id, lease_token=lease_token)
+            if run.sandbox_id != sandbox_id:
+                raise ConflictError("continuation sandbox no longer matches the active run")
+            if run.pi_session_id is None:
+                run.pi_session_id = pi_session_id
+            elif run.pi_session_id != pi_session_id:
+                raise ConflictError("continuation Pi session does not match the active run")
+            pending = await self._pending_input_request_in_session(session, run_id)
+            if pending is not None:
+                raise ConflictError("run already has a pending input request")
+
+            now = utcnow()
+            record = RunInputRequestRecord(
+                id=uuid7(),
+                run_id=run_id,
+                question=request.question,
+                choices=list(request.choices),
+                allow_freeform=request.allow_freeform,
+                status="pending",
+                stage=stage,
+                goal_id=goal_id,
+                created_at=now,
+            )
+            session.add(record)
+            run.continuation_request_id = record.id
+            run.continuation_key = continuation_key
+            run.continuation_stage = stage
+            run.continuation_goal_id = goal_id
+            run.continuation_context = context
+            run.status = RunStatus.waiting_for_user.value
+            run.lease_owner = None
+            run.lease_expires_at = None
+            run.updated_at = now
+            project = await session.get(ProjectRecord, run.project_id, with_for_update=True)
+            if project is not None:
+                project.active_run_id = run.id
+                project.status = RunStatus.waiting_for_user.value
+                project.updated_at = now
+            await self._append_event_in_session(
+                session,
+                run,
+                "run.input_requested",
+                role="pi",
+                payload={
+                    "requestId": record.id,
+                    "question": record.question,
+                    "choices": list(record.choices),
+                    "allowFreeform": record.allow_freeform,
+                    "stage": stage,
+                    "goalId": goal_id,
+                },
+            )
+            await self._append_event_in_session(
+                session,
+                run,
+                "run.status_changed",
+                payload={"status": run.status, "phase": run.phase},
+            )
+            await session.commit()
+            return _input_request_response(record)
+
+    async def get_pending_input_request(
+        self, run_id: str
+    ) -> UserInputRequestResponse | None:
+        async with self.database.session_factory() as session:
+            if await session.get(RunRecord, run_id) is None:
+                raise NotFoundError("run not found")
+            record = await self._pending_input_request_in_session(session, run_id)
+            return _input_request_response(record) if record is not None else None
+
+    async def answer_user_input(
+        self,
+        run_id: str,
+        request_id: str,
+        owner_session_id: str,
+        client_message_id: str,
+        answer: str,
+    ) -> tuple[MessageResponse, UserInputRequestResponse, RunResponse, bool]:
+        """Answer one pending request idempotently and requeue the same run."""
+
+        if not answer.strip():
+            raise ValueError("answer must be non-blank")
+        async with self.database.session_factory() as session:
+            run = await session.get(RunRecord, run_id, with_for_update=True)
+            if run is None:
+                raise NotFoundError("run not found")
+            await self._require_project_in_session(
+                session, run.project_id, owner_session_id
+            )
+            request = await session.get(
+                RunInputRequestRecord, request_id, with_for_update=True
+            )
+            if request is None or request.run_id != run_id:
+                raise NotFoundError("input request not found")
+
+            existing_message = await session.scalar(
+                select(MessageRecord).where(
+                    MessageRecord.project_id == run.project_id,
+                    MessageRecord.client_message_id == client_message_id,
+                )
+            )
+            if existing_message is not None:
+                if (
+                    existing_message.run_id != run_id
+                    or request.answer_message_id != existing_message.id
+                ):
+                    raise ConflictError("client message id belongs to another operation")
+                return (
+                    _message_response(existing_message),
+                    _input_request_response(request),
+                    await self._run_with_seq(session, run),
+                    False,
+                )
+
+            if request.status != "pending":
+                raise ConflictError("input request is no longer pending")
+            if run.status != RunStatus.waiting_for_user.value:
+                raise ConflictError("run is not waiting for user input")
+            if run.continuation_request_id != request.id:
+                raise ConflictError("input request is not the active continuation")
+
+            answer_content = answer
+            if not request.allow_freeform:
+                normalized_answer = answer.strip()
+                if normalized_answer not in request.choices:
+                    raise ConflictError(
+                        "answer must exactly match one of the input request choices"
+                    )
+                # Persist the canonical choice value, not transport whitespace.
+                answer_content = normalized_answer
+
+            now = utcnow()
+            message = MessageRecord(
+                id=uuid7(),
+                project_id=run.project_id,
+                role="user",
+                content=answer_content,
+                client_message_id=client_message_id,
+                run_id=run.id,
+                created_at=now,
+            )
+            session.add(message)
+            request.status = "answered"
+            request.answer_message_id = message.id
+            request.answered_at = now
+            run.status = RunStatus.queued.value
+            run.lease_owner = None
+            run.lease_expires_at = None
+            run.updated_at = now
+            project = await session.get(ProjectRecord, run.project_id, with_for_update=True)
+            if project is not None:
+                project.active_run_id = run.id
+                project.status = RunStatus.queued.value
+                project.updated_at = now
+            await self._append_event_in_session(
+                session,
+                run,
+                "run.input_answered",
+                role="user",
+                payload={"requestId": request.id, "messageId": message.id},
+            )
+            await self._append_event_in_session(
+                session,
+                run,
+                "run.status_changed",
+                payload={"status": run.status, "phase": run.phase},
+            )
+            await session.commit()
+            return (
+                _message_response(message),
+                _input_request_response(request),
+                await self._run_with_seq(session, run),
+                True,
+            )
+
+    async def get_run_continuation(self, run_id: str) -> RunContinuation | None:
+        async with self.database.session_factory() as session:
+            run = await session.get(RunRecord, run_id)
+            if run is None:
+                raise NotFoundError("run not found")
+            cursor_fields = (
+                run.continuation_key,
+                run.continuation_stage,
+                run.continuation_goal_id,
+                run.continuation_context,
+            )
+            if run.continuation_request_id is None:
+                if any(value is not None for value in cursor_fields):
+                    raise ConflictError("run continuation cursor is incomplete")
+                return None
+            required_identity = (
+                run.continuation_request_id,
+                run.continuation_key,
+                run.continuation_stage,
+                run.pi_session_id,
+                run.sandbox_id,
+            )
+            if any(
+                not isinstance(value, str) or not value
+                for value in required_identity
+            ):
+                raise ConflictError("run continuation identity is incomplete")
+            request = await session.get(
+                RunInputRequestRecord, run.continuation_request_id
+            )
+            if request is None or request.run_id != run_id:
+                raise ConflictError("run continuation request is missing")
+            answer: str | None = None
+            if request.answer_message_id is not None:
+                message = await session.get(MessageRecord, request.answer_message_id)
+                if message is None or message.run_id != run_id or message.role != "user":
+                    raise ConflictError("run continuation answer is missing")
+                answer = message.content
+            return RunContinuation(
+                request_id=request.id,
+                request_status=request.status,
+                continuation_key=run.continuation_key,
+                stage=run.continuation_stage,
+                goal_id=run.continuation_goal_id,
+                context=dict(run.continuation_context or {}),
+                question=request.question,
+                answer=answer,
+                pi_session_id=run.pi_session_id,
+                sandbox_id=run.sandbox_id,
+            )
+
+    async def complete_run_continuation(
+        self,
+        run_id: str,
+        request_id: str,
+        *,
+        lease_token: str,
+    ) -> None:
+        async with self.database.session_factory() as session:
+            run = await self._run_for_write(session, run_id, lease_token=lease_token)
+            if run.continuation_request_id != request_id:
+                raise ConflictError("run continuation changed before completion")
+            request = await session.get(RunInputRequestRecord, request_id)
+            if request is None or request.status != "answered":
+                raise ConflictError("run continuation has not been answered")
+            stage = run.continuation_stage
+            goal_id = run.continuation_goal_id
+            run.continuation_request_id = None
+            run.continuation_key = None
+            run.continuation_stage = None
+            run.continuation_goal_id = None
+            run.continuation_context = None
+            run.updated_at = utcnow()
+            await self._append_event_in_session(
+                session,
+                run,
+                "run.resumed",
+                payload={"requestId": request_id, "stage": stage, "goalId": goal_id},
+            )
+            await session.commit()
+
+    async def create_goal_graph(
+        self,
+        project_id: str,
+        run_id: str,
+        draft: GoalGraphDraft | Mapping[str, Any] | str | bytes,
+        *,
+        provenance: Mapping[str, Any] | None = None,
+        reason: str | None = None,
+        lease_token: str | None = None,
+    ) -> GoalGraphProjection:
+        """Persist an immutable revision and mutable node lifecycle projection."""
+        validated = draft if isinstance(draft, GoalGraphDraft) else parse_goal_graph_draft(draft)
+        graph = materialize_goal_graph(validated)
+        canonical = serialize_goal_graph_draft(validated)
+        content_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        now = utcnow()
+        async with self.database.session_factory() as session:
+            run = await self._run_for_write(session, run_id, lease_token=lease_token)
+            if run.project_id != project_id:
+                raise ConflictError("goal graph project does not match its run")
+            if await session.scalar(select(GoalGraphRecord.id).where(GoalGraphRecord.run_id == run_id)):
+                raise ConflictError("run already has a goal graph")
+            superseded_graph_ids = await self._supersede_terminal_project_graphs(
+                session, project_id, excluding_run_id=run_id
+            )
+            graph_record = GoalGraphRecord(
+                id=uuid7(),
+                project_id=project_id,
+                run_id=run_id,
+                schema_version=validated.schema_version,
+                current_revision=1,
+                status=graph.status.value,
+                created_at=now,
+                updated_at=now,
+            )
+            revision = GoalGraphRevisionRecord(
+                id=uuid7(),
+                graph_id=graph_record.id,
+                revision=1,
+                product_outcome=validated.product_outcome,
+                quality_bar=graph.quality_bar.model_dump(mode="json", by_alias=True),
+                content_hash=content_hash,
+                reason=reason.strip() if reason and reason.strip() else None,
+                provenance=dict(provenance or {"createdBy": f"run:{run_id}"}),
+                created_by_run_id=run_id,
+                created_at=now,
+            )
+            session.add_all([graph_record, revision])
+            nodes: list[GoalNodeRecord] = []
+            for position, goal in enumerate(graph.goals):
+                node = GoalNodeRecord(
+                    id=uuid7(),
+                    graph_id=graph_record.id,
+                    revision_id=revision.id,
+                    project_id=project_id,
+                    run_id=run_id,
+                    goal_key=goal.goal_id,
+                    position=position,
+                    title=goal.title,
+                    product_outcome=goal.product_outcome,
+                    user_visible=goal.user_visible,
+                    depends_on=list(goal.depends_on),
+                    acceptance=goal.acceptance.model_dump(mode="json", by_alias=True),
+                    status=goal.status.value,
+                )
+                nodes.append(node)
+                session.add(node)
+            read_projection = self._goal_graph_read_projection(
+                graph_record,
+                revision,
+                nodes,
+                checkpoint_by_node={},
+                evidence_count_by_key={},
+            )
+            await self._append_event_in_session(
+                session,
+                run,
+                "goal_graph.created",
+                payload={
+                    "graphId": graph_record.id,
+                    "revision": 1,
+                    "goalCount": len(nodes),
+                    "goalGraph": read_projection,
+                },
+            )
+            if superseded_graph_ids:
+                await self._append_event_in_session(
+                    session,
+                    run,
+                    "goal_graph.prior_superseded",
+                    payload={"graphIds": superseded_graph_ids, "supersededBy": graph_record.id},
+                )
+            await session.commit()
+            return self._goal_graph_projection(graph_record, revision, nodes)
+
+    async def get_goal_graph_for_run(self, run_id: str) -> GoalGraphProjection | None:
+        """Return None for a P0 run that has no GoalGraph."""
+        async with self.database.session_factory() as session:
+            return await self._goal_graph_for_run_in_session(session, run_id)
+
+    async def get_goal_graph(self, run_id: str) -> GoalGraphProjection | None:
+        return await self.get_goal_graph_for_run(run_id)
+
+    async def activate_goal(
+        self,
+        run_id: str,
+        goal_id: str,
+        *,
+        lease_token: str | None = None,
+    ) -> GoalGraphProjection:
+        async with self.database.session_factory() as session:
+            run = await self._run_for_write(session, run_id, lease_token=lease_token)
+            graph, revision, nodes, target = await self._goal_write_context(session, run_id, goal_id)
+            current_goal = await session.scalar(
+                select(GoalNodeRecord.id).where(
+                    GoalNodeRecord.project_id == run.project_id,
+                    GoalNodeRecord.status.in_(
+                        [GoalStatus.ACTIVE.value, GoalStatus.CLAIMED.value]
+                    ),
+                )
+            )
+            if current_goal is not None:
+                raise ConflictError("project already has an active goal")
+            status_by_key = {node.goal_key: node.status for node in nodes}
+            if any(status_by_key.get(key) != GoalStatus.VERIFIED.value for key in target.depends_on):
+                raise ConflictError("goal dependencies are not verified")
+            target.status = transition_goal_status(
+                GoalStatus(target.status), GoalStatus.ACTIVE
+            ).value
+            await self._append_event_in_session(
+                session,
+                run,
+                "goal.activated",
+                payload={"graphId": graph.id, "goalId": goal_id, "revision": revision.revision},
+            )
+            await session.commit()
+            return self._goal_graph_projection(graph, revision, nodes)
+
+    async def claim_goal(
+        self,
+        run_id: str,
+        goal_id: str,
+        *,
+        lease_token: str | None = None,
+    ) -> GoalGraphProjection:
+        async with self.database.session_factory() as session:
+            run = await self._run_for_write(session, run_id, lease_token=lease_token)
+            graph, revision, nodes, target = await self._goal_write_context(session, run_id, goal_id)
+            target.status = transition_goal_status(
+                GoalStatus(target.status), GoalStatus.CLAIMED
+            ).value
+            target.claimed_at = utcnow()
+            await self._append_event_in_session(
+                session,
+                run,
+                "goal.claimed",
+                payload={"graphId": graph.id, "goalId": goal_id, "revision": revision.revision},
+            )
+            await session.commit()
+            return self._goal_graph_projection(graph, revision, nodes)
+
+    async def resume_goal(
+        self,
+        run_id: str,
+        goal_id: str,
+        *,
+        lease_token: str,
+    ) -> GoalGraphProjection:
+        """Fence a resumed worker and return claimed work to executable active state."""
+        async with self.database.session_factory() as session:
+            run = await self._run_for_write(session, run_id, lease_token=lease_token)
+            graph, revision, nodes, target = await self._goal_write_context(
+                session, run_id, goal_id
+            )
+            current = GoalStatus(target.status)
+            if current == GoalStatus.CLAIMED:
+                target.status = transition_goal_status(current, GoalStatus.ACTIVE).value
+            elif current != GoalStatus.ACTIVE:
+                raise ConflictError("only an active or claimed goal can be resumed")
+            await self._append_event_in_session(
+                session,
+                run,
+                "goal.resumed",
+                payload={
+                    "graphId": graph.id,
+                    "goalId": goal_id,
+                    "revision": revision.revision,
+                },
+            )
+            await session.commit()
+            return self._goal_graph_projection(graph, revision, nodes)
+
+    async def terminalize_goal_graph(
+        self,
+        run_id: str,
+        status: GraphStatus | str,
+        *,
+        reason: str,
+        lease_token: str | None = None,
+    ) -> GoalGraphProjection:
+        """Close current and pending goals so a later project run cannot be blocked."""
+        status = GraphStatus(status)
+        if status not in {
+            GraphStatus.FAILED,
+            GraphStatus.CANCELLED,
+            GraphStatus.SUPERSEDED,
+        }:
+            raise ValueError("terminal graph status must be failed, cancelled, or superseded")
+        async with self.database.session_factory() as session:
+            run = await self._run_for_write(session, run_id, lease_token=lease_token)
+            graph = await session.scalar(
+                select(GoalGraphRecord)
+                .where(GoalGraphRecord.run_id == run_id)
+                .with_for_update()
+            )
+            if graph is None:
+                raise NotFoundError("goal graph not found")
+            revision = await self._current_revision_in_session(session, graph)
+            nodes = list(
+                await session.scalars(
+                    select(GoalNodeRecord)
+                    .where(GoalNodeRecord.revision_id == revision.id)
+                    .order_by(GoalNodeRecord.position)
+                    .with_for_update()
+                )
+            )
+            if graph.status == status.value:
+                return self._goal_graph_projection(graph, revision, nodes)
+            target_goal_status = (
+                GoalStatus.FAILED
+                if status == GraphStatus.FAILED
+                else GoalStatus.SUPERSEDED
+            )
+            for node in nodes:
+                current = GoalStatus(node.status)
+                if current in {GoalStatus.ACTIVE, GoalStatus.CLAIMED}:
+                    node.status = transition_goal_status(current, target_goal_status).value
+                    if target_goal_status == GoalStatus.FAILED:
+                        node.failed_at = utcnow()
+                elif current == GoalStatus.PENDING:
+                    node.status = transition_goal_status(
+                        current, GoalStatus.SUPERSEDED
+                    ).value
+            graph.status = transition_graph_status(GraphStatus(graph.status), status).value
+            graph.updated_at = utcnow()
+            goal_graph = await self._goal_graph_read_projection_in_session(
+                session, run_id
+            )
+            await self._append_event_in_session(
+                session,
+                run,
+                f"goal_graph.{status.value}",
+                payload={
+                    "graphId": graph.id,
+                    "status": status.value,
+                    "reason": reason,
+                    "goalGraph": goal_graph,
+                },
+            )
+            await session.commit()
+            return self._goal_graph_projection(graph, revision, nodes)
+
+    async def fail_goal(
+        self,
+        run_id: str,
+        goal_id: str,
+        *,
+        reason: str,
+        lease_token: str | None = None,
+    ) -> GoalGraphProjection:
+        async with self.database.session_factory() as session:
+            run = await self._run_for_write(session, run_id, lease_token=lease_token)
+            graph, revision, nodes, target = await self._goal_write_context(session, run_id, goal_id)
+            target.status = transition_goal_status(
+                GoalStatus(target.status), GoalStatus.FAILED
+            ).value
+            target.failed_at = utcnow()
+            graph.status = transition_graph_status(
+                GraphStatus(graph.status), GraphStatus.FAILED
+            ).value
+            graph.updated_at = utcnow()
+            await self._append_event_in_session(
+                session,
+                run,
+                "goal.failed",
+                payload={"graphId": graph.id, "goalId": goal_id, "reason": reason},
+            )
+            goal_graph = await self._goal_graph_read_projection_in_session(
+                session, run_id
+            )
+            await self._append_event_in_session(
+                session,
+                run,
+                "goal_graph.failed",
+                payload={
+                    "graphId": graph.id,
+                    "status": graph.status,
+                    "reason": reason,
+                    "goalGraph": goal_graph,
+                },
+            )
+            await session.commit()
+            return self._goal_graph_projection(graph, revision, nodes)
+
+    async def record_verified_checkpoint(
+        self,
+        run_id: str,
+        goal_id: str,
+        files: Iterable[Mapping[str, Any] | CheckpointFile],
+        evidence: Iterable[Mapping[str, Any]],
+        *,
+        lease_token: str,
+        commit_sha: str | None = None,
+        snapshot_id: str | None = None,
+        capsule: Mapping[str, Any] | None = None,
+    ) -> VerifiedCheckpoint:
+        """Atomically fence, checkpoint files/evidence, and advance the graph."""
+        normalized_files, manifest_hash = self._normalize_checkpoint_files(files)
+        normalized_evidence = [dict(item) for item in evidence]
+        if not normalized_evidence:
+            raise ValueError("verified checkpoint requires passed evidence")
+        async with self.database.session_factory() as session:
+            run = await self._run_for_write(session, run_id, lease_token=lease_token)
+            if run.cancel_requested_at is not None:
+                raise RunLeaseLost("run cancellation was requested before checkpoint")
+            graph, revision, nodes, target = await self._goal_write_context(session, run_id, goal_id)
+            transition_goal_status(GoalStatus(target.status), GoalStatus.VERIFIED)
+            required_keys = {
+                acceptance_persistence_key(goal_id, item["id"])
+                for item in target.acceptance.get("criteria", [])
+            }
+            supplied_keys: set[str] = set()
+            evidence_keys: set[tuple[str, str]] = set()
+            for item in normalized_evidence:
+                if item.get("status") != "passed":
+                    raise ValueError("verified checkpoint accepts passed evidence only")
+                acceptance_key = item.get("acceptanceKey", item.get("acceptance_key"))
+                kind = item.get("kind")
+                if not isinstance(acceptance_key, str) or not isinstance(kind, str) or not kind:
+                    raise ValueError("evidence requires acceptanceKey and kind")
+                if acceptance_key not in required_keys:
+                    raise ValueError("evidence acceptanceKey is outside the goal scope")
+                if (acceptance_key, kind) in evidence_keys:
+                    raise ValueError("duplicate checkpoint evidence")
+                evidence_keys.add((acceptance_key, kind))
+                supplied_keys.add(acceptance_key)
+            if supplied_keys != required_keys:
+                raise ValueError("every goal acceptance criterion requires passed evidence")
+
+            ordinal = int(
+                await session.scalar(
+                    select(func.coalesce(func.max(CheckpointRecord.ordinal), 0)).where(
+                        CheckpointRecord.graph_id == graph.id
+                    )
+                )
+                or 0
+            ) + 1
+            capsule_payload = dict(capsule or {})
+            checkpoint = CheckpointRecord(
+                id=uuid7(),
+                graph_id=graph.id,
+                revision_id=revision.id,
+                goal_node_id=target.id,
+                project_id=run.project_id,
+                run_id=run.id,
+                ordinal=ordinal,
+                manifest_hash=manifest_hash,
+                commit_sha=commit_sha,
+                snapshot_id=snapshot_id,
+                capsule=capsule_payload,
+            )
+            session.add(checkpoint)
+            # IDs are assigned client-side, but without ORM relationships the
+            # unit of work cannot infer instance-level ordering. Flush the
+            # checkpoint parent before its manifest/evidence children so
+            # SQLite foreign-key enforcement matches PostgreSQL.
+            await session.flush()
+            for item in normalized_files:
+                session.add(
+                    CheckpointFileRecord(
+                        id=uuid7(),
+                        checkpoint_id=checkpoint.id,
+                        path=item.path,
+                        sha256=item.sha256,
+                        size=item.size,
+                        content_text=item.content_text,
+                    )
+                )
+            for item in normalized_evidence:
+                artifact_id = item.get("artifactId", item.get("artifact_id"))
+                if artifact_id is not None:
+                    artifact = await session.get(ArtifactRecord, artifact_id)
+                    if artifact is None or artifact.run_id != run.id:
+                        raise ValueError("checkpoint evidence artifact must belong to the same run")
+                session.add(
+                    GoalEvidenceRecord(
+                        id=uuid7(),
+                        checkpoint_id=checkpoint.id,
+                        graph_id=graph.id,
+                        goal_node_id=target.id,
+                        project_id=run.project_id,
+                        run_id=run.id,
+                        acceptance_key=item.get("acceptanceKey", item.get("acceptance_key")),
+                        kind=item["kind"],
+                        status="passed",
+                        artifact_id=artifact_id,
+                        reference=item.get("reference", item.get("ref")),
+                        summary=str(item.get("summary", "")),
+                        payload=dict(item.get("payload") or {}),
+                    )
+                )
+
+            paths_by_goal = capsule_payload.get("goalChangedPathsByGoal")
+            raw_goal_paths = (
+                paths_by_goal.get(goal_id, []) if isinstance(paths_by_goal, dict) else []
+            )
+            snapshot_paths = {item.path for item in normalized_files}
+            implementation_paths = sorted(
+                {
+                    self._validated_file_path(path)
+                    for path in raw_goal_paths
+                    if isinstance(path, str)
+                    and path in snapshot_paths
+                    and _is_business_implementation_path(path)
+                }
+            )
+            acceptance_keys = sorted(required_keys)
+            existing_pairs = (
+                {
+                    (source_ref, target_ref)
+                    for source_ref, target_ref in (
+                        await session.execute(
+                        select(
+                            TraceLinkRecord.source_ref,
+                            TraceLinkRecord.target_ref,
+                        ).where(
+                            TraceLinkRecord.run_id == run.id,
+                            TraceLinkRecord.source_kind == "acceptance_criterion",
+                            TraceLinkRecord.source_ref.in_(acceptance_keys),
+                            TraceLinkRecord.relation == "implemented_in",
+                            TraceLinkRecord.target_kind == "file",
+                            TraceLinkRecord.target_ref.in_(implementation_paths),
+                        )
+                    )
+                    ).all()
+                }
+                if acceptance_keys and implementation_paths
+                else set()
+            )
+            for acceptance_key in acceptance_keys:
+                for path in implementation_paths:
+                    if (acceptance_key, path) in existing_pairs:
+                        continue
+                    trace_link = TraceLinkRecord(
+                        id=uuid7(),
+                        run_id=run.id,
+                        source_kind="acceptance_criterion",
+                        source_ref=acceptance_key,
+                        relation="implemented_in",
+                        target_kind="file",
+                        target_ref=path,
+                        metadata_json={"goalId": goal_id, "source": "goal_checkpoint"},
+                    )
+                    session.add(trace_link)
+                    await self._append_event_in_session(
+                        session,
+                        run,
+                        "trace.updated",
+                        payload={"traceLinkId": trace_link.id},
+                    )
+
+            target.status = GoalStatus.VERIFIED.value
+            target.verified_at = utcnow()
+            await self._append_event_in_session(
+                session,
+                run,
+                "checkpoint.recorded",
+                payload={
+                    "checkpointId": checkpoint.id,
+                    "graphId": graph.id,
+                    "goalId": goal_id,
+                    "manifestHash": manifest_hash,
+                    "fileCount": len(normalized_files),
+                },
+            )
+            next_goal = self._next_eligible_goal(nodes)
+            if next_goal is None:
+                if not all(node.status == GoalStatus.VERIFIED.value for node in nodes):
+                    raise ConflictError("goal graph has pending nodes with unsatisfied dependencies")
+                graph.status = transition_graph_status(
+                    GraphStatus(graph.status), GraphStatus.VERIFIED
+                ).value
+                graph.updated_at = utcnow()
+                await self._append_event_in_session(
+                    session,
+                    run,
+                    "goal_graph.verified",
+                    payload={"graphId": graph.id, "revision": revision.revision},
+                )
+            else:
+                next_goal.status = transition_goal_status(
+                    GoalStatus(next_goal.status), GoalStatus.ACTIVE
+                ).value
+                await self._append_event_in_session(
+                    session,
+                    run,
+                    "goal.activated",
+                    payload={
+                        "graphId": graph.id,
+                        "goalId": next_goal.goal_key,
+                        "revision": revision.revision,
+                    },
+                )
+            goal_graph = await self._goal_graph_read_projection_in_session(
+                session, run_id
+            )
+            await self._append_event_in_session(
+                session,
+                run,
+                "goal.verified",
+                payload={
+                    "graphId": graph.id,
+                    "goalId": goal_id,
+                    "checkpointId": checkpoint.id,
+                    "goalGraph": goal_graph,
+                },
+            )
+            await session.commit()
+            return await self._checkpoint_projection_in_session(session, checkpoint, target.goal_key)
+
+    async def get_latest_verified_checkpoint(self, run_id: str) -> VerifiedCheckpoint | None:
+        async with self.database.session_factory() as session:
+            checkpoint = await session.scalar(
+                select(CheckpointRecord)
+                .where(CheckpointRecord.run_id == run_id)
+                .order_by(CheckpointRecord.ordinal.desc())
+                .limit(1)
+            )
+            if checkpoint is None:
+                return None
+            node = await session.get(GoalNodeRecord, checkpoint.goal_node_id)
+            if node is None or node.status != GoalStatus.VERIFIED.value:
+                raise ManifestIntegrityError("checkpoint no longer belongs to a verified goal")
+            return await self._checkpoint_projection_in_session(session, checkpoint, node.goal_key)
+
+    async def get_recent_verified_checkpoint(self, run_id: str) -> VerifiedCheckpoint | None:
+        return await self.get_latest_verified_checkpoint(run_id)
+
+    async def record_usage_entry(
+        self,
+        run_id: str,
+        request_id: str,
+        *,
+        lease_token: str,
+        provider: str,
+        model: str,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+        tool_calls: int = 0,
+        cost_micros: int = 0,
+        metadata: Mapping[str, Any] | None = None,
+        goal_id: str | None = None,
+    ) -> UsageLedgerResult:
+        if not request_id.strip() or len(request_id) > 160:
+            raise ValueError("request_id must be nonempty and bounded")
+        counters = (
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            tool_calls,
+            cost_micros,
+        )
+        if any(type(value) is not int or value < 0 for value in counters):
+            raise ValueError("usage counters must be nonnegative integers")
+        async with self.database.session_factory() as session:
+            run = await self._run_for_write(session, run_id, lease_token=lease_token)
+            existing = await session.scalar(
+                select(UsageEntryRecord).where(
+                    UsageEntryRecord.run_id == run_id,
+                    UsageEntryRecord.request_id == request_id,
+                )
+            )
+            if existing is not None:
+                return UsageLedgerResult(entry_id=existing.id, created=False)
+            graph = await session.scalar(
+                select(GoalGraphRecord).where(GoalGraphRecord.run_id == run_id)
+            )
+            node = None
+            if goal_id is not None:
+                if graph is None:
+                    raise ConflictError("P0 run has no goal for scoped usage")
+                revision = await self._current_revision_in_session(session, graph)
+                node = await session.scalar(
+                    select(GoalNodeRecord).where(
+                        GoalNodeRecord.revision_id == revision.id,
+                        GoalNodeRecord.goal_key == goal_id,
+                    )
+                )
+                if node is None:
+                    raise NotFoundError("goal not found")
+            record = UsageEntryRecord(
+                id=uuid7(),
+                project_id=run.project_id,
+                run_id=run_id,
+                graph_id=graph.id if graph else None,
+                goal_node_id=node.id if node else None,
+                request_id=request_id,
+                provider=provider,
+                model=model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_read_tokens=cache_read_tokens,
+                cache_write_tokens=cache_write_tokens,
+                tool_calls=tool_calls,
+                cost_micros=cost_micros,
+                metadata_json=dict(metadata or {}),
+            )
+            session.add(record)
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                existing = await session.scalar(
+                    select(UsageEntryRecord).where(
+                        UsageEntryRecord.run_id == run_id,
+                        UsageEntryRecord.request_id == request_id,
+                    )
+                )
+                if existing is None:
+                    raise
+                return UsageLedgerResult(entry_id=existing.id, created=False)
+            return UsageLedgerResult(entry_id=record.id, created=True)
+
+    async def get_usage_totals(self, run_id: str) -> UsageTotals:
+        async with self.database.session_factory() as session:
+            if await session.get(RunRecord, run_id) is None:
+                raise NotFoundError("run not found")
+            row = (
+                await session.execute(
+                    select(
+                        func.coalesce(func.sum(UsageEntryRecord.input_tokens), 0),
+                        func.coalesce(func.sum(UsageEntryRecord.output_tokens), 0),
+                        func.coalesce(func.sum(UsageEntryRecord.cache_read_tokens), 0),
+                        func.coalesce(func.sum(UsageEntryRecord.cache_write_tokens), 0),
+                        func.coalesce(func.sum(UsageEntryRecord.tool_calls), 0),
+                        func.coalesce(func.sum(UsageEntryRecord.cost_micros), 0),
+                    ).where(UsageEntryRecord.run_id == run_id)
+                )
+            ).one()
+            return UsageTotals(
+                input_tokens=int(row[0]),
+                output_tokens=int(row[1]),
+                cache_read_tokens=int(row[2]),
+                cache_write_tokens=int(row[3]),
+                tool_calls=int(row[4]),
+                cost_micros=int(row[5]),
+            )
+
+    async def record_usage(self, run_id: str, request_id: str, **values: Any) -> UsageLedgerResult:
+        return await self.record_usage_entry(run_id, request_id, **values)
+
+    async def reserve_usage_entry(
+        self,
+        run_id: str,
+        request_id: str,
+        *,
+        lease_token: str,
+        provider: str,
+        model: str,
+        metadata: Mapping[str, Any] | None = None,
+        goal_id: str | None = None,
+    ) -> str:
+        """Reserve one provider request while the caller owns the run lease."""
+        if not request_id.strip() or len(request_id) > 160:
+            raise ValueError("request_id must be nonempty and bounded")
+        async with self.database.session_factory() as session:
+            run = await self._run_for_write(session, run_id, lease_token=lease_token)
+            existing = await session.scalar(
+                select(UsageEntryRecord).where(
+                    UsageEntryRecord.run_id == run_id,
+                    UsageEntryRecord.request_id == request_id,
+                )
+            )
+            if existing is not None:
+                token = existing.metadata_json.get("_usageReservationToken")
+                if (
+                    not isinstance(token, str)
+                    or existing.provider != provider
+                    or existing.model != model
+                ):
+                    raise ConflictError("usage request id is already bound differently")
+                return token
+
+            graph = await session.scalar(
+                select(GoalGraphRecord).where(GoalGraphRecord.run_id == run_id)
+            )
+            node = None
+            if goal_id is not None:
+                if graph is None:
+                    raise ConflictError("P0 run has no goal for scoped usage")
+                revision = await self._current_revision_in_session(session, graph)
+                node = await session.scalar(
+                    select(GoalNodeRecord).where(
+                        GoalNodeRecord.revision_id == revision.id,
+                        GoalNodeRecord.goal_key == goal_id,
+                    )
+                )
+                if node is None:
+                    raise NotFoundError("goal not found")
+            reservation_token = uuid7()
+            reservation_metadata = dict(metadata or {})
+            reservation_metadata.update(
+                {
+                    "_usageReservationToken": reservation_token,
+                    "_usageSettled": False,
+                }
+            )
+            session.add(
+                UsageEntryRecord(
+                    id=uuid7(),
+                    project_id=run.project_id,
+                    run_id=run_id,
+                    graph_id=graph.id if graph else None,
+                    goal_node_id=node.id if node else None,
+                    request_id=request_id,
+                    provider=provider,
+                    model=model,
+                    metadata_json=reservation_metadata,
+                )
+            )
+            await session.commit()
+            return reservation_token
+
+    async def settle_usage_entry(
+        self,
+        run_id: str,
+        request_id: str,
+        *,
+        usage_token: str,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+        tool_calls: int = 0,
+        cost_micros: int = 0,
+    ) -> UsageLedgerResult:
+        """Settle actual usage after provider work, even if the run lease was lost."""
+        counters = (
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            tool_calls,
+            cost_micros,
+        )
+        if any(type(value) is not int or value < 0 for value in counters):
+            raise ValueError("usage counters must be nonnegative integers")
+        async with self.database.session_factory() as session:
+            record = await session.scalar(
+                select(UsageEntryRecord)
+                .where(
+                    UsageEntryRecord.run_id == run_id,
+                    UsageEntryRecord.request_id == request_id,
+                )
+                .with_for_update()
+            )
+            if record is None:
+                raise NotFoundError("usage reservation not found")
+            metadata = dict(record.metadata_json)
+            if metadata.get("_usageReservationToken") != usage_token:
+                raise ConflictError("usage reservation token does not match")
+            recorded = (
+                record.input_tokens,
+                record.output_tokens,
+                record.cache_read_tokens,
+                record.cache_write_tokens,
+                record.tool_calls,
+                record.cost_micros,
+            )
+            if metadata.get("_usageSettled") is True:
+                if recorded != counters:
+                    raise ConflictError("usage request was already settled differently")
+                return UsageLedgerResult(entry_id=record.id, created=False)
+            (
+                record.input_tokens,
+                record.output_tokens,
+                record.cache_read_tokens,
+                record.cache_write_tokens,
+                record.tool_calls,
+                record.cost_micros,
+            ) = counters
+            metadata["_usageSettled"] = True
+            record.metadata_json = metadata
+            await session.commit()
+            return UsageLedgerResult(entry_id=record.id, created=True)
+
+    async def list_planning_cache_candidates(
+        self,
+        project_id: str,
+        requirement: str,
+        base_version_id: str | None,
+        starter_fingerprint: dict[str, Any],
+        *,
+        limit: int = 3,
+    ) -> list[dict[str, str]]:
+        """Return bounded prior planning outputs for exact-input revalidation.
+
+        Cache entries remain untrusted text: the current Direct Pi contract
+        must parse and validate each candidate before it can be reused.
+
+        A prior run qualifies by input fingerprint (project, requirement,
+        base version, starter fingerprint) — regardless of its final phase or
+        status — so runs that failed later in building/verifying still
+        contribute their planning output. The machine truth is the pair of
+        already-validated ``build_plan`` and ``acceptance_contract``
+        artifacts, never the public (display-capped) ``pi.message.completed``
+        text; a run without either artifact is skipped. The combined JSON is
+        re-validated by the current PlanningBundle parser before reuse. This
+        is a bounded cache lookup, not a fingerprint guarantee; there is no
+        separate schemaVersion field on the artifacts.
+        """
+        async with self.database.session_factory() as session:
+            runs = list(
+                await session.scalars(
+                    select(RunRecord)
+                    .join(MessageRecord, MessageRecord.run_id == RunRecord.id)
+                    .where(
+                        RunRecord.project_id == project_id,
+                        RunRecord.base_version_id == base_version_id,
+                        MessageRecord.content == requirement,
+                    )
+                    .order_by(RunRecord.created_at.desc(), RunRecord.id.desc())
+                    .limit(max(1, min(limit, 10)))
+                )
+            )
+            candidates: list[dict[str, str]] = []
+            for run in runs:
+                run_input = await session.scalar(
+                    select(ArtifactRecord)
+                    .where(
+                        ArtifactRecord.run_id == run.id,
+                        ArtifactRecord.kind == "run_input",
+                    )
+                    .order_by(ArtifactRecord.created_at.desc(), ArtifactRecord.id.desc())
+                    .limit(1)
+                )
+                if run_input is None or any(
+                    run_input.content.get(key) != value
+                    for key, value in starter_fingerprint.items()
+                ):
+                    continue
+                # Machine cache truth is the pair of already-validated
+                # planning artifacts (never display-capped message text).
+                build_plan = await session.scalar(
+                    select(ArtifactRecord)
+                    .where(
+                        ArtifactRecord.run_id == run.id,
+                        ArtifactRecord.kind == "build_plan",
+                    )
+                    .order_by(ArtifactRecord.created_at.desc(), ArtifactRecord.id.desc())
+                    .limit(1)
+                )
+                acceptance = await session.scalar(
+                    select(ArtifactRecord)
+                    .where(
+                        ArtifactRecord.run_id == run.id,
+                        ArtifactRecord.kind == "acceptance_contract",
+                    )
+                    .order_by(ArtifactRecord.created_at.desc(), ArtifactRecord.id.desc())
+                    .limit(1)
+                )
+                if build_plan is None or acceptance is None:
+                    continue
+                if not isinstance(build_plan.content, dict) or not isinstance(
+                    acceptance.content, dict
+                ):
+                    continue
+                candidates.append(
+                    {
+                        "runId": run.id,
+                        "text": json.dumps(
+                            {
+                                "buildPlan": build_plan.content,
+                                "acceptanceContract": acceptance.content,
+                            },
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                    }
+                )
+            return candidates
+
+    async def list_goal_graph_cache_candidates(
+        self,
+        project_id: str,
+        requirement: str,
+        base_version_id: str | None,
+        starter_fingerprint: dict[str, Any],
+        *,
+        limit: int = 3,
+    ) -> list[dict[str, Any]]:
+        """Return prior machine GoalGraph drafts for exact-input revalidation.
+
+        A run that planned successfully but failed later in Build is still a
+        useful cache source. The current runtime revalidates the stored draft
+        before creating a new, independently owned graph for the new run.
+        """
+
+        async with self.database.session_factory() as session:
+            candidate_limit = max(20, min(limit * 10, 100))
+            runs = list(
+                await session.scalars(
+                    select(RunRecord)
+                    .join(MessageRecord, MessageRecord.run_id == RunRecord.id)
+                    .where(
+                        RunRecord.project_id == project_id,
+                        RunRecord.base_version_id == base_version_id,
+                        MessageRecord.content == requirement,
+                    )
+                    .order_by(RunRecord.created_at.desc(), RunRecord.id.desc())
+                    # Artifact filtering happens below. Over-fetch a bounded
+                    # history so recent failed planning attempts cannot hide
+                    # the last valid machine draft.
+                    .limit(candidate_limit)
+                )
+            )
+            candidates: list[dict[str, Any]] = []
+            for run in runs:
+                run_input = await session.scalar(
+                    select(ArtifactRecord)
+                    .where(
+                        ArtifactRecord.run_id == run.id,
+                        ArtifactRecord.kind == "run_input",
+                    )
+                    .order_by(ArtifactRecord.created_at.desc(), ArtifactRecord.id.desc())
+                    .limit(1)
+                )
+                if run_input is None or any(
+                    run_input.content.get(key) != value
+                    for key, value in starter_fingerprint.items()
+                ):
+                    continue
+                graph = await session.scalar(
+                    select(ArtifactRecord)
+                    .where(
+                        ArtifactRecord.run_id == run.id,
+                        ArtifactRecord.kind == "goal_graph",
+                    )
+                    .order_by(ArtifactRecord.created_at.desc(), ArtifactRecord.id.desc())
+                    .limit(1)
+                )
+                if graph is None or not isinstance(graph.content, dict):
+                    continue
+                candidates.append({"runId": run.id, "draft": dict(graph.content)})
+                if len(candidates) >= max(1, min(limit, 10)):
+                    break
+            return candidates
 
     async def require_run_for_project(
         self, run_id: str, project_id: str, owner_session_id: str | None = None
@@ -432,10 +2027,24 @@ class Repository:
             run = await session.get(RunRecord, run_id, with_for_update=True)
             if run is None:
                 raise NotFoundError("run not found")
-            if run.status == RunStatus.queued.value:
+            if run.status in {
+                RunStatus.queued.value,
+                RunStatus.waiting_for_user.value,
+            }:
+                pending = await self._pending_input_request_in_session(session, run_id)
+                if pending is not None:
+                    pending.status = "cancelled"
                 run.status = RunStatus.cancelled.value
-                run.phase = RunPhase.queued.value
+                if run.phase == RunPhase.queued.value:
+                    run.phase = RunPhase.queued.value
                 run.cancel_requested_at = utcnow()
+                run.lease_owner = None
+                run.lease_expires_at = None
+                run.continuation_request_id = None
+                run.continuation_key = None
+                run.continuation_stage = None
+                run.continuation_goal_id = None
+                run.continuation_context = None
                 await self._append_event_in_session(session, run, "run.cancel_requested")
                 await self._append_event_in_session(session, run, "run.cancelled")
                 await self._advance_project_after_terminal(session, run)
@@ -449,6 +2058,21 @@ class Repository:
         async with self.database.session_factory() as session:
             record = await session.get(RunRecord, run_id)
             return record is None or record.cancel_requested_at is not None
+
+    async def is_user_input_suspended(self, run_id: str) -> bool:
+        """True only for the clean wait/answer handoff after a lease release."""
+
+        async with self.database.session_factory() as session:
+            record = await session.get(RunRecord, run_id)
+            return bool(
+                record is not None
+                and record.continuation_request_id is not None
+                and record.status
+                in {
+                    RunStatus.waiting_for_user.value,
+                    RunStatus.queued.value,
+                }
+            )
 
     async def get_active_lease_token(self, run_id: str) -> str:
         """Return the opaque token of an active lease for internal SOP entrypoints."""
@@ -486,24 +2110,69 @@ class Repository:
         test implementation deterministic.
         """
         async with self.database.session_factory() as session:
+            live_resources = (
+                select(RunSandboxResourceRecord.id)
+                .where(
+                    RunSandboxResourceRecord.run_id == RunRecord.id,
+                    RunSandboxResourceRecord.cleaned_at.is_(None),
+                )
+                .correlate(RunRecord)
+            )
+            exact_continuation_resource = (
+                select(RunSandboxResourceRecord.id)
+                .where(
+                    RunSandboxResourceRecord.run_id == RunRecord.id,
+                    RunSandboxResourceRecord.cleaned_at.is_(None),
+                    RunSandboxResourceRecord.kind == "generation",
+                    RunSandboxResourceRecord.sandbox_id == RunRecord.sandbox_id,
+                )
+                .correlate(RunRecord)
+            )
+            conflicting_continuation_resource = (
+                select(RunSandboxResourceRecord.id)
+                .where(
+                    RunSandboxResourceRecord.run_id == RunRecord.id,
+                    RunSandboxResourceRecord.cleaned_at.is_(None),
+                    or_(
+                        RunSandboxResourceRecord.kind != "generation",
+                        RunSandboxResourceRecord.sandbox_id != RunRecord.sandbox_id,
+                    ),
+                )
+                .correlate(RunRecord)
+            )
+            resumable_continuation = and_(
+                RunRecord.continuation_request_id.is_not(None),
+                RunRecord.sandbox_id.is_not(None),
+                exact_continuation_resource.exists(),
+                ~conflicting_continuation_resource.exists(),
+            )
             candidates = list(
                 await session.scalars(
                     select(RunRecord)
-                    .where(RunRecord.status == RunStatus.queued.value)
+                    .where(
+                        RunRecord.status == RunStatus.queued.value,
+                        or_(~live_resources.exists(), resumable_continuation),
+                    )
                     .order_by(RunRecord.created_at.asc())
                     .with_for_update(skip_locked=True)
                 )
             )
             for run in candidates:
-                running_count = await session.scalar(
+                active_writer_count = await session.scalar(
                     select(func.count())
                     .select_from(RunRecord)
                     .where(
                         RunRecord.project_id == run.project_id,
-                        RunRecord.status == RunStatus.running.value,
+                        RunRecord.id != run.id,
+                        RunRecord.status.in_(
+                            [
+                                RunStatus.running.value,
+                                RunStatus.waiting_for_user.value,
+                            ]
+                        ),
                     )
                 )
-                if running_count:
+                if active_writer_count:
                     continue
                 # Worker identity is intentionally not a fence: every claim
                 # gets an opaque, per-run token so an old process cannot write
@@ -511,6 +2180,12 @@ class Repository:
                 lease_token = uuid7()
                 run.status = RunStatus.running.value
                 run.phase = RunPhase.product_analysis.value
+                if run.continuation_request_id is not None:
+                    # User wait time is outside the active execution budget;
+                    # durable token/tool/spend ledgers still cap repeated turns.
+                    run.execution_started_at = utcnow()
+                elif run.execution_started_at is None:
+                    run.execution_started_at = utcnow()
                 run.lease_owner = lease_token
                 run.lease_expires_at = utcnow() + timedelta(seconds=lease_seconds)
                 project = await session.get(ProjectRecord, run.project_id, with_for_update=True)
@@ -559,13 +2234,12 @@ class Repository:
     async def recover_expired_running_runs(
         self, *, now: datetime | None = None
     ) -> list[SandboxCleanupTarget]:
-        """Terminalize abandoned running runs and return their stale sandboxes.
+        """Recover abandoned runs and return stale sandboxes for destruction.
 
-        This is intentionally idempotent. Rows are selected and rechecked
-        while locked, then transitioned exactly once; later recovery passes
-        cannot append another terminal event. A cancellation request wins over
-        a lease-expiry failure so an interrupted user cancellation converges to
-        the outcome the user asked for.
+        P0 runs retain the terminal failure/cancellation behavior. P1 runs
+        with an integrity-checked verified checkpoint are requeued so a fresh
+        sandbox/session can resume; registered resources fence the next claim
+        until cleanup is acknowledged. A cancellation request always wins.
         """
         cutoff = now or utcnow()
         if cutoff.tzinfo is None:
@@ -587,6 +2261,154 @@ class Repository:
                 )
             )
             for run in candidates:
+                graph = await session.scalar(
+                    select(GoalGraphRecord)
+                    .where(
+                        GoalGraphRecord.run_id == run.id,
+                        GoalGraphRecord.status.in_(
+                            [GraphStatus.ACTIVE.value, GraphStatus.VERIFIED.value]
+                        ),
+                    )
+                    .with_for_update()
+                )
+                current_goal: GoalNodeRecord | None = None
+                terminal_nodes: list[GoalNodeRecord] = []
+                latest_checkpoint: CheckpointRecord | None = None
+                checkpoint_goal: GoalNodeRecord | None = None
+                checkpoint_valid = False
+                if graph is not None:
+                    revision = await self._current_revision_in_session(session, graph)
+                    current_goal = await session.scalar(
+                        select(GoalNodeRecord)
+                        .where(
+                            GoalNodeRecord.revision_id == revision.id,
+                            GoalNodeRecord.status.in_(
+                                [GoalStatus.ACTIVE.value, GoalStatus.CLAIMED.value]
+                            ),
+                        )
+                        .with_for_update()
+                    )
+                    latest_checkpoint = await session.scalar(
+                        select(CheckpointRecord)
+                        .where(CheckpointRecord.graph_id == graph.id)
+                        .order_by(CheckpointRecord.ordinal.desc())
+                        .limit(1)
+                    )
+                    if latest_checkpoint is not None:
+                        checkpoint_goal = await session.get(
+                            GoalNodeRecord, latest_checkpoint.goal_node_id
+                        )
+                        if checkpoint_goal is not None:
+                            try:
+                                checkpoint_projection = (
+                                    await self._checkpoint_projection_in_session(
+                                        session,
+                                        latest_checkpoint,
+                                        checkpoint_goal.goal_key,
+                                    )
+                                )
+                                checkpoint_valid = bool(checkpoint_projection.evidence)
+                            except ManifestIntegrityError:
+                                checkpoint_valid = False
+                if (
+                    graph is not None
+                    and latest_checkpoint is not None
+                    and checkpoint_goal is not None
+                    and checkpoint_valid
+                    and (
+                        graph.status == GraphStatus.VERIFIED.value
+                        or current_goal is not None
+                    )
+                    and run.cancel_requested_at is None
+                ):
+                    legacy_sandbox_id = run.sandbox_id
+                    result = await session.execute(
+                        update(RunRecord)
+                        .where(
+                            RunRecord.id == run.id,
+                            RunRecord.status == RunStatus.running.value,
+                            RunRecord.cancel_requested_at.is_(None),
+                            or_(
+                                RunRecord.lease_expires_at.is_(None),
+                                RunRecord.lease_expires_at <= cutoff,
+                            ),
+                        )
+                        .values(
+                            status=RunStatus.queued.value,
+                            phase=RunPhase.queued.value,
+                            error_code=None,
+                            lease_owner=None,
+                            lease_expires_at=None,
+                            sandbox_id=None,
+                            preview_url=None,
+                            updated_at=utcnow(),
+                        )
+                        .execution_options(synchronize_session=False)
+                    )
+                    if result.rowcount != 1:
+                        continue
+                    await session.refresh(run)
+                    project = await session.get(
+                        ProjectRecord, run.project_id, with_for_update=True
+                    )
+                    if project is not None:
+                        project.active_run_id = run.id
+                        project.status = "queued"
+                        project.updated_at = utcnow()
+                    await self._append_event_in_session(
+                        session,
+                        run,
+                        "goal.resume_scheduled",
+                        payload={
+                            "graphId": graph.id,
+                            "goalId": (
+                                current_goal.goal_key
+                                if current_goal is not None
+                                else checkpoint_goal.goal_key
+                            ),
+                            "checkpointId": latest_checkpoint.id,
+                            "graphStatus": graph.status,
+                        },
+                    )
+                    resources = list(
+                        await session.scalars(
+                            select(RunSandboxResourceRecord).where(
+                                RunSandboxResourceRecord.run_id == run.id,
+                                RunSandboxResourceRecord.cleaned_at.is_(None),
+                            )
+                        )
+                    )
+                    recovered.extend(
+                        SandboxCleanupTarget(
+                            run_id=run.id,
+                            project_id=run.project_id,
+                            sandbox_id=resource.sandbox_id,
+                            resource_id=resource.id,
+                            kind=resource.kind,
+                        )
+                        for resource in resources
+                    )
+                    if legacy_sandbox_id and not any(
+                        resource.sandbox_id == legacy_sandbox_id for resource in resources
+                    ):
+                        recovered.append(
+                            SandboxCleanupTarget(
+                                run_id=run.id,
+                                project_id=run.project_id,
+                                sandbox_id=legacy_sandbox_id,
+                            )
+                        )
+                    continue
+
+                if graph is not None and graph.status == GraphStatus.ACTIVE.value:
+                    revision = await self._current_revision_in_session(session, graph)
+                    terminal_nodes = list(
+                        await session.scalars(
+                            select(GoalNodeRecord)
+                            .where(GoalNodeRecord.revision_id == revision.id)
+                            .with_for_update()
+                        )
+                    )
                 # The compare-and-set update is the real recovery claim. It
                 # protects SQLite too, where SELECT FOR UPDATE is advisory.
                 # Reading cancel_requested inside SQL makes a request that
@@ -620,6 +2442,43 @@ class Repository:
                 if result.rowcount != 1:
                     continue
                 await session.refresh(run)
+                if graph is not None and graph.status == GraphStatus.ACTIVE.value:
+                    graph_target = (
+                        GraphStatus.CANCELLED
+                        if run.status == RunStatus.cancelled.value
+                        else GraphStatus.FAILED
+                    )
+                    for node in terminal_nodes:
+                        current = GoalStatus(node.status)
+                        if current in {GoalStatus.ACTIVE, GoalStatus.CLAIMED}:
+                            node_target = (
+                                GoalStatus.SUPERSEDED
+                                if graph_target == GraphStatus.CANCELLED
+                                else GoalStatus.FAILED
+                            )
+                            node.status = transition_goal_status(current, node_target).value
+                        elif current == GoalStatus.PENDING:
+                            node.status = transition_goal_status(
+                                current, GoalStatus.SUPERSEDED
+                            ).value
+                    graph.status = transition_graph_status(
+                        GraphStatus(graph.status), graph_target
+                    ).value
+                    graph.updated_at = utcnow()
+                    goal_graph = await self._goal_graph_read_projection_in_session(
+                        session, run.id
+                    )
+                    await self._append_event_in_session(
+                        session,
+                        run,
+                        f"goal_graph.{graph_target.value}",
+                        payload={
+                            "graphId": graph.id,
+                            "status": graph_target.value,
+                            "reason": "worker lease expired",
+                            "goalGraph": goal_graph,
+                        },
+                    )
                 summary = (
                     "Cancelled after the worker lease expired."
                     if run.status == RunStatus.cancelled.value
@@ -774,6 +2633,10 @@ class Repository:
             raise ValueError("mark_terminal requires a terminal status")
         async with self.database.session_factory() as session:
             run = await self._run_for_write(session, run_id, lease_token=lease_token)
+            if run.cancel_requested_at is not None and status != RunStatus.cancelled:
+                status = RunStatus.cancelled
+                error_code = None
+                summary = "Cancelled safely by request."
             result = await session.execute(
                 update(RunRecord)
                 .where(
@@ -887,7 +2750,17 @@ class Repository:
             if run is None:
                 raise NotFoundError("artifact not found")
             project = await session.get(ProjectRecord, run.project_id)
-            if project is None or project.owner_session_id != owner_session_id:
+            if project is None:
+                raise NotFoundError("artifact not found")
+            try:
+                owned = await self._session_can_access_project(
+                    session,
+                    project,
+                    owner_session_id,
+                )
+            except NotFoundError as exc:
+                raise NotFoundError("artifact not found") from exc
+            if not owned:
                 raise NotFoundError("artifact not found")
             record = await session.get(ArtifactRecord, artifact_id)
             if record is None or record.run_id != run_id:
@@ -1007,19 +2880,31 @@ class Repository:
                 artifact_id=artifact_id,
             )
             session.add(record)
+            scoped_goal_id: str | None = None
+            local_acceptance_id = acceptance_key
+            if ":" in acceptance_key:
+                scoped_goal_id, local_acceptance_id = acceptance_key.split(":", 1)
             # Acceptance evidence always carries the closed-set acceptance
             # scope; the frontend Release gate consumes only project scope.
+            event_payload: dict[str, Any] = {
+                "evidenceId": record.id,
+                "acceptanceId": local_acceptance_id,
+                "status": status,
+                "scope": "acceptance",
+            }
+            if scoped_goal_id is not None:
+                event_payload.update(
+                    {
+                        "acceptanceKey": acceptance_key,
+                        "goalId": scoped_goal_id,
+                    }
+                )
             await self._append_event_in_session(
                 session,
                 run,
                 "verification.updated",
                 role="reviewer",
-                payload={
-                    "evidenceId": record.id,
-                    "acceptanceId": acceptance_key,
-                    "status": status,
-                    "scope": "acceptance",
-                },
+                payload=event_payload,
             )
             await session.commit()
             return record.id
@@ -1099,6 +2984,7 @@ class Repository:
                 qa_status=qa_status,
             )
             session.add(version)
+            await session.flush()
             for item in files:
                 session.add(
                     VersionFileRecord(
@@ -1120,6 +3006,183 @@ class Repository:
                 "version.created",
                 payload={"versionId": version.id, "number": number, "commitSha": commit_sha},
             )
+            await session.commit()
+            return _version_response(version)
+
+    async def finalize_verified_publish(
+        self,
+        run_id: str,
+        *,
+        commit_sha: str,
+        files: Iterable[dict[str, Any]],
+        product_title: str,
+        acceptance_items: Iterable[tuple[str, str | None]],
+        preview_url: str | None,
+        preview_elapsed_seconds: float | None,
+        lease_token: str,
+        snapshot_id: str | None = None,
+    ) -> VersionResponse:
+        """Atomically publish a verified version and converge the run to success.
+
+        A successful retry for the same run and commit returns the already
+        published version. Cancellation and lease loss fail before any version
+        or project-head mutation is committed.
+        """
+        normalized_files = [dict(item) for item in files]
+        if not normalized_files:
+            raise ValueError("published version requires at least one file")
+        normalized_acceptance = tuple(acceptance_items)
+        acceptance_keys = [item[0] for item in normalized_acceptance]
+        if len(acceptance_keys) != len(set(acceptance_keys)):
+            raise ValueError("published acceptance keys must be unique")
+
+        async with self.database.session_factory() as session:
+            run = await session.get(RunRecord, run_id, with_for_update=True)
+            if run is None:
+                raise NotFoundError("run not found")
+            if run.status == RunStatus.succeeded.value:
+                event = await session.scalar(
+                    select(RunEventRecord)
+                    .where(
+                        RunEventRecord.run_id == run_id,
+                        RunEventRecord.kind == "version.created",
+                    )
+                    .order_by(RunEventRecord.seq.desc())
+                    .limit(1)
+                )
+                version_id = event.payload.get("versionId") if event is not None else None
+                version = (
+                    await session.get(VersionRecord, version_id)
+                    if isinstance(version_id, str)
+                    else None
+                )
+                if (
+                    version is None
+                    or version.project_id != run.project_id
+                    or version.commit_sha != commit_sha
+                ):
+                    raise ConflictError("run already succeeded with a different publication")
+                return _version_response(version)
+            if run.status in TERMINAL_STATUSES:
+                raise ConflictError("terminal run cannot publish a version")
+
+            run = await self._run_for_write(
+                session, run_id, lease_token=lease_token
+            )
+            if run.cancel_requested_at is not None:
+                raise RunLeaseLost("run cancellation was requested before publication")
+            project = await session.get(
+                ProjectRecord, run.project_id, with_for_update=True
+            )
+            if project is None:
+                raise NotFoundError("project not found")
+            number = int(
+                await session.scalar(
+                    select(func.coalesce(func.max(VersionRecord.number), 0)).where(
+                        VersionRecord.project_id == project.id
+                    )
+                )
+                or 0
+            ) + 1
+            version = VersionRecord(
+                id=uuid7(),
+                project_id=project.id,
+                number=number,
+                commit_sha=commit_sha,
+                parent_version_id=run.base_version_id,
+                snapshot_id=snapshot_id,
+                qa_status="passed",
+            )
+            session.add(version)
+            await session.flush()
+            for item in normalized_files:
+                session.add(
+                    VersionFileRecord(
+                        id=uuid7(),
+                        version_id=version.id,
+                        path=str(item["path"]),
+                        sha256=str(item["sha256"]),
+                        size=int(item["size"]),
+                        mime=str(item["mime"]),
+                        content_text=item.get("content_text"),
+                        object_key=item.get("object_key"),
+                    )
+                )
+            project.head_version_id = version.id
+            project.updated_at = utcnow()
+            await self._append_event_in_session(
+                session,
+                run,
+                "version.created",
+                payload={
+                    "versionId": version.id,
+                    "number": number,
+                    "commitSha": commit_sha,
+                },
+            )
+            for acceptance_key, goal_id in normalized_acceptance:
+                trace = TraceLinkRecord(
+                    id=uuid7(),
+                    run_id=run_id,
+                    source_kind="acceptance_criterion",
+                    source_ref=acceptance_key,
+                    relation="verified_in",
+                    target_kind="version",
+                    target_ref=version.id,
+                    metadata_json={"goalId": goal_id} if goal_id is not None else {},
+                )
+                session.add(trace)
+                await self._append_event_in_session(
+                    session,
+                    run,
+                    "trace.updated",
+                    payload={"traceLinkId": trace.id},
+                )
+            run.preview_url = preview_url
+            if preview_url is not None:
+                await self._append_event_in_session(
+                    session,
+                    run,
+                    "preview.verified",
+                    payload={
+                        "url": preview_url,
+                        "verificationStatus": "verified",
+                        "elapsedSeconds": preview_elapsed_seconds,
+                    },
+                )
+            run.phase = RunPhase.ready.value
+            await self._append_event_in_session(
+                session,
+                run,
+                "run.status_changed",
+                payload={"status": run.status, "phase": run.phase},
+            )
+            await self._append_event_in_session(
+                session,
+                run,
+                "assistant.summary",
+                payload={
+                    "summary": (
+                        f"{product_title} is ready as version {number}; "
+                        "the clean sandbox gates and frozen acceptance workflows passed."
+                    )
+                },
+            )
+            run.status = RunStatus.succeeded.value
+            run.error_code = None
+            run.lease_owner = None
+            run.lease_expires_at = None
+            run.updated_at = utcnow()
+            await self._append_event_in_session(
+                session,
+                run,
+                "run.completed",
+                payload={
+                    "status": RunStatus.succeeded.value,
+                    "summary": f"Version {number} passed deterministic verification.",
+                },
+            )
+            await self._advance_project_after_terminal(session, run)
             await session.commit()
             return _version_response(version)
 
@@ -1302,6 +3365,127 @@ class Repository:
             run.updated_at = utcnow()
             await session.commit()
 
+    async def register_sandbox_resource(
+        self,
+        run_id: str,
+        sandbox_id: str,
+        kind: str,
+        *,
+        lease_token: str,
+    ) -> str:
+        if kind not in {"generation", "verification"}:
+            raise ValueError("sandbox resource kind must be generation or verification")
+        if not sandbox_id.strip() or len(sandbox_id) > 128:
+            raise ValueError("sandbox_id must be nonempty and bounded")
+        async with self.database.session_factory() as session:
+            await self._run_for_write(session, run_id, lease_token=lease_token)
+            record = await session.scalar(
+                select(RunSandboxResourceRecord).where(
+                    RunSandboxResourceRecord.run_id == run_id,
+                    RunSandboxResourceRecord.sandbox_id == sandbox_id,
+                    RunSandboxResourceRecord.kind == kind,
+                )
+            )
+            if record is None:
+                record = RunSandboxResourceRecord(
+                    id=uuid7(),
+                    run_id=run_id,
+                    sandbox_id=sandbox_id,
+                    kind=kind,
+                )
+                session.add(record)
+            else:
+                record.cleaned_at = None
+            await session.commit()
+            return record.id
+
+    async def require_live_sandbox_resource(
+        self,
+        run_id: str,
+        sandbox_id: str,
+        kind: str,
+        *,
+        lease_token: str,
+    ) -> str:
+        """Adopt an already-registered continuation sandbox under a new lease."""
+
+        async with self.database.session_factory() as session:
+            run = await self._run_for_write(session, run_id, lease_token=lease_token)
+            if run.sandbox_id != sandbox_id:
+                raise ConflictError("continuation sandbox reference changed")
+            record = await session.scalar(
+                select(RunSandboxResourceRecord).where(
+                    RunSandboxResourceRecord.run_id == run_id,
+                    RunSandboxResourceRecord.sandbox_id == sandbox_id,
+                    RunSandboxResourceRecord.kind == kind,
+                    RunSandboxResourceRecord.cleaned_at.is_(None),
+                )
+            )
+            if record is None:
+                raise ConflictError("continuation sandbox resource is unavailable")
+            return record.id
+
+    async def list_sandbox_cleanup_targets(
+        self, run_id: str | None = None
+    ) -> list[SandboxCleanupTarget]:
+        async with self.database.session_factory() as session:
+            statement = (
+                select(RunSandboxResourceRecord, RunRecord)
+                .join(RunRecord, RunRecord.id == RunSandboxResourceRecord.run_id)
+                .where(
+                    RunSandboxResourceRecord.cleaned_at.is_(None),
+                    RunRecord.status != RunStatus.running.value,
+                    ~and_(
+                        RunRecord.status.in_(
+                            [
+                                RunStatus.waiting_for_user.value,
+                                RunStatus.queued.value,
+                            ]
+                        ),
+                        RunRecord.continuation_request_id.is_not(None),
+                        RunRecord.sandbox_id == RunSandboxResourceRecord.sandbox_id,
+                        RunSandboxResourceRecord.kind == "generation",
+                    ),
+                    # The current verification sandbox of a successful run is
+                    # the live verified preview. Retain it until the preview is
+                    # invalidated or the durable sandbox reference changes.
+                    or_(
+                        RunRecord.status != RunStatus.succeeded.value,
+                        RunSandboxResourceRecord.kind != "verification",
+                        RunRecord.preview_url.is_(None),
+                        RunRecord.sandbox_id.is_(None),
+                        RunRecord.sandbox_id != RunSandboxResourceRecord.sandbox_id,
+                    ),
+                )
+                .order_by(RunSandboxResourceRecord.created_at, RunSandboxResourceRecord.id)
+            )
+            if run_id is not None:
+                statement = statement.where(RunSandboxResourceRecord.run_id == run_id)
+            rows = (await session.execute(statement)).all()
+            return [
+                SandboxCleanupTarget(
+                    run_id=run.id,
+                    project_id=run.project_id,
+                    sandbox_id=resource.sandbox_id,
+                    resource_id=resource.id,
+                    kind=resource.kind,
+                )
+                for resource, run in rows
+            ]
+
+    async def acknowledge_sandbox_cleanup(self, resource_id: str) -> bool:
+        async with self.database.session_factory() as session:
+            result = await session.execute(
+                update(RunSandboxResourceRecord)
+                .where(
+                    RunSandboxResourceRecord.id == resource_id,
+                    RunSandboxResourceRecord.cleaned_at.is_(None),
+                )
+                .values(cleaned_at=utcnow())
+            )
+            await session.commit()
+            return result.rowcount == 1
+
     async def set_preview_url(
         self, run_id: str, preview_url: str | None, *, lease_token: str | None = None
     ) -> None:
@@ -1317,6 +3501,101 @@ class Repository:
             if project is None:
                 raise NotFoundError("project not found")
             return await self._get_preview_in_session(session, project)
+
+    async def require_verified_preview_target(self, sandbox_id: str) -> VerifiedPreviewTarget:
+        """Resolve only the retained verification sandbox of a published run.
+
+        Preview hostnames are unguessable capability URLs, but the hostname is
+        never sufficient authorization by itself.  The gateway must also prove
+        that the sandbox is still the current, uncleaned resource behind a
+        successfully verified run.
+        """
+
+        candidate = sandbox_id.strip()
+        if not candidate or len(candidate) > 128:
+            raise NotFoundError("verified preview not found")
+        async with self.database.session_factory() as session:
+            row = (
+                await session.execute(
+                    select(RunRecord, RunSandboxResourceRecord)
+                    .join(
+                        RunSandboxResourceRecord,
+                        RunSandboxResourceRecord.run_id == RunRecord.id,
+                    )
+                    .where(
+                        RunRecord.sandbox_id == candidate,
+                        RunRecord.status == RunStatus.succeeded.value,
+                        RunRecord.preview_url.is_not(None),
+                        RunSandboxResourceRecord.sandbox_id == candidate,
+                        RunSandboxResourceRecord.kind == "verification",
+                        RunSandboxResourceRecord.cleaned_at.is_(None),
+                    )
+                    .order_by(RunRecord.updated_at.desc(), RunRecord.id.desc())
+                    .limit(1)
+                )
+            ).first()
+            if row is None:
+                raise NotFoundError("verified preview not found")
+            run, _resource = row
+            return VerifiedPreviewTarget(
+                run_id=run.id,
+                project_id=run.project_id,
+                sandbox_id=candidate,
+                preview_url=run.preview_url,
+            )
+
+    async def expire_verified_preview_target(
+        self,
+        sandbox_id: str,
+        *,
+        expected_preview_url: str | None = None,
+    ) -> bool:
+        """Converge a confirmed provider-side expiry into durable preview state."""
+
+        candidate = sandbox_id.strip()
+        if not candidate or len(candidate) > 128:
+            return False
+        async with self.database.session_factory() as session:
+            conditions = [
+                RunRecord.sandbox_id == candidate,
+                RunRecord.status == RunStatus.succeeded.value,
+                RunRecord.preview_url.is_not(None),
+                RunSandboxResourceRecord.sandbox_id == candidate,
+                RunSandboxResourceRecord.kind == "verification",
+                RunSandboxResourceRecord.cleaned_at.is_(None),
+            ]
+            if expected_preview_url is not None:
+                conditions.append(RunRecord.preview_url == expected_preview_url)
+            row = (
+                await session.execute(
+                    select(RunRecord, RunSandboxResourceRecord)
+                    .join(
+                        RunSandboxResourceRecord,
+                        RunSandboxResourceRecord.run_id == RunRecord.id,
+                    )
+                    .where(*conditions)
+                    .with_for_update()
+                    .limit(1)
+                )
+            ).first()
+            if row is None:
+                return False
+            run, resource = row
+            now = utcnow()
+            run.preview_url = None
+            run.updated_at = now
+            resource.cleaned_at = now
+            await self._append_event_in_session(
+                session,
+                run,
+                "preview.expired",
+                payload={
+                    "sandboxId": candidate,
+                    "reason": "sandbox_expired",
+                },
+            )
+            await session.commit()
+            return True
 
     async def _list_versions_in_session(
         self, session: AsyncSession, project_id: str
@@ -1385,6 +3664,7 @@ class Repository:
             qa_status=qa_status,
         )
         session.add(version)
+        await session.flush()
         return version
 
     @staticmethod
@@ -1443,6 +3723,96 @@ class Repository:
             }
             for item in links
         ]
+        # Compatibility projection for successful GoalGraph runs created before
+        # checkpoint writes materialized implemented_in links. The verified
+        # capsule is durable provenance, so this stays read-only and fail-safe.
+        if run_id is not None:
+            run = await session.get(RunRecord, run_id)
+            graph = await session.scalar(
+                select(GoalGraphRecord).where(GoalGraphRecord.run_id == run_id)
+            )
+            if (
+                run is not None
+                and run.status == RunStatus.succeeded.value
+                and graph is not None
+                and graph.status == GraphStatus.VERIFIED.value
+            ):
+                revision = await self._current_revision_in_session(session, graph)
+                nodes = list(
+                    await session.scalars(
+                        select(GoalNodeRecord)
+                        .where(GoalNodeRecord.revision_id == revision.id)
+                        .order_by(GoalNodeRecord.position)
+                    )
+                )
+                checkpoint = await session.scalar(
+                    select(CheckpointRecord)
+                    .where(CheckpointRecord.graph_id == graph.id)
+                    .order_by(CheckpointRecord.ordinal.desc())
+                    .limit(1)
+                )
+                paths_by_goal = (
+                    checkpoint.capsule.get("goalChangedPathsByGoal")
+                    if checkpoint is not None and isinstance(checkpoint.capsule, dict)
+                    else None
+                )
+                if isinstance(paths_by_goal, dict) and checkpoint is not None:
+                    snapshot_paths = set(
+                        await session.scalars(
+                            select(CheckpointFileRecord.path).where(
+                                CheckpointFileRecord.checkpoint_id == checkpoint.id
+                            )
+                        )
+                    )
+                    existing_pairs = {
+                        (str(link["sourceRef"]), str(link["targetRef"]))
+                        for link in link_payload
+                        if link["sourceKind"] == "acceptance_criterion"
+                        and link["relation"] == "implemented_in"
+                        and link["targetKind"] == "file"
+                    }
+                    for node in nodes:
+                        raw_paths = paths_by_goal.get(node.goal_key, [])
+                        if not isinstance(raw_paths, list):
+                            continue
+                        inferred_paths = sorted(
+                            {
+                                path
+                                for path in raw_paths
+                                if isinstance(path, str)
+                                and path in snapshot_paths
+                                and _is_business_implementation_path(path)
+                            }
+                        )
+                        for criterion in node.acceptance.get("criteria", []):
+                            local_id = criterion.get("id")
+                            if not isinstance(local_id, str):
+                                continue
+                            acceptance_key = acceptance_persistence_key(
+                                node.goal_key, local_id
+                            )
+                            for path in inferred_paths:
+                                if (acceptance_key, path) in existing_pairs:
+                                    continue
+                                digest = hashlib.sha256(
+                                    f"{run_id}\0{acceptance_key}\0{path}".encode()
+                                ).hexdigest()[:32]
+                                link_payload.append(
+                                    {
+                                        "id": f"inferred-{digest}",
+                                        "sourceKind": "acceptance_criterion",
+                                        "sourceRef": acceptance_key,
+                                        "relation": "implemented_in",
+                                        "targetKind": "file",
+                                        "targetRef": path,
+                                        "metadata": {
+                                            "goalId": node.goal_key,
+                                            "inferred": True,
+                                            "source": "goal_checkpoint_capsule",
+                                        },
+                                    }
+                                )
+                                existing_pairs.add((acceptance_key, path))
         evidence_payload = [
             {
                 "id": item.id,
@@ -1599,6 +3969,421 @@ class Repository:
             raise ConflictError("An agent run is active; wait for it before changing the published version.")
 
     @staticmethod
+    def _goal_graph_projection(
+        graph_record: GoalGraphRecord,
+        revision: GoalGraphRevisionRecord,
+        nodes: list[GoalNodeRecord],
+    ) -> GoalGraphProjection:
+        draft_payload = {
+            "schemaVersion": graph_record.schema_version,
+            "productOutcome": revision.product_outcome,
+            "goals": [
+                {
+                    "goalId": node.goal_key,
+                    "title": node.title,
+                    "productOutcome": node.product_outcome,
+                    "userVisible": node.user_visible,
+                    "dependsOn": list(node.depends_on),
+                    "acceptance": dict(node.acceptance),
+                }
+                for node in sorted(nodes, key=lambda item: item.position)
+            ],
+        }
+        draft = parse_goal_graph_draft(draft_payload)
+        actual_hash = hashlib.sha256(
+            serialize_goal_graph_draft(draft).encode("utf-8")
+        ).hexdigest()
+        if actual_hash != revision.content_hash:
+            raise ManifestIntegrityError("GoalGraph revision content hash mismatch")
+        trusted = materialize_goal_graph(draft)
+        goal_by_key = {goal.goal_id: goal for goal in trusted.goals}
+        projected_goals = [
+            Goal.model_validate(
+                {
+                    **goal_by_key[node.goal_key].model_dump(mode="json", by_alias=True),
+                    "status": node.status,
+                }
+            )
+            for node in sorted(nodes, key=lambda item: item.position)
+        ]
+        projected = GoalGraph.model_validate(
+            {
+                "schemaVersion": graph_record.schema_version,
+                "productOutcome": revision.product_outcome,
+                "qualityBar": dict(revision.quality_bar),
+                "goals": [item.model_dump(mode="json", by_alias=True) for item in projected_goals],
+                "status": graph_record.status,
+            }
+        )
+        return GoalGraphProjection(
+            graph_id=graph_record.id,
+            project_id=graph_record.project_id,
+            run_id=graph_record.run_id,
+            revision=revision.revision,
+            revision_id=revision.id,
+            content_hash=revision.content_hash,
+            graph=projected,
+        )
+
+    async def _goal_graph_for_run_in_session(
+        self, session: AsyncSession, run_id: str
+    ) -> GoalGraphProjection | None:
+        graph = await session.scalar(
+            select(GoalGraphRecord).where(GoalGraphRecord.run_id == run_id)
+        )
+        if graph is None:
+            return None
+        revision = await self._current_revision_in_session(session, graph)
+        nodes = list(
+            await session.scalars(
+                select(GoalNodeRecord)
+                .where(GoalNodeRecord.revision_id == revision.id)
+                .order_by(GoalNodeRecord.position)
+            )
+        )
+        return self._goal_graph_projection(graph, revision, nodes)
+
+    async def _goal_graph_read_projection_in_session(
+        self, session: AsyncSession, run_id: str
+    ) -> dict[str, Any] | None:
+        graph = await session.scalar(
+            select(GoalGraphRecord).where(GoalGraphRecord.run_id == run_id)
+        )
+        if graph is None:
+            return None
+        revision = await self._current_revision_in_session(session, graph)
+        nodes = list(
+            await session.scalars(
+                select(GoalNodeRecord)
+                .where(GoalNodeRecord.revision_id == revision.id)
+                .order_by(GoalNodeRecord.position)
+            )
+        )
+        node_ids = [node.id for node in nodes]
+        checkpoints = (
+            list(
+                await session.scalars(
+                    select(CheckpointRecord).where(
+                        CheckpointRecord.goal_node_id.in_(node_ids)
+                    )
+                )
+            )
+            if node_ids
+            else []
+        )
+        evidence_rows = (
+            (
+                await session.execute(
+                    select(
+                        GoalEvidenceRecord.goal_node_id,
+                        GoalEvidenceRecord.acceptance_key,
+                        func.count(GoalEvidenceRecord.id),
+                    )
+                    .where(GoalEvidenceRecord.goal_node_id.in_(node_ids))
+                    .group_by(
+                        GoalEvidenceRecord.goal_node_id,
+                        GoalEvidenceRecord.acceptance_key,
+                    )
+                )
+            ).all()
+            if node_ids
+            else []
+        )
+        return self._goal_graph_read_projection(
+            graph,
+            revision,
+            nodes,
+            checkpoint_by_node={item.goal_node_id: item.id for item in checkpoints},
+            evidence_count_by_key={
+                (node_id, acceptance_key): int(count)
+                for node_id, acceptance_key, count in evidence_rows
+            },
+        )
+
+    @staticmethod
+    def _goal_graph_read_projection(
+        graph: GoalGraphRecord,
+        revision: GoalGraphRevisionRecord,
+        nodes: list[GoalNodeRecord],
+        *,
+        checkpoint_by_node: Mapping[str, str],
+        evidence_count_by_key: Mapping[tuple[str, str], int],
+    ) -> dict[str, Any]:
+        active = next(
+            (
+                node.goal_key
+                for node in nodes
+                if node.status in {GoalStatus.ACTIVE.value, GoalStatus.CLAIMED.value}
+            ),
+            None,
+        )
+        goals: list[dict[str, Any]] = []
+        for node in sorted(nodes, key=lambda item: item.position):
+            acceptance: list[dict[str, Any]] = []
+            goal_evidence_count = 0
+            for criterion in node.acceptance.get("criteria", []):
+                acceptance_key = acceptance_persistence_key(node.goal_key, criterion["id"])
+                count = evidence_count_by_key.get((node.id, acceptance_key), 0)
+                goal_evidence_count += count
+                acceptance.append(
+                    {
+                        "acceptanceId": criterion["id"],
+                        "title": criterion["title"],
+                        "priority": criterion.get("priority", "must"),
+                        "status": "passed" if count else "unverified",
+                    }
+                )
+            goals.append(
+                {
+                    "id": node.goal_key,
+                    "title": node.title,
+                    "userVisible": node.user_visible,
+                    "dependsOn": list(node.depends_on),
+                    "status": node.status,
+                    "checkpointId": checkpoint_by_node.get(node.id),
+                    "claimedAt": (
+                        _as_utc(node.claimed_at).isoformat() if node.claimed_at else None
+                    ),
+                    "verifiedAt": (
+                        _as_utc(node.verified_at).isoformat() if node.verified_at else None
+                    ),
+                    "acceptance": acceptance,
+                    "evidenceCount": goal_evidence_count,
+                }
+            )
+        return {
+            "graphId": graph.id,
+            "runId": graph.run_id,
+            "revision": revision.revision,
+            "status": graph.status,
+            "productOutcome": revision.product_outcome,
+            "activeGoalId": active,
+            "goals": goals,
+        }
+
+    async def _supersede_terminal_project_graphs(
+        self,
+        session: AsyncSession,
+        project_id: str,
+        *,
+        excluding_run_id: str,
+    ) -> list[str]:
+        """Explicitly close stale terminal-run graphs before later graph creation."""
+        prior_graphs = list(
+            await session.scalars(
+                select(GoalGraphRecord)
+                .where(
+                    GoalGraphRecord.project_id == project_id,
+                    GoalGraphRecord.run_id != excluding_run_id,
+                    GoalGraphRecord.status == GraphStatus.ACTIVE.value,
+                )
+                .with_for_update()
+            )
+        )
+        superseded: list[str] = []
+        for graph in prior_graphs:
+            prior_run = await session.get(RunRecord, graph.run_id, with_for_update=True)
+            if prior_run is None:
+                raise ManifestIntegrityError("GoalGraph owner run is missing")
+            if prior_run.status not in TERMINAL_STATUSES:
+                raise ConflictError("another nonterminal run owns the project GoalGraph")
+            revision = await self._current_revision_in_session(session, graph)
+            nodes = list(
+                await session.scalars(
+                    select(GoalNodeRecord)
+                    .where(GoalNodeRecord.revision_id == revision.id)
+                    .with_for_update()
+                )
+            )
+            for node in nodes:
+                current = GoalStatus(node.status)
+                if current in {GoalStatus.PENDING, GoalStatus.ACTIVE, GoalStatus.CLAIMED}:
+                    node.status = transition_goal_status(current, GoalStatus.SUPERSEDED).value
+            graph.status = transition_graph_status(
+                GraphStatus(graph.status), GraphStatus.SUPERSEDED
+            ).value
+            graph.updated_at = utcnow()
+            goal_graph = await self._goal_graph_read_projection_in_session(
+                session, prior_run.id
+            )
+            await self._append_event_in_session(
+                session,
+                prior_run,
+                "goal_graph.superseded",
+                payload={
+                    "graphId": graph.id,
+                    "status": GraphStatus.SUPERSEDED.value,
+                    "reason": "superseded by a later project run",
+                    "goalGraph": goal_graph,
+                },
+            )
+            superseded.append(graph.id)
+        return superseded
+
+    @staticmethod
+    async def _current_revision_in_session(
+        session: AsyncSession, graph: GoalGraphRecord
+    ) -> GoalGraphRevisionRecord:
+        revision = await session.scalar(
+            select(GoalGraphRevisionRecord).where(
+                GoalGraphRevisionRecord.graph_id == graph.id,
+                GoalGraphRevisionRecord.revision == graph.current_revision,
+            )
+        )
+        if revision is None:
+            raise ManifestIntegrityError("GoalGraph current revision is missing")
+        return revision
+
+    async def _goal_write_context(
+        self,
+        session: AsyncSession,
+        run_id: str,
+        goal_id: str,
+    ) -> tuple[GoalGraphRecord, GoalGraphRevisionRecord, list[GoalNodeRecord], GoalNodeRecord]:
+        graph = await session.scalar(
+            select(GoalGraphRecord)
+            .where(GoalGraphRecord.run_id == run_id)
+            .with_for_update()
+        )
+        if graph is None:
+            raise NotFoundError("goal graph not found")
+        if graph.status != GraphStatus.ACTIVE.value:
+            raise ConflictError("goal graph is not active")
+        revision = await self._current_revision_in_session(session, graph)
+        nodes = list(
+            await session.scalars(
+                select(GoalNodeRecord)
+                .where(GoalNodeRecord.revision_id == revision.id)
+                .order_by(GoalNodeRecord.position)
+                .with_for_update()
+            )
+        )
+        target = next((node for node in nodes if node.goal_key == goal_id), None)
+        if target is None:
+            raise NotFoundError("goal not found")
+        return graph, revision, nodes, target
+
+    @staticmethod
+    def _next_eligible_goal(nodes: list[GoalNodeRecord]) -> GoalNodeRecord | None:
+        status_by_key = {node.goal_key: node.status for node in nodes}
+        for node in sorted(nodes, key=lambda item: item.position):
+            if node.status != GoalStatus.PENDING.value:
+                continue
+            if all(status_by_key.get(key) == GoalStatus.VERIFIED.value for key in node.depends_on):
+                return node
+        return None
+
+    @classmethod
+    def _normalize_checkpoint_files(
+        cls, files: Iterable[Mapping[str, Any] | CheckpointFile]
+    ) -> tuple[list[CheckpointFile], str]:
+        normalized: list[CheckpointFile] = []
+        seen: set[str] = set()
+        for value in files:
+            if isinstance(value, CheckpointFile):
+                path = cls._validated_file_path(value.path)
+                content = value.content_text
+                expected_hash = value.sha256
+                expected_size = value.size
+            else:
+                path_value = value.get("path")
+                content = value.get("contentText", value.get("content_text", value.get("content")))
+                if not isinstance(path_value, str):
+                    raise ValueError("checkpoint file requires path")
+                path = cls._validated_file_path(path_value)
+                expected_hash = value.get("sha256")
+                expected_size = value.get("size")
+            if path in seen:
+                raise ValueError("checkpoint file paths must be unique")
+            if not isinstance(content, str):
+                raise ValueError("checkpoint files must contain complete UTF-8 text")
+            encoded = content.encode("utf-8", errors="strict")
+            digest = hashlib.sha256(encoded).hexdigest()
+            size = len(encoded)
+            if expected_hash is not None and expected_hash != digest:
+                raise ManifestIntegrityError(f"checkpoint file hash mismatch: {path}")
+            if expected_size is not None and expected_size != size:
+                raise ManifestIntegrityError(f"checkpoint file size mismatch: {path}")
+            seen.add(path)
+            normalized.append(
+                CheckpointFile(path=path, content_text=content, sha256=digest, size=size)
+            )
+        if not normalized:
+            raise ValueError("checkpoint manifest must contain at least one model-owned file")
+        normalized.sort(key=lambda item: item.path.encode("utf-8"))
+        manifest = [
+            {"path": item.path, "sha256": item.sha256, "size": item.size}
+            for item in normalized
+        ]
+        canonical = json.dumps(
+            manifest,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return normalized, hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    async def _checkpoint_projection_in_session(
+        self,
+        session: AsyncSession,
+        checkpoint: CheckpointRecord,
+        goal_id: str,
+    ) -> VerifiedCheckpoint:
+        records = list(
+            await session.scalars(
+                select(CheckpointFileRecord)
+                .where(CheckpointFileRecord.checkpoint_id == checkpoint.id)
+                .order_by(CheckpointFileRecord.path)
+            )
+        )
+        files = [
+            CheckpointFile(
+                path=record.path,
+                content_text=record.content_text,
+                sha256=record.sha256,
+                size=record.size,
+            )
+            for record in records
+        ]
+        _, manifest_hash = self._normalize_checkpoint_files(files)
+        if manifest_hash != checkpoint.manifest_hash:
+            raise ManifestIntegrityError("checkpoint manifest hash mismatch")
+        evidence_records = list(
+            await session.scalars(
+                select(GoalEvidenceRecord)
+                .where(GoalEvidenceRecord.checkpoint_id == checkpoint.id)
+                .order_by(GoalEvidenceRecord.acceptance_key, GoalEvidenceRecord.kind)
+            )
+        )
+        return VerifiedCheckpoint(
+            id=checkpoint.id,
+            graph_id=checkpoint.graph_id,
+            run_id=checkpoint.run_id,
+            goal_id=goal_id,
+            ordinal=checkpoint.ordinal,
+            manifest_hash=checkpoint.manifest_hash,
+            commit_sha=checkpoint.commit_sha,
+            snapshot_id=checkpoint.snapshot_id,
+            capsule=dict(checkpoint.capsule),
+            files=tuple(files),
+            evidence=tuple(
+                {
+                    "id": item.id,
+                    "acceptanceKey": item.acceptance_key,
+                    "kind": item.kind,
+                    "status": item.status,
+                    "artifactId": item.artifact_id,
+                    "reference": item.reference,
+                    "summary": item.summary,
+                    "payload": dict(item.payload),
+                }
+                for item in evidence_records
+            ),
+            created_at=_as_utc(checkpoint.created_at),
+        )
+
+    @staticmethod
     def _validated_file_path(path: str) -> str:
         candidate = PurePosixPath(path)
         if not path or candidate.is_absolute() or ".." in candidate.parts or str(candidate) in {"", "."}:
@@ -1607,13 +4392,93 @@ class Repository:
             raise FilePathError("path is not editable through the project API")
         return candidate.as_posix()
 
+    async def _active_session_in_session(
+        self,
+        session: AsyncSession,
+        session_id: str,
+        *,
+        for_update: bool = False,
+    ) -> SessionRecord:
+        record = await session.get(
+            SessionRecord,
+            session_id,
+            with_for_update=for_update,
+        )
+        if (
+            record is None
+            or record.revoked_at is not None
+            or _is_expired(record.expires_at)
+        ):
+            raise NotFoundError("session not found or expired")
+        return record
+
+    async def _issue_user_session_in_session(
+        self,
+        session: AsyncSession,
+        user_id: str,
+        *,
+        claim_guest_session_id: str | None,
+        ttl_hours: int,
+    ) -> SessionRecord:
+        now = utcnow()
+        expires_at = now + timedelta(hours=ttl_hours)
+        record = SessionRecord(
+            id=new_session_id(),
+            kind="user",
+            user_id=user_id,
+            expires_at=expires_at,
+        )
+        session.add(record)
+        # Flush before moving project foreign keys to the newly issued token.
+        await session.flush()
+        if claim_guest_session_id is not None:
+            candidate = await session.get(
+                SessionRecord,
+                claim_guest_session_id,
+                with_for_update=True,
+            )
+            if (
+                candidate is not None
+                and candidate.kind == "guest"
+                and candidate.user_id is None
+                and candidate.revoked_at is None
+                and not _is_expired(candidate.expires_at, at=now)
+            ):
+                await session.execute(
+                    update(ProjectRecord)
+                    .where(ProjectRecord.owner_session_id == candidate.id)
+                    .values(owner_session_id=record.id)
+                )
+                candidate.revoked_at = now
+        return record
+
+    async def _session_can_access_project(
+        self,
+        session: AsyncSession,
+        project: ProjectRecord,
+        requester_session_id: str,
+    ) -> bool:
+        requester = await self._active_session_in_session(session, requester_session_id)
+        if project.owner_session_id == requester_session_id:
+            return True
+        if requester.kind != "user" or requester.user_id is None:
+            return False
+        owner = await session.get(SessionRecord, project.owner_session_id)
+        if (
+            owner is None
+            or owner.kind != "user"
+            or owner.user_id != requester.user_id
+        ):
+            return False
+        return await session.get(UserRecord, requester.user_id) is not None
+
     async def _require_project_in_session(
         self, session: AsyncSession, project_id: str, owner_session_id: str
     ) -> ProjectRecord:
         record = await session.get(ProjectRecord, project_id, with_for_update=True)
         if record is None:
             raise NotFoundError("project not found")
-        if record.owner_session_id != owner_session_id:
+        if not await self._session_can_access_project(session, record, owner_session_id):
             raise OwnershipError("project does not belong to this session")
         return record
 
@@ -1665,7 +4530,25 @@ class Repository:
             )
             or 0
         )
-        return _run_response(run, last_seq)
+        pending = await self._pending_input_request_in_session(session, run.id)
+        return _run_response(run, last_seq, pending)
+
+    @staticmethod
+    async def _pending_input_request_in_session(
+        session: AsyncSession, run_id: str
+    ) -> RunInputRequestRecord | None:
+        return await session.scalar(
+            select(RunInputRequestRecord)
+            .where(
+                RunInputRequestRecord.run_id == run_id,
+                RunInputRequestRecord.status == "pending",
+            )
+            .order_by(
+                RunInputRequestRecord.created_at.desc(),
+                RunInputRequestRecord.id.desc(),
+            )
+            .limit(1)
+        )
 
     async def _append_event_in_session(
         self,

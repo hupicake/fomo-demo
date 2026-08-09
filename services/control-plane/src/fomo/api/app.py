@@ -7,7 +7,6 @@ from typing import Annotated, Any
 
 import uvicorn
 from fastapi import (
-    Cookie,
     Depends,
     FastAPI,
     Header,
@@ -24,6 +23,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from fomo.config import Settings
 from fomo.persistence import (
+    AuthenticationError,
     ConflictError,
     Database,
     FilePathError,
@@ -33,6 +33,7 @@ from fomo.persistence import (
 )
 from fomo.schemas import (
     ArtifactDetailResponse,
+    AuthSessionResponse,
     FileContentResponse,
     FileContentUpdate,
     GuestSessionResponse,
@@ -45,6 +46,11 @@ from fomo.schemas import (
     ProjectSnapshotResponse,
     RunResponse,
     TraceResponse,
+    UserInputAnswerCreate,
+    UserInputAnswerResponse,
+    UserLogin,
+    UserRegister,
+    UserResponse,
     VersionResponse,
 )
 
@@ -60,6 +66,38 @@ def problem(status_code: int, title: str, detail: str) -> JSONResponse:
         },
         media_type="application/problem+json",
     )
+
+
+async def _stream_run_events(
+    request: Request,
+    repository: Repository,
+    run_id: str,
+    owner_session_id: str,
+    cursor: int,
+    *,
+    poll_interval_seconds: float = 0.5,
+) -> AsyncIterator[dict[str, str]]:
+    """Replay events while continuously enforcing the original read grant."""
+    while not await request.is_disconnected():
+        try:
+            run = await repository.get_run(run_id)
+            await repository.require_project(run.project_id, owner_session_id)
+        except (NotFoundError, OwnershipError):
+            # Headers have already been sent for an SSE response. Ending the
+            # stream is the only non-leaking response to a revoked/expired
+            # session or ownership change.
+            return
+        events = await repository.list_events(run_id, after=cursor)
+        for event in events:
+            cursor = event.seq
+            yield {
+                "id": str(event.seq),
+                "event": "run.event",
+                "data": event.model_dump_json(by_alias=True),
+            }
+        if run.status.value in {"succeeded", "failed", "cancelled", "needs_attention"}:
+            return
+        await asyncio.sleep(poll_interval_seconds)
 
 
 def create_app(settings: Settings | None = None, repository: Repository | None = None) -> FastAPI:
@@ -94,6 +132,10 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
     async def _forbidden(_: Request, exc: OwnershipError) -> JSONResponse:
         return problem(403, "Forbidden", str(exc))
 
+    @app.exception_handler(AuthenticationError)
+    async def _unauthorized(_: Request, exc: AuthenticationError) -> JSONResponse:
+        return problem(401, "Unauthorized", str(exc))
+
     @app.exception_handler(ConflictError)
     async def _conflict(_: Request, exc: ConflictError) -> JSONResponse:
         return problem(409, "Conflict", str(exc))
@@ -113,9 +155,8 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
     async def session_id(
         request: Request,
         x_fomo_session: Annotated[str | None, Header()] = None,
-        fomo_session: Annotated[str | None, Cookie()] = None,
     ) -> str:
-        candidate = x_fomo_session or request.cookies.get(settings.session_cookie_name) or fomo_session
+        candidate = x_fomo_session or request.cookies.get(settings.session_cookie_key)
         if not candidate:
             raise HTTPException(status_code=401, detail="guest session is required")
         try:
@@ -126,6 +167,43 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
 
     SessionId = Annotated[str, Depends(session_id)]
 
+    async def claimable_guest_session_id(request: Request) -> str | None:
+        candidate = request.headers.get("X-FOMO-Session") or request.cookies.get(
+            settings.session_cookie_key
+        )
+        if candidate is None:
+            return None
+        try:
+            record = await repository.get_session(candidate)
+        except NotFoundError:
+            return None
+        if record.kind != "guest" or record.user_id is not None:
+            return None
+        return record.id
+
+    def set_session_cookie(response: Response, session_value: str, max_age: int) -> None:
+        response.set_cookie(
+            key=settings.session_cookie_key,
+            value=session_value,
+            max_age=max_age,
+            path="/",
+            httponly=True,
+            secure=settings.session_cookie_secure,
+            samesite="lax",
+        )
+
+    def auth_session_response(user, auth_session) -> AuthSessionResponse:
+        return AuthSessionResponse(
+            session_id=auth_session.id,
+            expires_at=auth_session.expires_at,
+            user=UserResponse(
+                id=user.id,
+                email=user.email,
+                display_name=user.display_name,
+                created_at=user.created_at,
+            ),
+        )
+
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
@@ -133,15 +211,67 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
     @app.post("/v1/sessions/guest", response_model=GuestSessionResponse, status_code=status.HTTP_201_CREATED)
     async def create_guest(response: Response) -> GuestSessionResponse:
         record = await repository.create_guest_session()
-        response.set_cookie(
-            key=settings.session_cookie_name,
-            value=record.id,
-            max_age=14 * 24 * 60 * 60,
-            httponly=True,
-            secure=settings.app_env not in {"development", "test"},
-            samesite="lax",
+        set_session_cookie(
+            response,
+            record.id,
+            14 * 24 * 60 * 60,
         )
         return GuestSessionResponse(id=record.id, expires_at=record.expires_at)
+
+    @app.post(
+        "/v1/auth/register",
+        response_model=AuthSessionResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def register(
+        payload: UserRegister,
+        request: Request,
+        response: Response,
+    ) -> AuthSessionResponse:
+        user, auth_session = await repository.register_user(
+            payload.email,
+            payload.password,
+            payload.display_name,
+            claim_guest_session_id=await claimable_guest_session_id(request),
+        )
+        set_session_cookie(response, auth_session.id, 30 * 24 * 60 * 60)
+        return auth_session_response(user, auth_session)
+
+    @app.post("/v1/auth/login", response_model=AuthSessionResponse)
+    async def login(
+        payload: UserLogin,
+        request: Request,
+        response: Response,
+    ) -> AuthSessionResponse:
+        user, auth_session = await repository.authenticate_user(
+            payload.email,
+            payload.password,
+            claim_guest_session_id=await claimable_guest_session_id(request),
+        )
+        set_session_cookie(response, auth_session.id, 30 * 24 * 60 * 60)
+        return auth_session_response(user, auth_session)
+
+    @app.get("/v1/auth/me", response_model=UserResponse)
+    async def current_user(owner_session_id: SessionId) -> UserResponse:
+        user = await repository.get_current_user(owner_session_id)
+        return UserResponse(
+            id=user.id,
+            email=user.email,
+            display_name=user.display_name,
+            created_at=user.created_at,
+        )
+
+    @app.post("/v1/auth/logout", status_code=status.HTTP_204_NO_CONTENT)
+    async def logout(response: Response, owner_session_id: SessionId) -> None:
+        await repository.get_current_user(owner_session_id)
+        await repository.revoke_session(owner_session_id)
+        response.delete_cookie(
+            key=settings.session_cookie_key,
+            path="/",
+            httponly=True,
+            secure=settings.session_cookie_secure,
+            samesite="lax",
+        )
 
     @app.get("/v1/projects", response_model=list[ProjectResponse])
     async def list_projects(owner_session_id: SessionId) -> list[ProjectResponse]:
@@ -172,6 +302,8 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
             ),
             preview=snapshot["preview"],
             artifact_refs=snapshot["artifact_refs"],
+            goal_graph=snapshot["goal_graph"],
+            pending_input_request=snapshot["pending_input_request"],
         )
 
     @app.patch("/v1/projects/{project_id}", response_model=ProjectResponse)
@@ -232,24 +364,14 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
         except ValueError as exc:
             raise HTTPException(status_code=422, detail="Last-Event-ID must be an integer sequence") from exc
 
-        async def stream() -> AsyncIterator[dict[str, str]]:
-            nonlocal cursor
-            while not await request.is_disconnected():
-                events = await repository.list_events(run_id, after=cursor)
-                for event in events:
-                    cursor = event.seq
-                    yield {
-                        "id": str(event.seq),
-                        "event": "run.event",
-                        "data": event.model_dump_json(by_alias=True),
-                    }
-                run = await repository.get_run(run_id)
-                if run.status.value in {"succeeded", "failed", "cancelled", "needs_attention"}:
-                    return
-                await asyncio.sleep(0.5)
-
         return EventSourceResponse(
-            stream(),
+            _stream_run_events(
+                request,
+                repository,
+                run_id,
+                owner_session_id,
+                cursor,
+            ),
             ping=15,
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -258,6 +380,40 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
     async def cancel_run(run_id: str, owner_session_id: SessionId) -> RunResponse:
         await _owned_run(run_id, owner_session_id)
         return await repository.request_cancel(run_id)
+
+    @app.post(
+        "/v1/runs/{run_id}/input-requests/{request_id}/answer",
+        response_model=UserInputAnswerResponse,
+    )
+    async def answer_run_input_request(
+        run_id: str,
+        request_id: str,
+        payload: UserInputAnswerCreate,
+        response: Response,
+        owner_session_id: SessionId,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> UserInputAnswerResponse:
+        if idempotency_key and idempotency_key != payload.client_message_id:
+            raise HTTPException(
+                status_code=422,
+                detail="Idempotency-Key must match clientMessageId",
+            )
+        await _owned_run(run_id, owner_session_id)
+        message, input_request, run, created = await repository.answer_user_input(
+            run_id,
+            request_id,
+            owner_session_id,
+            payload.client_message_id,
+            payload.answer,
+        )
+        response.status_code = (
+            status.HTTP_202_ACCEPTED if created else status.HTTP_200_OK
+        )
+        return UserInputAnswerResponse(
+            message=message,
+            request=input_request,
+            run=run,
+        )
 
     @app.get("/v1/projects/{project_id}/files")
     async def list_files(
