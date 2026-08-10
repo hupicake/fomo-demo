@@ -201,7 +201,6 @@ function normalizeStrictOutputSchema(schema) {
   visit(schema);
   return schema;
 }
-
 function bounded(value, maximum = MAX.publicTextCharacters) {
   const text = String(value ?? "");
   return text.length <= maximum ? text : `${text.slice(0, maximum)}…[truncated]`;

@@ -291,7 +291,6 @@ test("OpenCode bridge resumes a mapped session when history telemetry cannot pro
   assert.equal(records[0].payload.resumed, true);
   assert.equal(records.at(-1).type, "completed");
 });
-
 test("OpenCode bridge classifies provider responses without exposing their body", async () => {
   const paths = await fixture();
   const result = await runBridge({ ...baseEnvironment(paths), FOMO_TEST_MODEL_FAILURE: "1" });
