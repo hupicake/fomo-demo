@@ -206,8 +206,11 @@ async def test_audit_rejects_env_secret_files_even_when_present(
     # the settle audit is the last line of defense.
     sandbox.sandboxes[generation.id].files[secret_path] = b"SECRET=1"
 
-    with pytest.raises(WorkspaceContractError, match="rejected secret file"):
+    with pytest.raises(WorkspaceContractError, match="rejected secret file") as caught:
         await workspaces.audit(generation, baseline=baseline)
+    assert caught.value.repair is not None
+    assert caught.value.repair.code == "rejected_secret_file"
+    assert caught.value.repair.affected_files == ()
 
 
 @pytest.mark.asyncio
@@ -280,6 +283,12 @@ async def test_generation_advisory_is_protected_and_excluded_from_candidate_trut
     assert "tests/fomo-acceptance/G-1/search-books.smoke.spec.ts" in command
     assert f"--config={ADVISORY_ACCEPTANCE_CONFIG_PATH}" in command
     assert "--project=chromium --workers=1 --retries=0 --reporter=line" in command
+    advisory_config = next(
+        change.content
+        for change in compiled.changes
+        if change.path == ADVISORY_ACCEPTANCE_CONFIG_PATH
+    )
+    assert 'cwd: "../.."' in advisory_config
     for path, digest in compiled.sha256_by_path.items():
         assert hashlib.sha256(await sandbox.read_file(generation, path)).hexdigest() == digest
 
@@ -334,12 +343,30 @@ async def test_generation_advisory_replaces_prior_goal_and_fails_closed_on_tampe
         generation,
         [FileChange(path=second_path, content="// tampered\n", operation="modify")],
     )
-    with pytest.raises(WorkspaceContractError, match="changed outside FOMO"):
-        await workspaces.reconcile_generation_advisory(
-            generation,
-            second,
-            baseline=baseline,
-        )
+    baseline, _command = await workspaces.reconcile_generation_advisory(
+        generation,
+        second,
+        baseline=baseline,
+    )
+    assert hashlib.sha256(await sandbox.read_file(generation, second_path)).hexdigest() == (
+        second.sha256_by_path[second_path]
+    )
+
+    await sandbox.apply_changes(
+        generation,
+        [FileChange(path=second_path, content="// tampered again\n", operation="modify")],
+    )
+
+    with pytest.raises(WorkspaceContractError) as caught:
+        await workspaces.audit(generation, baseline=baseline)
+    assert caught.value.repair is not None
+    assert caught.value.repair.restore_protected_files
+    assert await workspaces.restore_generation_protected_files(
+        generation,
+        second,
+        baseline=baseline,
+    )
+    await workspaces.audit(generation, baseline=baseline)
 
 
 @pytest.mark.asyncio
@@ -398,6 +425,24 @@ async def test_audit_does_not_impose_file_size_or_changed_source_quotas(
     )
     audited = await workspaces.audit(generation, baseline=baseline)
     assert {"app/layout.tsx", "pnpm-lock.yaml"}.issubset(audited.changed_paths)
+
+
+@pytest.mark.asyncio
+async def test_audit_timeout_is_not_sent_to_the_model_for_repair(
+    repository, settings
+) -> None:
+    project, run, lease = await _run_context(repository, "audit-timeout")
+    sandbox = GitAwareSandbox()
+    workspaces = _manager(repository, sandbox, settings, run.id, project.id, lease)
+    generation = await workspaces.create_generation(run.base_version_id)
+    baseline = await workspaces.snapshot_hashes(generation)
+    workspaces.commands.run = AsyncMock(
+        return_value=ExecResult(exit_code=-1, stdout="", stderr="", timed_out=True)
+    )
+
+    with pytest.raises(WorkspaceContractError, match="audit timed out") as caught:
+        await workspaces.audit(generation, baseline=baseline)
+    assert caught.value.repair is None
 
 
 @pytest.mark.asyncio
