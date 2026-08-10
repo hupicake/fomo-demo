@@ -216,14 +216,41 @@ test("Codex bridge resumes only the captured UUID and fail-closes a missing sess
 });
 
 test("Codex bridge classifies structured, model, and protocol terminal failures", async () => {
+  const unsupportedKeywords = [
+    "default", "minLength", "maxLength", "pattern", "format",
+    "minItems", "maxItems", "minimum", "maximum", "exclusiveMinimum",
+    "exclusiveMaximum", "multipleOf", "minProperties", "maxProperties",
+    "patternProperties", "unevaluatedProperties", "propertyNames", "contains",
+    "minContains", "maxContains", "dependentRequired", "dependentSchemas",
+  ];
   const schema = {
     type: "object",
+    title: "Structured answer",
+    description: "Schema annotations stay available to the model.",
+    $defs: {
+      MustPriority: { type: "string", const: "must", enum: ["must", "legacy"] },
+      ShouldPriority: { type: "string", const: "should" },
+    },
     properties: {
       answer: {
         type: "object",
         properties: {
           label: { type: "string" },
-          priority: { type: "string", default: "must" },
+          priority: {
+            anyOf: [{ type: "null" }],
+            oneOf: [
+              { $ref: "#/$defs/MustPriority" },
+              { $ref: "#/$defs/ShouldPriority" },
+            ],
+            discriminator: {
+              propertyName: "kind",
+              mapping: {
+                must: "#/$defs/MustPriority",
+                should: "#/$defs/ShouldPriority",
+              },
+            },
+            ...Object.fromEntries(unsupportedKeywords.map((key) => [key, true])),
+          },
         },
         required: ["label"],
       },
@@ -239,17 +266,36 @@ test("Codex bridge classifies structured, model, and protocol terminal failures"
   const structuredEvents = records(structured.stdout);
   const submit = structuredEvents.find((event) => event.payload.toolName === "submit_structured_output");
   assert.deepEqual(submit.payload.args, { answer: { label: "ok", priority: "must" } });
-  assert.deepEqual(JSON.parse((await invocations(structuredPaths.log))[0].schema), {
-    ...schema,
-    additionalProperties: false,
-    properties: {
-      answer: {
-        ...schema.properties.answer,
-        required: ["label", "priority"],
-        additionalProperties: false,
-      },
-    },
-  });
+  const normalized = JSON.parse((await invocations(structuredPaths.log))[0].schema);
+  assert.equal(normalized.title, schema.title);
+  assert.equal(normalized.description, schema.description);
+  assert.deepEqual(normalized.required, ["answer"]);
+  assert.equal(normalized.additionalProperties, false);
+  assert.deepEqual(normalized.properties.answer.required, ["label", "priority"]);
+  assert.equal(normalized.properties.answer.additionalProperties, false);
+  assert.equal(normalized.$defs.MustPriority.const, undefined);
+  assert.deepEqual(normalized.$defs.MustPriority.enum, ["must"]);
+  assert.equal(normalized.$defs.ShouldPriority.const, undefined);
+  assert.deepEqual(normalized.$defs.ShouldPriority.enum, ["should"]);
+
+  const priority = normalized.properties.answer.properties.priority;
+  assert.equal(priority.oneOf, undefined);
+  assert.equal(priority.discriminator, undefined);
+  assert.deepEqual(priority.anyOf, [
+    { type: "null" },
+    { $ref: "#/$defs/MustPriority" },
+    { $ref: "#/$defs/ShouldPriority" },
+  ]);
+  const unsupported = new Set(unsupportedKeywords);
+  const assertStrictSubset = (value) => {
+    if (Array.isArray(value)) return value.forEach(assertStrictSubset);
+    if (!value || typeof value !== "object") return;
+    for (const [key, child] of Object.entries(value)) {
+      assert.equal(unsupported.has(key), false, `unsupported schema keyword ${key}`);
+      assertStrictSubset(child);
+    }
+  };
+  assertStrictSubset(normalized);
 
   for (const [mode, expected] of [
     ["model-failed", "codex_model_failed"],
