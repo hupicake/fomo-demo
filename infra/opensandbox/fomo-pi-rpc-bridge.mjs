@@ -128,7 +128,11 @@ const COMPACTION_SETTINGS = Object.freeze({
 });
 // Official Pi v0.84.1 builtin tools. The bridge mirrors this list as the
 // fail-closed transport contract; it never intercepts or rewrites tool calls.
-const ALLOWED_TOOLS = "read,write,edit,bash,grep,find,ls";
+const BUILTIN_TOOLS = "read,write,edit,bash,grep,find,ls";
+const DELEGATE_SUBTASKS_TOOL = "delegate_subtasks";
+const DELEGATE_SUBTASKS_EXTENSION = fileURLToPath(
+  new URL("./fomo-delegate-subtasks.ts", import.meta.url),
+);
 const STRUCTURED_OUTPUT_TOOL = "submit_structured_output";
 const STRUCTURED_OUTPUT_EXTENSION = fileURLToPath(new URL("./fomo-structured-output.ts", import.meta.url));
 const USER_INPUT_TOOL = "request_user_input";
@@ -146,6 +150,7 @@ const ENV = Object.freeze({
   stateDir: "FOMO_PI_STATE_DIR",
   piBin: "FOMO_PI_BIN",
   thinkingLevel: "FOMO_PI_THINKING_LEVEL",
+  effectiveThinkingLevel: "FOMO_PI_EFFECTIVE_THINKING_LEVEL",
   modelRef: "FOMO_PI_MODEL_REF",
   contextWindow: "FOMO_PI_CONTEXT_WINDOW",
   activitySilenceSeconds: "FOMO_PI_ACTIVITY_SILENCE_SECONDS",
@@ -178,6 +183,9 @@ const LIMITS = Object.freeze({
   userInputChoiceCharacters: 200,
   userInputChoices: 8,
   userInputReasonCharacters: 1000,
+  delegatedTasks: 3,
+  delegatedTaskIdCharacters: 40,
+  delegatedTaskCharacters: 2000,
   arrayItems: 128,
 });
 
@@ -232,8 +240,8 @@ let structuredOutputSchemaBase64 = "";
 let structuredOutputMode = false;
 let userInputEnabled = false;
 let requireResume = false;
-let activeTools = ALLOWED_TOOLS;
-let allowedToolNames = new Set(ALLOWED_TOOLS.split(","));
+let activeTools = BUILTIN_TOOLS;
+let allowedToolNames = new Set(BUILTIN_TOOLS.split(","));
 let timeoutSeconds = null;
 let graceSeconds = DEFAULTS.graceSeconds;
 
@@ -270,6 +278,18 @@ let userInputCalls = 0;
 let userInputSuccesses = 0;
 let inputRequest = null;
 const toolCounts = {};
+let delegatedTaskCount = 0;
+let delegatedChildTaskCount = 0;
+let delegatedChildToolCalls = 0;
+let delegatedChildTurns = 0;
+const delegatedUsage = {
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+  cost: 0,
+};
+const delegatedTaskIdsByCallId = new Map();
 
 const pendingResponses = new Map();
 const initial = { modelSelected: false, thinkingSelected: false, state: null, stats: null };
@@ -392,6 +412,18 @@ function parseFeatureFlag(name) {
   return true;
 }
 
+function configureDelegateSubtasksTool() {
+  if (structuredOutputMode || process.env.FOMO_PI_DELEGATION_CHILD === "1") return;
+  if (
+    !existsSync(DELEGATE_SUBTASKS_EXTENSION) ||
+    !statSync(DELEGATE_SUBTASKS_EXTENSION).isFile()
+  ) {
+    throw new Error("trusted read-only delegation extension is unavailable");
+  }
+  activeTools = `${activeTools},${DELEGATE_SUBTASKS_TOOL}`;
+  allowedToolNames.add(DELEGATE_SUBTASKS_TOOL);
+}
+
 function configureUserInputTool() {
   userInputEnabled = parseFeatureFlag(ENV.userInputEnabled);
   requireResume = parseFeatureFlag(ENV.requireResume);
@@ -485,6 +517,7 @@ function parseEnvironment() {
     );
   }
   parseStructuredOutputSchema();
+  configureDelegateSubtasksTool();
   configureUserInputTool();
 
   if (process.env[ENV.timeoutSeconds]) {
@@ -547,6 +580,7 @@ function spawnPi(sessionsDir) {
   environment.PI_OFFLINE = "1";
   environment.PI_SKIP_VERSION_CHECK = "1";
   environment.PI_TELEMETRY = "0";
+  environment[ENV.effectiveThinkingLevel] = effectiveThinkingLevel;
 
   const arguments_ = [
     "--mode", "rpc",
@@ -558,6 +592,9 @@ function spawnPi(sessionsDir) {
     "--no-context-files",
     "--no-extensions",
   ];
+  if (allowedToolNames.has(DELEGATE_SUBTASKS_TOOL)) {
+    arguments_.push("--extension", DELEGATE_SUBTASKS_EXTENSION);
+  }
   if (structuredOutputMode) arguments_.push("--extension", STRUCTURED_OUTPUT_EXTENSION);
   if (userInputEnabled) arguments_.push("--extension", USER_INPUT_EXTENSION);
   arguments_.push(
@@ -837,6 +874,19 @@ function onSettled() {
 
 function maybeFinalize() {
   if (lifecycle !== "settled" || !final.state || !final.stats) return;
+  if (delegatedChildTaskCount > 0) {
+    for (const key of ["input", "output", "cacheRead", "cacheWrite"]) {
+      const observed = final.stats.tokens[key] - initial.stats.tokens[key];
+      if (observed < delegatedUsage[key]) {
+        fail("invalid_delegation_usage", "parent session did not persist delegated token usage", 1, true);
+        return;
+      }
+    }
+    if (final.stats.cost - initial.stats.cost + 1e-9 < delegatedUsage.cost) {
+      fail("invalid_delegation_usage", "parent session did not persist delegated cost usage", 1, true);
+      return;
+    }
+  }
   lifecycle = "finalizing";
   if (timeoutHandle) clearTimeout(timeoutHandle);
   clearActivityTimer();
@@ -860,6 +910,12 @@ function maybeComplete() {
       firstEditOrWriteToolElapsedMs,
       toolCounts: { ...toolCounts },
       lastStopReason,
+      delegation: {
+        requestedTasks: delegatedTaskCount,
+        completedTasks: delegatedChildTaskCount,
+        childTurns: delegatedChildTurns,
+        childToolCalls: delegatedChildToolCalls,
+      },
     },
   });
   cleanPrivateConfiguration();
@@ -991,6 +1047,175 @@ function normalizeUserInputArguments(value) {
   return { value: normalized, error: null };
 }
 
+function normalizeDelegateArguments(value) {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.keys(value).some((key) => key !== "tasks") ||
+    !Array.isArray(value.tasks) ||
+    value.tasks.length < 1 ||
+    value.tasks.length > LIMITS.delegatedTasks ||
+    delegatedTaskCount + value.tasks.length > LIMITS.delegatedTasks
+  ) {
+    return { value: null, publicValue: null };
+  }
+  const taskIds = [];
+  const seen = new Set();
+  for (const task of value.tasks) {
+    if (
+      !task ||
+      typeof task !== "object" ||
+      Array.isArray(task) ||
+      Object.keys(task).some((key) => key !== "id" && key !== "task") ||
+      typeof task.id !== "string" ||
+      !/^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$/.test(task.id) ||
+      task.id.length > LIMITS.delegatedTaskIdCharacters ||
+      seen.has(task.id) ||
+      typeof task.task !== "string" ||
+      !task.task.trim() ||
+      task.task.length > LIMITS.delegatedTaskCharacters ||
+      /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(task.task)
+    ) {
+      return { value: null, publicValue: null };
+    }
+    seen.add(task.id);
+    taskIds.push(task.id);
+  }
+  return {
+    value: taskIds,
+    // Task bodies may contain repository excerpts. Public progress exposes
+    // only caller-chosen bounded identifiers, never child output or prompts.
+    publicValue: { tasks: taskIds.map((id) => ({ id })) },
+  };
+}
+
+function delegationInteger(value) {
+  if (!Number.isSafeInteger(value) || value < 0 || value > 1_000_000_000) {
+    throw new Error("invalid delegated integer usage");
+  }
+  return value;
+}
+
+function delegationCost(value) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new Error("invalid delegated cost usage");
+  }
+  return value;
+}
+
+function normalizeDelegatedUsage(value, { child = false } = {}) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("delegated usage must be an object");
+  }
+  const expectedKeys = new Set([
+    "input", "output", "cacheRead", "cacheWrite", "totalTokens", "cost",
+    ...(child ? ["toolCalls", "turns"] : []),
+  ]);
+  if (Object.keys(value).some((key) => !expectedKeys.has(key))) {
+    throw new Error("delegated usage contains unknown fields");
+  }
+  if (!value.cost || typeof value.cost !== "object" || Array.isArray(value.cost)) {
+    throw new Error("delegated cost must be an object");
+  }
+  const costKeys = new Set(["input", "output", "cacheRead", "cacheWrite", "total"]);
+  if (Object.keys(value.cost).some((key) => !costKeys.has(key))) {
+    throw new Error("delegated cost contains unknown fields");
+  }
+  const usage = {
+    input: delegationInteger(value.input),
+    output: delegationInteger(value.output),
+    cacheRead: delegationInteger(value.cacheRead),
+    cacheWrite: delegationInteger(value.cacheWrite),
+    totalTokens: delegationInteger(value.totalTokens),
+    cost: {
+      input: delegationCost(value.cost.input),
+      output: delegationCost(value.cost.output),
+      cacheRead: delegationCost(value.cost.cacheRead),
+      cacheWrite: delegationCost(value.cost.cacheWrite),
+      total: delegationCost(value.cost.total),
+    },
+    toolCalls: child ? delegationInteger(value.toolCalls) : 0,
+    turns: child ? delegationInteger(value.turns) : 0,
+  };
+  return usage;
+}
+
+function approximatelyEqual(left, right) {
+  return Math.abs(left - right) <= 1e-9 * Math.max(1, Math.abs(left), Math.abs(right));
+}
+
+function normalizeDelegationResult(result, expectedTaskIds) {
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    throw new Error("delegation result must be an object");
+  }
+  const details = result.details;
+  if (
+    !details ||
+    typeof details !== "object" ||
+    Array.isArray(details) ||
+    Object.keys(details).some((key) => !["schemaVersion", "kind", "results"].includes(key)) ||
+    details.schemaVersion !== 1 ||
+    details.kind !== "fomo.delegate_subtasks.result" ||
+    !Array.isArray(details.results) ||
+    details.results.length !== expectedTaskIds.length
+  ) {
+    throw new Error("delegation details are invalid");
+  }
+
+  const aggregate = {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    toolCalls: 0,
+    turns: 0,
+  };
+  details.results.forEach((item, index) => {
+    if (
+      !item ||
+      typeof item !== "object" ||
+      Array.isArray(item) ||
+      Object.keys(item).some((key) => !["id", "status", "usage"].includes(key)) ||
+      item.id !== expectedTaskIds[index] ||
+      !["succeeded", "failed", "cancelled"].includes(item.status)
+    ) {
+      throw new Error("delegation child result is invalid");
+    }
+    const usage = normalizeDelegatedUsage(item.usage, { child: true });
+    if (usage.totalTokens !== usage.input + usage.output + usage.cacheRead + usage.cacheWrite) {
+      throw new Error("delegation child total token usage is inconsistent");
+    }
+    for (const key of ["input", "output", "cacheRead", "cacheWrite", "totalTokens", "toolCalls", "turns"]) {
+      aggregate[key] += usage[key];
+      if (!Number.isSafeInteger(aggregate[key])) throw new Error("delegated usage overflow");
+    }
+    for (const key of ["input", "output", "cacheRead", "cacheWrite", "total"]) {
+      aggregate.cost[key] += usage.cost[key];
+      if (!Number.isFinite(aggregate.cost[key])) throw new Error("delegated cost overflow");
+    }
+  });
+
+  const parentUsage = normalizeDelegatedUsage(result.usage);
+  for (const key of ["input", "output", "cacheRead", "cacheWrite"]) {
+    if (parentUsage[key] !== aggregate[key]) {
+      throw new Error("delegation parent usage does not match child usage");
+    }
+  }
+  const componentTotal = aggregate.input + aggregate.output + aggregate.cacheRead + aggregate.cacheWrite;
+  if (parentUsage.totalTokens !== componentTotal) {
+    throw new Error("delegation total token usage is inconsistent");
+  }
+  for (const key of ["input", "output", "cacheRead", "cacheWrite", "total"]) {
+    if (!approximatelyEqual(parentUsage.cost[key], aggregate.cost[key])) {
+      throw new Error("delegation parent cost does not match child usage");
+    }
+  }
+  return { usage: parentUsage, toolCalls: aggregate.toolCalls, turns: aggregate.turns };
+}
+
 function emitPi(kind, payload = {}) {
   if (!PUBLIC_PI_KINDS.has(kind)) {
     fail("unknown_public_event", `bridge attempted unknown public Pi event ${kind}`, 1);
@@ -1028,6 +1253,15 @@ function beginToolCall(message) {
     fail("invalid_user_input_request", `${USER_INPUT_TOOL} must be the only active tool`, 1, true);
     return false;
   }
+  if (delegatedTaskIdsByCallId.size !== 0) {
+    fail(
+      "invalid_delegation",
+      `${DELEGATE_SUBTASKS_TOOL} must be the only active parent tool`,
+      1,
+      true,
+    );
+    return false;
+  }
   if (structuredOutputMode && toolName !== STRUCTURED_OUTPUT_TOOL && toolName !== USER_INPUT_TOOL) {
     fail(
       "invalid_structured_output",
@@ -1063,6 +1297,22 @@ function beginToolCall(message) {
     }
     userInputCalls += 1;
     userInputArgumentsByCallId.set(toolCallId, normalizeUserInputArguments(message.args));
+  }
+  if (toolName === DELEGATE_SUBTASKS_TOOL) {
+    if (!allowedToolNames.has(DELEGATE_SUBTASKS_TOOL) || activeToolCalls.size !== 0) {
+      fail("invalid_delegation", `${DELEGATE_SUBTASKS_TOOL} is unavailable or concurrent`, 1, true);
+      return false;
+    }
+    const normalized = normalizeDelegateArguments(message.args);
+    if (normalized.value === null) {
+      fail("invalid_delegation", `${DELEGATE_SUBTASKS_TOOL} arguments are invalid`, 1, true);
+      return false;
+    }
+    delegatedTaskCount += normalized.value.length;
+    delegatedTaskIdsByCallId.set(toolCallId, {
+      ids: normalized.value,
+      publicValue: normalized.publicValue,
+    });
   }
   activeToolCalls.set(toolCallId, toolName);
   if (firstToolElapsedMs === null && runStartedAt > 0) {
@@ -1110,6 +1360,29 @@ function endToolCall(message, ending) {
           requestId: `input-${randomUUID()}`,
           ...normalized.value,
         };
+      }
+    }
+    if (toolName === DELEGATE_SUBTASKS_TOOL) {
+      const expected = delegatedTaskIdsByCallId.get(toolCallId);
+      delegatedTaskIdsByCallId.delete(toolCallId);
+      if (!expected) {
+        fail("invalid_delegation", "delegation result has no matching task contract", 1, true);
+        return false;
+      }
+      if (message.isError !== true) {
+        try {
+          const normalized = normalizeDelegationResult(message.result, expected.ids);
+          delegatedChildTaskCount += expected.ids.length;
+          delegatedChildToolCalls += normalized.toolCalls;
+          delegatedChildTurns += normalized.turns;
+          for (const key of ["input", "output", "cacheRead", "cacheWrite"]) {
+            delegatedUsage[key] += normalized.usage[key];
+          }
+          delegatedUsage.cost += normalized.usage.cost.total;
+        } catch {
+          fail("invalid_delegation", "delegation result or usage is invalid", 1, true);
+          return false;
+        }
       }
     }
     if (
@@ -1201,6 +1474,8 @@ function handleEvent(message) {
           args = structuredOutputArguments(message.args);
         } else if (toolName === USER_INPUT_TOOL) {
           args = userInputArgumentsByCallId.get(String(message.toolCallId ?? ""))?.value ?? {};
+        } else if (toolName === DELEGATE_SUBTASKS_TOOL) {
+          args = delegatedTaskIdsByCallId.get(String(message.toolCallId ?? ""))?.publicValue ?? {};
         } else {
           args = sanitizePublic(message.args);
         }

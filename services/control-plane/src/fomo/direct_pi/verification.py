@@ -86,6 +86,12 @@ _PLAYWRIGHT = fomo_runner_command(
 )
 
 
+def _with_preview_asset_prefix(command: str, asset_prefix: str | None) -> str:
+    if not asset_prefix:
+        return command
+    return f"FOMO_PREVIEW_ASSET_PREFIX={shlex.quote(asset_prefix)} {command}"
+
+
 @dataclass(frozen=True, slots=True)
 class VerificationOutcome:
     passed: bool
@@ -301,9 +307,13 @@ class Verifier:
                     )
                 )
             if all(item.status == GateStatus.passed for item in gates):
+                build_command = _with_preview_asset_prefix(
+                    f"{_WORKSPACE_NEXT} build",
+                    self.settings.published_preview_asset_prefix(ref.id),
+                )
                 gates.append(
                     await self._command_gate(
-                        ref, "build", f"{_WORKSPACE_NEXT} build",
+                        ref, "build", build_command,
                         candidate_paths=candidate_paths,
                     )
                 )
@@ -475,7 +485,10 @@ class Verifier:
         return gate
 
     async def _start_preview(self, ref: SandboxRef) -> tuple[GateResult, str | None]:
-        command_text = f"{_WORKSPACE_NEXT} start --hostname 0.0.0.0 --port 8080"
+        command_text = _with_preview_asset_prefix(
+            f"{_WORKSPACE_NEXT} start --hostname 0.0.0.0 --port 8080",
+            self.settings.published_preview_asset_prefix(ref.id),
+        )
         operation_id = uuid7()
         await self.repository.append_event(
             self.run_id,

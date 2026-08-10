@@ -18,7 +18,7 @@ from pathlib import PurePosixPath
 from fomo.sandbox.base import FileChange
 
 STARTER_ID = "fomo-next-radix-v2"
-STARTER_VERSION = "2.0.0"
+STARTER_VERSION = "2.0.1"
 _BASE_ASSET_DIRECTORY = "base"
 _CAPABILITY_ASSET_DIRECTORY = "capabilities"
 
@@ -26,7 +26,7 @@ _CAPABILITY_ASSET_DIRECTORY = "capabilities"
 # a trust decision. They are filled from the checked-in files below; changing
 # any base/capability asset therefore requires an explicit versioned update.
 _EXPECTED_BASE_TREE_SHA256 = (
-    "0c253bcdc52fd3292739acb78b57aa72ddd3468e3108cd6432479b402bf10bdd"
+    "bf45c15f6affbe6af4fe693d91f443c72ba5ec092a31bcfd6e80360179934d55"
 )
 _EXPECTED_CAPABILITY_TREE_SHA256 = {
     "crud": "1d1bb2d5e289051e8b1d812215da5bb8965b9454f48205787f7eebb72ea2cbad",

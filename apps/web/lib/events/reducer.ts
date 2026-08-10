@@ -72,6 +72,10 @@ const publicFailureContracts = {
     title: "模型运行问题：无可用结果",
     message: "模型未返回可用的公开结果。请重试、切换模型或缩小任务范围。",
   },
+  coding_agent_runtime_failed: {
+    title: "Coding Agent 运行环境问题",
+    message: "Coding Agent 运行环境暂时不可用，请重试；若问题持续发生，请检查 OpenCode 服务状态。",
+  },
   planning_contract_failed: {
     title: "模型运行问题：规划输出无效",
     message: "模型未能按要求返回有效的产品规划合约。请重试或切换模型。",
@@ -407,6 +411,7 @@ export function createRunPresentation(input: {
     inputRequests: pendingInputRequest ? [pendingInputRequest] : [],
     goalGraph: input.goalGraph ?? null,
     contextUsage: undefined,
+    agentFramework: input.run?.agentFramework,
     runtime: input.runtime ?? input.run?.runtime,
   };
 }

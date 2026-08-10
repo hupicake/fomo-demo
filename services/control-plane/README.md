@@ -1,11 +1,10 @@
 # FOMO Control Plane
 
 FastAPI control plane plus an independent durable worker for FOMO's coding
-agent runtime. The production path is **Direct Pi**
-(`AGENT_FRAMEWORK=direct_pi`): `WorkerRunner → DirectPiOrchestrator →
-fomo-pi-ds`, where Pi runs inside an OpenSandbox generation sandbox with its
-official builtin tools and full project permission. The runtime now contains
-the **P0 native Pi baseline** and the **P1-A GoalGraph vertical slice**.
+agent runtimes. Each run freezes `pi` or `opencode`; both execute inside an
+OpenSandbox generation sandbox and reuse the same GoalGraph, safety audit,
+clean verification and publication pipeline. The runtime contains the **P0 Pi
+baseline** and the **P1-A GoalGraph vertical slice**.
 
 **Status (honest): P0 and P1-A code are landed.** GoalGraph, goal-scoped
 acceptance, durable checkpoints, recovery, selectable model runtime contracts,
@@ -22,6 +21,15 @@ only accepts commands and serves state; generated code and package commands
 run in the worker through a `SandboxProvider`.
 
 ## Runtime
+
+- `FOMO_AGENT_ENABLED_FRAMEWORKS` controls the `pi,opencode` allowlist and
+  `FOMO_AGENT_DEFAULT_FRAMEWORK` controls the default. The browser submits a
+  public framework id; the server freezes it on the Run and workers fail closed
+  if the selected adapter is unavailable.
+- OpenCode is pinned in the sandbox image and accessed through a loopback-only
+  SDK server. Its bridge maps sessions, structured planning, tools, usage and
+  cancellation into FOMO's durable event contract; OpenSandbox remains the
+  hard process/filesystem boundary.
 
 - Python is pinned to **3.11** (`>=3.11,<3.12`).
 - Direct Pi model egress goes through LiteLLM with a per-run opaque virtual
@@ -173,19 +181,22 @@ The worker never starts a host process unless that explicit opt-in is present.
 The FOMO system `.gitignore` baseline is owned by the control plane and cannot
 be weakened by agent output.
 
-For a controlled public deployment, set `PUBLIC_PREVIEW_BASE_DOMAIN` and run
-`fomo-preview-gateway` (the Compose `public-preview` profile exposes it only on
-loopback port 8001). Final publication stores the wildcard HTTPS URL, while QA
-continues to verify the direct internal endpoint first. The gateway accepts
-only canonical sandbox UUID hosts backed by a current, uncleaned verified
-resource, strips control-plane credentials/cookies, and maps confirmed provider
-expiry to durable `preview.expired` state. It is an HTTP proxy; generated apps
+For a controlled public deployment, run `fomo-preview-gateway` (the Compose
+`public-preview` profile exposes it only on loopback port 8001). Configure either
+`PUBLIC_PREVIEW_BASE_URL` for a same-origin path or the stronger isolated
+`PUBLIC_PREVIEW_BASE_DOMAIN` wildcard mode; production defaults to
+`WEB_ORIGIN/preview` when both are unset. QA continues to verify the direct
+internal endpoint first. The gateway requires an exact canonical UUID and
+verified persisted URL, strips credentials/cookies, adds no-store, and maps
+confirmed provider expiry to durable `preview.expired` state. Path HTML is CSP-
+sandboxed without same-origin/forms and may connect only inside its own Preview
+path. It is an HTTP proxy; generated apps
 that require WebSocket, SSE, or streaming transport are outside the current
 demo contract.
 
 The gateway service must use a minimal environment: `DATABASE_URL`,
-`OPENSANDBOX_BASE_URL`, `OPENSANDBOX_API_KEY`,
-`PUBLIC_PREVIEW_BASE_DOMAIN`, `PREVIEW_UPSTREAM_HOST_OVERRIDE`, and
+`APP_ENV`, `WEB_ORIGIN`, `OPENSANDBOX_BASE_URL`, `OPENSANDBOX_API_KEY`,
+one public Preview setting, `PREVIEW_UPSTREAM_HOST_OVERRIDE`, and
 `PREVIEW_GATEWAY_PORT` only. It must not inherit the API/worker environment or
 receive LiteLLM/model, Redis, MinIO, or AWS credentials.
 

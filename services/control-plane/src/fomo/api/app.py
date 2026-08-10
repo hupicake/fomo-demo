@@ -21,6 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
+from fomo.agent_framework import AgentFramework
 from fomo.config import Settings
 from fomo.fomo_pi_ds.gateway import InferenceGatewayError, LiteLLMRunKeyClient
 from fomo.persistence import (
@@ -40,6 +41,7 @@ from fomo.runtime_contract import (
     resolve_runtime_contract,
 )
 from fomo.schemas import (
+    AgentFrameworkOption,
     ArtifactDetailResponse,
     AuthSessionResponse,
     FileContentResponse,
@@ -276,6 +278,26 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
         return RuntimeOptionsResponse(
             default_profile_id=default_profile_id,
             profiles=options,
+            default_agent_framework=AgentFramework(settings.agent_default_framework),
+            agent_frameworks=[
+                AgentFrameworkOption(
+                    id=framework,
+                    label="Pi" if framework is AgentFramework.pi else "OpenCode",
+                    available=(
+                        settings.agent_framework == "direct_pi"
+                        and framework.value in settings.agent_enabled_frameworks
+                    ),
+                    disabled_reason=(
+                        None
+                        if (
+                            settings.agent_framework == "direct_pi"
+                            and framework.value in settings.agent_enabled_frameworks
+                        )
+                        else "Not enabled by the server."
+                    ),
+                )
+                for framework in AgentFramework
+            ],
         )
 
     @app.post(
@@ -408,17 +430,32 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
                     payload.thinking is not None
                     and payload.thinking != existing_run.runtime.thinking
                 )
+                or (
+                    payload.agent_framework is not None
+                    and payload.agent_framework != existing_run.agent_framework
+                )
             ):
                 raise ConflictError(
                     "Idempotency-Key was already used with a different request"
                 )
             response.status_code = status.HTTP_200_OK
             return MessageRunResponse(message=existing_message, run=existing_run)
+        selected_agent_framework = (
+            payload.agent_framework.value
+            if payload.agent_framework is not None
+            else settings.agent_default_framework
+        )
+        if selected_agent_framework not in settings.agent_enabled_frameworks:
+            raise HTTPException(status_code=422, detail="agent framework is not enabled")
         if settings.agent_framework != "direct_pi":
-            if payload.profile_id is not None or payload.thinking is not None:
+            if (
+                payload.agent_framework is not None
+                or payload.profile_id is not None
+                or payload.thinking is not None
+            ):
                 raise HTTPException(
                     status_code=422,
-                    detail="runtime model selection requires the Direct Pi framework",
+                    detail="runtime selection requires the Direct Pi framework",
                 )
             message, run, created = await repository.create_message_and_run(
                 project_id,
@@ -426,7 +463,11 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
                 payload.client_message_id,
                 payload.content,
                 payload.base_version_id,
+                agent_framework=selected_agent_framework,
                 runtime_contract=legacy_runtime_contract(),
+                enforce_agent_framework_match=(
+                    "agent_framework" in payload.model_fields_set
+                ),
             )
             response.status_code = status.HTTP_202_ACCEPTED if created else status.HTTP_200_OK
             return MessageRunResponse(message=message, run=run)
@@ -472,9 +513,13 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
             payload.client_message_id,
             payload.content,
             payload.base_version_id,
+            agent_framework=selected_agent_framework,
             runtime_contract=runtime_contract,
             enforce_runtime_match=bool(
                 {"profile_id", "thinking"}.intersection(payload.model_fields_set)
+            ),
+            enforce_agent_framework_match=(
+                "agent_framework" in payload.model_fields_set
             ),
         )
         response.status_code = status.HTTP_202_ACCEPTED if created else status.HTTP_200_OK

@@ -57,7 +57,7 @@ async def test_run_key_is_least_privilege_and_blocked_by_exact_secret() -> None:
         "models": [FOMO_PI_SELECTABLE_LITELLM_ALIASES[0]],
         "duration": "4200s",
         "max_budget": 2.0,
-        "max_parallel_requests": 1,
+        "max_parallel_requests": 3,
         "rpm_limit": 60,
         "tpm_limit": 1_000_000,
         "metadata": {"fomo_run_id": "run-123", "scope": "fomo-pi-ds"},

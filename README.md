@@ -1,9 +1,9 @@
 # FOMO
 
-FOMO is a web coding agent workbench that drives **Pi (the coding agent) as a
-replaceable execution kernel** inside an OpenSandbox generation sandbox, with
-FOMO as the single persistent control plane for verification, versions, and
-provenance. The current implementation contains the **P0 native Pi baseline**
+FOMO is a web coding agent workbench that runs **Pi or OpenCode as a
+per-run selectable Coding Agent runtime** inside an OpenSandbox generation
+sandbox, with FOMO as the single persistent control plane for verification,
+versions, and provenance. The current implementation contains the **P0 Pi baseline**
 and the **P1-A GoalGraph vertical slice**. A real OpenSandbox canary has reached
 `succeeded / ready`, and local Chrome/Playwright has verified both the direct
 generated-app endpoint and the host-based Preview gateway through interaction
@@ -50,6 +50,11 @@ If a local environment file does not already exist, copy `.env.example` to
 `.env.local` and fill in only the model credentials you use. Do not overwrite an
 existing `.env.local`.
 
+`FOMO_AGENT_ENABLED_FRAMEWORKS=pi,opencode` controls the public framework
+allowlist and `FOMO_AGENT_DEFAULT_FRAMEWORK=pi` selects the initial UI value.
+The selected framework, model and thinking level are frozen together when a
+run is created; workers never silently fall back to another framework.
+
 Start the complete stack:
 
 ```bash
@@ -85,7 +90,15 @@ Use `docker compose --env-file .env.local logs -f api worker web` for runtime
 logs, and `docker compose --env-file .env.local down` to stop the stack without
 deleting persistent volumes.
 
-## Direct Pi runtime (production path)
+## Coding Agent runtimes
+
+Pi and OpenCode share the same GoalGraph, workspace safety audit, clean
+Playwright verification, Preview and version publication pipeline. Pi uses the
+root-owned RPC bridge. OpenCode runs as a loopback-only server inside the same
+generation sandbox through a pinned SDK bridge; it receives only the run-scoped
+LiteLLM virtual key and never a provider or LiteLLM master credential.
+
+### Direct Pi
 
 A run is executed by `WorkerRunner → DirectPiOrchestrator → fomo-pi-ds`:
 
@@ -148,8 +161,9 @@ A run is executed by `WorkerRunner → DirectPiOrchestrator → fomo-pi-ds`:
   repair), and infrastructure failures clear it. It is never upgraded without
   full gate evidence. A fully verified OpenSandbox Preview is renewed
   to the bounded seven-day retention window before publication. When
-  `PUBLIC_PREVIEW_BASE_DOMAIN` is configured, the final atomic publish stores
-  `https://<sandbox-id>.<domain>/`; internal health checks still use the direct
+  `PUBLIC_PREVIEW_BASE_URL` is configured, publish stores
+  `<base-url>/<sandbox-id>/`; wildcard `PUBLIC_PREVIEW_BASE_DOMAIN` remains
+  compatible and stores `https://<sandbox-id>.<domain>/`. Internal health checks still use the direct
   endpoint, avoiding a circular dependency on the not-yet-published gateway
   authorization. Pi self-checks are never release evidence.
 
@@ -255,10 +269,12 @@ failed run rather than a false preview success.
 ## Controlled public Preview gateway
 
 The optional `public-preview` Compose profile starts `fomo-preview-gateway` on
-loopback port `8001`. A wildcard DNS/TLS ingress routes
-`*.PUBLIC_PREVIEW_BASE_DOMAIN` to it. For every request the gateway:
+loopback port `8001`. It supports either the existing wildcard-host mode or a
+same-origin `/preview/<sandbox-id>/` path routed through Web's official Next.js
+external rewrite. Production derives `WEB_ORIGIN/preview` when neither public
+Preview setting is explicit, so no new DNS entry is required. For every request the gateway:
 
-- accepts one canonical sandbox UUID subdomain only;
+- accepts one canonical sandbox UUID host label or path segment only;
 - requires that persistence still identifies it as the live, uncleaned
   verification sandbox of a succeeded run;
 - resolves the random OpenSandbox host port server-side, so the browser never
@@ -266,13 +282,17 @@ loopback port `8001`. A wildcard DNS/TLS ingress routes
   keep working;
 - strips FOMO cookies, authorization, forwarding headers, the OpenSandbox key,
   and generated-app `Set-Cookie` responses;
+- applies `no-store`; same-origin HTML additionally receives a CSP sandbox
+  without `allow-same-origin` or forms, and network connections are limited to
+  that exact Preview path. This preserves ordinary client-side UI while making
+  the reduced isolation explicit;
 - records `preview.expired` and removes the durable URL only after an
   authoritative OpenSandbox 404/410; transient provider failures return 502.
 
 The Compose service has its own minimal environment instead of inheriting the
 control-plane environment. It receives only the application database URL,
-OpenSandbox lifecycle URL/key, public Preview domain, upstream host override,
-and listen port. In particular, it has no LiteLLM master key, provider/model
+OpenSandbox lifecycle URL/key, `APP_ENV`, `WEB_ORIGIN`, public Preview route,
+upstream host override, and listen port. In particular, it has no LiteLLM master key, provider/model
 credential, Redis URL, MinIO endpoint, or AWS credential.
 
 Start the local profile with
@@ -292,8 +312,9 @@ hostname goes to port 8001. `cloudflared` is the only required reverse proxy;
 do not add an `httpHostHeader` override to the Preview rule because the UUID
 Host is part of gateway authorization.
 
-Before building Web, set `NEXT_PUBLIC_API_URL=https://app.example.com`. At
-runtime set `APP_ENV=production`, `WEB_ORIGIN=https://app.example.com`, and
+Before building Web, set `NEXT_PUBLIC_API_URL=https://app.example.com`. With
+`APP_ENV=production` and `WEB_ORIGIN=https://app.example.com`, path mode needs
+no additional setting. To use the stronger wildcard mode instead, set
 `PUBLIC_PREVIEW_BASE_DOMAIN=fomo-previews.example.net`. The Preview name must
 be a delegated zone of its own or have an explicit certificate covering
 `*.fomo-previews.example.net`; parent-zone Universal SSL does not normally

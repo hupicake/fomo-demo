@@ -50,6 +50,7 @@ async def test_fresh_database_upgrades_to_head(tmp_path: Path) -> None:
             "runtime_run_max_tokens",
             "runtime_inference_tpm_limit",
             "runtime_max_spend_micros",
+            "agent_framework",
         } <= run_columns
         token_budget_column = next(
             row
@@ -94,7 +95,7 @@ async def test_pre_model_selection_run_upgrades_with_legacy_execution_contract(
         row = connection.execute(
             "SELECT runtime_profile_id, runtime_model_ref, runtime_thinking, "
             "runtime_context_window, runtime_policy_version, runtime_run_max_tokens, "
-            "runtime_inference_tpm_limit, runtime_max_spend_micros "
+            "runtime_inference_tpm_limit, runtime_max_spend_micros, agent_framework "
             "FROM runs WHERE id = 'run-1'"
         ).fetchone()
     assert row == (
@@ -106,6 +107,7 @@ async def test_pre_model_selection_run_upgrades_with_legacy_execution_contract(
         400_000,
         1_000_000,
         2_000_000,
+        "pi",
     )
 
 

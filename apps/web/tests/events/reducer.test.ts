@@ -604,6 +604,24 @@ describe("run presentation reducer", () => {
     expect(JSON.stringify(state)).not.toContain("private-value");
   });
 
+  it("shows OpenCode runtime failures as a closed Coding Agent environment category", () => {
+    const initial = createRunPresentation({
+      projectId: "project-library",
+      run: { id: "run-library", projectId: "project-library", status: "running", lastSeq: 0 },
+    });
+
+    const state = reduceDomainEvent(initial, event(1, "pi.failed", {
+      code: "coding_agent_runtime_failed",
+      message: "OpenCode SDK leaked api_key=private-value",
+    }));
+
+    expect(state.worklog.at(-1)).toEqual(expect.objectContaining({
+      title: "Coding Agent 运行环境问题",
+      detail: "Coding Agent 运行环境暂时不可用，请重试；若问题持续发生，请检查 OpenCode 服务状态。",
+    }));
+    expect(JSON.stringify(state)).not.toContain("private-value");
+  });
+
   it("infers only exact safe failure types for legacy generic terminal events", () => {
     const snapshot = hydrateRunPresentationFromSnapshot({
       events: [

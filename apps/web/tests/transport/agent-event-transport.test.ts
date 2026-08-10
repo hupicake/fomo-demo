@@ -56,6 +56,7 @@ describe("AgentEventTransport", () => {
           project_id: "project-2",
           status: "queued",
           last_seq: 1,
+          agent_framework: "opencode",
           runtime: {
             profile_id: "gpt-5.6",
             thinking: "low",
@@ -70,7 +71,7 @@ describe("AgentEventTransport", () => {
     ));
     vi.stubGlobal("fetch", fetchMock);
     const onRunStarted = vi.fn();
-    const getRuntimeSelection = vi.fn((clientMessageId: string) => ({ profileId: "gpt-5.6", thinking: "low" }));
+    const getRuntimeSelection = vi.fn((clientMessageId: string) => ({ agentFramework: "opencode" as const, profileId: "gpt-5.6", thinking: "low" }));
 
     const transport = new AgentEventTransport({
       getLastSeq: () => 0,
@@ -87,7 +88,7 @@ describe("AgentEventTransport", () => {
 
     expect(getRuntimeSelection).toHaveBeenCalledWith("message-2");
     const body = JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit).body));
-    expect(body).toMatchObject({ profileId: "gpt-5.6", thinking: "low" });
-    expect(onRunStarted).toHaveBeenCalledWith("run-2", expect.objectContaining({ profileId: "gpt-5.6", thinking: "low" }));
+    expect(body).toMatchObject({ agentFramework: "opencode", profileId: "gpt-5.6", thinking: "low" });
+    expect(onRunStarted).toHaveBeenCalledWith("run-2", "opencode", expect.objectContaining({ profileId: "gpt-5.6", thinking: "low" }));
   });
 });

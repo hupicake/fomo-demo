@@ -36,7 +36,7 @@ import { RuntimeBadge, RuntimeSelector, findRuntimeProfile } from "@/components/
 import { Workspace } from "@/components/workbench/workspace";
 import { derivePreviewState, deriveRunState, type PreviewStateView, type RunStateView } from "@/lib/run-state";
 import { ApiProblem, controlPlane, controlPlaneUrl } from "@/lib/api/client";
-import { type AgentUIMessage, type DomainEvent, type FileContent, type FileManifestEntry, type ProjectMessage, type ProjectSnapshot, type ProjectSummary, type RunPresentation, type RuntimeOptionsResponse, type UserInputAnswerInput, type UserInputAnswerResponse, type VersionSummary } from "@/lib/contracts";
+import { type AgentFrameworkId, type AgentUIMessage, type DomainEvent, type FileContent, type FileManifestEntry, type ProjectMessage, type ProjectSnapshot, type ProjectSummary, type RunPresentation, type RuntimeOptionsResponse, type UserInputAnswerInput, type UserInputAnswerResponse, type VersionSummary } from "@/lib/contracts";
 import { submitChatMessage } from "@/lib/chat/submit-message";
 import { createRunPresentation, hydrateRunPresentationFromSnapshot, reconcileInputAnswer, reconcileInputRequestSnapshot, reduceDomainEvent } from "@/lib/events/reducer";
 import { projectStatusLabel } from "@/lib/project-status";
@@ -299,11 +299,14 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
     { revalidateOnFocus: false },
   );
   const availableProfiles = runtimeOptions?.profiles.filter((profile) => profile.available) ?? [];
+  const availableFrameworks = runtimeOptions?.agentFrameworks.filter((framework) => framework.available) ?? [];
   const hasAvailableModel = availableProfiles.length > 0;
+  const hasAvailableFramework = availableFrameworks.length > 0;
   const runtimeOptionsLoading = !runtimeOptions && !runtimeOptionsError;
 
   // The user's choice for the next run. Defaults to the server's suggested
   // profile (and that profile's default thinking) once options load.
+  const [selectedAgentFramework, setSelectedAgentFramework] = useState<AgentFrameworkId>();
   const [selectedProfileId, setSelectedProfileId] = useState<string>();
   const [selectedThinking, setSelectedThinking] = useState<string>();
   const activeProfileId = selectedProfileId
@@ -311,6 +314,22 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
     ?? availableProfiles[0]?.profileId;
   const activeThinking = selectedThinking
     ?? runtimeOptions?.profiles.find((profile) => profile.profileId === activeProfileId)?.defaultThinking;
+  const selectedAvailableFramework = runtimeOptions?.agentFrameworks.find(
+    (framework) => framework.id === selectedAgentFramework && framework.available,
+  );
+  const defaultAvailableFramework = runtimeOptions?.agentFrameworks.find(
+    (framework) => framework.id === runtimeOptions.defaultAgentFramework && framework.available,
+  );
+  const activeAgentFramework = selectedAvailableFramework?.id
+    ?? defaultAvailableFramework?.id
+    ?? availableFrameworks[0]?.id;
+  useEffect(() => {
+    if (!runtimeOptions || selectedAgentFramework) return;
+    const framework = runtimeOptions.agentFrameworks.find(
+      (candidate) => candidate.id === runtimeOptions.defaultAgentFramework && candidate.available,
+    ) ?? runtimeOptions.agentFrameworks.find((candidate) => candidate.available);
+    if (framework) setSelectedAgentFramework(framework.id);
+  }, [runtimeOptions, selectedAgentFramework]);
   useEffect(() => {
     if (!runtimeOptions || selectedProfileId) return;
     const profile = runtimeOptions.profiles.find((candidate) => candidate.profileId === runtimeOptions.defaultProfileId && candidate.available)
@@ -324,16 +343,20 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
   // Retries reuse the first selection for a given clientMessageId. useChat may
   // resend the same message id on reconnect; capture it once so the backend's
   // idempotency check never sees a conflicting runtime pair.
-  const runtimeSelectionByMessageId = useRef(new Map<string, { profileId: string; thinking: string }>());
+  const runtimeSelectionByMessageId = useRef(new Map<string, { agentFramework: AgentFrameworkId; profileId: string; thinking: string }>());
   const resolveRuntimeSelection = useCallback(
     (clientMessageId: string) => {
       const cached = runtimeSelectionByMessageId.current.get(clientMessageId);
       if (cached) return cached;
-      const selection = { profileId: activeProfileId ?? "", thinking: activeThinking ?? "" };
-      if (selection.profileId) runtimeSelectionByMessageId.current.set(clientMessageId, selection);
+      const selection = {
+        agentFramework: activeAgentFramework ?? "pi",
+        profileId: activeProfileId ?? "",
+        thinking: activeThinking ?? "",
+      };
+      if (selection.agentFramework && selection.profileId) runtimeSelectionByMessageId.current.set(clientMessageId, selection);
       return selection;
     },
-    [activeProfileId, activeThinking],
+    [activeAgentFramework, activeProfileId, activeThinking],
   );
   const resolveRuntimeSelectionRef = useRef(resolveRuntimeSelection);
   resolveRuntimeSelectionRef.current = resolveRuntimeSelection;
@@ -390,7 +413,7 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
         });
       }
     },
-    onRunStarted: (runId, runtime) => setPresentation((current) => ({ ...createRunPresentation({ projectId, run: { id: runId, projectId, status: "running", lastSeq: 0 }, runtime }), versions: current.versions, preview: current.preview })),
+    onRunStarted: (runId, agentFramework, runtime) => setPresentation((current) => ({ ...createRunPresentation({ projectId, run: { id: runId, projectId, status: "running", lastSeq: 0, agentFramework }, runtime }), versions: current.versions, preview: current.preview })),
     projectId,
   }), [mutatePreview, mutateProject, mutateVersions, projectId]);
 
@@ -494,8 +517,13 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
       throw new Error("请先回答工作日志中等待处理的问题。");
     }
     if (!text.trim()) return;
+    if (!hasAvailableFramework || !activeAgentFramework) {
+      const failure = new Error("当前没有可用的 Coding Agent 框架，无法开始运行。");
+      setConnectionMessage(failure.message);
+      throw failure;
+    }
     if (!hasAvailableModel || !activeProfileId || !activeThinking) {
-      const failure = new Error("当前没有可用的运行时模型，无法开始运行。");
+      const failure = new Error("当前没有可用的模型，无法开始运行。");
       setConnectionMessage(failure.message);
       throw failure;
     }
@@ -507,7 +535,7 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
       setConnectionMessage(failure.message);
       throw failure;
     }
-  }, [activeProfileId, activeThinking, clearError, hasAvailableModel, sendMessage]);
+  }, [activeAgentFramework, activeProfileId, activeThinking, clearError, hasAvailableFramework, hasAvailableModel, sendMessage]);
 
   const answerClarification = useCallback(async (requestId: string, input: UserInputAnswerInput) => {
     const current = presentationRef.current;
@@ -710,7 +738,7 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
               {/* Project name lives in the rail at lg+; keep it only for mobile/tablet chat. */}
               <p className="truncate text-sm font-semibold lg:hidden">{currentProjectName}</p>
               <RunStatusBadge status={presentation.status} />
-              {presentation.runtime ? <RuntimeBadge profileLabel={runtimeProfileLabel ?? presentation.runtime.profileId} runtime={presentation.runtime} /> : null}
+              {presentation.runtime ? <RuntimeBadge agentFramework={presentation.agentFramework} profileLabel={runtimeProfileLabel ?? presentation.runtime.profileId} runtime={presentation.runtime} /> : null}
             </div>
             <div className="hidden shrink-0 items-center gap-1 lg:flex">
               <ThemeToggle />
@@ -734,7 +762,8 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
                 <PromptInputFooter className="flex-wrap items-center gap-x-2 gap-y-1.5 !justify-start">
                   <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1.5">
                     <RuntimeSelector
-                      disabled={runActive || !hasAvailableModel || runtimeOptionsLoading}
+                      disabled={runActive || !hasAvailableFramework || !hasAvailableModel || runtimeOptionsLoading}
+                      onSelectAgentFramework={setSelectedAgentFramework}
                       onSelectProfile={(profileId) => {
                         setSelectedProfileId(profileId);
                         const profile = runtimeOptions?.profiles.find((candidate) => candidate.profileId === profileId);
@@ -742,6 +771,7 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
                       }}
                       onSelectThinking={setSelectedThinking}
                       options={runtimeOptions}
+                      selectedAgentFramework={activeAgentFramework}
                       selectedProfileId={selectedProfileId}
                       selectedThinking={selectedThinking}
                     />
@@ -755,7 +785,7 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
                   </div>
                   <PromptInputSubmit
                     className="ml-auto shrink-0"
-                    disabled={!canStopRun && !hasAvailableModel}
+                    disabled={!canStopRun && (!hasAvailableFramework || !hasAvailableModel)}
                     onStop={canStopRun ? stopRun : undefined}
                     status={runActive ? "streaming" : chatStatus}
                   />

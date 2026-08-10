@@ -1,11 +1,11 @@
 import type { ChatTransport, UIMessageChunk } from "ai";
 
 import { ApiProblem, controlPlane, controlPlaneUrl } from "@/lib/api/client";
-import type { AgentDataParts, AgentMessageMetadata, AgentUIMessage, DomainEvent, RunRuntimeResponse } from "@/lib/contracts";
+import type { AgentDataParts, AgentFrameworkId, AgentMessageMetadata, AgentUIMessage, DomainEvent, RunRuntimeResponse } from "@/lib/contracts";
 import { domainEventToMessageChunks } from "@/lib/events/reducer";
 import { consumeDomainEventStream } from "@/lib/events/sse";
 
-type RuntimeSelection = { profileId?: string; thinking?: string };
+type RuntimeSelection = { agentFramework?: AgentFrameworkId; profileId?: string; thinking?: string };
 
 type TransportOptions = {
   getLastSeq: () => number;
@@ -13,7 +13,7 @@ type TransportOptions = {
   getRuntimeSelection?: (clientMessageId: string) => RuntimeSelection;
   onConnectionChange?: (connected: boolean, message?: string) => void;
   onEvent: (event: DomainEvent) => void;
-  onRunStarted: (runId: string, runtime?: RunRuntimeResponse) => void;
+  onRunStarted: (runId: string, agentFramework?: AgentFrameworkId, runtime?: RunRuntimeResponse) => void;
   projectId: string;
 };
 
@@ -69,11 +69,12 @@ export class AgentEventTransport implements ChatTransport<AgentUIMessage> {
     const run = await controlPlane.startRun(this.options.projectId, {
       clientMessageId: message.id,
       content: message.text,
+      ...(selection.agentFramework ? { agentFramework: selection.agentFramework } : {}),
       ...(selection.profileId ? { profileId: selection.profileId, thinking: selection.thinking } : {}),
     });
     this.activeRunId = run.runId;
     this.terminalRunIds.delete(run.runId);
-    this.options.onRunStarted(run.runId, run.runtime);
+    this.options.onRunStarted(run.runId, run.agentFramework, run.runtime);
     // Sequence numbers are scoped to a run. A new run always starts at cursor zero.
     return this.open(run.runId, 0, abortSignal);
   }

@@ -31,6 +31,7 @@ from .rpc import (
     PiBridgeStreamReducer,
 )
 from .transport import (
+    OpenSandboxOpenCodeTransport,
     OpenSandboxPiTransport,
     PiTransportCancelled,
     PiTransportError,
@@ -54,6 +55,7 @@ __all__ = [
     "FOMO_PI_REQUIRE_RESUME",
     "InferenceGatewayError",
     "LiteLLMRunKeyClient",
+    "OpenSandboxOpenCodeTransport",
     "OpenSandboxPiTransport",
     "PiBridgeEnvelope",
     "PiBridgeFailed",

@@ -15,6 +15,13 @@ from pathlib import Path
 from urllib.parse import urlparse
 from uuid import UUID
 
+from fomo.agent_framework import (
+    DEFAULT_AGENT_FRAMEWORK,
+    legacy_framework_mode,
+    parse_enabled_agent_frameworks,
+    public_framework_from_legacy,
+    validated_default_agent_framework,
+)
 from fomo.runtime_contract import (
     DEFAULT_PROFILE_ID,
     parse_enabled_profile_ids,
@@ -32,6 +39,9 @@ DEFAULT_DEV_ACCOUNT_DISPLAY_NAME = "Dev"
 MAX_ENGINEER_FILE_CHARACTERS = 24_000
 INFERENCE_TOKEN_EXPIRY_GRACE_SECONDS = 600
 _DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_PREVIEW_PATH = re.compile(
+    r"^/(?:[A-Za-z0-9][A-Za-z0-9._~-]*)(?:/[A-Za-z0-9][A-Za-z0-9._~-]*)*$"
+)
 _COOKIE_NAME = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 
 
@@ -71,6 +81,32 @@ def _public_preview_base_domain(value: str | None) -> str | None:
     ):
         raise ValueError("PUBLIC_PREVIEW_BASE_DOMAIN must be a DNS domain without a scheme or port")
     return domain
+
+
+def _public_preview_base_url(value: str | None) -> str | None:
+    if value is None or not value.strip():
+        return None
+    candidate = value.strip()
+    if candidate != value or "\\" in candidate:
+        raise ValueError("PUBLIC_PREVIEW_BASE_URL must be an absolute http(s) URL")
+    parsed = urlparse(candidate)
+    try:
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("PUBLIC_PREVIEW_BASE_URL must be an absolute http(s) URL") from exc
+    path = parsed.path.rstrip("/")
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+        or (path and not _PREVIEW_PATH.fullmatch(path))
+    ):
+        raise ValueError("PUBLIC_PREVIEW_BASE_URL must be an absolute http(s) URL")
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}"
 
 
 def _registrable_site(hostname: str) -> str:
@@ -237,6 +273,10 @@ class Settings:
     litellm_api_key: str | None = None
     runtime_enabled_profiles: tuple[str, ...] = (DEFAULT_PROFILE_ID,)
     runtime_default_profile: str = DEFAULT_PROFILE_ID
+    # Public, per-run Coding Agent choices. These identifiers are frozen on a
+    # run and are independent from the retired process-wide compatibility mode.
+    agent_enabled_frameworks: tuple[str, ...] = ("pi", "opencode")
+    agent_default_framework: str = DEFAULT_AGENT_FRAMEWORK
     # Direct Pi receives only a short-lived LiteLLM virtual key. The master key
     # stays in the control plane and provider credentials stay inside LiteLLM.
     inference_token_ttl_seconds: int = 4_200
@@ -293,10 +333,11 @@ class Settings:
     opensandbox_image: str = DEFAULT_OPENSANDBOX_IMAGE
     opensandbox_lifetime_seconds: int = DEFAULT_OPENSANDBOX_LIFETIME_SECONDS
     opensandbox_ready_timeout_seconds: int = DEFAULT_OPENSANDBOX_READY_TIMEOUT_SECONDS
-    # When configured, verified preview URLs use an isolated wildcard HTTPS
-    # origin and are served by fomo-preview-gateway. Unset keeps local direct
-    # OpenSandbox endpoints unchanged.
+    # Verified previews can use either an isolated wildcard host or a same-origin
+    # path. Path mode is the deployment-light compromise and is CSP-sandboxed by
+    # fomo-preview-gateway; the two public routing modes are mutually exclusive.
     public_preview_base_domain: str | None = None
+    public_preview_base_url: str | None = None
     # Successful, fully verified previews outlive their build sandboxes. The
     # OpenSandbox server hard limit is kept in sync with this bounded value.
     verified_preview_lifetime_seconds: int = DEFAULT_VERIFIED_PREVIEW_LIFETIME_SECONDS
@@ -316,6 +357,16 @@ class Settings:
     max_repair_rounds: int = 3
 
     def __post_init__(self) -> None:
+        enabled_agent_frameworks = parse_enabled_agent_frameworks(
+            self.agent_enabled_frameworks
+        )
+        default_agent_framework = validated_default_agent_framework(
+            self.agent_default_framework,
+            enabled_agent_frameworks,
+        )
+        object.__setattr__(self, "agent_enabled_frameworks", enabled_agent_frameworks)
+        object.__setattr__(self, "agent_default_framework", default_agent_framework)
+        object.__setattr__(self, "agent_framework", legacy_framework_mode(self.agent_framework))
         enabled_profiles = parse_enabled_profile_ids(
             ",".join(self.runtime_enabled_profiles)
         )
@@ -334,22 +385,37 @@ class Settings:
                 "runtime profile"
             )
         normalized_preview_domain = _public_preview_base_domain(self.public_preview_base_domain)
+        normalized_preview_url = _public_preview_base_url(self.public_preview_base_url)
+        if normalized_preview_domain and normalized_preview_url:
+            raise ValueError(
+                "PUBLIC_PREVIEW_BASE_URL and PUBLIC_PREVIEW_BASE_DOMAIN are mutually exclusive"
+            )
+        # Production defaults to the existing web origin so the path gateway can
+        # be enabled without provisioning DNS or changing the deployed .env.
+        if not normalized_preview_domain and not normalized_preview_url and self.app_env == "production":
+            _web_origin_site(self.web_origin)
+            normalized_preview_url = _public_preview_base_url(
+                f"{self.web_origin.strip().rstrip('/')}/preview"
+            )
         object.__setattr__(self, "public_preview_base_domain", normalized_preview_domain)
+        object.__setattr__(self, "public_preview_base_url", normalized_preview_url)
         object.__setattr__(
             self,
             "session_cookie_name",
             _validated_session_cookie_name(self.session_cookie_name),
         )
-        if normalized_preview_domain:
+        if normalized_preview_domain or normalized_preview_url:
             if (
                 self.sandbox_provider != "opensandbox"
                 or self.agent_framework != "direct_pi"
                 or not self.direct_pi_goal_graph_enabled
             ):
                 raise ValueError(
-                    "PUBLIC_PREVIEW_BASE_DOMAIN requires SANDBOX_PROVIDER=opensandbox, "
+                    "PUBLIC_PREVIEW_BASE_URL or PUBLIC_PREVIEW_BASE_DOMAIN requires "
+                    "SANDBOX_PROVIDER=opensandbox, "
                     "AGENT_FRAMEWORK=direct_pi, and DIRECT_PI_GOAL_GRAPH_ENABLED=true"
                 )
+        if normalized_preview_domain:
             preview_site = _registrable_site(normalized_preview_domain)
             web_site = _web_origin_site(self.web_origin)
             if preview_site == web_site:
@@ -437,9 +503,9 @@ class Settings:
         return self.session_cookie_name
 
     def published_preview_url(self, sandbox_id: str) -> str | None:
-        """Return the isolated public URL only after verification is complete."""
+        """Return the configured public URL only after verification is complete."""
 
-        if not self.public_preview_base_domain:
+        if not self.public_preview_base_domain and not self.public_preview_base_url:
             return None
         try:
             canonical_id = str(UUID(sandbox_id))
@@ -447,13 +513,45 @@ class Settings:
             raise ValueError("public preview requires a canonical sandbox UUID") from exc
         if canonical_id != sandbox_id:
             raise ValueError("public preview requires a canonical sandbox UUID")
+        if self.public_preview_base_url:
+            return f"{self.public_preview_base_url}/{canonical_id}/"
         return f"https://{canonical_id}.{self.public_preview_base_domain}/"
+
+    def published_preview_asset_prefix(self, sandbox_id: str) -> str | None:
+        """Return the path-mode prefix baked into a generated Next build."""
+
+        if not self.public_preview_base_url:
+            return None
+        public_url = self.published_preview_url(sandbox_id)
+        assert public_url is not None
+        return urlparse(public_url).path.rstrip("/")
 
     @classmethod
     def from_env(cls) -> Settings:
         defaults = cls()
         app_env = os.getenv("APP_ENV", defaults.app_env).strip().lower()
         database_url = os.getenv("DATABASE_URL", defaults.database_url)
+        legacy_agent_framework_raw = os.getenv(
+            "AGENT_FRAMEWORK", defaults.agent_framework
+        ).strip().lower()
+        enabled_agent_frameworks_raw = os.getenv("FOMO_AGENT_ENABLED_FRAMEWORKS")
+        default_agent_framework_raw = os.getenv("FOMO_AGENT_DEFAULT_FRAMEWORK")
+        enabled_agent_frameworks = parse_enabled_agent_frameworks(
+            defaults.agent_enabled_frameworks
+            if enabled_agent_frameworks_raw is None
+            else enabled_agent_frameworks_raw
+        )
+        default_agent_framework = (
+            validated_default_agent_framework(
+                default_agent_framework_raw,
+                enabled_agent_frameworks,
+            )
+            if default_agent_framework_raw is not None
+            else validated_default_agent_framework(
+                public_framework_from_legacy(legacy_agent_framework_raw),
+                enabled_agent_frameworks,
+            )
+        )
         engineer_target_file_characters, engineer_max_file_characters = (
             _engineer_file_character_limits(
                 defaults.engineer_target_file_characters,
@@ -497,6 +595,8 @@ class Settings:
                 os.getenv("FOMO_RUNTIME_DEFAULT_PROFILE", defaults.runtime_default_profile).strip()
                 or defaults.runtime_default_profile
             ),
+            agent_enabled_frameworks=enabled_agent_frameworks,
+            agent_default_framework=default_agent_framework,
             inference_token_ttl_seconds=_positive_int_environment_value(
                 "FOMO_INFERENCE_TOKEN_TTL", defaults.inference_token_ttl_seconds
             ),
@@ -566,7 +666,7 @@ class Settings:
             ),
             engineer_target_file_characters=engineer_target_file_characters,
             engineer_max_file_characters=engineer_max_file_characters,
-            agent_framework=os.getenv("AGENT_FRAMEWORK", defaults.agent_framework).strip().lower(),
+            agent_framework=legacy_agent_framework_raw,
             direct_pi_goal_graph_enabled=_bool("DIRECT_PI_GOAL_GRAPH_ENABLED", True),
             sandbox_provider=os.getenv("SANDBOX_PROVIDER", defaults.sandbox_provider).lower(),
             opensandbox_base_url=os.getenv("OPENSANDBOX_BASE_URL", defaults.opensandbox_base_url),
@@ -587,6 +687,9 @@ class Settings:
             ),
             public_preview_base_domain=_public_preview_base_domain(
                 os.getenv("PUBLIC_PREVIEW_BASE_DOMAIN")
+            ),
+            public_preview_base_url=_public_preview_base_url(
+                os.getenv("PUBLIC_PREVIEW_BASE_URL")
             ),
             verified_preview_lifetime_seconds=_verified_preview_lifetime_seconds(
                 defaults.verified_preview_lifetime_seconds

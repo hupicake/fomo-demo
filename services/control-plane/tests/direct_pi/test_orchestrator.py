@@ -487,6 +487,8 @@ def test_legacy_build_and_repair_prompts_allow_complete_sandbox_work() -> None:
     for prompt in (build, type_repair, verification_repair):
         assert "FOMO frontend-only runtime contract" in prompt
         assert "business logic and mutable product data must remain client-side" in prompt
+        assert "delegate_subtasks" in prompt
+        assert "You remain the only writer and integrator" in prompt
 
 
 class _GoalGraphTransport:

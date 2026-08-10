@@ -9,12 +9,40 @@ from fomo.sandbox import OpenSandboxProvider
 from fomo.worker.runner import WorkerRunner
 
 
+def test_agent_framework_allowlist_defaults_and_legacy_environment_mapping(monkeypatch) -> None:
+    defaults = Settings()
+    assert defaults.agent_enabled_frameworks == ("pi", "opencode")
+    assert defaults.agent_default_framework == "pi"
+
+    monkeypatch.setenv("AGENT_FRAMEWORK", "opencode")
+    from_legacy_switch = Settings.from_env()
+    assert from_legacy_switch.agent_framework == "direct_pi"
+    assert from_legacy_switch.agent_default_framework == "opencode"
+
+    monkeypatch.setenv("FOMO_AGENT_ENABLED_FRAMEWORKS", "opencode")
+    monkeypatch.setenv("FOMO_AGENT_DEFAULT_FRAMEWORK", "opencode")
+    explicit = Settings.from_env()
+    assert explicit.agent_enabled_frameworks == ("opencode",)
+    assert explicit.agent_default_framework == "opencode"
+
+
+def test_agent_framework_configuration_fails_closed() -> None:
+    with pytest.raises(ValueError, match="unsupported agent framework"):
+        Settings(agent_enabled_frameworks=("pi", "unknown"))
+    with pytest.raises(ValueError, match="default agent framework must be present"):
+        Settings(
+            agent_enabled_frameworks=("pi",),
+            agent_default_framework="opencode",
+        )
+
+
 def test_direct_pi_bridge_enables_official_builtin_tools_and_no_business_policy() -> None:
     bridge = (
         Path(__file__).parents[3] / "infra" / "opensandbox" / "fomo-pi-rpc-bridge.mjs"
     ).read_text(encoding="utf-8")
 
-    assert 'const ALLOWED_TOOLS = "read,write,edit,bash,grep,find,ls";' in bridge
+    assert 'const BUILTIN_TOOLS = "read,write,edit,bash,grep,find,ls";' in bridge
+    assert 'const DELEGATE_SUBTASKS_TOOL = "delegate_subtasks";' in bridge
     # No business-file write allowlist survives in the bridge: Pi keeps its
     # official builtin tools with full /workspace permission.
     assert "allowedWritePaths" not in bridge
@@ -144,6 +172,40 @@ def test_public_preview_domain_is_optional_normalized_and_validated(monkeypatch)
     for invalid in ("https://preview.example.test", "preview.example.test:443", "localhost"):
         with pytest.raises(ValueError, match="PUBLIC_PREVIEW_BASE_DOMAIN"):
             Settings(public_preview_base_domain=invalid)
+
+
+def test_public_preview_path_url_is_normalized_exclusive_and_defaults_in_production() -> None:
+    sandbox_id = "11111111-1111-4111-8111-111111111111"
+    configured = Settings(
+        web_origin="https://app.example.test",
+        public_preview_base_url="https://APP.Example.Test/preview/",
+    )
+    assert configured.public_preview_base_url == "https://app.example.test/preview"
+    assert configured.published_preview_url(sandbox_id) == (
+        f"https://app.example.test/preview/{sandbox_id}/"
+    )
+    assert configured.published_preview_asset_prefix(sandbox_id) == (
+        f"/preview/{sandbox_id}"
+    )
+    assert Settings().public_preview_base_url is None
+    assert Settings(
+        app_env="production",
+        web_origin="https://app.example.test",
+    ).public_preview_base_url == "https://app.example.test/preview"
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        Settings(
+            public_preview_base_url="https://app.example.test/preview",
+            public_preview_base_domain="preview.example.net",
+        )
+    for invalid in (
+        "//app.example.test/preview",
+        "https://user:secret@app.example.test/preview",
+        "https://app.example.test/preview?token=secret",
+        "https://app.example.test/../preview",
+    ):
+        with pytest.raises(ValueError, match="PUBLIC_PREVIEW_BASE_URL"):
+            Settings(public_preview_base_url=invalid)
 
 
 @pytest.mark.parametrize(

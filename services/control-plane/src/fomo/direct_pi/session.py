@@ -67,6 +67,7 @@ class DirectPiSession:
         virtual_key: RunVirtualKey,
         *,
         runtime_contract: RuntimeContract | None = None,
+        agent_framework: str = "pi",
         run_id: str,
         lease_token: str,
         started_at: float,
@@ -80,6 +81,9 @@ class DirectPiSession:
         if self.runtime_contract.litellm_alias not in virtual_key.model_aliases:
             raise ValueError("virtual key does not authorize the run runtime profile")
         self.run_id = run_id
+        if agent_framework not in {"pi", "opencode"}:
+            raise ValueError("agent framework must be pi or opencode")
+        self.agent_framework = agent_framework
         self.lease_token = lease_token
         self.started_at = started_at
         self.session_id = session_id or f"fomo-{run_id}"
@@ -125,7 +129,9 @@ class DirectPiSession:
             # connection, and spend boundary own termination—not a FOMO wall.
             timeout_seconds=None,
             structured_output_schema=structured_output_schema,
-            user_input_enabled=True,
+            # OpenCode MVP can resume its durable session, but its bridge does
+            # not yet implement FOMO's request_user_input virtual tool.
+            user_input_enabled=self.agent_framework == "pi",
             require_resume=resume_request_id is not None or require_existing_session,
         )
         usage_token = await self._reserve_usage(
@@ -200,7 +206,11 @@ class DirectPiSession:
             await self.repository.append_event(
                 self.run_id,
                 "pi.diagnostic",
-                payload={"stage": stage, "message": "".join(diagnostic)[:16_000]},
+                payload={
+                    "stage": stage,
+                    "framework": self.agent_framework,
+                    "message": "".join(diagnostic)[:16_000],
+                },
                 lease_token=self.lease_token,
             )
         input_request = self._input_request(result)
@@ -308,6 +318,7 @@ class DirectPiSession:
             cost_micros=usage["cost_micros"],
             metadata={
                 "stage": stage,
+                "framework": self.agent_framework,
                 "sessionId": self.session_id,
                 "executionId": result.execution_id,
             },
@@ -335,6 +346,7 @@ class DirectPiSession:
             model=model,
             metadata={
                 "stage": stage,
+                "framework": self.agent_framework,
                 "sessionId": self.session_id,
             },
             goal_id=goal_id,

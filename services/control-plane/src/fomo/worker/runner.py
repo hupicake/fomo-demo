@@ -11,14 +11,25 @@ from collections.abc import Awaitable, Callable
 from typing import Protocol
 from urllib.parse import urlparse
 
+from fomo.agent_framework import (
+    AgentTransportRegistry,
+    normalize_agent_framework,
+    resolve_run_agent_framework,
+)
 from fomo.agent_runtime import ModelClient, OpenAICompatibleClient, SOPRunner
 from fomo.config import Settings
 from fomo.direct_pi import DirectPiOrchestrator
-from fomo.fomo_pi_ds import LiteLLMRunKeyClient, OpenSandboxPiTransport
+from fomo.direct_pi.failures import CODING_AGENT_FAILED
+from fomo.fomo_pi_ds import (
+    LiteLLMRunKeyClient,
+    OpenSandboxOpenCodeTransport,
+    OpenSandboxPiTransport,
+)
 from fomo.persistence import Database, Repository, SandboxCleanupTarget
 from fomo.runtime_contract import runtime_profile
 from fomo.runtime_preflight import DirectPiRuntimePreflight
 from fomo.sandbox import OpenSandboxProvider, SandboxProvider, SandboxRef, create_sandbox_provider
+from fomo.schemas import RunStatus
 
 logger = logging.getLogger(__name__)
 _PREFLIGHT_SUCCESS_TTL_SECONDS = 60.0
@@ -114,18 +125,38 @@ class WorkerRunner:
                     master_key=settings.litellm_api_key,
                     timeout_seconds=settings.inference_management_timeout_seconds,
                 )
-                transport = OpenSandboxPiTransport(
+                enabled_frameworks = tuple(
+                    normalize_agent_framework(framework)
+                    for framework in getattr(
+                        settings, "agent_enabled_frameworks", ("pi",)
+                    )
+                )
+                transports = {}
+                pi_transport = OpenSandboxPiTransport(
                     self.sandbox,
                     # This is the provider resource lifetime, not a FOMO run
                     # budget. Individual Pi turns have no bridge wall timer.
                     default_timeout_seconds=settings.opensandbox_lifetime_seconds,
                     stderr_limit_bytes=settings.command_output_limit_bytes,
                 )
+                if "pi" in enabled_frameworks:
+                    transports["pi"] = pi_transport
+                if "opencode" in enabled_frameworks:
+                    transports["opencode"] = OpenSandboxOpenCodeTransport(
+                        self.sandbox,
+                        default_timeout_seconds=settings.opensandbox_lifetime_seconds,
+                        stderr_limit_bytes=settings.command_output_limit_bytes,
+                    )
+                transport_registry = AgentTransportRegistry(transports)
+                # The startup probe validates the shared run-scoped LiteLLM
+                # route from OpenSandbox. It is framework-neutral and must
+                # remain enabled when both Pi and OpenCode are available, so a
+                # provider outage never consumes a queued user run.
                 if self._runtime_preflight is None:
                     self._runtime_preflight = DirectPiRuntimePreflight(
                         gateway=gateway,
                         sandbox=self.sandbox,
-                        transport=transport,
+                        transport=pi_transport,
                         provider_base_url=settings.pi_provider_base_url,
                         sandbox_ready_timeout_seconds=settings.opensandbox_ready_timeout_seconds,
                         sandbox_lifetime_seconds=settings.opensandbox_lifetime_seconds,
@@ -138,7 +169,11 @@ class WorkerRunner:
                         ),
                     )
                 self.direct_orchestrator = DirectPiOrchestrator(
-                    repository, self.sandbox, settings, gateway, transport
+                    repository,
+                    self.sandbox,
+                    settings,
+                    gateway,
+                    transport_registry,
                 )
         elif settings.agent_framework == "native":
             if direct_orchestrator is not None:
@@ -166,10 +201,30 @@ class WorkerRunner:
         run = await self.repository.claim_next_run(self.worker_id, self.settings.worker_lease_seconds)
         if run is None:
             return False
+        lease_token = run.lease_owner
+        if not lease_token:
+            raise RuntimeError("claimed run is missing its lease token")
+        claimed_framework = getattr(run, "agent_framework", None)
+        framework = (
+            normalize_agent_framework(claimed_framework)
+            if claimed_framework is not None
+            else await resolve_run_agent_framework(self.repository, run.id)
+        )
         if self.direct_orchestrator is not None:
             orchestrator = self.direct_orchestrator
-            task_name = f"fomo-direct-pi:{run.id}"
+            task_name = f"fomo-{framework}-agent:{run.id}"
         else:
+            if framework != "pi":
+                # Legacy SOP has no OpenCode semantics. Never silently execute
+                # an OpenCode run with the historical native implementation.
+                await self.repository.mark_terminal(
+                    run.id,
+                    RunStatus.failed,
+                    error_code=CODING_AGENT_FAILED.code,
+                    summary=CODING_AGENT_FAILED.summary,
+                    lease_token=lease_token,
+                )
+                return True
             assert self.model is not None
             orchestrator = SOPRunner(
                 self.repository,
@@ -178,9 +233,6 @@ class WorkerRunner:
                 self.settings,
             )
             task_name = f"fomo-legacy-sop:{run.id}"
-        lease_token = run.lease_owner
-        if not lease_token:
-            raise RuntimeError("claimed run is missing its lease token")
         lease_lost = asyncio.Event()
         run_task = asyncio.create_task(
             orchestrator.run(run.id, lease_token=lease_token),
