@@ -736,11 +736,13 @@ def test_direct_pi_catalog_aliases_are_unique_scoped_and_documented() -> None:
     assert "model: openai/gpt-5.6-sol" in canonical_gpt56
     assert "api_key: os.environ/OPENAI_API_KEY" in canonical_gpt56
     assert "api_base: os.environ/OPENAI_API_BASE" in canonical_gpt56
+    assert "use_chat_completions_api: true" in canonical_gpt56
 
     canonical_gpt55 = aliases_by_name["fomo-pi-gpt-5.5"]
     assert "model: openai/gpt-5.5" in canonical_gpt55
     assert "api_key: os.environ/OPENAI_API_KEY" in canonical_gpt55
     assert "api_base: os.environ/OPENAI_API_BASE" in canonical_gpt55
+    assert "use_chat_completions_api: true" in canonical_gpt55
 
     canonical_flash = aliases_by_name["fomo-pi-deepseek-flash"]
     assert "model: deepseek/deepseek-v4-flash" in canonical_flash

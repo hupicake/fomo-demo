@@ -59,12 +59,16 @@ model_list:
       model: openai/gpt-5.6-sol
       api_key: os.environ/OPENAI_API_KEY
       api_base: os.environ/OPENAI_API_BASE
+      # Codex speaks Responses, while this OpenAI-compatible upstream exposes
+      # the model through Chat Completions. LiteLLM performs the translation.
+      use_chat_completions_api: true
 
   - model_name: fomo-pi-gpt-5.5
     litellm_params:
       model: openai/gpt-5.5
       api_key: os.environ/OPENAI_API_KEY
       api_base: os.environ/OPENAI_API_BASE
+      use_chat_completions_api: true
 
   - model_name: fomo-pi-deepseek-flash
     litellm_params:
