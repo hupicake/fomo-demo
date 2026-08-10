@@ -115,6 +115,8 @@ async def test_path_gateway_strips_prefix_isolates_credentials_and_sandboxes_htm
     assert f"connect-src {public_url}" in csp
     assert "form-action 'none'" in csp
     assert response.headers["cache-control"] == "private, no-store, max-age=0"
+    assert response.headers["access-control-allow-origin"] == "*"
+    assert response.headers["cross-origin-resource-policy"] == "cross-origin"
     repository.require_verified_preview_target.assert_awaited_once_with(sandbox_id)
     await outbound_client.aclose()
 
