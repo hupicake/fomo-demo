@@ -287,6 +287,11 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
         payload: UserRegister,
         response: Response,
     ) -> AuthSessionResponse:
+        if settings.app_env == "production":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Registration is disabled.",
+            )
         user, auth_session = await repository.register_user(
             payload.email,
             payload.password,

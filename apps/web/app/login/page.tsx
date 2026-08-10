@@ -16,6 +16,7 @@ const PASSWORD_MAX = 128;
 const DISPLAY_NAME_MAX = 100;
 const REDIRECT_BASE = new URL("https://fomo.invalid");
 const NEXT_DEVELOPMENT = process.env.NODE_ENV === "development";
+const REGISTRATION_ENABLED = NEXT_DEVELOPMENT;
 const DEVELOPMENT_EMAIL = process.env.NEXT_PUBLIC_DEV_ACCOUNT_EMAIL
   || (NEXT_DEVELOPMENT ? "dev@fomo.local" : "");
 const DEVELOPMENT_PASSWORD = process.env.NEXT_PUBLIC_DEV_ACCOUNT_PASSWORD
@@ -79,7 +80,7 @@ function LoginForm({ initialMode, redirectTo }: { initialMode: AuthMode; redirec
   const displayErrorId = useId();
   const formErrorId = useId();
 
-  const isRegister = mode === "register";
+  const isRegister = REGISTRATION_ENABLED && mode === "register";
 
   // Already authenticated (e.g. opened /login in a second tab) — go home.
   useEffect(() => {
@@ -228,7 +229,9 @@ function LoginForm({ initialMode, redirectTo }: { initialMode: AuthMode; redirec
         </form>
 
         <div className="mt-5 border-t pt-4 text-center text-sm text-muted-foreground">
-          {isRegister ? (
+          {!REGISTRATION_ENABLED ? (
+            <span>当前仅开放受邀账号登录。</span>
+          ) : isRegister ? (
             <>
               已有账号？
               <button
@@ -270,7 +273,9 @@ function LoginForm({ initialMode, redirectTo }: { initialMode: AuthMode; redirec
 function LoginContent() {
   const searchParams = useSearchParams();
   const redirectTo = safeRedirectPath(searchParams.get("redirect"));
-  const initialMode: AuthMode = searchParams.get("mode") === "register" ? "register" : "signin";
+  const initialMode: AuthMode = REGISTRATION_ENABLED && searchParams.get("mode") === "register"
+    ? "register"
+    : "signin";
 
   return (
     <main className="relative grid min-h-screen lg:grid-cols-2">
