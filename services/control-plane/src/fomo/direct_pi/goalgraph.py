@@ -1,8 +1,9 @@
 """Strict, engine-neutral GoalGraph domain contracts.
 
-The graph is deliberately limited to frozen product outcomes, dependency
-ordering, and the existing FOMO-owned acceptance DSL.  Execution and
-checkpoint policy belong to the control plane, not to this schema.
+The graph contains frozen product outcomes, dependency ordering, and the
+existing FOMO-owned acceptance DSL. Execution and checkpoint policy belong to
+the control plane, not to this schema. Product complexity determines graph
+size; the schema does not impose arbitrary goal or acceptance-count ceilings.
 """
 
 from __future__ import annotations
@@ -109,14 +110,11 @@ class GoalDraft(SchemaModel):
     title: GoalTitle
     product_outcome: GoalProductOutcome
     user_visible: StrictBool
-    depends_on: list[Identifier] = Field(default_factory=list, max_length=5)
+    depends_on: list[Identifier] = Field(default_factory=list)
     acceptance: AcceptanceContract
 
     @model_validator(mode="after")
-    def bounded_unique_acceptance(self) -> GoalDraft:
-        criterion_count = len(self.acceptance.criteria)
-        if not 1 <= criterion_count <= 8:
-            raise ValueError("a goal must contain between 1 and 8 acceptance criteria")
+    def unique_dependencies(self) -> GoalDraft:
         if len(self.depends_on) != len(set(self.depends_on)):
             raise ValueError("goal dependencies must be unique")
         if self.goal_id in self.depends_on:
@@ -135,7 +133,7 @@ class GoalGraphDraft(SchemaModel):
 
     schema_version: Literal[SCHEMA_VERSION] = SCHEMA_VERSION
     product_outcome: ProductOutcome
-    goals: list[GoalDraft] = Field(min_length=1, max_length=6)
+    goals: list[GoalDraft] = Field(min_length=1)
 
     @model_validator(mode="after")
     def valid_topological_graph(self) -> GoalGraphDraft:
@@ -153,9 +151,6 @@ class GoalGraphDraft(SchemaModel):
                 )
             seen.add(goal.goal_id)
 
-        criterion_count = sum(len(goal.acceptance.criteria) for goal in self.goals)
-        if criterion_count > 12:
-            raise ValueError("a GoalGraph may contain at most 12 acceptance criteria")
         return self
 
 
@@ -163,7 +158,7 @@ class GoalGraph(GoalGraphDraft):
     """Trusted persisted graph projection with server-owned policy and state."""
 
     quality_bar: GoalGraphQualityBar
-    goals: list[Goal] = Field(min_length=1, max_length=6)
+    goals: list[Goal] = Field(min_length=1)
     status: GraphStatus
 
     @model_validator(mode="after")

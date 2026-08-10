@@ -46,14 +46,14 @@ describe("AgentActivityPanel", () => {
     ];
     render(createElement(AgentActivityPanel, { items }));
 
-    expect(screen.getByRole("heading", { name: "Agent activity" })).toBeTruthy();
-    expect(screen.getByText("3 entries")).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Agent 活动" })).toBeTruthy();
+    expect(screen.getByText("3 条")).toBeTruthy();
     const first = screen.getByText("Agent progress update");
     const second = screen.getByText("Edit file");
     const third = screen.getByText("Running QA");
     expect(first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(second.compareDocumentPosition(third) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(screen.getByText("Now")).toBeTruthy();
+    expect(screen.getByText("进行中")).toBeTruthy();
     expect(screen.queryByRole("button", { name: /full history|recent only/i })).toBeNull();
     expect(screen.queryByText(/private chain-of-thought/i)).toBeNull();
   });
@@ -62,7 +62,7 @@ describe("AgentActivityPanel", () => {
     const items = Array.from({ length: 22 }, (_, index) => worklogItem(index));
     render(createElement(AgentActivityPanel, { items }));
 
-    expect(screen.getByText("22 entries")).toBeTruthy();
+    expect(screen.getByText("22 条")).toBeTruthy();
     expect(screen.getByText("Action 0")).toBeTruthy();
     expect(screen.getByText("Action 12")).toBeTruthy();
     expect(screen.getByText("Action 21")).toBeTruthy();
@@ -102,8 +102,8 @@ describe("AgentActivityPanel", () => {
   it("shows a concise empty state before the first public event", () => {
     render(createElement(AgentActivityPanel, { items: [] }));
 
-    expect(screen.getByText("Activity appears here as work begins.")).toBeTruthy();
-    expect(screen.queryByText("Now")).toBeNull();
+    expect(screen.getByText("当工作开始时，活动将显示在这里。")).toBeTruthy();
+    expect(screen.queryByText("进行中")).toBeNull();
   });
 
   it("keeps a pending clarification at the tail, then lets later activity append after it", () => {
@@ -116,7 +116,7 @@ describe("AgentActivityPanel", () => {
 
     const pendingQuestion = screen.getByRole("heading", { name: "Which catalogue layout should we use?" });
     expect(screen.getByText("Action 3").compareDocumentPosition(pendingQuestion) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(screen.getByText("3 entries")).toBeTruthy();
+    expect(screen.getByText("3 条")).toBeTruthy();
 
     rerender(createElement(AgentActivityPanel, {
       inputRequests: [inputRequest({ status: "answered", resolvedSeq: 2 })],

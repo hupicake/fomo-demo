@@ -37,7 +37,6 @@ const testUser = {
 
 // Register / login wrap the user under a nested `user` object.
 const testSession = {
-  sessionId: "sess_1",
   expiresAt: "2026-09-01T00:00:00.000Z",
   user: testUser,
 };
@@ -62,10 +61,9 @@ describe("auth contract", () => {
       password: "password123",
       displayName: "Ada",
     });
-    // Exact real response shape: nested user, top-level session fields.
+    // Exact public response shape: nested user and a top-level expiry hint.
     expect(session).toEqual(testSession);
     expect(session.user.id).toBe("user_1");
-    expect(session.sessionId).toBe("sess_1");
   });
 
   it("surfaces a duplicate-email 409 from register as an ApiProblem", async () => {
@@ -107,15 +105,14 @@ describe("auth contract", () => {
     expect(user).toEqual(testUser);
   });
 
-  it("returns null for a guest on a 401 from /auth/me and never bootstraps a guest", async () => {
+  it("returns null for an unauthenticated 401 from /auth/me without retrying", async () => {
     process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
-    const fetchMock = installFetch(jsonResponse({ detail: "guest session required" }, 401));
+    const fetchMock = installFetch(jsonResponse({ detail: "authentication required" }, 401));
 
     const user = await auth.me();
 
     expect(user).toBeNull();
-    // Critical contract: a 401 from /auth/me must NOT trigger the generic
-    // guest-session bootstrap-and-retry path.
+    // Identity checks fail closed and never manufacture a second session.
     expect(fetchMock.mock.calls).toHaveLength(1);
     expect(requestUrl(fetchMock).pathname).toBe("/v1/auth/me");
   });

@@ -7,21 +7,14 @@ fomo-pi-ds`, where Pi runs inside an OpenSandbox generation sandbox with its
 official builtin tools and full project permission. The runtime now contains
 the **P0 native Pi baseline** and the **P1-A GoalGraph vertical slice**.
 
-**Status (honest): P0 and P1-A code are landed.** The latest concentrated code
-regression is green: 385 backend tests, 134 Web Vitest tests, 18 Pi bridge
-tests, 2/2 local Web Playwright tests, Web typecheck/build, and Ruff. The real
-local fixed-runner canary has passed. The ten-run lifecycle matrix is unfinished,
-must not be counted as passed, and is not a release condition for the current
-take-home Demo. Same-condition A/B validation, Context OS, and public HTTPS
-acceptance remain incomplete, so nothing here is claimed as
-environment-accepted or security-converged. GoalGraph, goal-scoped acceptance,
-durable checkpoints, and recovery are implemented; Verified Reuse remains
-planned (`DESIGN.md`) and is **not implemented**.
-
-The Preview Gateway's unit/integration tests are included in the 385-test
-backend suite. Real local OpenSandbox and Chrome/Gateway checks are separate
-runtime evidence. Neither level proves public DNS, TLS, Tunnel routing, or an
-external-network browser flow.
+**Status (honest): P0 and P1-A code are landed.** GoalGraph, goal-scoped
+acceptance, durable checkpoints, recovery, selectable model runtime contracts,
+and authenticated account/session isolation are implemented. A standalone
+Context Inspector, semantic Verified Reuse registry, same-condition A/B
+benchmark, and public HTTPS acceptance remain incomplete. Current release
+verification results are recorded in the repository-level `SUBMISSION.md`;
+code tests, local OpenSandbox/Chrome checks, and public DNS/TLS/Tunnel checks
+remain distinct evidence levels.
 
 The database owns sessions, projects, runs, durable SSE events, structured
 artifacts, trace links, evidence, versions, and text file snapshots. The API
@@ -32,10 +25,12 @@ run in the worker through a `SandboxProvider`.
 
 - Python is pinned to **3.11** (`>=3.11,<3.12`).
 - Direct Pi model egress goes through LiteLLM with a per-run opaque virtual
-  key (`LiteLLMRunKeyClient`); only `fomo-pi-flash` (planning) and
-  `fomo-pi-build` (building/repairing) aliases are allowed, with explicit
-  thinking levels and **no silent fallback**. The bridge's model selection is
-  fail-closed. Provider credentials stay in LiteLLM and never enter a sandbox.
+  key (`LiteLLMRunKeyClient`). Public model profiles are restricted by
+  `FOMO_RUNTIME_ENABLED_PROFILES` (default: `deepseek-flash`), discovered
+  aliases, and explicit thinking compatibility with **no silent fallback**.
+  Legacy `fomo-pi-flash` (planning) and `fomo-pi-build` (building/repairing)
+  aliases remain for persisted-run compatibility. Provider credentials stay in
+  LiteLLM and never enter a sandbox.
 - An uninterrupted run reuses one `fomo-pi-ds` session across planning,
   multiple GoalGraph goals, and repair turns. Recovery never trusts an orphan
   process: it creates a fresh session from the latest verified checkpoint and
@@ -50,7 +45,8 @@ run in the worker through a `SandboxProvider`.
   outright; `.git/**` (the G-internal checkpoint) is excluded; no
   symlinks/devices or non-regular files; only real changed/new files enter
   the candidate diff (`pnpm-lock.yaml` allowed up to the 512 KiB persistence
-  limit); bounded changed-file counts; FOMO-owned roots
+  limit); no business-file count or ordinary source-size development quota;
+  FOMO-owned roots
   (`tests/fomo-acceptance/**`, `tests/harness/**` — present-and-unchanged
   files are excluded, any add/modify/delete fails) and the system
   `.gitignore`. There is no full-content secret scanner (only `.env*` path
@@ -143,18 +139,34 @@ export DATABASE_URL='sqlite+aiosqlite:///./fomo.db'
 uv run fomo-api
 ```
 
-Run the worker in another terminal. A real user-facing run uses LiteLLM and the
-local OpenSandbox Server started by Compose. Set `OPENSANDBOX_BASE_URL`,
-`OPENSANDBOX_API_KEY`, and optionally `OPENSANDBOX_IMAGE` through the shell or
-your deployment secret manager; this application never reads dotenv files. For
-trusted local development only, the process adapter can exercise the entire
-file/command/Git/QA path:
+Run the worker in another terminal. The repository default Direct Pi profile
+uses the DeepSeek-backed canonical alias; override it to a route you have
+actually verified. GPT profiles use `OPENAI_API_KEY`, Grok uses
+`GROK_API_KEY`, and Kimi/Gemini use `OPENCODE_API_KEY`. This application never
+reads dotenv files itself; for a host process, load the repository environment
+explicitly and run the bounded preflight before the worker:
 
 ```bash
+cd ../..
+uv run --env-file .env.local --project services/control-plane fomo-runtime-preflight
+uv run --env-file .env.local --project services/control-plane fomo-worker
+```
+
+The preflight creates a short-lived OpenSandbox and proves one bounded streamed
+function call through every enabled alias via `SANDBOX_LITELLM_BASE_URL`; it
+then revokes the temporary key and destroys the sandbox. Optional profiles must
+be added explicitly to `FOMO_RUNTIME_ENABLED_PROFILES` only after their real
+credential is configured. A failing enabled route blocks worker startup and
+cannot silently fall back. The canary can incur a very small provider charge.
+For trusted local development of the legacy native path only, the process
+adapter can exercise the file/command/Git/QA path:
+
+```bash
+export AGENT_FRAMEWORK=native
 export SANDBOX_PROVIDER=process
 export ALLOW_UNSAFE_PROCESS_SANDBOX=true
 export LITELLM_BASE_URL=http://localhost:4000/v1
-uv run fomo-worker
+uv run --env-file .env.local --project services/control-plane fomo-worker
 ```
 
 The worker never starts a host process unless that explicit opt-in is present.
@@ -197,7 +209,9 @@ interaction, and reload persistence.
 
 ## API slice
 
-- `POST /v1/sessions/guest`
+- `POST /v1/auth/register`, `POST /v1/auth/login`, `GET /v1/auth/me`, and
+  `POST /v1/auth/logout`; browser authentication uses the host-only HttpOnly
+  session cookie and never exposes the session token in JSON.
 - `GET|POST /v1/projects`, `GET|PATCH /v1/projects/{projectId}`
 - `POST /v1/projects/{projectId}/messages` (idempotent, returns a queued run)
 - `GET /v1/runs/{runId}`, `GET /v1/runs/{runId}/events`, `POST .../cancel`

@@ -62,4 +62,24 @@ describe("error-state chat submission", () => {
     expect(calls).toEqual(["clear", "send:Add reader search and loans"]);
     expect(textarea.value).toBe("");
   });
+
+  it("keeps the submitted text when an async submission fails", async () => {
+    const onSubmit = vi.fn(async () => {
+      throw new Error("Coding Agent is unavailable");
+    });
+
+    render(createElement(
+      PromptInput,
+      { onSubmit },
+      createElement(PromptInputTextarea, { placeholder: "Retry the request" }),
+      createElement(PromptInputSubmit, { status: "ready" }),
+    ));
+
+    const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "Keep this product brief" } });
+    fireEvent.click(screen.getByRole("button", { name: "Submit" }));
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    expect(textarea.value).toBe("Keep this product brief");
+  });
 });

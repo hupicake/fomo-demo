@@ -105,6 +105,8 @@ def test_direct_pi_budget_environment_is_loaded_as_one_validated_set(monkeypatch
     monkeypatch.setenv("RUN_MAX_SPEND", "3.5")
     monkeypatch.setenv("RUN_INFERENCE_RPM_LIMIT", "40")
     monkeypatch.setenv("RUN_INFERENCE_TPM_LIMIT", "900000")
+    monkeypatch.setenv("FOMO_RUNTIME_ENABLED_PROFILES", "gpt-5.6")
+    monkeypatch.setenv("FOMO_RUNTIME_DEFAULT_PROFILE", "gpt-5.6")
     monkeypatch.setenv("PI_CONTEXT_WINDOW", "256000")
     monkeypatch.setenv("MODEL_REQUEST_TIMEOUT_SECONDS", "420")
     settings = Settings.from_env()
@@ -237,6 +239,7 @@ def test_goal_graph_rollout_defaults_on_and_can_be_disabled(monkeypatch) -> None
     assert Settings.from_env().direct_pi_goal_graph_enabled is False
 
 
-def test_direct_pi_virtual_key_ttl_must_cover_wall_budget_and_expiry_grace() -> None:
-    with pytest.raises(ValueError, match=r"run_max_wall_seconds \+ 600"):
-        Settings(run_max_wall_seconds=3_600, inference_token_ttl_seconds=4_199)
+def test_direct_pi_virtual_key_ttl_covers_active_sandbox_and_cleanup_grace() -> None:
+    settings = Settings(inference_token_ttl_seconds=300)
+
+    assert settings.active_run_inference_token_ttl_seconds == 22_200

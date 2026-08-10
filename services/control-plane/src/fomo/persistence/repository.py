@@ -19,6 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from fomo.auth import hash_password, new_session_id, normalize_email, verify_password
+from fomo.direct_pi.failures import public_failure_for_code
 from fomo.direct_pi.goalgraph import (
     Goal,
     GoalGraph,
@@ -33,6 +34,11 @@ from fomo.direct_pi.goalgraph import (
     transition_graph_status,
 )
 from fomo.ids import utcnow, uuid7
+from fomo.runtime_contract import (
+    RuntimeContract,
+    resolve_runtime_contract,
+    runtime_contract_from_storage,
+)
 from fomo.schemas import (
     ARTIFACT_KIND_TO_ROLE,
     ARTIFACT_KIND_TO_STAGE,
@@ -42,6 +48,7 @@ from fomo.schemas import (
     ProjectResponse,
     RunPhase,
     RunResponse,
+    RunRuntimeResponse,
     RunStatus,
     UserInputRequestDraft,
     UserInputRequestResponse,
@@ -72,6 +79,31 @@ from .models import (
     VersionFileRecord,
     VersionRecord,
 )
+
+
+def _terminal_event_payload(
+    *,
+    status: str,
+    error_code: str | None,
+    summary: str,
+) -> dict[str, str]:
+    """Build the durable browser payload without forwarding failure text.
+
+    Successful and cancelled summaries are server-authored lifecycle text.
+    Failed summaries may originate at many runtime boundaries, so only the
+    closed terminal code is allowed to select browser-visible content.
+    """
+
+    if status in {RunStatus.failed.value, RunStatus.needs_attention.value}:
+        failure = public_failure_for_code(error_code)
+        return {
+            "status": status,
+            "code": failure.code,
+            "message": failure.message,
+            # Kept for clients replaying the legacy run.failed shape.
+            "summary": failure.summary,
+        }
+    return {"status": status, "summary": summary}
 
 
 class NotFoundError(LookupError):
@@ -132,16 +164,32 @@ def _is_business_implementation_path(path: str) -> bool:
     if parts and parts[0] in {".github", ".fomo", "docs"}:
         return False
     if len(parts) == 1 and (
-        name in {
-            ".gitignore", ".npmrc", ".nvmrc", "components.json", "next-env.d.ts",
-            "package.json", "package-lock.json", "pnpm-lock.yaml", "pnpm-workspace.yaml",
+        name
+        in {
+            ".gitignore",
+            ".npmrc",
+            ".nvmrc",
+            "components.json",
+            "next-env.d.ts",
+            "package.json",
+            "package-lock.json",
+            "pnpm-lock.yaml",
+            "pnpm-workspace.yaml",
             "yarn.lock",
         }
-        or name.startswith((
-            "eslint.config.", "jest.config.", "next.config.", "playwright.config.",
-            "postcss.config.", "prettier.config.", "tailwind.config.", "tsconfig",
-            "vitest.config.",
-        ))
+        or name.startswith(
+            (
+                "eslint.config.",
+                "jest.config.",
+                "next.config.",
+                "playwright.config.",
+                "postcss.config.",
+                "prettier.config.",
+                "tailwind.config.",
+                "tsconfig",
+                "vitest.config.",
+            )
+        )
     ):
         return False
     return True
@@ -310,8 +358,30 @@ def _run_response(
         execution_started_at=(
             _as_utc(record.execution_started_at) if record.execution_started_at else None
         ),
+        runtime=RunRuntimeResponse(
+            profile_id=record.runtime_profile_id,
+            thinking=record.runtime_thinking,
+            context_window=record.runtime_context_window,
+            policy_version=record.runtime_policy_version,
+            run_token_budget=record.runtime_run_max_tokens,
+            run_token_budget_unlimited=record.runtime_run_max_tokens is None,
+            inference_tpm_limit=record.runtime_inference_tpm_limit,
+        ),
         created_at=record.created_at,
         updated_at=record.updated_at,
+    )
+
+
+def _runtime_contract(record: RunRecord) -> RuntimeContract:
+    return runtime_contract_from_storage(
+        profile_id=record.runtime_profile_id,
+        model_ref=record.runtime_model_ref,
+        thinking=record.runtime_thinking,
+        context_window=record.runtime_context_window,
+        policy_version=record.runtime_policy_version,
+        run_max_tokens=record.runtime_run_max_tokens,
+        inference_tpm_limit=record.runtime_inference_tpm_limit,
+        max_spend_micros=record.runtime_max_spend_micros,
     )
 
 
@@ -335,7 +405,7 @@ def _bounded_text(value: object, fallback: str, limit: int = 120) -> str:
             return collapsed
         # ``limit`` is the final-output hard cap: the ellipsis is part of it,
         # so a long value never exceeds ``limit`` characters.
-        return f"{collapsed[:limit - 1].rstrip()}…"
+        return f"{collapsed[: limit - 1].rstrip()}…"
     return fallback
 
 
@@ -348,7 +418,11 @@ def _artifact_title(kind: str, content: dict[str, Any]) -> str:
         return "Acceptance contract"
     if kind == "diagnostic_report":
         round_number = content.get("round")
-        return f"Verification round {round_number}" if isinstance(round_number, int) else "Verification report"
+        return (
+            f"Verification round {round_number}"
+            if isinstance(round_number, int)
+            else "Verification report"
+        )
     if kind == "product_spec":
         return _bounded_text(content.get("title"), "Product Specification")
     return _bounded_text(content.get("title"), "Technical Specification")
@@ -364,7 +438,11 @@ def _artifact_summary(kind: str, content: dict[str, Any]) -> str:
         count = len(criteria) if isinstance(criteria, list) else 0
         return f"{count} frozen acceptance workflows"
     if kind == "diagnostic_report":
-        return "All deterministic gates passed" if content.get("passed") is True else "Deterministic verification found blockers"
+        return (
+            "All deterministic gates passed"
+            if content.get("passed") is True
+            else "Deterministic verification found blockers"
+        )
     if kind == "product_spec":
         return _bounded_text(content.get("problem"), "Product Specification")
     return _bounded_text(content.get("framework"), "Technical Specification")
@@ -396,28 +474,12 @@ class Repository:
     async def initialize(self) -> None:
         await self.database.upgrade()
 
-    async def create_guest_session(self, ttl_hours: int = 24 * 14) -> SessionRecord:
-        record = SessionRecord(
-            id=uuid7(),
-            kind="guest",
-            expires_at=utcnow() + timedelta(hours=ttl_hours),
-        )
-        async with self.database.session_factory() as session:
-            session.add(record)
-            await session.commit()
-        return record
-
-    async def get_session(self, session_id: str) -> SessionRecord:
-        async with self.database.session_factory() as session:
-            return await self._active_session_in_session(session, session_id)
-
     async def register_user(
         self,
         email: str,
         password: str,
         display_name: str | None = None,
         *,
-        claim_guest_session_id: str | None = None,
         ttl_hours: int = 24 * 30,
     ) -> tuple[UserRecord, SessionRecord]:
         normalized_email = normalize_email(email)
@@ -442,23 +504,64 @@ class Repository:
             auth_session = await self._issue_user_session_in_session(
                 session,
                 user.id,
-                claim_guest_session_id=claim_guest_session_id,
                 ttl_hours=ttl_hours,
             )
             await session.commit()
             return user, auth_session
+
+    async def ensure_development_user(
+        self,
+        email: str,
+        password: str,
+        display_name: str,
+    ) -> UserRecord:
+        """Create or repair the configured local-only development account."""
+
+        normalized_email = normalize_email(email)
+        normalized_name = display_name.strip() or normalized_email.partition("@")[0]
+        async with self.database.session_factory() as session:
+            user = await session.scalar(
+                select(UserRecord).where(UserRecord.email == normalized_email)
+            )
+            if user is not None:
+                password_matches = await asyncio.to_thread(
+                    verify_password,
+                    password,
+                    user.password_hash,
+                )
+                if password_matches and user.display_name == normalized_name:
+                    return user
+                user.password_hash = await asyncio.to_thread(hash_password, password)
+                user.display_name = normalized_name
+                user.updated_at = utcnow()
+                await session.commit()
+                return user
+
+            now = utcnow()
+            user = UserRecord(
+                id=uuid7(),
+                email=normalized_email,
+                display_name=normalized_name,
+                password_hash=await asyncio.to_thread(hash_password, password),
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(user)
+            await session.commit()
+            return user
 
     async def authenticate_user(
         self,
         email: str,
         password: str,
         *,
-        claim_guest_session_id: str | None = None,
         ttl_hours: int = 24 * 30,
     ) -> tuple[UserRecord, SessionRecord]:
         normalized_email = normalize_email(email)
         async with self.database.session_factory() as session:
-            user = await session.scalar(select(UserRecord).where(UserRecord.email == normalized_email))
+            user = await session.scalar(
+                select(UserRecord).where(UserRecord.email == normalized_email)
+            )
             valid = await asyncio.to_thread(
                 verify_password,
                 password,
@@ -469,7 +572,6 @@ class Repository:
             auth_session = await self._issue_user_session_in_session(
                 session,
                 user.id,
-                claim_guest_session_id=claim_guest_session_id,
                 ttl_hours=ttl_hours,
             )
             await session.commit()
@@ -497,7 +599,7 @@ class Repository:
 
     async def create_project(self, owner_session_id: str, title: str) -> ProjectResponse:
         async with self.database.session_factory() as session:
-            await self._active_session_in_session(session, owner_session_id)
+            await self._authenticated_session_in_session(session, owner_session_id)
             record = ProjectRecord(
                 id=uuid7(),
                 owner_session_id=owner_session_id,
@@ -509,28 +611,26 @@ class Repository:
 
     async def list_projects(self, owner_session_id: str) -> list[ProjectResponse]:
         async with self.database.session_factory() as session:
-            requester = await self._active_session_in_session(session, owner_session_id)
-            ownership_filter = ProjectRecord.owner_session_id == owner_session_id
-            statement = select(ProjectRecord)
-            if (
-                requester.kind == "user"
-                and requester.user_id is not None
-                and await session.get(UserRecord, requester.user_id) is not None
-            ):
-                statement = statement.join(
-                    SessionRecord,
-                    ProjectRecord.owner_session_id == SessionRecord.id,
-                )
-                ownership_filter = and_(
-                    SessionRecord.kind == "user",
-                    SessionRecord.user_id == requester.user_id,
-                )
+            requester = await self._authenticated_session_in_session(
+                session,
+                owner_session_id,
+            )
+            statement = select(ProjectRecord).join(
+                SessionRecord,
+                ProjectRecord.owner_session_id == SessionRecord.id,
+            )
+            ownership_filter = and_(
+                SessionRecord.kind == "user",
+                SessionRecord.user_id == requester.user_id,
+            )
             result = await session.scalars(
                 statement.where(ownership_filter).order_by(ProjectRecord.updated_at.desc())
             )
             return [_project_response(record) for record in result]
 
-    async def require_project(self, project_id: str, owner_session_id: str | None = None) -> ProjectRecord:
+    async def require_project(
+        self, project_id: str, owner_session_id: str | None = None
+    ) -> ProjectRecord:
         async with self.database.session_factory() as session:
             record = await session.get(ProjectRecord, project_id)
             if record is None:
@@ -543,13 +643,39 @@ class Repository:
                 raise OwnershipError("project does not belong to this session")
             return record
 
-    async def patch_project(self, project_id: str, owner_session_id: str, title: str) -> ProjectResponse:
+    async def patch_project(
+        self, project_id: str, owner_session_id: str, title: str
+    ) -> ProjectResponse:
         async with self.database.session_factory() as session:
             record = await self._require_project_in_session(session, project_id, owner_session_id)
             record.title = title.strip()
             record.updated_at = utcnow()
             await session.commit()
             return _project_response(record)
+
+    async def get_message_run_by_client_id(
+        self,
+        project_id: str,
+        owner_session_id: str,
+        client_message_id: str,
+    ) -> tuple[MessageResponse, RunResponse] | None:
+        """Read an existing idempotent result before consulting mutable runtime policy."""
+        async with self.database.session_factory() as session:
+            await self._require_project_in_session(session, project_id, owner_session_id)
+            message = await session.scalar(
+                select(MessageRecord).where(
+                    MessageRecord.project_id == project_id,
+                    MessageRecord.client_message_id == client_message_id,
+                )
+            )
+            if message is None:
+                return None
+            if message.run_id is None:
+                raise RuntimeError("idempotent message is missing its run")
+            run = await session.get(RunRecord, message.run_id)
+            if run is None:
+                raise RuntimeError("idempotent message points to a missing run")
+            return _message_response(message), await self._run_with_seq(session, run)
 
     async def create_message_and_run(
         self,
@@ -558,6 +684,9 @@ class Repository:
         client_message_id: str,
         content: str,
         base_version_id: str | None = None,
+        *,
+        runtime_contract: RuntimeContract | None = None,
+        enforce_runtime_match: bool = False,
     ) -> tuple[MessageResponse, RunResponse, bool]:
         """Save a message and queued run atomically; duplicate client IDs are idempotent."""
         async with self.database.session_factory() as session:
@@ -574,7 +703,26 @@ class Repository:
                 existing_run = await session.get(RunRecord, existing_message.run_id)
                 if existing_run is None:
                     raise RuntimeError("idempotent message points to a missing run")
-                return _message_response(existing_message), await self._run_with_seq(session, existing_run), False
+                if (
+                    existing_message.content != content
+                    or (
+                        base_version_id is not None
+                        and existing_run.base_version_id != base_version_id
+                    )
+                    or (
+                        enforce_runtime_match
+                        and runtime_contract is not None
+                        and _runtime_contract(existing_run) != runtime_contract
+                    )
+                ):
+                    raise ConflictError(
+                        "Idempotency-Key was already used with a different request"
+                    )
+                return (
+                    _message_response(existing_message),
+                    await self._run_with_seq(session, existing_run),
+                    False,
+                )
 
             if project.active_run_id is not None:
                 active = await session.get(RunRecord, project.active_run_id)
@@ -583,6 +731,7 @@ class Repository:
                         "the active run is waiting for an answer; use its input-request endpoint"
                     )
 
+            frozen_runtime = runtime_contract or resolve_runtime_contract()
             run_id = uuid7()
             run = RunRecord(
                 id=run_id,
@@ -591,6 +740,14 @@ class Repository:
                 status=RunStatus.queued.value,
                 phase=RunPhase.queued.value,
                 pi_session_id=f"fomo-{run_id}",
+                runtime_profile_id=frozen_runtime.profile_id,
+                runtime_model_ref=frozen_runtime.model_ref,
+                runtime_thinking=frozen_runtime.thinking,
+                runtime_context_window=frozen_runtime.context_window,
+                runtime_policy_version=frozen_runtime.policy_version,
+                runtime_run_max_tokens=frozen_runtime.run_max_tokens,
+                runtime_inference_tpm_limit=frozen_runtime.inference_tpm_limit,
+                runtime_max_spend_micros=frozen_runtime.max_spend_micros,
             )
             message = MessageRecord(
                 id=uuid7(),
@@ -609,7 +766,14 @@ class Repository:
                 session,
                 run,
                 "run.created",
-                payload={"messageId": message.id, "baseVersionId": run.base_version_id},
+                payload={
+                    "messageId": message.id,
+                    "baseVersionId": run.base_version_id,
+                    "profileId": frozen_runtime.profile_id,
+                    "thinking": frozen_runtime.thinking,
+                    "contextWindow": frozen_runtime.context_window,
+                    "runtimePolicy": frozen_runtime.policy_version,
+                },
             )
             await session.commit()
             return _message_response(message), await self._run_with_seq(session, run), True
@@ -638,7 +802,9 @@ class Repository:
                 else None
             )
             active_run = (
-                await self._run_with_seq(session, active_record) if active_record is not None else None
+                await self._run_with_seq(session, active_record)
+                if active_record is not None
+                else None
             )
             pending_input_request = (
                 await self._pending_input_request_in_session(session, active_record.id)
@@ -648,7 +814,9 @@ class Repository:
             # `active_run` is deliberately null once a run becomes terminal,
             # but refresh still needs the latest completed run's visible trace
             # to reconstruct role progress in the workbench.
-            display_record = active_record if active_record is not None else (runs[0] if runs else None)
+            display_record = (
+                active_record if active_record is not None else (runs[0] if runs else None)
+            )
             display_events: list[EventEnvelope] = []
             if display_record is not None:
                 event_records = list(
@@ -658,7 +826,9 @@ class Repository:
                         .order_by(RunEventRecord.seq.asc())
                     )
                 )
-                display_events = [self._event_envelope(display_record, item) for item in event_records]
+                display_events = [
+                    self._event_envelope(display_record, item) for item in event_records
+                ]
             trace_run_id = display_record.id if display_record is not None else None
             files = await self._list_version_files_in_session(session, project)
             versions = await self._list_versions_in_session(session, project_id)
@@ -702,6 +872,14 @@ class Repository:
             if record is None:
                 raise NotFoundError("run not found")
             return await self._run_with_seq(session, record)
+
+    async def get_run_runtime_contract(self, run_id: str) -> RuntimeContract:
+        """Return the immutable internal runtime tuple without exposing its alias."""
+        async with self.database.session_factory() as session:
+            record = await session.get(RunRecord, run_id)
+            if record is None:
+                raise NotFoundError("run not found")
+            return _runtime_contract(record)
 
     async def get_run_prompt(self, run_id: str) -> str:
         async with self.database.session_factory() as session:
@@ -840,9 +1018,7 @@ class Repository:
             await session.commit()
             return _input_request_response(record)
 
-    async def get_pending_input_request(
-        self, run_id: str
-    ) -> UserInputRequestResponse | None:
+    async def get_pending_input_request(self, run_id: str) -> UserInputRequestResponse | None:
         async with self.database.session_factory() as session:
             if await session.get(RunRecord, run_id) is None:
                 raise NotFoundError("run not found")
@@ -865,12 +1041,8 @@ class Repository:
             run = await session.get(RunRecord, run_id, with_for_update=True)
             if run is None:
                 raise NotFoundError("run not found")
-            await self._require_project_in_session(
-                session, run.project_id, owner_session_id
-            )
-            request = await session.get(
-                RunInputRequestRecord, request_id, with_for_update=True
-            )
+            await self._require_project_in_session(session, run.project_id, owner_session_id)
+            request = await session.get(RunInputRequestRecord, request_id, with_for_update=True)
             if request is None or request.run_id != run_id:
                 raise NotFoundError("input request not found")
 
@@ -976,14 +1148,9 @@ class Repository:
                 run.pi_session_id,
                 run.sandbox_id,
             )
-            if any(
-                not isinstance(value, str) or not value
-                for value in required_identity
-            ):
+            if any(not isinstance(value, str) or not value for value in required_identity):
                 raise ConflictError("run continuation identity is incomplete")
-            request = await session.get(
-                RunInputRequestRecord, run.continuation_request_id
-            )
+            request = await session.get(RunInputRequestRecord, run.continuation_request_id)
             if request is None or request.run_id != run_id:
                 raise ConflictError("run continuation request is missing")
             answer: str | None = None
@@ -1055,7 +1222,9 @@ class Repository:
             run = await self._run_for_write(session, run_id, lease_token=lease_token)
             if run.project_id != project_id:
                 raise ConflictError("goal graph project does not match its run")
-            if await session.scalar(select(GoalGraphRecord.id).where(GoalGraphRecord.run_id == run_id)):
+            if await session.scalar(
+                select(GoalGraphRecord.id).where(GoalGraphRecord.run_id == run_id)
+            ):
                 raise ConflictError("run already has a goal graph")
             superseded_graph_ids = await self._supersede_terminal_project_graphs(
                 session, project_id, excluding_run_id=run_id
@@ -1147,19 +1316,21 @@ class Repository:
     ) -> GoalGraphProjection:
         async with self.database.session_factory() as session:
             run = await self._run_for_write(session, run_id, lease_token=lease_token)
-            graph, revision, nodes, target = await self._goal_write_context(session, run_id, goal_id)
+            graph, revision, nodes, target = await self._goal_write_context(
+                session, run_id, goal_id
+            )
             current_goal = await session.scalar(
                 select(GoalNodeRecord.id).where(
                     GoalNodeRecord.project_id == run.project_id,
-                    GoalNodeRecord.status.in_(
-                        [GoalStatus.ACTIVE.value, GoalStatus.CLAIMED.value]
-                    ),
+                    GoalNodeRecord.status.in_([GoalStatus.ACTIVE.value, GoalStatus.CLAIMED.value]),
                 )
             )
             if current_goal is not None:
                 raise ConflictError("project already has an active goal")
             status_by_key = {node.goal_key: node.status for node in nodes}
-            if any(status_by_key.get(key) != GoalStatus.VERIFIED.value for key in target.depends_on):
+            if any(
+                status_by_key.get(key) != GoalStatus.VERIFIED.value for key in target.depends_on
+            ):
                 raise ConflictError("goal dependencies are not verified")
             target.status = transition_goal_status(
                 GoalStatus(target.status), GoalStatus.ACTIVE
@@ -1182,7 +1353,9 @@ class Repository:
     ) -> GoalGraphProjection:
         async with self.database.session_factory() as session:
             run = await self._run_for_write(session, run_id, lease_token=lease_token)
-            graph, revision, nodes, target = await self._goal_write_context(session, run_id, goal_id)
+            graph, revision, nodes, target = await self._goal_write_context(
+                session, run_id, goal_id
+            )
             target.status = transition_goal_status(
                 GoalStatus(target.status), GoalStatus.CLAIMED
             ).value
@@ -1246,9 +1419,7 @@ class Repository:
         async with self.database.session_factory() as session:
             run = await self._run_for_write(session, run_id, lease_token=lease_token)
             graph = await session.scalar(
-                select(GoalGraphRecord)
-                .where(GoalGraphRecord.run_id == run_id)
-                .with_for_update()
+                select(GoalGraphRecord).where(GoalGraphRecord.run_id == run_id).with_for_update()
             )
             if graph is None:
                 raise NotFoundError("goal graph not found")
@@ -1264,9 +1435,7 @@ class Repository:
             if graph.status == status.value:
                 return self._goal_graph_projection(graph, revision, nodes)
             target_goal_status = (
-                GoalStatus.FAILED
-                if status == GraphStatus.FAILED
-                else GoalStatus.SUPERSEDED
+                GoalStatus.FAILED if status == GraphStatus.FAILED else GoalStatus.SUPERSEDED
             )
             for node in nodes:
                 current = GoalStatus(node.status)
@@ -1275,14 +1444,10 @@ class Repository:
                     if target_goal_status == GoalStatus.FAILED:
                         node.failed_at = utcnow()
                 elif current == GoalStatus.PENDING:
-                    node.status = transition_goal_status(
-                        current, GoalStatus.SUPERSEDED
-                    ).value
+                    node.status = transition_goal_status(current, GoalStatus.SUPERSEDED).value
             graph.status = transition_graph_status(GraphStatus(graph.status), status).value
             graph.updated_at = utcnow()
-            goal_graph = await self._goal_graph_read_projection_in_session(
-                session, run_id
-            )
+            goal_graph = await self._goal_graph_read_projection_in_session(session, run_id)
             await self._append_event_in_session(
                 session,
                 run,
@@ -1307,7 +1472,9 @@ class Repository:
     ) -> GoalGraphProjection:
         async with self.database.session_factory() as session:
             run = await self._run_for_write(session, run_id, lease_token=lease_token)
-            graph, revision, nodes, target = await self._goal_write_context(session, run_id, goal_id)
+            graph, revision, nodes, target = await self._goal_write_context(
+                session, run_id, goal_id
+            )
             target.status = transition_goal_status(
                 GoalStatus(target.status), GoalStatus.FAILED
             ).value
@@ -1322,9 +1489,7 @@ class Repository:
                 "goal.failed",
                 payload={"graphId": graph.id, "goalId": goal_id, "reason": reason},
             )
-            goal_graph = await self._goal_graph_read_projection_in_session(
-                session, run_id
-            )
+            goal_graph = await self._goal_graph_read_projection_in_session(session, run_id)
             await self._append_event_in_session(
                 session,
                 run,
@@ -1360,7 +1525,9 @@ class Repository:
             run = await self._run_for_write(session, run_id, lease_token=lease_token)
             if run.cancel_requested_at is not None:
                 raise RunLeaseLost("run cancellation was requested before checkpoint")
-            graph, revision, nodes, target = await self._goal_write_context(session, run_id, goal_id)
+            graph, revision, nodes, target = await self._goal_write_context(
+                session, run_id, goal_id
+            )
             transition_goal_status(GoalStatus(target.status), GoalStatus.VERIFIED)
             required_keys = {
                 acceptance_persistence_key(goal_id, item["id"])
@@ -1384,14 +1551,17 @@ class Repository:
             if supplied_keys != required_keys:
                 raise ValueError("every goal acceptance criterion requires passed evidence")
 
-            ordinal = int(
-                await session.scalar(
-                    select(func.coalesce(func.max(CheckpointRecord.ordinal), 0)).where(
-                        CheckpointRecord.graph_id == graph.id
+            ordinal = (
+                int(
+                    await session.scalar(
+                        select(func.coalesce(func.max(CheckpointRecord.ordinal), 0)).where(
+                            CheckpointRecord.graph_id == graph.id
+                        )
                     )
+                    or 0
                 )
-                or 0
-            ) + 1
+                + 1
+            )
             capsule_payload = dict(capsule or {})
             checkpoint = CheckpointRecord(
                 id=uuid7(),
@@ -1467,18 +1637,18 @@ class Repository:
                     (source_ref, target_ref)
                     for source_ref, target_ref in (
                         await session.execute(
-                        select(
-                            TraceLinkRecord.source_ref,
-                            TraceLinkRecord.target_ref,
-                        ).where(
-                            TraceLinkRecord.run_id == run.id,
-                            TraceLinkRecord.source_kind == "acceptance_criterion",
-                            TraceLinkRecord.source_ref.in_(acceptance_keys),
-                            TraceLinkRecord.relation == "implemented_in",
-                            TraceLinkRecord.target_kind == "file",
-                            TraceLinkRecord.target_ref.in_(implementation_paths),
+                            select(
+                                TraceLinkRecord.source_ref,
+                                TraceLinkRecord.target_ref,
+                            ).where(
+                                TraceLinkRecord.run_id == run.id,
+                                TraceLinkRecord.source_kind == "acceptance_criterion",
+                                TraceLinkRecord.source_ref.in_(acceptance_keys),
+                                TraceLinkRecord.relation == "implemented_in",
+                                TraceLinkRecord.target_kind == "file",
+                                TraceLinkRecord.target_ref.in_(implementation_paths),
+                            )
                         )
-                    )
                     ).all()
                 }
                 if acceptance_keys and implementation_paths
@@ -1523,7 +1693,9 @@ class Repository:
             next_goal = self._next_eligible_goal(nodes)
             if next_goal is None:
                 if not all(node.status == GoalStatus.VERIFIED.value for node in nodes):
-                    raise ConflictError("goal graph has pending nodes with unsatisfied dependencies")
+                    raise ConflictError(
+                        "goal graph has pending nodes with unsatisfied dependencies"
+                    )
                 graph.status = transition_graph_status(
                     GraphStatus(graph.status), GraphStatus.VERIFIED
                 ).value
@@ -1548,9 +1720,7 @@ class Repository:
                         "revision": revision.revision,
                     },
                 )
-            goal_graph = await self._goal_graph_read_projection_in_session(
-                session, run_id
-            )
+            goal_graph = await self._goal_graph_read_projection_in_session(session, run_id)
             await self._append_event_in_session(
                 session,
                 run,
@@ -1563,7 +1733,9 @@ class Repository:
                 },
             )
             await session.commit()
-            return await self._checkpoint_projection_in_session(session, checkpoint, target.goal_key)
+            return await self._checkpoint_projection_in_session(
+                session, checkpoint, target.goal_key
+            )
 
     async def get_latest_verified_checkpoint(self, run_id: str) -> VerifiedCheckpoint | None:
         async with self.database.session_factory() as session:
@@ -2007,7 +2179,9 @@ class Repository:
                 await self._require_project_in_session(session, project_id, owner_session_id)
             return run
 
-    async def list_events(self, run_id: str, after: int = 0, limit: int = 500) -> list[EventEnvelope]:
+    async def list_events(
+        self, run_id: str, after: int = 0, limit: int = 500
+    ) -> list[EventEnvelope]:
         async with self.database.session_factory() as session:
             run = await session.get(RunRecord, run_id)
             if run is None:
@@ -2087,6 +2261,79 @@ class Repository:
             ):
                 raise RunLeaseLost("run lease is no longer active")
             return record.lease_owner
+
+    async def has_claimable_run(self) -> bool:
+        """Return whether the paid runtime preflight can lead to a real claim.
+
+        This read-only hint mirrors ``claim_next_run``'s resource and
+        single-writer filters. The later locked claim remains authoritative.
+        """
+
+        async with self.database.session_factory() as session:
+            live_resources = (
+                select(RunSandboxResourceRecord.id)
+                .where(
+                    RunSandboxResourceRecord.run_id == RunRecord.id,
+                    RunSandboxResourceRecord.cleaned_at.is_(None),
+                )
+                .correlate(RunRecord)
+            )
+            exact_continuation_resource = (
+                select(RunSandboxResourceRecord.id)
+                .where(
+                    RunSandboxResourceRecord.run_id == RunRecord.id,
+                    RunSandboxResourceRecord.cleaned_at.is_(None),
+                    RunSandboxResourceRecord.kind == "generation",
+                    RunSandboxResourceRecord.sandbox_id == RunRecord.sandbox_id,
+                )
+                .correlate(RunRecord)
+            )
+            conflicting_continuation_resource = (
+                select(RunSandboxResourceRecord.id)
+                .where(
+                    RunSandboxResourceRecord.run_id == RunRecord.id,
+                    RunSandboxResourceRecord.cleaned_at.is_(None),
+                    or_(
+                        RunSandboxResourceRecord.kind != "generation",
+                        RunSandboxResourceRecord.sandbox_id != RunRecord.sandbox_id,
+                    ),
+                )
+                .correlate(RunRecord)
+            )
+            resumable_continuation = and_(
+                RunRecord.continuation_request_id.is_not(None),
+                RunRecord.sandbox_id.is_not(None),
+                exact_continuation_resource.exists(),
+                ~conflicting_continuation_resource.exists(),
+            )
+            candidates = list(
+                await session.scalars(
+                    select(RunRecord)
+                    .where(
+                        RunRecord.status == RunStatus.queued.value,
+                        or_(~live_resources.exists(), resumable_continuation),
+                    )
+                    .order_by(RunRecord.created_at.asc())
+                )
+            )
+            for run in candidates:
+                active_writer_count = await session.scalar(
+                    select(func.count())
+                    .select_from(RunRecord)
+                    .where(
+                        RunRecord.project_id == run.project_id,
+                        RunRecord.id != run.id,
+                        RunRecord.status.in_(
+                            [
+                                RunStatus.running.value,
+                                RunStatus.waiting_for_user.value,
+                            ]
+                        ),
+                    )
+                )
+                if not active_writer_count:
+                    return True
+            return False
 
     async def is_active_lease(self, run_id: str, lease_token: str) -> bool:
         """Read-only fast path used by SOP cancellation checkpoints."""
@@ -2315,10 +2562,7 @@ class Repository:
                     and latest_checkpoint is not None
                     and checkpoint_goal is not None
                     and checkpoint_valid
-                    and (
-                        graph.status == GraphStatus.VERIFIED.value
-                        or current_goal is not None
-                    )
+                    and (graph.status == GraphStatus.VERIFIED.value or current_goal is not None)
                     and run.cancel_requested_at is None
                 ):
                     legacy_sandbox_id = run.sandbox_id
@@ -2348,9 +2592,7 @@ class Repository:
                     if result.rowcount != 1:
                         continue
                     await session.refresh(run)
-                    project = await session.get(
-                        ProjectRecord, run.project_id, with_for_update=True
-                    )
+                    project = await session.get(ProjectRecord, run.project_id, with_for_update=True)
                     if project is not None:
                         project.active_run_id = run.id
                         project.status = "queued"
@@ -2465,9 +2707,7 @@ class Repository:
                         GraphStatus(graph.status), graph_target
                     ).value
                     graph.updated_at = utcnow()
-                    goal_graph = await self._goal_graph_read_projection_in_session(
-                        session, run.id
-                    )
+                    goal_graph = await self._goal_graph_read_projection_in_session(session, run.id)
                     await self._append_event_in_session(
                         session,
                         run,
@@ -2491,7 +2731,11 @@ class Repository:
                     session,
                     run,
                     event_kind,
-                    payload={"status": run.status, "summary": summary},
+                    payload=_terminal_event_payload(
+                        status=run.status,
+                        error_code=run.error_code,
+                        summary=summary,
+                    ),
                 )
                 await self._advance_project_after_terminal(session, run)
                 # A failed/needs-attention run may deliberately retain its
@@ -2542,10 +2786,7 @@ class Repository:
                 )
                 for record in records
                 if record.sandbox_id is not None
-                and (
-                    record.status == RunStatus.cancelled.value
-                    or record.preview_url is None
-                )
+                and (record.status == RunStatus.cancelled.value or record.preview_url is None)
             ]
 
     async def clear_sandbox_id(
@@ -2664,7 +2905,11 @@ class Repository:
                 session,
                 run,
                 event_kind,
-                payload={"status": status.value, "summary": summary or ""},
+                payload=_terminal_event_payload(
+                    status=status.value,
+                    error_code=error_code,
+                    summary=summary or "",
+                ),
             )
             await self._advance_project_after_terminal(session, run)
             await session.commit()
@@ -2680,7 +2925,9 @@ class Repository:
     ) -> EventEnvelope:
         async with self.database.session_factory() as session:
             run = await self._run_for_write(session, run_id, lease_token=lease_token)
-            record = await self._append_event_in_session(session, run, kind, role=role, payload=payload)
+            record = await self._append_event_in_session(
+                session, run, kind, role=role, payload=payload
+            )
             await session.commit()
             return self._event_envelope(run, record)
 
@@ -2695,7 +2942,9 @@ class Repository:
     ) -> str:
         async with self.database.session_factory() as session:
             run = await self._run_for_write(session, run_id, lease_token=lease_token)
-            record = ArtifactRecord(id=uuid7(), run_id=run_id, kind=kind, schema_version=1, content=content)
+            record = ArtifactRecord(
+                id=uuid7(), run_id=run_id, kind=kind, schema_version=1, content=content
+            )
             session.add(record)
             await self._append_event_in_session(
                 session,
@@ -2925,17 +3174,13 @@ class Repository:
         try:
             payload = json.loads(summary)
         except (json.JSONDecodeError, ValueError) as exc:
-            raise ValueError(
-                "playwright_smoke evidence summary must be structured JSON"
-            ) from exc
+            raise ValueError("playwright_smoke evidence summary must be structured JSON") from exc
         if not isinstance(payload, dict):
             raise ValueError("playwright_smoke evidence summary must be a JSON object")
         if payload.get("runId") != run_id:
             raise ValueError("playwright_smoke evidence summary runId must match the run")
         if payload.get("acceptanceId") != acceptance_key:
-            raise ValueError(
-                "playwright_smoke evidence summary acceptanceId must match the record"
-            )
+            raise ValueError("playwright_smoke evidence summary acceptanceId must match the record")
         if payload.get("result") != status:
             raise ValueError("playwright_smoke evidence summary result must match the status")
         if payload.get("artifactRef") != artifact_id:
@@ -2966,14 +3211,17 @@ class Repository:
             project = await session.get(ProjectRecord, run.project_id, with_for_update=True)
             if project is None:
                 raise NotFoundError("project not found")
-            number = int(
-                await session.scalar(
-                    select(func.coalesce(func.max(VersionRecord.number), 0)).where(
-                        VersionRecord.project_id == project.id
+            number = (
+                int(
+                    await session.scalar(
+                        select(func.coalesce(func.max(VersionRecord.number), 0)).where(
+                            VersionRecord.project_id == project.id
+                        )
                     )
+                    or 0
                 )
-                or 0
-            ) + 1
+                + 1
+            )
             version = VersionRecord(
                 id=uuid7(),
                 project_id=project.id,
@@ -3066,24 +3314,23 @@ class Repository:
             if run.status in TERMINAL_STATUSES:
                 raise ConflictError("terminal run cannot publish a version")
 
-            run = await self._run_for_write(
-                session, run_id, lease_token=lease_token
-            )
+            run = await self._run_for_write(session, run_id, lease_token=lease_token)
             if run.cancel_requested_at is not None:
                 raise RunLeaseLost("run cancellation was requested before publication")
-            project = await session.get(
-                ProjectRecord, run.project_id, with_for_update=True
-            )
+            project = await session.get(ProjectRecord, run.project_id, with_for_update=True)
             if project is None:
                 raise NotFoundError("project not found")
-            number = int(
-                await session.scalar(
-                    select(func.coalesce(func.max(VersionRecord.number), 0)).where(
-                        VersionRecord.project_id == project.id
+            number = (
+                int(
+                    await session.scalar(
+                        select(func.coalesce(func.max(VersionRecord.number), 0)).where(
+                            VersionRecord.project_id == project.id
+                        )
                     )
+                    or 0
                 )
-                or 0
-            ) + 1
+                + 1
+            )
             version = VersionRecord(
                 id=uuid7(),
                 project_id=project.id,
@@ -3202,7 +3449,9 @@ class Repository:
         async with self.database.session_factory() as session:
             return await self._list_versions_in_session(session, project_id)
 
-    async def list_version_files(self, project_id: str, version_id: str | None = None) -> list[dict[str, Any]]:
+    async def list_version_files(
+        self, project_id: str, version_id: str | None = None
+    ) -> list[dict[str, Any]]:
         async with self.database.session_factory() as session:
             project = await session.get(ProjectRecord, project_id)
             if project is None:
@@ -3254,7 +3503,9 @@ class Repository:
                         .order_by(VersionFileRecord.path.asc())
                     )
                 )
-            current_file = next((item for item in previous_files if item.path == normalized_path), None)
+            current_file = next(
+                (item for item in previous_files if item.path == normalized_path), None
+            )
             expected_sha = current_file.sha256 if current_file is not None else None
             if (base_sha256 or None) != expected_sha:
                 raise ConflictError("The file changed; reload before saving.")
@@ -3647,14 +3898,17 @@ class Repository:
         commit_sha: str,
         qa_status: str,
     ) -> VersionRecord:
-        number = int(
-            await session.scalar(
-                select(func.coalesce(func.max(VersionRecord.number), 0)).where(
-                    VersionRecord.project_id == project.id
+        number = (
+            int(
+                await session.scalar(
+                    select(func.coalesce(func.max(VersionRecord.number), 0)).where(
+                        VersionRecord.project_id == project.id
+                    )
                 )
+                or 0
             )
-            or 0
-        ) + 1
+            + 1
+        )
         version = VersionRecord(
             id=uuid7(),
             project_id=project.id,
@@ -3788,9 +4042,7 @@ class Repository:
                             local_id = criterion.get("id")
                             if not isinstance(local_id, str):
                                 continue
-                            acceptance_key = acceptance_persistence_key(
-                                node.goal_key, local_id
-                            )
+                            acceptance_key = acceptance_persistence_key(node.goal_key, local_id)
                             for path in inferred_paths:
                                 if (acceptance_key, path) in existing_pairs:
                                     continue
@@ -3843,14 +4095,19 @@ class Repository:
             item_evidence = [
                 entry
                 for entry in evidence_payload
-                if entry["acceptanceId"] == acceptance_id
-                and entry["kind"] == "playwright_smoke"
+                if entry["acceptanceId"] == acceptance_id and entry["kind"] == "playwright_smoke"
             ]
             item_links = [
                 link
                 for link in link_payload
-                if (link["sourceKind"] == "acceptance_criterion" and link["sourceRef"] == acceptance_id)
-                or (link["targetKind"] == "acceptance_criterion" and link["targetRef"] == acceptance_id)
+                if (
+                    link["sourceKind"] == "acceptance_criterion"
+                    and link["sourceRef"] == acceptance_id
+                )
+                or (
+                    link["targetKind"] == "acceptance_criterion"
+                    and link["targetRef"] == acceptance_id
+                )
             ]
             acceptance_trace.append(
                 {
@@ -3966,7 +4223,9 @@ class Repository:
     @staticmethod
     def _ensure_no_active_writer(project: ProjectRecord) -> None:
         if project.active_run_id is not None:
-            raise ConflictError("An agent run is active; wait for it before changing the published version.")
+            raise ConflictError(
+                "An agent run is active; wait for it before changing the published version."
+            )
 
     @staticmethod
     def _goal_graph_projection(
@@ -3990,9 +4249,7 @@ class Repository:
             ],
         }
         draft = parse_goal_graph_draft(draft_payload)
-        actual_hash = hashlib.sha256(
-            serialize_goal_graph_draft(draft).encode("utf-8")
-        ).hexdigest()
+        actual_hash = hashlib.sha256(serialize_goal_graph_draft(draft).encode("utf-8")).hexdigest()
         if actual_hash != revision.content_hash:
             raise ManifestIntegrityError("GoalGraph revision content hash mismatch")
         trusted = materialize_goal_graph(draft)
@@ -4063,9 +4320,7 @@ class Repository:
         checkpoints = (
             list(
                 await session.scalars(
-                    select(CheckpointRecord).where(
-                        CheckpointRecord.goal_node_id.in_(node_ids)
-                    )
+                    select(CheckpointRecord).where(CheckpointRecord.goal_node_id.in_(node_ids))
                 )
             )
             if node_ids
@@ -4203,9 +4458,7 @@ class Repository:
                 GraphStatus(graph.status), GraphStatus.SUPERSEDED
             ).value
             graph.updated_at = utcnow()
-            goal_graph = await self._goal_graph_read_projection_in_session(
-                session, prior_run.id
-            )
+            goal_graph = await self._goal_graph_read_projection_in_session(session, prior_run.id)
             await self._append_event_in_session(
                 session,
                 prior_run,
@@ -4241,9 +4494,7 @@ class Repository:
         goal_id: str,
     ) -> tuple[GoalGraphRecord, GoalGraphRevisionRecord, list[GoalNodeRecord], GoalNodeRecord]:
         graph = await session.scalar(
-            select(GoalGraphRecord)
-            .where(GoalGraphRecord.run_id == run_id)
-            .with_for_update()
+            select(GoalGraphRecord).where(GoalGraphRecord.run_id == run_id).with_for_update()
         )
         if graph is None:
             raise NotFoundError("goal graph not found")
@@ -4312,8 +4563,7 @@ class Repository:
             raise ValueError("checkpoint manifest must contain at least one model-owned file")
         normalized.sort(key=lambda item: item.path.encode("utf-8"))
         manifest = [
-            {"path": item.path, "sha256": item.sha256, "size": item.size}
-            for item in normalized
+            {"path": item.path, "sha256": item.sha256, "size": item.size} for item in normalized
         ]
         canonical = json.dumps(
             manifest,
@@ -4386,7 +4636,12 @@ class Repository:
     @staticmethod
     def _validated_file_path(path: str) -> str:
         candidate = PurePosixPath(path)
-        if not path or candidate.is_absolute() or ".." in candidate.parts or str(candidate) in {"", "."}:
+        if (
+            not path
+            or candidate.is_absolute()
+            or ".." in candidate.parts
+            or str(candidate) in {"", "."}
+        ):
             raise FilePathError("path must stay inside the project source tree")
         if ".git" in candidate.parts or any(part.startswith(".env") for part in candidate.parts):
             raise FilePathError("path is not editable through the project API")
@@ -4404,12 +4659,26 @@ class Repository:
             session_id,
             with_for_update=for_update,
         )
-        if (
-            record is None
-            or record.revoked_at is not None
-            or _is_expired(record.expires_at)
-        ):
+        if record is None or record.revoked_at is not None or _is_expired(record.expires_at):
             raise NotFoundError("session not found or expired")
+        return record
+
+    async def _authenticated_session_in_session(
+        self,
+        session: AsyncSession,
+        session_id: str,
+        *,
+        for_update: bool = False,
+    ) -> SessionRecord:
+        record = await self._active_session_in_session(
+            session,
+            session_id,
+            for_update=for_update,
+        )
+        if record.kind != "user" or record.user_id is None:
+            raise AuthenticationError("an authenticated account is required")
+        if await session.get(UserRecord, record.user_id) is None:
+            raise AuthenticationError("the session account no longer exists")
         return record
 
     async def _issue_user_session_in_session(
@@ -4417,7 +4686,6 @@ class Repository:
         session: AsyncSession,
         user_id: str,
         *,
-        claim_guest_session_id: str | None,
         ttl_hours: int,
     ) -> SessionRecord:
         now = utcnow()
@@ -4429,27 +4697,6 @@ class Repository:
             expires_at=expires_at,
         )
         session.add(record)
-        # Flush before moving project foreign keys to the newly issued token.
-        await session.flush()
-        if claim_guest_session_id is not None:
-            candidate = await session.get(
-                SessionRecord,
-                claim_guest_session_id,
-                with_for_update=True,
-            )
-            if (
-                candidate is not None
-                and candidate.kind == "guest"
-                and candidate.user_id is None
-                and candidate.revoked_at is None
-                and not _is_expired(candidate.expires_at, at=now)
-            ):
-                await session.execute(
-                    update(ProjectRecord)
-                    .where(ProjectRecord.owner_session_id == candidate.id)
-                    .values(owner_session_id=record.id)
-                )
-                candidate.revoked_at = now
         return record
 
     async def _session_can_access_project(
@@ -4458,17 +4705,12 @@ class Repository:
         project: ProjectRecord,
         requester_session_id: str,
     ) -> bool:
-        requester = await self._active_session_in_session(session, requester_session_id)
-        if project.owner_session_id == requester_session_id:
-            return True
-        if requester.kind != "user" or requester.user_id is None:
-            return False
+        requester = await self._authenticated_session_in_session(
+            session,
+            requester_session_id,
+        )
         owner = await session.get(SessionRecord, project.owner_session_id)
-        if (
-            owner is None
-            or owner.kind != "user"
-            or owner.user_id != requester.user_id
-        ):
+        if owner is None or owner.kind != "user" or owner.user_id != requester.user_id:
             return False
         return await session.get(UserRecord, requester.user_id) is not None
 
@@ -4526,7 +4768,9 @@ class Repository:
     async def _run_with_seq(self, session: AsyncSession, run: RunRecord) -> RunResponse:
         last_seq = int(
             await session.scalar(
-                select(func.coalesce(func.max(RunEventRecord.seq), 0)).where(RunEventRecord.run_id == run.id)
+                select(func.coalesce(func.max(RunEventRecord.seq), 0)).where(
+                    RunEventRecord.run_id == run.id
+                )
             )
             or 0
         )
@@ -4561,7 +4805,9 @@ class Repository:
     ) -> RunEventRecord:
         last_seq = int(
             await session.scalar(
-                select(func.coalesce(func.max(RunEventRecord.seq), 0)).where(RunEventRecord.run_id == run.id)
+                select(func.coalesce(func.max(RunEventRecord.seq), 0)).where(
+                    RunEventRecord.run_id == run.id
+                )
             )
             or 0
         )
@@ -4595,7 +4841,9 @@ class Repository:
             return
         next_run = await session.scalar(
             select(RunRecord)
-            .where(RunRecord.project_id == run.project_id, RunRecord.status == RunStatus.queued.value)
+            .where(
+                RunRecord.project_id == run.project_id, RunRecord.status == RunStatus.queued.value
+            )
             .order_by(RunRecord.created_at.asc())
             .limit(1)
         )

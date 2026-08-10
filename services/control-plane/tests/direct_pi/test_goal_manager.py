@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 
 import pytest
 
@@ -33,7 +34,21 @@ from fomo.direct_pi.goalgraph import (
     materialize_goal_graph,
     parse_goal_graph_draft,
 )
-from fomo.direct_pi.prompts import goal_build_prompt, goal_repair_prompt
+from fomo.direct_pi.prompts import (
+    PRODUCT_DESIGN_POLICY,
+    PRODUCT_REQUIREMENTS_POLICY,
+    _bounded_goal_diagnostic,
+    goal_build_prompt,
+    goal_graph_planning_prompt,
+    goal_repair_prompt,
+)
+
+_ADVISORY_SELF_CHECK_COMMAND = (
+    "pnpm typecheck && pnpm exec playwright test "
+    "tests/fomo-acceptance/G-2/test-2.smoke.spec.ts "
+    "--config=playwright.config.ts --project=chromium "
+    "--workers=1 --retries=0 --reporter=line"
+)
 
 
 def _acceptance(index: int) -> dict[str, object]:
@@ -306,14 +321,40 @@ def test_goal_prompts_bind_revision_and_exclude_raw_diagnostics() -> None:
         requirement="Build both workflows.",
         starter={"manifestHash": "safe-hash"},
         execution_plan=plan,
+        advisory_self_check_command=_ADVISORY_SELF_CHECK_COMMAND,
     )
     repair = goal_repair_prompt(
         execution_plan=plan,
         round_number=1,
+        advisory_self_check_command=_ADVISORY_SELF_CHECK_COMMAND,
         diagnostic={
             "gate": "typecheck",
             "summary": "A typed interface does not match.",
             "affectedFiles": ["app/page.tsx"],
+            "gates": [
+                {
+                    "gate": "acceptance_test",
+                    "scope": "acceptance",
+                    "status": "failed",
+                    "outcome": "failed",
+                    "summary": "Acceptance workflow assertion failed.",
+                    "acceptanceId": "G-2:AC-1",
+                    "testPath": "tests/fomo-acceptance/G-2/outcome.smoke.spec.ts",
+                    "testName": "shows the registered attendee",
+                    "exitCode": 1,
+                    "diagnostic": {
+                        "message": (
+                            "expect(locator).toBeVisible() failed; "
+                            "PASSWORD=prompt-secret"
+                        ),
+                        "locator": "getByText('张三', { exact: true }).first()",
+                        "testName": "shows the registered attendee",
+                        "line": 10,
+                        "trace": "DO-NOT-LEAK-trace",
+                    },
+                    "evidence": ["DO-NOT-LEAK-command-output"],
+                }
+            ],
             "rawLog": "DO-NOT-LEAK-sensitive-terminal-output",
             "stderr": "DO-NOT-LEAK-sensitive-stderr",
         },
@@ -321,13 +362,106 @@ def test_goal_prompts_bind_revision_and_exclude_raw_diagnostics() -> None:
 
     assert '"graphRevision":7' in build
     assert '"goalId":"G-2"' in build
-    assert "not the planner or coding agent" in build
+    assert "Goal Manager selected the active goal" in build
+    assert "shared foundations" in build
     assert "verification_evidence:ev-1" in build
     assert "public progress text" in build
     assert "Before the first tool batch" in build
     assert "Do not reveal hidden chain-of-thought" in build
+    assert _ADVISORY_SELF_CHECK_COMMAND in build
+    assert "advisory mirror" in build
+    assert "never edit, delete, replace, bypass, or duplicate it" in build
+    assert "independently recompiled tests in the clean verification sandbox" in build
     assert "public progress text" in repair
     assert "Before the first repair tool batch" in repair
     assert "make any extra tool call solely to report progress" in repair
+    assert _ADVISORY_SELF_CHECK_COMMAND in repair
+    assert "advisory only" in repair
+    assert "never modify, delete, replace, bypass, or duplicate" in repair
+    assert "clean verification sandbox" in repair
     assert "DO-NOT-LEAK" not in repair
+    assert "prompt-secret" not in repair
     assert "typed interface" in repair
+    assert "getByText('张三', { exact: true }).first()" in repair
+    assert '"line":10' in repair
+    assert '"testName":"shows the registered attendee"' in repair
+    assert "Make the smallest root-cause edits" not in repair
+    assert "every root-cause, architectural, state, and product-integrity edit" in repair
+
+
+def test_goal_prompts_preserve_product_scope_and_apply_design_baseline() -> None:
+    planning = goal_graph_planning_prompt(
+        requirement="Build a useful event product.",
+        starter={"routes": ["/"]},
+    )
+    _active, plan = plan_goal_execution(_graph(), graph_revision=1)
+    building = goal_build_prompt(
+        requirement="Build a useful event product.",
+        starter={"routes": ["/"]},
+        execution_plan=plan,
+        advisory_self_check_command=_ADVISORY_SELF_CHECK_COMMAND,
+    )
+
+    for prompt in (planning, building):
+        assert PRODUCT_DESIGN_POLICY in prompt
+        assert PRODUCT_REQUIREMENTS_POLICY in prompt
+        assert "Preserve the requested product breadth across the plan" in prompt
+        assert "If the user specifies a visual direction, follow it" in prompt
+        assert "Do not force an Apple" in prompt
+        assert "Make useful, reversible product-design decisions" in prompt
+        assert "giant-heading-plus-a-few-cards" in prompt
+        assert "as many or as few files and components" in prompt
+        assert "verbatim JSON string" in prompt
+        assert "Apple-inspired" not in prompt
+
+    assert "GoalGraph structures delivery order, not product ambition" in planning
+    assert "derive the number and granularity" in planning
+    assert "artificial consolidation or fragmentation" in planning
+    assert "Act as a product manager" in planning
+    assert "intended users and use context" in planning
+    assert "user intent -> action -> system feedback -> completed outcome" in planning
+    assert "use product judgment to make reasonable, reversible assumptions" in planning
+    assert "`productOutcome` is the compact product brief rather than a slogan" in planning
+    assert "During planning, rely on the embedded verified Base Snapshot" in planning
+    assert "define 1-3" not in planning
+    assert "prefer exactly one goal" not in planning
+    assert "acceptance contract is the verification floor" in building
+    assert "complete active outcome and all supporting architecture" in building
+    assert "make necessary subtraction" in building
+
+
+def test_goal_repair_diagnostic_has_a_hard_json_cap() -> None:
+    diagnostic = {
+        "passed": False,
+        "gates": [
+            {
+                "gate": "acceptance_test",
+                "scope": "acceptance",
+                "status": "failed",
+                "outcome": "failed",
+                "summary": "failure " + "summary-detail " * 2_000,
+                "acceptanceId": f"G-1:AC-{index}",
+                "testPath": f"tests/fomo-acceptance/failure-{index}.smoke.spec.ts",
+                "testName": "test " + "name-detail " * 2_000,
+                "diagnostic": {
+                    "message": "assertion " + "message-detail " * 20_000,
+                    "locator": "getByText('missing') " + "locator-detail " * 20_000,
+                    "testName": "test " + "title-detail " * 20_000,
+                    "line": index + 1,
+                    "body": "A" * 1_000_000,
+                    "trace": "private-trace",
+                },
+            }
+            for index in range(20)
+        ],
+        "rawLog": "raw-terminal-output",
+    }
+
+    bounded = _bounded_goal_diagnostic(diagnostic)
+    rendered = json.dumps(bounded, ensure_ascii=False, separators=(",", ":"))
+
+    assert len(rendered) <= 12_000
+    assert "omittedFailedGateCount" in bounded
+    assert "raw-terminal-output" not in rendered
+    assert "private-trace" not in rendered
+    assert "A" * 1_000 not in rendered

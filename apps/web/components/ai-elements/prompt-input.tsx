@@ -852,11 +852,17 @@ export const PromptInput = ({
             return (formData.get("message") as string) || "";
           })();
 
-      // Reset form immediately after capturing text to avoid race condition
-      // where user input during async blob conversion would be lost
-      if (!usingProvider) {
-        form.reset();
-      }
+      const clearSubmittedText = () => {
+        const message = form.elements.namedItem("message");
+        if (message instanceof HTMLTextAreaElement && message.value !== text) {
+          return;
+        }
+        if (usingProvider) {
+          controller.textInput.clear();
+        } else {
+          form.reset();
+        }
+      };
 
       try {
         // Convert blob URLs to data URLs asynchronously
@@ -881,18 +887,14 @@ export const PromptInput = ({
           try {
             await result;
             clear();
-            if (usingProvider) {
-              controller.textInput.clear();
-            }
+            clearSubmittedText();
           } catch {
             // Don't clear on error - user may want to retry
           }
         } else {
           // Sync function completed without throwing, clear inputs
           clear();
-          if (usingProvider) {
-            controller.textInput.clear();
-          }
+          clearSubmittedText();
         }
       } catch {
         // Don't clear on error - user may want to retry

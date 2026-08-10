@@ -57,7 +57,7 @@ const submitStructuredOutput = defineTool({
 		"Submit the final planning contract by filling every field required by the provided schema.",
 	promptSnippet: "Submit the final planning contract through its schema-backed form",
 	promptGuidelines: [
-		"Complete submit_structured_output successfully exactly once. If the form reports a schema validation error, correct it and retry, with at most 3 total attempts.",
+		"Complete submit_structured_output successfully exactly once. If the form reports a schema validation error, correct it and retry until it succeeds.",
 		"Fill every required submit_structured_output field directly; do not return the contract as prose, Markdown, or a JSON code block.",
 		"Stop immediately after submit_structured_output succeeds; do not emit another assistant response in the same turn.",
 	],

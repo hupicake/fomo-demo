@@ -93,6 +93,126 @@ def test_assertion_failure_requires_unexpected_overall_with_plain_failed_result(
     assert timed_out is not None and timed_out.status == "did_not_run"
 
 
+def test_failed_assertion_projects_only_bounded_sanitized_details() -> None:
+    secret = "diagnostic-secret-value"
+    base64_body = "A" * 4_000
+    oversized_tail = "TAIL-MUST-NOT-SURVIVE-" + "z" * 20_000
+    message = "\n".join(
+        (
+            "Error: \x1b[2mexpect(locator).toBeVisible()\x1b[22m failed",
+            "Locator: getByText('张三', { exact: true }).first()",
+            "Expected: visible",
+            "Received: <element(s) not found>",
+            f"PASSWORD={secret}",
+            f"attachment: data:image/png;base64,{base64_body}",
+            "Call log:",
+            oversized_tail,
+        )
+    )
+    report = _report(
+        [
+            _suite(
+                [
+                    {
+                        "title": "报名成功后展示报名人",
+                        "tests": [
+                            {
+                                "status": "unexpected",
+                                "results": [
+                                    {
+                                        "status": "failed",
+                                        "error": {
+                                            "message": message,
+                                            "stack": f"TRACE-MUST-NOT-LEAK {secret}",
+                                            "location": {
+                                                "file": "/workspace/tests/private.spec.ts",
+                                                "line": 16,
+                                                "column": 94,
+                                            },
+                                            "snippet": base64_body,
+                                        },
+                                        "attachments": [
+                                            {
+                                                "name": "trace",
+                                                "body": base64_body,
+                                            }
+                                        ],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            )
+        ]
+    )
+
+    outcome = parse_playwright_json(report)
+
+    assert outcome is not None and outcome.status == "failed"
+    assert outcome.assertion is not None
+    assert outcome.assertion.test_name == "报名成功后展示报名人"
+    assert outcome.assertion.locator == "getByText('张三', { exact: true }).first()"
+    assert outcome.assertion.line == 16
+    assert "Expected: visible" in outcome.assertion.message
+    assert "[REDACTED]" in outcome.assertion.message
+    assert len(outcome.assertion.message) <= 1_200
+    serialized = repr(outcome)
+    for forbidden in (
+        "\x1b",
+        secret,
+        "TRACE-MUST-NOT-LEAK",
+        base64_body,
+        oversized_tail,
+        "/workspace/tests/private.spec.ts",
+    ):
+        assert forbidden not in serialized
+
+
+def test_oversized_assertion_message_is_truncated_without_unbounded_body() -> None:
+    message = "Error: assertion failed\nLocator: getByText('候补位置 #1')\n" + (
+        "safe-detail " * 50_000
+    )
+    payload = json.loads(
+        _report([_suite([_spec("候补位置保留", "unexpected", "failed")])])
+    )
+    result = payload["suites"][0]["specs"][0]["tests"][0]["results"][0]
+    result["error"] = {"message": message, "location": {"line": 21}}
+
+    outcome = parse_playwright_json(json.dumps(payload))
+
+    assert outcome is not None and outcome.assertion is not None
+    assert outcome.assertion.locator == "getByText('候补位置 #1')"
+    assert outcome.assertion.line == 21
+    assert len(outcome.assertion.message) <= 1_200
+    assert "…" in outcome.assertion.message
+
+
+def test_select_option_failure_keeps_action_and_target_without_call_log_body() -> None:
+    payload = json.loads(
+        _report([_suite([_spec("选择票种", "unexpected", "failed")])])
+    )
+    result = payload["suites"][0]["specs"][0]["tests"][0]["results"][0]
+    result["error"] = {
+        "message": "\n".join(
+            (
+                "Error: locator.selectOption: Element is not a <select> element",
+                "Call log:",
+                "  - waiting for getByLabel('票种')",
+                "  - locator resolved to <button>内部大段 DOM 不应进入诊断</button>",
+            )
+        ),
+        "location": {"line": 8},
+    }
+
+    outcome = parse_playwright_json(json.dumps(payload, ensure_ascii=False))
+
+    assert outcome is not None and outcome.assertion is not None
+    assert "locator.selectOption" in outcome.assertion.message
+    assert outcome.assertion.locator == "getByLabel('票种')"
+    assert "内部大段 DOM" not in repr(outcome.assertion)
+
+
 def test_flaky_skipped_and_interrupted_overall_never_become_assertions() -> None:
     for overall in ("flaky", "skipped", "didNotRun", "interrupted"):
         outcome = parse_playwright_json(

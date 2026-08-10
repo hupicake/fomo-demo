@@ -710,10 +710,10 @@ def test_gpt55_role_routes_use_xhigh_reasoning_effort_without_pro_models() -> No
         assert "model: openai/gpt-5.5" in match.group("body")
         assert "reasoning_effort: xhigh" in match.group("body")
 
-    assert all("pro" not in model.lower() for model in re.findall(r"^      model: (.+)$", config, re.M))
+    assert "model: openai/gpt-5.5-pro" not in config
 
 
-def test_deepseek_and_direct_pi_aliases_are_unique_scoped_and_documented() -> None:
+def test_direct_pi_catalog_aliases_are_unique_scoped_and_documented() -> None:
     repository_root = Path(__file__).resolve().parents[3]
     config = (repository_root / "infra" / "litellm" / "config.yaml").read_text(encoding="utf-8")
     model_aliases = list(
@@ -732,6 +732,22 @@ def test_deepseek_and_direct_pi_aliases_are_unique_scoped_and_documented() -> No
     assert "thinking:\n        type: disabled" in legacy_flash
     assert legacy_flash.count("thinking:") == 1
 
+    canonical_gpt56 = aliases_by_name["fomo-pi-gpt-5.6"]
+    assert "model: openai/gpt-5.6-sol" in canonical_gpt56
+    assert "api_key: os.environ/OPENAI_API_KEY" in canonical_gpt56
+    assert "api_base: os.environ/OPENAI_API_BASE" in canonical_gpt56
+
+    canonical_gpt55 = aliases_by_name["fomo-pi-gpt-5.5"]
+    assert "model: openai/gpt-5.5" in canonical_gpt55
+    assert "api_key: os.environ/OPENAI_API_KEY" in canonical_gpt55
+    assert "api_base: os.environ/OPENAI_API_BASE" in canonical_gpt55
+
+    canonical_flash = aliases_by_name["fomo-pi-deepseek-flash"]
+    assert "model: deepseek/deepseek-v4-flash" in canonical_flash
+    assert "api_key: os.environ/DEEPSEEK_API_KEY" in canonical_flash
+    assert "api_base: https://api.deepseek.com" in canonical_flash
+    assert "thinking:" not in canonical_flash
+
     direct_flash = aliases_by_name["fomo-pi-flash"]
     assert "model: deepseek/deepseek-v4-flash" in direct_flash
     assert "api_key: os.environ/DEEPSEEK_API_KEY" in direct_flash
@@ -747,12 +763,46 @@ def test_deepseek_and_direct_pi_aliases_are_unique_scoped_and_documented() -> No
     # this GPT route must not inherit DeepSeek's static `thinking` request body.
     assert "thinking:" not in direct_build
 
+    grok_route = aliases_by_name["fomo-pi-grok-4.5"]
+    assert "model: openai/grok-4.5" in grok_route
+    assert "api_key: os.environ/GROK_API_KEY" in grok_route
+    assert "api_base: https://sub.yieldsum.com/v1" in grok_route
+    assert "input_cost_per_token: 0.000004" in grok_route
+    assert "output_cost_per_token: 0.000012" in grok_route
+
+    opencode_routes = {
+        "fomo-pi-kimi-k2.7-code": (
+            "model: openai/kimi-k2.7-code",
+            "input_cost_per_token: 0.00000095",
+            "output_cost_per_token: 0.000004",
+        ),
+        "fomo-pi-gemini-3.6-flash": (
+            "model: gemini/gemini-3.6-flash",
+            "input_cost_per_token: 0.0000015",
+            "output_cost_per_token: 0.0000075",
+        ),
+        "fomo-pi-gemini-3.1-pro": (
+            "model: gemini/gemini-3.1-pro",
+            "input_cost_per_token: 0.000004",
+            "output_cost_per_token: 0.000018",
+        ),
+    }
+    for alias, expected_fragments in opencode_routes.items():
+        route = aliases_by_name[alias]
+        assert "api_key: os.environ/OPENCODE_API_KEY" in route
+        assert "api_base: https://opencode.ai/zen/v1" in route
+        assert all(fragment in route for fragment in expected_fragments)
+
     deepseek_routes = {
         name
         for name, body in aliases_by_name.items()
         if "model: deepseek/deepseek-v4-flash" in body
     }
-    assert deepseek_routes == {"deepseek-flash", "fomo-pi-flash"}
+    assert deepseek_routes == {
+        "deepseek-flash",
+        "fomo-pi-deepseek-flash",
+        "fomo-pi-flash",
+    }
     assert "deepseek-v4-pro" not in config.lower()
 
     compose = (repository_root / "compose.yaml").read_text(encoding="utf-8")
@@ -763,12 +813,32 @@ def test_deepseek_and_direct_pi_aliases_are_unique_scoped_and_documented() -> No
     assert litellm_service is not None
     assert "DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}" in litellm_service.group("body")
     assert len(re.findall(r"(?m)^\s+DEEPSEEK_API_KEY:", compose)) == 1
+    assert "GROK_API_KEY: ${GROK_API_KEY:-}" in litellm_service.group("body")
+    assert len(re.findall(r"(?m)^\s+GROK_API_KEY:", compose)) == 1
+    assert "OPENCODE_API_KEY: ${OPENCODE_API_KEY:-}" in litellm_service.group("body")
+    assert len(re.findall(r"(?m)^\s+OPENCODE_API_KEY:", compose)) == 1
+    assert (
+        "FOMO_RUNTIME_ENABLED_PROFILES: "
+        "${FOMO_RUNTIME_ENABLED_PROFILES:-deepseek-flash}"
+    ) in compose
+    assert (
+        "FOMO_RUNTIME_DEFAULT_PROFILE: "
+        "${FOMO_RUNTIME_DEFAULT_PROFILE:-deepseek-flash}"
+    ) in compose
 
     env_example = (repository_root / ".env.example").read_text(encoding="utf-8")
     assert re.search(r"(?m)^DEEPSEEK_API_KEY=$", env_example)
+    assert re.search(r"(?m)^GROK_API_KEY=$", env_example)
+    assert re.search(r"(?m)^OPENCODE_API_KEY=$", env_example)
+    assert re.search(
+        r"(?m)^FOMO_RUNTIME_ENABLED_PROFILES=deepseek-flash$", env_example
+    )
+    assert re.search(
+        r"(?m)^FOMO_RUNTIME_DEFAULT_PROFILE=deepseek-flash$", env_example
+    )
     runtime_readme = (repository_root / "services" / "control-plane" / "README.md").read_text(
         encoding="utf-8"
     )
     assert "`fomo-pi-flash` (planning)" in runtime_readme
     assert "`fomo-pi-build` (building/repairing)" in runtime_readme
-    assert "explicit\n  thinking levels" in runtime_readme
+    assert "explicit thinking compatibility" in runtime_readme

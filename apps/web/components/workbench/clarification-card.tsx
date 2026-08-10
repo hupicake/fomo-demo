@@ -94,7 +94,7 @@ export function ClarificationCard({
 
           {!resolved ? (
             <fieldset className="mt-3 space-y-3" disabled={submitting}>
-              <legend className="sr-only">Answer clarification: {request.question}</legend>
+              <legend className="sr-only">回答澄清：{request.question}</legend>
               {request.choices.length > 0 ? (
                 <div>
                   <p className="mb-1.5 text-xs text-muted-foreground" id={`clarification-${request.id}-choices`}>Choose an answer</p>

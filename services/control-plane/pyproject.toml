@@ -28,6 +28,7 @@ dev = [
 fomo-api = "fomo.api.app:run"
 fomo-migrate = "fomo.persistence.database:run_migrations"
 fomo-preview-gateway = "fomo.preview_gateway:run"
+fomo-runtime-preflight = "fomo.runtime_preflight:run"
 fomo-worker = "fomo.worker.runner:run"
 
 [build-system]

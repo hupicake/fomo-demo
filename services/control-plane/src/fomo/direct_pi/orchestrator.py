@@ -31,12 +31,18 @@ from .acceptance import (
     CompiledAcceptance,
     compile_acceptance,
     compile_acceptance_suite,
+    compile_goal_advisory_acceptance,
 )
 from .contracts import PlanningBundle
 from .execution import (
     CommandExecutor,
     DirectPiRunCancelled,
     assert_run_active,
+)
+from .failures import (
+    DirectPiOrchestrationError,
+    PlanningContractError,
+    classify_direct_pi_failure,
 )
 from .goal_manager import (
     RegressionSuite,
@@ -57,6 +63,7 @@ from .goalgraph import (
 )
 from .prompts import (
     GOAL_GRAPH_PLANNING_POLICY,
+    PRODUCT_DESIGN_POLICY,
     build_prompt,
     build_repair_prompt,
     goal_build_prompt,
@@ -93,13 +100,10 @@ class RunKeyGateway(Protocol):
         max_budget: float,
         rpm_limit: int,
         tpm_limit: int,
+        model_aliases: tuple[str, ...] | None = None,
     ) -> RunVirtualKey: ...
 
     async def block(self, virtual_key: RunVirtualKey) -> None: ...
-
-
-class DirectPiOrchestrationError(RuntimeError):
-    pass
 
 
 class DirectPiOrchestrator:
@@ -137,6 +141,7 @@ class DirectPiOrchestrator:
         """Execute a frozen GoalGraph one server-selected goal at a time."""
 
         run = await self.repository.get_run(run_id)
+        runtime_contract = await self.repository.get_run_runtime_contract(run_id)
         if run.status in {
             RunStatus.cancelled,
             RunStatus.succeeded,
@@ -202,6 +207,8 @@ class DirectPiOrchestrator:
                         "starterCapabilities": list(starter.capability_ids),
                         "goalGraph": True,
                         "planningPolicy": GOAL_GRAPH_PLANNING_POLICY,
+                        "productDesignPolicy": PRODUCT_DESIGN_POLICY,
+                        **runtime_contract.cache_fingerprint(),
                     },
                     lease_token=active_lease,
                 )
@@ -312,10 +319,14 @@ class DirectPiOrchestrator:
             await assert_run_active(self.repository, run_id, active_lease)
             virtual_key = await self.gateway.issue(
                 run_id=run_id,
-                duration_seconds=self.settings.inference_token_ttl_seconds,
-                max_budget=await self._remaining_spend_budget(run_id),
+                duration_seconds=self.settings.active_run_inference_token_ttl_seconds,
+                max_budget=await self._remaining_spend_budget(
+                    run_id,
+                    runtime_contract.max_spend_micros,
+                ),
                 rpm_limit=self.settings.run_inference_rpm_limit,
-                tpm_limit=self.settings.run_inference_tpm_limit,
+                tpm_limit=runtime_contract.inference_tpm_limit,
+                model_aliases=(runtime_contract.litellm_alias,),
             )
 
             pi_session_id = await self.repository.ensure_pi_session_id(
@@ -328,6 +339,7 @@ class DirectPiOrchestrator:
                 self.transport,
                 self.settings,
                 virtual_key,
+                runtime_contract=runtime_contract,
                 run_id=run_id,
                 lease_token=active_lease,
                 started_at=started_at,
@@ -344,6 +356,8 @@ class DirectPiOrchestrator:
                     "starterCapabilities": list(starter.capability_ids),
                     "goalGraph": True,
                     "planningPolicy": GOAL_GRAPH_PLANNING_POLICY,
+                    "productDesignPolicy": PRODUCT_DESIGN_POLICY,
+                    **runtime_contract.cache_fingerprint(),
                 }
                 continuation_context = {"baselineHashes": before_planning}
                 if continuation is not None:
@@ -410,34 +424,37 @@ class DirectPiOrchestrator:
                     )
                     await workspaces.assert_unchanged(generation, before_planning)
                     await assert_run_active(self.repository, run_id, active_lease)
-                    try:
-                        draft = self._parse_goal_graph_draft(plan_text)
-                    except DirectPiOrchestrationError as exc:
-                        await self.repository.append_event(
-                            run_id,
-                            "pi.retrying",
-                            payload={
-                                "stage": "planning",
-                                "reason": "goal_graph_contract_validation",
-                                "thinkingLevel": "high",
-                            },
-                            lease_token=active_lease,
-                        )
-                        corrected = await pi.invoke(
-                            generation,
-                            goal_graph_planning_correction_prompt(
-                                validation_error=str(exc)
-                            ),
-                            stage="planning",
-                            structured_output_schema=GoalGraphDraft.model_json_schema(
-                                by_alias=True
-                            ),
-                            continuation_key="goal_graph.planning_correction",
-                            continuation_context=continuation_context,
-                        )
-                        await workspaces.assert_unchanged(generation, before_planning)
-                        await assert_run_active(self.repository, run_id, active_lease)
-                        draft = self._parse_goal_graph_draft(corrected)
+                    while True:
+                        try:
+                            draft = self._parse_goal_graph_draft(plan_text)
+                            break
+                        except DirectPiOrchestrationError as exc:
+                            await self.repository.append_event(
+                                run_id,
+                                "pi.retrying",
+                                payload={
+                                    "stage": "planning",
+                                    "reason": "goal_graph_contract_validation",
+                                    "thinkingLevel": runtime_contract.thinking,
+                                },
+                                lease_token=active_lease,
+                            )
+                            plan_text = await pi.invoke(
+                                generation,
+                                goal_graph_planning_correction_prompt(
+                                    validation_error=str(exc)
+                                ),
+                                stage="planning",
+                                structured_output_schema=GoalGraphDraft.model_json_schema(
+                                    by_alias=True
+                                ),
+                                continuation_key="goal_graph.planning_correction",
+                                continuation_context=continuation_context,
+                            )
+                            await workspaces.assert_unchanged(generation, before_planning)
+                            await assert_run_active(
+                                self.repository, run_id, active_lease
+                            )
                 else:
                     await workspaces.assert_unchanged(generation, before_planning)
                     await assert_run_active(self.repository, run_id, active_lease)
@@ -511,6 +528,19 @@ class DirectPiOrchestrator:
                     )
                 await assert_run_active(self.repository, run_id, active_lease)
 
+                advisory = compile_goal_advisory_acceptance(
+                    current_goal_id,
+                    execution_plan.active_goal.acceptance,
+                )
+                baseline, advisory_self_check_command = (
+                    await workspaces.reconcile_generation_advisory(
+                        generation,
+                        advisory,
+                        baseline=baseline,
+                    )
+                )
+                await assert_run_active(self.repository, run_id, active_lease)
+
                 turn_continuation_context = {
                     "baselineHashes": baseline,
                     "goalStartHashes": self._checkpoint_hashes(
@@ -542,7 +572,7 @@ class DirectPiOrchestrator:
                         stage=turn_stage,
                         goal_id=current_goal_id,
                         continuation_key=continuation.continuation_key,
-                        continuation_context=continuation.context,
+                        continuation_context=turn_continuation_context,
                         resume_request_id=continuation.request_id,
                     )
                     continuation = None
@@ -553,6 +583,7 @@ class DirectPiOrchestrator:
                             requirement=requirement,
                             starter=starter.as_architect_context(),
                             execution_plan=execution_plan,
+                            advisory_self_check_command=advisory_self_check_command,
                         ),
                         stage="building",
                         goal_id=current_goal_id,
@@ -570,22 +601,7 @@ class DirectPiOrchestrator:
                     lease_token=active_lease,
                 )
                 typecheck = await workspaces.typecheck_workspace(generation)
-                if typecheck.exit_code != 0 or typecheck.timed_out:
-                    if total_repair_round >= self.settings.max_repair_rounds:
-                        await self.repository.fail_goal(
-                            run_id,
-                            current_goal_id,
-                            reason="run-total repair rounds exhausted during typecheck",
-                            lease_token=active_lease,
-                        )
-                        await self.repository.mark_terminal(
-                            run_id,
-                            RunStatus.needs_attention,
-                            error_code="goal_typecheck_failed",
-                            summary="The current goal failed direct typecheck and the run repair budget is exhausted.",
-                            lease_token=active_lease,
-                        )
-                        return
+                while typecheck.exit_code != 0 or typecheck.timed_out:
                     total_repair_round = await self.repository.increment_repair_round(
                         run_id,
                         phase=RunPhase.repairing,
@@ -603,6 +619,7 @@ class DirectPiOrchestrator:
                                 "summary": "The fixed direct TypeScript check failed.",
                             },
                             round_number=total_repair_round,
+                            advisory_self_check_command=advisory_self_check_command,
                         ),
                         stage="repairing",
                         goal_id=current_goal_id,
@@ -610,21 +627,6 @@ class DirectPiOrchestrator:
                         continuation_context=turn_continuation_context,
                     )
                     typecheck = await workspaces.typecheck_workspace(generation)
-                    if typecheck.exit_code != 0 or typecheck.timed_out:
-                        await self.repository.fail_goal(
-                            run_id,
-                            current_goal_id,
-                            reason="direct typecheck failed after same-goal repair",
-                            lease_token=active_lease,
-                        )
-                        await self.repository.mark_terminal(
-                            run_id,
-                            RunStatus.needs_attention,
-                            error_code="goal_typecheck_failed",
-                            summary="The current goal did not pass direct typecheck after repair.",
-                            lease_token=active_lease,
-                        )
-                        return
                 projection = await self.repository.claim_goal(
                     run_id,
                     current_goal_id,
@@ -784,11 +786,7 @@ class DirectPiOrchestrator:
                         },
                         lease_token=active_lease,
                     )
-                    terminal = (
-                        outcome.has_infrastructure_failure
-                        or total_repair_round >= self.settings.max_repair_rounds
-                    )
-                    if terminal:
+                    if outcome.has_infrastructure_failure:
                         await self._discard_goal_workspace(workspaces, verification)
                         verification = None
                         await self.repository.set_preview_url(
@@ -797,21 +795,13 @@ class DirectPiOrchestrator:
                         await self.repository.fail_goal(
                             run_id,
                             current_goal_id,
-                            reason=(
-                                "verification infrastructure failed"
-                                if outcome.has_infrastructure_failure
-                                else "goal repair rounds exhausted"
-                            ),
+                            reason="verification infrastructure failed",
                             lease_token=active_lease,
                         )
                         await self.repository.mark_terminal(
                             run_id,
                             RunStatus.needs_attention,
-                            error_code=(
-                                "goal_verification_infrastructure_failed"
-                                if outcome.has_infrastructure_failure
-                                else "goal_verification_failed"
-                            ),
+                            error_code="goal_verification_infrastructure_failed",
                             summary="The current goal could not be verified; no claim was promoted.",
                             lease_token=active_lease,
                         )
@@ -848,6 +838,7 @@ class DirectPiOrchestrator:
                             execution_plan=repair_plan,
                             diagnostic=outcome.as_repair_context(),
                             round_number=total_repair_round,
+                            advisory_self_check_command=advisory_self_check_command,
                         ),
                         stage="repairing",
                         goal_id=current_goal_id,
@@ -948,6 +939,7 @@ class DirectPiOrchestrator:
             raise
         except Exception as exc:
             logger.error("GoalGraph Direct Pi run failed", extra={"run_id": run_id})
+            public_failure = classify_direct_pi_failure(exc)
             try:
                 if current_goal_id is not None:
                     latest = await self.repository.get_goal_graph_for_run(run_id)
@@ -980,14 +972,14 @@ class DirectPiOrchestrator:
                 await self.repository.append_event(
                     run_id,
                     "pi.failed",
-                    payload={"errorType": type(exc).__name__, "goalId": current_goal_id},
+                    payload=public_failure.event_payload(goal_id=current_goal_id),
                     lease_token=active_lease,
                 )
                 await self.repository.mark_terminal(
                     run_id,
                     RunStatus.failed,
-                    error_code="goal_graph_execution_error",
-                    summary="GoalGraph execution stopped before a verified release was created.",
+                    error_code=public_failure.code,
+                    summary=public_failure.summary,
                     lease_token=active_lease,
                 )
             except RunLeaseLost:
@@ -1010,6 +1002,7 @@ class DirectPiOrchestrator:
 
     async def _run_p0(self, run_id: str, *, lease_token: str | None = None) -> None:
         run = await self.repository.get_run(run_id)
+        runtime_contract = await self.repository.get_run_runtime_contract(run_id)
         if run.status in {
             RunStatus.cancelled,
             RunStatus.succeeded,
@@ -1062,16 +1055,22 @@ class DirectPiOrchestrator:
                     "starterId": starter.id,
                     "starterVersion": starter.version,
                     "starterCapabilities": list(starter.capability_ids),
+                    "productDesignPolicy": PRODUCT_DESIGN_POLICY,
+                    **runtime_contract.cache_fingerprint(),
                 },
                 lease_token=active_lease,
             )
             await assert_run_active(self.repository, run_id, active_lease)
             virtual_key = await self.gateway.issue(
                 run_id=run_id,
-                duration_seconds=self.settings.inference_token_ttl_seconds,
-                max_budget=self.settings.run_max_spend,
+                duration_seconds=self.settings.active_run_inference_token_ttl_seconds,
+                max_budget=await self._remaining_spend_budget(
+                    run_id,
+                    runtime_contract.max_spend_micros,
+                ),
                 rpm_limit=self.settings.run_inference_rpm_limit,
-                tpm_limit=self.settings.run_inference_tpm_limit,
+                tpm_limit=runtime_contract.inference_tpm_limit,
+                model_aliases=(runtime_contract.litellm_alias,),
             )
             commands = CommandExecutor(
                 self.repository,
@@ -1100,6 +1099,7 @@ class DirectPiOrchestrator:
                 self.transport,
                 self.settings,
                 virtual_key,
+                runtime_contract=runtime_contract,
                 run_id=run_id,
                 lease_token=active_lease,
                 started_at=started_at,
@@ -1125,6 +1125,8 @@ class DirectPiOrchestrator:
                 "starterId": starter.id,
                 "starterVersion": starter.version,
                 "starterCapabilities": list(starter.capability_ids),
+                "productDesignPolicy": PRODUCT_DESIGN_POLICY,
+                **runtime_contract.cache_fingerprint(),
             }
             candidates = await self.repository.list_planning_cache_candidates(
                 run.project_id,
@@ -1162,32 +1164,35 @@ class DirectPiOrchestrator:
                 )
                 await workspaces.assert_unchanged(generation, before_planning)
                 await assert_run_active(self.repository, run_id, active_lease)
-                try:
-                    bundle = self._parse_planning_bundle(plan_text)
-                except DirectPiOrchestrationError as exc:
-                    await self.repository.append_event(
-                        run_id,
-                        "pi.retrying",
-                        payload={
-                            "stage": "planning",
-                            "reason": "contract_validation",
-                            "thinkingLevel": "high",
-                        },
-                        lease_token=active_lease,
-                    )
-                    corrected_plan_text = await pi.invoke(
-                        generation,
-                        planning_correction_prompt(validation_error=str(exc)),
-                        stage="planning",
-                        structured_output_schema=PlanningBundle.model_json_schema(
-                            by_alias=True
-                        ),
-                        continuation_key="p0.planning_correction",
-                        continuation_context={"baselineHashes": before_planning},
-                    )
-                    await workspaces.assert_unchanged(generation, before_planning)
-                    await assert_run_active(self.repository, run_id, active_lease)
-                    bundle = self._parse_planning_bundle(corrected_plan_text)
+                while True:
+                    try:
+                        bundle = self._parse_planning_bundle(plan_text)
+                        break
+                    except DirectPiOrchestrationError as exc:
+                        await self.repository.append_event(
+                            run_id,
+                            "pi.retrying",
+                            payload={
+                                "stage": "planning",
+                                "reason": "contract_validation",
+                                "thinkingLevel": runtime_contract.thinking,
+                            },
+                            lease_token=active_lease,
+                        )
+                        plan_text = await pi.invoke(
+                            generation,
+                            planning_correction_prompt(validation_error=str(exc)),
+                            stage="planning",
+                            structured_output_schema=PlanningBundle.model_json_schema(
+                                by_alias=True
+                            ),
+                            continuation_key="p0.planning_correction",
+                            continuation_context={"baselineHashes": before_planning},
+                        )
+                        await workspaces.assert_unchanged(generation, before_planning)
+                        await assert_run_active(
+                            self.repository, run_id, active_lease
+                        )
             else:
                 await workspaces.assert_unchanged(generation, before_planning)
                 await assert_run_active(self.repository, run_id, active_lease)
@@ -1356,26 +1361,6 @@ class DirectPiOrchestrator:
                         lease_token=active_lease,
                     )
                     return
-                if round_number >= self.settings.max_repair_rounds:
-                    keep_verification = outcome.preview_url is not None
-                    if not keep_verification:
-                        await self._discard_workspace(
-                            run_id, verification, active_lease
-                        )
-                        verification = None
-                    await self.repository.mark_terminal(
-                        run_id,
-                        RunStatus.needs_attention,
-                        error_code="direct_pi_verification_failed",
-                        summary=(
-                            "The preview is available but deterministic verification still has blockers."
-                            if keep_verification
-                            else "Deterministic verification did not produce a browser-reachable preview."
-                        ),
-                        lease_token=active_lease,
-                    )
-                    return
-
                 await self._retire_verification(
                     run_id, verification, generation, active_lease
                 )
@@ -1449,6 +1434,7 @@ class DirectPiOrchestrator:
             raise
         except Exception as exc:
             logger.error("Direct Pi run failed", extra={"run_id": run_id})
+            public_failure = classify_direct_pi_failure(exc)
             try:
                 await self.repository.set_preview_url(
                     run_id, None, lease_token=active_lease
@@ -1460,14 +1446,14 @@ class DirectPiOrchestrator:
                 await self.repository.append_event(
                     run_id,
                     "pi.failed",
-                    payload={"errorType": type(exc).__name__},
+                    payload=public_failure.event_payload(),
                     lease_token=active_lease,
                 )
                 await self.repository.mark_terminal(
                     run_id,
                     RunStatus.failed,
-                    error_code="direct_pi_execution_error",
-                    summary="The Direct Pi run stopped before a verified version was created.",
+                    error_code=public_failure.code,
+                    summary=public_failure.summary,
                     lease_token=active_lease,
                 )
             except RunLeaseLost:
@@ -1571,7 +1557,9 @@ class DirectPiOrchestrator:
         elapsed = max(0.0, (utcnow() - value.astimezone(UTC)).total_seconds())
         return time.monotonic() - elapsed
 
-    async def _remaining_spend_budget(self, run_id: str) -> float:
+    async def _remaining_spend_budget(
+        self, run_id: str, max_spend_micros: int | None = None
+    ) -> float:
         getter = getattr(self.repository, "get_usage_totals", None)
         spent = 0.0
         if callable(getter):
@@ -1579,7 +1567,12 @@ class DirectPiOrchestrator:
             cost_micros = getattr(totals, "cost_micros", 0)
             if isinstance(cost_micros, int) and cost_micros >= 0:
                 spent = cost_micros / 1_000_000
-        remaining = self.settings.run_max_spend - spent
+        budget = (
+            max_spend_micros / 1_000_000
+            if max_spend_micros is not None
+            else self.settings.run_max_spend
+        )
+        remaining = budget - spent
         if remaining <= 0:
             raise DirectPiOrchestrationError("Direct Pi exhausted its durable spend budget")
         return remaining
@@ -2113,7 +2106,7 @@ class DirectPiOrchestrator:
                 details = f"JSON syntax error at character {exc.pos}"
             else:
                 details = str(exc) or type(exc).__name__
-            raise DirectPiOrchestrationError(
+            raise PlanningContractError(
                 f"Direct Pi returned an invalid planning contract: {details}"
             ) from exc
 
@@ -2140,6 +2133,6 @@ class DirectPiOrchestrator:
                 details = f"JSON syntax error at character {exc.pos}"
             else:
                 details = str(exc) or type(exc).__name__
-            raise DirectPiOrchestrationError(
+            raise PlanningContractError(
                 f"Direct Pi returned an invalid GoalGraphDraft: {details}"
             ) from exc

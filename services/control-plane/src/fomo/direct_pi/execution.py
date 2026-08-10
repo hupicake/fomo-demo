@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import math
-import re
 from typing import Any
 
 from fomo.config import Settings
@@ -12,6 +11,9 @@ from fomo.fomo_pi_ds import PiBridgeEnvelope
 from fomo.ids import uuid7
 from fomo.persistence import Repository, RunLeaseLost
 from fomo.sandbox.base import Command, ExecResult, SandboxProvider, SandboxRef
+from fomo.text_safety import redact
+
+from .failures import public_bridge_failure
 
 _PUBLIC_MESSAGE_CHARACTERS = 8_192
 _PUBLIC_DETAIL_CHARACTERS = 4_096
@@ -20,39 +22,6 @@ _PUBLIC_NUMBER_MAX = 2**53 - 1
 _PUBLIC_PATH_TOOLS = frozenset({"read", "write", "edit", "ls", "find", "grep"})
 _PUBLIC_PATH_KEYS = ("path", "file", "filePath", "file_path", "directory", "cwd")
 _PUBLIC_TEXT_DELTA_TYPES = frozenset({"text_start", "text_delta", "text_end"})
-_CREDENTIAL_NAME = (
-    r"(?:[A-Za-z_][A-Za-z0-9_-]*[_-])?"
-    r"(?:api[_-]?key|access[_-]?token|auth[_-]?token|token|password|passwd|"
-    r"secret|cookie|private[_-]?key|master[_-]?key)"
-)
-_QUOTED_CREDENTIAL = re.compile(
-    rf"(?i)(?P<prefix>[\"']?{_CREDENTIAL_NAME}[\"']?\s*[=:]\s*)"
-    r"(?P<quote>[\"'])(?P<value>.*?)(?P=quote)"
-)
-_UNQUOTED_CREDENTIAL = re.compile(
-    rf"(?i)(?P<prefix>[\"']?{_CREDENTIAL_NAME}[\"']?\s*[=:]\s*)"
-    r"(?P<value>[^\s,;}\]]+)"
-)
-
-
-def redact(value: str) -> str:
-    """Redact common credential forms before text crosses the public event boundary."""
-
-    value = re.sub(
-        r"(?im)(\b(?:cookie|set-cookie)\s*:\s*)[^\r\n]+",
-        r"\1[REDACTED]",
-        value,
-    )
-    value = re.sub(r"(?i)(\bbearer\s+)[^\s,;]+", r"\1[REDACTED]", value)
-    value = _QUOTED_CREDENTIAL.sub(
-        lambda match: (
-            f"{match.group('prefix')}{match.group('quote')}"
-            f"[REDACTED]{match.group('quote')}"
-        ),
-        value,
-    )
-    value = _UNQUOTED_CREDENTIAL.sub(r"\g<prefix>[REDACTED]", value)
-    return re.sub(r"\bsk-[A-Za-z0-9_\-]{8,}\b", "[REDACTED]", value)
 
 
 class DirectPiRunCancelled(RuntimeError):
@@ -335,8 +304,9 @@ def _public_payload(kind: str, source: dict[str, Any]) -> dict[str, Any]:
         # The Pi session id is an internal continuation capability. Keep it in
         # the bridge/runtime result and durable RunRecord, never in browser/SSE
         # telemetry where it has no user-facing value.
-        for key in ("model", "thinkingLevel"):
-            _public_string(output, source, key, limit=256)
+        # Provider/model aliases remain server-owned. The immutable public
+        # runtime profile is projected through RunResponse.runtime instead.
+        _public_string(output, source, "thinkingLevel", limit=32)
         if not _public_context_usage(output, source, "initialStats"):
             _public_nonnegative_number(output, source, "contextWindow")
         _public_boolean(output, source, "resumed")
@@ -347,9 +317,8 @@ def _public_payload(kind: str, source: dict[str, Any]) -> dict[str, Any]:
         return output
 
     if kind == "pi.failed":
-        for key in ("code", "phase"):
-            _public_string(output, source, key, limit=256)
-        _public_string(output, source, "message")
+        failure = public_bridge_failure(source.get("code"))
+        output.update(failure.event_payload())
         return output
 
     if kind == "pi.message.delta":

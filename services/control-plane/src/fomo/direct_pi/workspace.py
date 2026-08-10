@@ -12,9 +12,8 @@ settle audit enforces only real safety invariants:
 - the candidate diff contains only real changes: create/modify for files whose
   hash differs from the seed baseline, delete for removed files; unchanged
   files are not transferred;
-- size limits apply only to changed/new files: ordinary source uses
-  pi_max_file_characters; pnpm-lock.yaml may reach the persistence limit
-  (512 KiB) so a normal lockfile update does not fail every run.
+- changed/new files are not subject to FOMO development quotas; the audit
+  still requires complete regular UTF-8 text without NUL bytes.
 
 FOMO-owned acceptance tests are never seeded into G; they are injected by
 FOMO into the clean verification sandbox V after the audited candidate diff
@@ -36,7 +35,11 @@ from fomo.persistence import Repository
 from fomo.sandbox.base import ExecResult, FileChange, SandboxProvider, SandboxRef
 from fomo.starter import StarterIntegrityError, StarterManifest
 
-from .acceptance import ACCEPTANCE_ROOT, CompiledAcceptance
+from .acceptance import (
+    ACCEPTANCE_ROOT,
+    ADVISORY_ACCEPTANCE_CONFIG_PATH,
+    CompiledAcceptance,
+)
 from .execution import CommandExecutor
 
 SYSTEM_GITIGNORE_PATH = ".gitignore"
@@ -61,11 +64,11 @@ _REGULAR_SOURCE_TREE = (
 # FOMO-owned roots: never part of the model's candidate diff. Acceptance tests
 # are injected into V per run; the harness smoke is part of the immutable seed.
 _FOMO_OWNED_ROOTS = (ACCEPTANCE_ROOT, "tests/harness")
-# pnpm-lock.yaml may legitimately grow to the persistence limit (the version
-# manifest stores file text up to this size); ordinary source stays bounded by
-# pi_max_file_characters.
-_PNPM_LOCKFILE_PATH = "pnpm-lock.yaml"
-_PNPM_LOCKFILE_MAX_BYTES = 512 * 1024
+# Next owns this declaration file and rewrites its generated type imports when
+# switching between `next dev` and `next build`. It is reproducible from the
+# trusted starter/runtime, so a G-side rewrite must never become candidate or
+# durable checkpoint truth.
+_RUNNER_GENERATED_PATHS = frozenset({"next-env.d.ts"})
 # FOMO-owned verification runner: fixed absolute binaries in the root-owned,
 # read-only runtime cache baked into the sandbox image (self-contained; it
 # shares no inode with the candidate-writable pnpm store). The runner entries
@@ -372,6 +375,93 @@ class WorkspaceManager:
             timeout_seconds=120,
         )
 
+    async def reconcile_generation_advisory(
+        self,
+        ref: SandboxRef,
+        compiled: CompiledAcceptance,
+        *,
+        baseline: dict[str, str],
+    ) -> tuple[dict[str, str], str]:
+        """Install one current-goal self-check without changing candidate truth.
+
+        The advisory specs reuse the frozen acceptance compiler but remain
+        untrusted release evidence.  They live under the already protected
+        acceptance root, are bound into the settle-audit baseline, and are
+        replaced at each goal boundary.  The clean verification sandbox still
+        recompiles its own authoritative suite from the persisted GoalGraph.
+        """
+
+        expected_hashes = dict(compiled.sha256_by_path)
+        expected_paths = set(expected_hashes)
+        change_paths = {change.path for change in compiled.changes}
+        test_paths = sorted(set(compiled.test_path_by_acceptance_id.values()))
+        allowed_paths = {ADVISORY_ACCEPTANCE_CONFIG_PATH, *test_paths}
+        if (
+            not expected_paths
+            or change_paths != expected_paths
+            or not test_paths
+            or expected_paths != allowed_paths
+            or any(not path.startswith(f"{ACCEPTANCE_ROOT}/") for path in expected_paths)
+        ):
+            raise WorkspaceContractError(
+                "generation advisory must contain only its config and current-goal specs"
+            )
+
+        previous_hashes = {
+            path: digest
+            for path, digest in baseline.items()
+            if path.startswith(f"{ACCEPTANCE_ROOT}/")
+        }
+        current_hashes = {
+            str(item["path"]): str(item["sha256"])
+            for item in await self._list_files(ref)
+            if str(item["path"]).startswith(f"{ACCEPTANCE_ROOT}/")
+        }
+        if current_hashes != previous_hashes:
+            raise WorkspaceContractError(
+                "generation advisory acceptance specs changed outside FOMO"
+            )
+
+        changes = [
+            FileChange(path=path, operation="delete")
+            for path in sorted(set(previous_hashes) - expected_paths)
+        ]
+        changes.extend(compiled.changes)
+        await self.sandbox.apply_changes(ref, changes)
+
+        installed_hashes: dict[str, str] = {}
+        for path in sorted(expected_paths):
+            try:
+                content = await self.sandbox.read_file(ref, path)
+            except FileNotFoundError as exc:
+                raise WorkspaceContractError(
+                    "generation advisory acceptance spec is missing"
+                ) from exc
+            digest = hashlib.sha256(content).hexdigest()
+            if digest != expected_hashes[path]:
+                raise WorkspaceContractError(
+                    "generation advisory acceptance spec hash mismatch"
+                )
+            installed_hashes[path] = digest
+
+        refreshed_baseline = {
+            path: digest
+            for path, digest in baseline.items()
+            if not path.startswith(f"{ACCEPTANCE_ROOT}/")
+        }
+        refreshed_baseline.update(installed_hashes)
+        quoted_tests = " ".join(shlex.quote(path) for path in test_paths)
+        typecheck = fomo_runner_command(bin_name="tsc", args="--noEmit")
+        playwright = fomo_runner_command(
+            bin_name="playwright",
+            args=(
+                f"test {quoted_tests} "
+                f"--config={shlex.quote(ADVISORY_ACCEPTANCE_CONFIG_PATH)} "
+                "--project=chromium --workers=1 --retries=0 --reporter=line"
+            ),
+        )
+        return refreshed_baseline, f"{typecheck} && {playwright}"
+
     async def checkpoint_workspace(self, ref: SandboxRef) -> str:
         result = await self.commands.run(
             ref,
@@ -508,10 +598,6 @@ class WorkspaceManager:
                 ) from exc
             if "\x00" in content:
                 raise WorkspaceContractError("changed candidate files must not contain NUL bytes")
-            if self._exceeds_file_limit(path, content):
-                raise WorkspaceContractError(
-                    f"changed candidate file exceeds the file limit: {path}"
-                )
             changes.append(FileChange(path=path, content=content, operation="create"))
             changed_paths.append(path)
 
@@ -529,10 +615,6 @@ class WorkspaceManager:
                 changed_paths.append(path)
 
         changed_paths.sort()
-        if len(changed_paths) > self.settings.pi_max_changed_files:
-            raise WorkspaceContractError(
-                f"candidate exceeds the changed-file limit: {len(changed_paths)}"
-            )
         return AuditedWorkspace(
             files=tuple(listed),
             model_changes=tuple(changes),
@@ -703,13 +785,6 @@ class WorkspaceManager:
             raise WorkspaceContractError("sandbox workspace is empty")
         return files
 
-    def _exceeds_file_limit(self, path: str, content: str) -> bool:
-        if path == _PNPM_LOCKFILE_PATH:
-            # Match the sandbox manifest and persistence boundary, both of
-            # which are byte-based. Character counts understate UTF-8 size.
-            return len(content.encode("utf-8")) > _PNPM_LOCKFILE_MAX_BYTES
-        return len(content) > self.settings.pi_max_file_characters
-
     @staticmethod
     def _is_fomo_owned_path(path: str) -> bool:
         return any(path == root or path.startswith(root + "/") for root in _FOMO_OWNED_ROOTS)
@@ -724,8 +799,8 @@ class WorkspaceManager:
 
     @staticmethod
     def _is_excluded_path(path: str) -> bool:
-        """VCS-internal and FOMO-system exclusions: never candidate files."""
-        if path == SYSTEM_GITIGNORE_PATH:
+        """VCS-internal, generated, and FOMO-system exclusions."""
+        if path == SYSTEM_GITIGNORE_PATH or path in _RUNNER_GENERATED_PATHS:
             return True
         return path == ".git" or path.startswith(".git/")
 

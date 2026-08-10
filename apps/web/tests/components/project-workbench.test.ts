@@ -1,23 +1,19 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createElement, StrictMode } from "react";
-import type { HTMLAttributes, ReactNode } from "react";
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { createElement } from "react";
+import type { ReactNode } from "react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
-import {
-  ProjectWorkbench,
-  clearArtifactDetailCache,
-  useArtifactDetailLoader,
-} from "@/components/workbench/project-workbench";
+import { ProjectWorkbench } from "@/components/workbench/project-workbench";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { ApiProblem } from "@/lib/api/client";
+import { useAuthStore } from "@/lib/store/auth-store";
 import { useWorkbenchStore } from "@/lib/store/workbench-store";
-import type { ArtifactDetail, ArtifactKind, ArtifactRef, VisibleArtifactRef } from "@/lib/contracts";
 
 const h = vi.hoisted(() => ({
   answerRunInputRequest: vi.fn(),
   cancelRun: vi.fn(),
-  getArtifact: vi.fn(),
   mutate: vi.fn(),
   emptyArray: Object.freeze([]),
   emptyObject: Object.freeze({}),
@@ -49,12 +45,12 @@ vi.mock("@/lib/api/client", () => ({
   controlPlane: {
     answerRunInputRequest: h.answerRunInputRequest,
     cancelRun: h.cancelRun,
-    getArtifact: h.getArtifact,
   },
   controlPlaneUrl: (path: string) => path,
 }));
 
 vi.mock("swr", () => ({
+  mutate: vi.fn(),
   default: (key: unknown) => {
     const first = Array.isArray(key) ? key[0] : key;
     if (first === "project") {
@@ -71,7 +67,7 @@ vi.mock("swr", () => ({
 }));
 
 vi.mock("@ai-sdk/react", () => ({ useChat: () => h.chat }));
-vi.mock("next/navigation", () => ({ useRouter: () => ({ push: vi.fn() }) }));
+vi.mock("next/navigation", () => ({ usePathname: () => "/projects/test", useRouter: () => ({ push: vi.fn(), replace: vi.fn() }) }));
 vi.mock("next/link", () => ({
   default: ({ children }: { children?: ReactNode }) => createElement("a", null, children),
 }));
@@ -85,14 +81,6 @@ vi.mock("@/components/ai-elements/message", () => ({
   Message: ({ children }: { children?: ReactNode }) => createElement("div", null, children),
   MessageContent: ({ children }: { children?: ReactNode }) => createElement("div", null, children),
   MessageResponse: ({ children }: { children?: ReactNode }) => createElement("div", null, children),
-}));
-vi.mock("@/components/ai-elements/plan", () => ({
-  Plan: ({ children }: { children?: ReactNode }) => createElement("section", null, children),
-  PlanContent: ({ children }: { children?: ReactNode }) => createElement("div", null, children),
-  PlanDescription: ({ children }: { children?: ReactNode }) => createElement("p", null, children),
-  PlanHeader: ({ children }: { children?: ReactNode }) => createElement("header", null, children),
-  PlanTitle: ({ children }: { children?: ReactNode }) => createElement("h3", null, children),
-  PlanTrigger: () => createElement("button"),
 }));
 vi.mock("@/components/ai-elements/prompt-input", () => ({
   PromptInput: ({ children }: { children?: ReactNode }) => createElement("form", null, children),
@@ -109,6 +97,11 @@ vi.mock("@/components/ai-elements/prompt-input", () => ({
     placeholder,
   }),
   PromptInputTools: ({ children }: { children?: ReactNode }) => createElement("div", null, children),
+  PromptInputSelect: ({ children, value, onValueChange, disabled }: { children?: ReactNode; value?: string; onValueChange?: (value: string) => void; disabled?: boolean }) => createElement("div", { "data-select": value ?? "", "data-disabled": disabled ? "true" : undefined, onChange: onValueChange }, children),
+  PromptInputSelectTrigger: ({ children, ...rest }: { children?: ReactNode } & Record<string, unknown>) => createElement("button", { type: "button", ...rest }, children),
+  PromptInputSelectContent: ({ children }: { children?: ReactNode }) => createElement("div", null, children),
+  PromptInputSelectItem: ({ children, value }: { children?: ReactNode; value?: string }) => createElement("div", { "data-item": value }, children),
+  PromptInputSelectValue: ({ placeholder }: { placeholder?: string }) => createElement("span", null, placeholder),
 }));
 
 if (typeof window.matchMedia !== "function") {
@@ -129,7 +122,22 @@ if (typeof window.matchMedia !== "function") {
 
 afterEach(cleanup);
 
+function renderWorkbench(ui: ReactNode = createElement(ProjectWorkbench, { projectId: "project-1" })) {
+  return render(createElement(TooltipProvider, null, ui));
+}
+
 beforeEach(() => {
+  useAuthStore.setState({
+    status: "authenticated",
+    user: {
+      id: "user-1",
+      email: "owner@example.test",
+      createdAt: "2026-08-07T12:00:00.000Z",
+    },
+    loading: false,
+    busy: false,
+    error: undefined,
+  });
   useWorkbenchStore.setState({
     device: "desktop",
     lastSeqByRun: {},
@@ -141,37 +149,9 @@ beforeEach(() => {
   h.cancelRun.mockReset().mockResolvedValue(undefined);
   h.mutate.mockReset().mockResolvedValue(undefined);
   h.chat.status = "ready";
-  clearArtifactDetailCache();
 });
 
-function refFixture(id: string, kind: ArtifactKind, runId = "run-1"): VisibleArtifactRef {
-  const ownership = {
-    run_input: ["user", "input"],
-    build_plan: ["pi", "planning"],
-    acceptance_contract: ["fomo", "acceptance"],
-    diagnostic_report: ["fomo", "verification"],
-    product_spec: ["product_manager", "product"],
-    technical_spec: ["architect", "architecture"],
-  } as const;
-  const [role, stage] = ownership[kind];
-  return {
-    id,
-    runId,
-    kind,
-    role,
-    stage,
-    schemaVersion: 1,
-    title: `${kind.replaceAll("_", " ")} ${id}`,
-    summary: `Summary ${id}`,
-    createdAt: "2026-08-07T12:00:00.000Z",
-  };
-}
-
-function detailFixture(ref: VisibleArtifactRef, problem: string): ArtifactDetail {
-  return { ...ref, content: { problem } };
-}
-
-function snapshotFixture(refs: ArtifactRef[], lastSeq = 12): Record<string, unknown> {
+function snapshotFixture(lastSeq = 12): Record<string, unknown> {
   return {
     goalGraph: null,
     project: { id: "project-1", name: "Library", status: "idle" },
@@ -181,9 +161,7 @@ function snapshotFixture(refs: ArtifactRef[], lastSeq = 12): Record<string, unkn
     events: [],
     files: [],
     versions: [],
-    trace: [],
     preview: { status: "unavailable" },
-    artifactRefs: refs,
   };
 }
 
@@ -199,7 +177,7 @@ function waitingSnapshotFixture(): Record<string, unknown> {
     createdAt: "2026-08-09T10:00:00.000Z",
   };
   return {
-    ...snapshotFixture([], 8),
+    ...snapshotFixture(8),
     activeRun: {
       id: "run-1",
       projectId: "project-1",
@@ -211,139 +189,24 @@ function waitingSnapshotFixture(): Record<string, unknown> {
   };
 }
 
-function LoaderHarness({ refs, runId }: { refs: ArtifactRef[]; runId?: string }) {
-  const loads = useArtifactDetailLoader(refs, runId);
-  return createElement("pre", { "data-testid": "loads" } as HTMLAttributes<HTMLPreElement>, JSON.stringify(loads));
-}
-
-function loadsFromDom(): Record<string, unknown> {
-  return JSON.parse(screen.getByTestId("loads").textContent || "{}");
-}
-
-describe("useArtifactDetailLoader", () => {
-  it("fetches each ref exactly once across rerenders with fresh ref arrays", async () => {
-    const refA = refFixture("product-1", "product_spec", "run-a");
-    h.getArtifact.mockResolvedValue(detailFixture(refA, "readers can search"));
-
-    const { rerender } = render(createElement(LoaderHarness, { refs: [refA], runId: "run-a" }));
-    rerender(createElement(LoaderHarness, { refs: [{ ...refA }], runId: "run-a" }));
-
-    await waitFor(() => {
-      expect(loadsFromDom()["product-1"]).toEqual({ status: "ready", detail: expect.anything() });
-    });
-    expect(h.getArtifact).toHaveBeenCalledTimes(1);
-  });
-
-  it("loads exactly once per ref under StrictMode double effects", async () => {
-    const refA = refFixture("product-1", "product_spec", "run-a");
-    const refB = refFixture("technical-1", "technical_spec", "run-a");
-    h.getArtifact.mockResolvedValue(detailFixture(refA, "readers can search"));
-
-    render(createElement(StrictMode, null, createElement(LoaderHarness, { refs: [refA, refB], runId: "run-a" })));
-
-    await waitFor(() => expect(h.getArtifact).toHaveBeenCalledTimes(2));
-  });
-
-  it("skips hidden kinds and refs without a run id without fetching", () => {
-    render(createElement(LoaderHarness, {
-      refs: [
-        { ...refFixture("hidden-1", "product_spec"), kind: "implementation_plan" },
-        { ...refFixture("norun-1", "product_spec"), runId: undefined },
-      ],
-      runId: "run-a",
-    }));
-
-    expect(h.getArtifact).not.toHaveBeenCalled();
-    expect(loadsFromDom()).toEqual({});
-  });
-
-  it("never applies a late response from a previous run to the current run", async () => {
-    const refA = refFixture("product-1", "product_spec", "run-a");
-    const refB = refFixture("product-1", "product_spec", "run-b");
-    let resolveOld: ((detail: ArtifactDetail) => void) | undefined;
-    h.getArtifact.mockImplementation((runId: string, artifactId: string) => {
-      if (runId === "run-a") {
-        return new Promise<ArtifactDetail>((resolve) => {
-          resolveOld = resolve;
-        });
-      }
-      return Promise.resolve(detailFixture(refFixture(artifactId, "product_spec", runId), "run-b content"));
-    });
-
-    const { rerender } = render(createElement(LoaderHarness, { refs: [refA], runId: "run-a" }));
-    expect(h.getArtifact).toHaveBeenCalledTimes(1);
-
-    rerender(createElement(LoaderHarness, { refs: [refB], runId: "run-b" }));
-    await waitFor(() => {
-      expect(loadsFromDom()["product-1"]).toEqual({
-        status: "ready",
-        detail: expect.objectContaining({ runId: "run-b" }),
-      });
-    });
-
-    // The stale run-a response resolves after the run switch and must be dropped.
-    await act(async () => {
-      resolveOld?.(detailFixture(refA, "stale run-a content"));
-    });
-
-    expect(loadsFromDom()["product-1"]).toEqual({
-      status: "ready",
-      detail: expect.objectContaining({ runId: "run-b", content: { problem: "run-b content" } }),
-    });
-    expect(JSON.stringify(loadsFromDom())).not.toContain("stale");
-  });
-
-  it("surfaces failures explicitly and never retries on rerender", async () => {
-    const refA = refFixture("product-1", "product_spec", "run-a");
-    h.getArtifact.mockRejectedValue(new Error("artifact fetch failed"));
-
-    const { rerender } = render(createElement(LoaderHarness, { refs: [refA], runId: "run-a" }));
-    await waitFor(() => {
-      expect(loadsFromDom()["product-1"]).toEqual({ status: "error", message: "artifact fetch failed" });
-    });
-
-    rerender(createElement(LoaderHarness, { refs: [{ ...refA }], runId: "run-a" }));
-    expect(h.getArtifact).toHaveBeenCalledTimes(1);
-  });
-});
-
 describe("ProjectWorkbench runtime overview", () => {
   it("shows the bounded run overview without contract proof or artifact detail loading", () => {
-    h.snapshot.project = snapshotFixture([]);
+    h.snapshot.project = snapshotFixture();
 
-    render(createElement(ProjectWorkbench, { projectId: "project-1" }));
+    renderWorkbench();
 
-    const workLog = screen.getByLabelText("Work log");
-    const activity = screen.getByRole("region", { name: "Agent activity" });
-    const taskSummary = screen.getByRole("region", { name: "Current task" });
+    const workLog = screen.getByLabelText("工作日志");
+    const activity = screen.getByRole("region", { name: "Agent 活动" });
+    const taskSummary = screen.getByRole("region", { name: "当前任务" });
     const composer = screen.getByRole("textbox");
-    expect(screen.getByRole("region", { name: "Agent work log" })).toBeTruthy();
-    expect(screen.getByRole("region", { name: "Run stages" })).toBeTruthy();
-    expect(screen.getByRole("region", { name: "Run metrics" })).toBeTruthy();
+    expect(screen.getByRole("region", { name: "Agent 工作日志" })).toBeTruthy();
+    expect(screen.getByRole("region", { name: "运行阶段" })).toBeTruthy();
+    expect(screen.getByRole("region", { name: "运行指标" })).toBeTruthy();
     expect(workLog.contains(activity)).toBe(true);
     expect(workLog.contains(taskSummary)).toBe(false);
     expect(workLog.compareDocumentPosition(taskSummary) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(taskSummary.compareDocumentPosition(composer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(screen.getByRole("region", { name: "Workspace" })).toBeTruthy();
-    expect(screen.queryByText("Contract-to-Proof")).toBeNull();
-    expect(h.getArtifact).not.toHaveBeenCalled();
-  });
-
-  it("keeps spec artifacts out of the main UI across hydration and refresh", () => {
-    const product = refFixture("product-1", "product_spec");
-    const technical = refFixture("technical-1", "technical_spec");
-    h.snapshot.project = snapshotFixture([product, technical], 12);
-
-    const { rerender } = render(createElement(StrictMode, null, createElement(ProjectWorkbench, { projectId: "project-1" })));
-    expect(h.getArtifact).not.toHaveBeenCalled();
-    expect(screen.queryByText("Contract-to-Proof")).toBeNull();
-
-    rerender(createElement(StrictMode, null, createElement(ProjectWorkbench, { projectId: "project-1" })));
-    expect(h.getArtifact).not.toHaveBeenCalled();
-
-    h.snapshot.project = snapshotFixture([product, technical], 99);
-    rerender(createElement(StrictMode, null, createElement(ProjectWorkbench, { projectId: "project-1" })));
-    expect(h.getArtifact).not.toHaveBeenCalled();
+    expect(screen.getByRole("region", { name: "工作区" })).toBeTruthy();
     expect(screen.queryByText("Contract-to-Proof")).toBeNull();
   });
 
@@ -365,12 +228,12 @@ describe("ProjectWorkbench runtime overview", () => {
       run: { id: "run-1", projectId: "project-1", status: "queued", lastSeq: 10 },
     });
 
-    render(createElement(ProjectWorkbench, { projectId: "project-1" }));
+    renderWorkbench();
 
     const composer = screen.getByRole("textbox", { name: "Project prompt" });
     expect((composer as HTMLTextAreaElement).disabled).toBe(true);
-    expect((composer as HTMLTextAreaElement).placeholder).toBe("Answer the question in the work log to continue");
-    expect(screen.getByText("Answer the question in the work log to continue this run.")).toBeTruthy();
+    expect((composer as HTMLTextAreaElement).placeholder).toBe("请在工作日志中回答问题以继续");
+    expect(screen.getByText("请回答工作日志中的问题以继续本次运行。")).toBeTruthy();
 
     await user.click(screen.getByRole("button", { name: "Grid" }));
     await user.click(screen.getByRole("button", { name: "Continue" }));
@@ -391,7 +254,7 @@ describe("ProjectWorkbench runtime overview", () => {
     h.snapshot.project = waitingSnapshotFixture();
     h.chat.status = "ready";
 
-    render(createElement(ProjectWorkbench, { projectId: "project-1" }));
+    renderWorkbench();
 
     const stopButton = screen.getByRole("button", { name: "Stop" });
     expect((stopButton as HTMLButtonElement).disabled).toBe(false);
@@ -407,15 +270,68 @@ describe("ProjectWorkbench runtime overview", () => {
     h.snapshot.project = waitingSnapshotFixture();
     h.answerRunInputRequest.mockRejectedValue(new ApiProblem({ status: 409, title: "Conflict" }));
 
-    render(createElement(ProjectWorkbench, { projectId: "project-1" }));
+    renderWorkbench();
 
     const grid = screen.getByRole("button", { name: "Grid" });
     await user.click(grid);
     await user.click(screen.getByRole("button", { name: "Continue" }));
 
-    expect((await screen.findByRole("alert")).textContent).toContain("already answered");
+    expect((await screen.findByRole("alert")).textContent).toContain("已回答");
     expect(grid.getAttribute("aria-pressed")).toBe("true");
     expect(h.mutate).toHaveBeenCalled();
     expect(h.chat.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("shows the immutable runtime contract from RunResponse.runtime after a run is created", () => {
+    h.snapshot.project = {
+      ...snapshotFixture(12),
+      activeRun: {
+        id: "run-1",
+        projectId: "project-1",
+        status: "completed",
+        lastSeq: 12,
+        runtime: {
+          profileId: "deepseek-flash",
+          thinking: "high",
+          contextWindow: 1_000_000,
+          policyVersion: "direct-pi-runtime-v2",
+          runTokenBudget: null,
+          runTokenBudgetUnlimited: true,
+          inferenceTpmLimit: 1_250_000,
+        },
+      },
+    };
+
+    const { container } = renderWorkbench();
+
+    const badge = container.querySelector('[data-runtime="deepseek-flash"]');
+    expect(badge).toBeTruthy();
+    expect(badge?.getAttribute("data-thinking")).toBe("high");
+    expect(badge?.textContent).toContain("1M");
+  });
+
+  it("disables the composer when no runtime model is available", () => {
+    h.snapshot.project = snapshotFixture();
+    h.answerRunInputRequest.mockResolvedValue({
+      message: { id: "message-1", role: "user", content: "Grid" },
+      request: {
+        id: "input-1",
+        runId: "run-1",
+        question: "Which catalogue layout should we use?",
+        choices: ["Grid", "List"],
+        allowFreeform: false,
+        status: "answered",
+        stage: "building",
+        answeredAt: "2026-08-09T10:01:00.000Z",
+      },
+      run: { id: "run-1", projectId: "project-1", status: "queued", lastSeq: 10 },
+    });
+
+    renderWorkbench();
+
+    const composer = screen.getByRole("textbox", { name: "Project prompt" }) as HTMLTextAreaElement;
+    const submit = screen.getByRole("button", { name: "Submit" }) as HTMLButtonElement;
+    expect(submit.disabled).toBe(true);
+    expect(composer.disabled).toBe(false);
   });
 });

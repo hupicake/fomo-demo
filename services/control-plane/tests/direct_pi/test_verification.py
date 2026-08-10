@@ -35,6 +35,7 @@ from fomo.direct_pi.workspace import (
 from fomo.sandbox.base import ExecResult
 from fomo.sandbox.fake import FakeSandboxProvider
 from fomo.schemas import GateStatus
+from tests.helpers import create_user_session
 
 _HARNESS_PATH = FOMO_HARNESS_PATH
 _RUNNER_PROBE = (
@@ -105,6 +106,58 @@ def _playwright_report(title: str) -> str:
                             "errors": [],
                             "tests": [
                                 {"status": "expected", "results": [{"status": "passed"}]}
+                            ],
+                        }
+                    ]
+                }
+            ],
+        }
+    )
+
+
+def _playwright_failure_report(title: str) -> str:
+    import json
+
+    return json.dumps(
+        {
+            "errors": [],
+            "suites": [
+                {
+                    "specs": [
+                        {
+                            "title": title,
+                            "errors": [],
+                            "tests": [
+                                {
+                                    "status": "unexpected",
+                                    "results": [
+                                        {
+                                            "status": "failed",
+                                            "error": {
+                                                "message": (
+                                                    "Error: \u001b[31mexpect(locator).toBeVisible()\u001b[39m failed\n"
+                                                    "Locator: getByText('张三', { exact: true }).first()\n"
+                                                    "Expected: visible\n"
+                                                    "PASSWORD=artifact-secret\n"
+                                                    "Call log:\n"
+                                                    + "x" * 20_000
+                                                ),
+                                                "stack": "trace-secret-must-not-persist",
+                                                "location": {
+                                                    "file": "/workspace/tests/fomo-acceptance/private.spec.ts",
+                                                    "line": 10,
+                                                    "column": 89,
+                                                },
+                                            },
+                                            "attachments": [
+                                                {
+                                                    "name": "trace",
+                                                    "body": "A" * 20_000,
+                                                }
+                                            ],
+                                        }
+                                    ],
+                                }
                             ],
                         }
                     ]
@@ -191,7 +244,7 @@ def test_fixed_runner_contract_pins_absolute_wrappers_and_trusted_path() -> None
 
 
 async def _run_context(repository, message_id: str = "verify-test"):
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, message_id, "Build a library manager."
@@ -278,6 +331,54 @@ async def test_verify_full_gates_use_fixed_runner_and_never_scripts(
         _WORKSPACE_NEXT_BUILD,
         _WORKSPACE_NEXT_START,
     ]
+
+
+@pytest.mark.asyncio
+async def test_failed_acceptance_persists_safe_assertion_diagnostic(
+    repository, settings
+) -> None:
+    project, run, lease = await _run_context(repository, "assertion-diagnostic")
+    contract = _contract()
+    results = _playwright_results()
+    acceptance_command = _playwright_command(
+        "tests/fomo-acceptance/search-books.smoke.spec.ts"
+    )
+    results[acceptance_command] = ExecResult(
+        1,
+        _playwright_failure_report("searches books"),
+        "",
+    )
+    sandbox = FakeSandboxProvider(results)
+    ref = await sandbox.create(project.id)
+
+    outcome = await _verifier(repository, sandbox, settings, run.id, lease).verify(
+        ref,
+        contract,
+        compile_acceptance(contract),
+        round_number=0,
+        candidate_paths=("app/page.tsx",),
+    )
+
+    assert not outcome.passed
+    failed = next(gate for gate in outcome.gates if gate.outcome == "failed")
+    assert failed.diagnostic is not None
+    assert failed.diagnostic.locator == "getByText('张三', { exact: true }).first()"
+    assert failed.diagnostic.test_name == "searches books"
+    assert failed.diagnostic.line == 10
+    assert "[REDACTED]" in failed.diagnostic.message
+    artifact = await repository.get_latest_artifact(run.id, "diagnostic_report")
+    assert artifact is not None
+    serialized = __import__("json").dumps(artifact, ensure_ascii=False)
+    assert "张三" in serialized
+    assert '"line": 10' in serialized
+    for forbidden in (
+        "artifact-secret",
+        "trace-secret-must-not-persist",
+        "/workspace/tests/fomo-acceptance/private.spec.ts",
+        "A" * 1_000,
+        "x" * 1_000,
+    ):
+        assert forbidden not in serialized
 
 
 @pytest.mark.asyncio

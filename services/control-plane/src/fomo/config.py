@@ -15,10 +15,20 @@ from pathlib import Path
 from urllib.parse import urlparse
 from uuid import UUID
 
+from fomo.runtime_contract import (
+    DEFAULT_PROFILE_ID,
+    parse_enabled_profile_ids,
+    runtime_profile,
+    validated_default_profile_id,
+)
+
 DEFAULT_OPENSANDBOX_IMAGE = "fomo-sandbox-node:2026-08-08"
 DEFAULT_OPENSANDBOX_LIFETIME_SECONDS = 21_600
 DEFAULT_OPENSANDBOX_READY_TIMEOUT_SECONDS = 120
 DEFAULT_VERIFIED_PREVIEW_LIFETIME_SECONDS = 604_800
+DEFAULT_DEV_ACCOUNT_EMAIL = "dev@fomo.local"
+DEFAULT_DEV_ACCOUNT_PASSWORD = "fomo-dev-password"
+DEFAULT_DEV_ACCOUNT_DISPLAY_NAME = "Dev"
 MAX_ENGINEER_FILE_CHARACTERS = 24_000
 INFERENCE_TOKEN_EXPIRY_GRACE_SECONDS = 600
 _DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
@@ -216,22 +226,28 @@ class Settings:
     database_url: str = "sqlite+aiosqlite:///./fomo.db"
     web_origin: str = "http://localhost:3000"
     session_cookie_name: str = "fomo_session"
+    dev_account_email: str | None = None
+    dev_account_password: str | None = None
+    dev_account_display_name: str = DEFAULT_DEV_ACCOUNT_DISPLAY_NAME
     litellm_base_url: str = "http://localhost:4000/v1"
     # The worker calls LiteLLM's management API from the control-plane host,
     # while Pi calls the OpenAI-compatible endpoint from inside OpenSandbox.
     # Those are different network namespaces in local Docker development.
     sandbox_litellm_base_url: str | None = None
     litellm_api_key: str | None = None
+    runtime_enabled_profiles: tuple[str, ...] = (DEFAULT_PROFILE_ID,)
+    runtime_default_profile: str = DEFAULT_PROFILE_ID
     # Direct Pi receives only a short-lived LiteLLM virtual key. The master key
     # stays in the control plane and provider credentials stay inside LiteLLM.
     inference_token_ttl_seconds: int = 4_200
     inference_management_timeout_seconds: int = 15
+    # Legacy/native compatibility knobs. Direct Pi deliberately does not use
+    # these as development quotas; its lifetime is the sandbox resource lease.
     run_max_wall_seconds: int = 3_600
-    run_max_spend: float = 2.0
+    run_max_spend: float = 5.0
     run_inference_rpm_limit: int = 60
-    run_inference_tpm_limit: int = 1_000_000
+    run_inference_tpm_limit: int = 1_250_000
     run_max_tool_calls: int = 300
-    run_max_tokens: int = 400_000
     pi_max_file_characters: int = 20_000
     pi_max_changed_files: int = 24
     # Explicit logical context window passed to the bridge. The active model
@@ -294,9 +310,29 @@ class Settings:
     # 44772 is OpenSandbox execd; generated apps only use the fixed 8080 app port.
     preview_base_port: int = 8080
     structured_output_retries: int = 1
+    # Native SOP compatibility only. Direct Pi repairs until verification
+    # passes, the run is cancelled, or a real infrastructure/provider failure
+    # prevents further progress.
     max_repair_rounds: int = 3
 
     def __post_init__(self) -> None:
+        enabled_profiles = parse_enabled_profile_ids(
+            ",".join(self.runtime_enabled_profiles)
+        )
+        default_profile = validated_default_profile_id(
+            self.runtime_default_profile,
+            enabled_profiles,
+        )
+        object.__setattr__(self, "runtime_enabled_profiles", tuple(sorted(enabled_profiles)))
+        object.__setattr__(self, "runtime_default_profile", default_profile)
+        largest_context_window = max(
+            runtime_profile(profile_id).context_window for profile_id in enabled_profiles
+        )
+        if self.run_inference_tpm_limit <= largest_context_window:
+            raise ValueError(
+                "run_inference_tpm_limit must leave output headroom for every enabled "
+                "runtime profile"
+            )
         normalized_preview_domain = _public_preview_base_domain(self.public_preview_base_domain)
         object.__setattr__(self, "public_preview_base_domain", normalized_preview_domain)
         object.__setattr__(
@@ -336,7 +372,6 @@ class Settings:
             "run_inference_rpm_limit": self.run_inference_rpm_limit,
             "run_inference_tpm_limit": self.run_inference_tpm_limit,
             "run_max_tool_calls": self.run_max_tool_calls,
-            "run_max_tokens": self.run_max_tokens,
             "pi_max_file_characters": self.pi_max_file_characters,
             "pi_max_changed_files": self.pi_max_changed_files,
             "pi_context_window": self.pi_context_window,
@@ -349,19 +384,10 @@ class Settings:
                 raise ValueError(f"{name} must be greater than 0")
         if self.pi_context_window > 8_000_000:
             raise ValueError("pi_context_window must not exceed 8000000")
-        if self.pi_max_file_characters > 24_000:
-            raise ValueError("pi_max_file_characters must not exceed 24000")
-        if self.pi_max_changed_files > 24:
-            raise ValueError("pi_max_changed_files must not exceed 24")
         if self.verified_preview_lifetime_seconds > DEFAULT_VERIFIED_PREVIEW_LIFETIME_SECONDS:
             raise ValueError("verified_preview_lifetime_seconds must not exceed 604800")
         if not isfinite(self.run_max_spend) or self.run_max_spend <= 0:
             raise ValueError("run_max_spend must be greater than 0")
-        minimum_ttl = self.run_max_wall_seconds + INFERENCE_TOKEN_EXPIRY_GRACE_SECONDS
-        if self.inference_token_ttl_seconds < minimum_ttl:
-            raise ValueError(
-                "inference_token_ttl_seconds must be at least run_max_wall_seconds + 600 seconds"
-            )
 
     @property
     def litellm_management_url(self) -> str:
@@ -370,6 +396,21 @@ class Settings:
     @property
     def pi_provider_base_url(self) -> str:
         return _litellm_endpoints(self.sandbox_litellm_base_url or self.litellm_base_url)[1]
+
+    @property
+    def active_run_inference_token_ttl_seconds(self) -> int:
+        """Keep a scoped key alive for the sandbox's full resource lifetime.
+
+        The configured TTL remains a deployment minimum. Clamping it to the
+        sandbox lifetime plus cleanup grace prevents key expiry from becoming
+        a hidden run wall while retaining alias, rate, spend, and revocation
+        controls. The LiteLLM master key never enters the sandbox.
+        """
+
+        return max(
+            self.inference_token_ttl_seconds,
+            self.opensandbox_lifetime_seconds + INFERENCE_TOKEN_EXPIRY_GRACE_SECONDS,
+        )
 
     @property
     def sandbox_proxy_environment(self) -> dict[str, str]:
@@ -411,6 +452,7 @@ class Settings:
     @classmethod
     def from_env(cls) -> Settings:
         defaults = cls()
+        app_env = os.getenv("APP_ENV", defaults.app_env).strip().lower()
         database_url = os.getenv("DATABASE_URL", defaults.database_url)
         engineer_target_file_characters, engineer_max_file_characters = (
             _engineer_file_character_limits(
@@ -420,10 +462,22 @@ class Settings:
         )
         # SQLAlchemy's PostgreSQL async driver is selected by the supplied URL.
         return cls(
-            app_env=os.getenv("APP_ENV", defaults.app_env),
+            app_env=app_env,
             database_url=database_url,
             web_origin=os.getenv("WEB_ORIGIN", defaults.web_origin),
             session_cookie_name=os.getenv("SESSION_COOKIE_NAME", defaults.session_cookie_name),
+            dev_account_email=(
+                os.getenv("DEV_ACCOUNT_EMAIL", "").strip()
+                or (DEFAULT_DEV_ACCOUNT_EMAIL if app_env == "development" else None)
+            ),
+            dev_account_password=(
+                os.getenv("DEV_ACCOUNT_PASSWORD", "")
+                or (DEFAULT_DEV_ACCOUNT_PASSWORD if app_env == "development" else None)
+            ),
+            dev_account_display_name=(
+                os.getenv("DEV_ACCOUNT_DISPLAY_NAME", "").strip()
+                or DEFAULT_DEV_ACCOUNT_DISPLAY_NAME
+            ),
             litellm_base_url=os.getenv("LITELLM_BASE_URL", defaults.litellm_base_url).rstrip("/"),
             sandbox_litellm_base_url=(
                 os.getenv("SANDBOX_LITELLM_BASE_URL", "").strip().rstrip("/") or None
@@ -431,6 +485,17 @@ class Settings:
             # This is only a LiteLLM gateway credential. Provider keys stay inside LiteLLM.
             litellm_api_key=(
                 os.getenv("LITELLM_API_KEY") or os.getenv("LITELLM_MASTER_KEY") or None
+            ),
+            runtime_enabled_profiles=tuple(
+                sorted(
+                    parse_enabled_profile_ids(
+                        os.getenv("FOMO_RUNTIME_ENABLED_PROFILES")
+                    )
+                )
+            ),
+            runtime_default_profile=(
+                os.getenv("FOMO_RUNTIME_DEFAULT_PROFILE", defaults.runtime_default_profile).strip()
+                or defaults.runtime_default_profile
             ),
             inference_token_ttl_seconds=_positive_int_environment_value(
                 "FOMO_INFERENCE_TOKEN_TTL", defaults.inference_token_ttl_seconds
@@ -453,9 +518,6 @@ class Settings:
             ),
             run_max_tool_calls=_positive_int_environment_value(
                 "RUN_MAX_TOOL_CALLS", defaults.run_max_tool_calls
-            ),
-            run_max_tokens=_positive_int_environment_value(
-                "RUN_MAX_TOKENS", defaults.run_max_tokens
             ),
             pi_max_file_characters=_positive_int_environment_value(
                 "PI_MAX_FILE_CHARACTERS", defaults.pi_max_file_characters

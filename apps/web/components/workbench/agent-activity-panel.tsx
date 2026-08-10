@@ -71,13 +71,13 @@ function DetailPreview({ current, item }: { current: boolean; item: AgentWorklog
 function WorklogRow({ current = false, item }: { current?: boolean; item: AgentWorklogItem }) {
   const Icon = kindIcons[item.kind];
   return (
-    <div className={cn("relative flex min-w-0 shrink-0 gap-2.5 py-2 pl-7 pr-2", current && "rounded-lg bg-primary/[0.04] py-2.5 ring-1 ring-inset ring-primary/15")} data-status={item.status}>
+    <div className={cn("group relative flex min-w-0 shrink-0 gap-2 py-1.5 pl-7 pr-1 [content-visibility:auto] [contain-intrinsic-size:auto_4.5rem]", current && "rounded-lg bg-primary/[0.04] py-2 ring-1 ring-inset ring-primary/15")} data-status={item.status}>
       {!current ? <span aria-hidden="true" className="absolute bottom-0 left-[0.84rem] top-0 w-px bg-border last:hidden" /> : null}
       <span className={cn(
-        "absolute left-1 top-2.5 z-10 grid size-5 place-items-center rounded-full border bg-background text-muted-foreground",
-        current && "left-1.5 top-3 size-6",
+        "absolute left-1 top-2 z-10 grid size-5 place-items-center rounded-full border bg-background text-muted-foreground",
+        current && "left-1.5 top-2.5 size-6",
         item.status === "running" && "border-primary/30 bg-primary/10 text-primary",
-        item.status === "completed" && "border-emerald-600/25 bg-emerald-500/10 text-emerald-700",
+        item.status === "completed" && "border-emerald-600/25 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
         item.status === "failed" && "border-destructive/30 bg-destructive/10 text-destructive",
       )}>
         {current ? <Icon aria-hidden="true" className="size-3.5" /> : <StatusIcon status={item.status} />}
@@ -85,11 +85,11 @@ function WorklogRow({ current = false, item }: { current?: boolean; item: AgentW
       <div className="min-w-0 flex-1">
         <div className="flex min-w-0 items-start gap-2">
           <p className="min-w-0 flex-1 text-xs font-medium leading-5">{item.title}</p>
-          <span className="sr-only">Status: {item.status}</span>
-          {current ? <Badge className="h-5 shrink-0 px-1.5 text-[9px] uppercase" variant={item.status === "failed" ? "destructive" : "secondary"}>{item.status === "running" ? "Now" : item.status}</Badge> : null}
+          <span className="sr-only">状态：{item.status}</span>
+          {current ? <Badge className="h-5 shrink-0 px-1.5 text-[9px] uppercase" variant={item.status === "failed" ? "destructive" : "secondary"}>{item.status === "running" ? "进行中" : item.status}</Badge> : null}
         </div>
         <DetailPreview current={current} item={item} />
-        <div className="mt-1 flex flex-wrap items-center gap-1.5 font-mono text-[9px] uppercase tracking-wide text-muted-foreground">
+        <div className={cn("mt-0.5 hidden flex-wrap items-center gap-1.5 font-mono text-[9px] uppercase tracking-wide text-muted-foreground/75 group-focus-within:flex group-hover:flex", (current || item.status === "failed") && "flex")}>
           <span>{item.kind}</span>
           {item.stage ? <><span aria-hidden="true">·</span><span>{item.stage}</span></> : null}
           <time className="ml-auto normal-case tracking-normal" dateTime={item.occurredAt}>{stableTime(item.occurredAt)}</time>
@@ -147,20 +147,20 @@ export function AgentActivityPanel({
   }, [entries, inputRequests]);
 
   return (
-    <section aria-label="Agent activity" className="space-y-2" data-routine-hidden={routineHidden}>
-      <div className="flex items-center justify-between gap-3">
-        <h2 className="text-xs font-medium text-muted-foreground">Agent activity</h2>
-        <span className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
-          <span>{orderedEntries.length} entries</span>
-          {routineHidden > 0 ? <><span aria-hidden="true">·</span><span className="text-muted-foreground/70">{routineHidden} routine hidden</span></> : null}
+    <section aria-label="Agent 活动" data-routine-hidden={routineHidden}>
+      <div className="sr-only">
+        <h2>Agent 活动</h2>
+        <span>
+          <span>{orderedEntries.length} 条</span>
+          {routineHidden > 0 ? <><span aria-hidden="true">·</span><span className="text-muted-foreground/70">{routineHidden} 条常规已隐藏</span></> : null}
         </span>
       </div>
-      <div aria-live="polite" aria-relevant="additions text" className="space-y-0.5">
+      <div aria-live="polite" aria-relevant="additions text">
         {orderedEntries.length > 0
           ? orderedEntries.map((entry, index) => entry.kind === "activity"
             ? <WorklogRow current={index === orderedEntries.length - 1} item={entry.item} key={`activity:${entry.item.id}`} />
             : <ClarificationCard key={`clarification:${entry.request.id}`} onAnswer={onAnswer || unavailableAnswer} request={entry.request} />)
-          : <p className="rounded-lg border border-dashed px-3 py-3 text-xs leading-5 text-muted-foreground">Activity appears here as work begins.</p>}
+          : <p className="rounded-lg border border-dashed px-3 py-3 text-xs leading-5 text-muted-foreground">当工作开始时，活动将显示在这里。</p>}
       </div>
     </section>
   );

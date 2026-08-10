@@ -59,10 +59,12 @@ RUN apt-get update \
 # dependency graph. Keep it root-owned and immutable while the sandbox runs as
 # the unprivileged node user.
 COPY --chown=root:root fomo-pi-rpc-bridge.mjs /opt/fomo/bin/fomo-pi-rpc-bridge.mjs
+COPY --chown=root:root fomo-runtime-preflight.mjs /opt/fomo/bin/fomo-runtime-preflight.mjs
 COPY --chown=root:root fomo-structured-output.ts /opt/fomo/bin/fomo-structured-output.ts
 COPY --chown=root:root fomo-request-user-input.ts /opt/fomo/bin/fomo-request-user-input.ts
 RUN chmod 0555 \
     /opt/fomo/bin/fomo-pi-rpc-bridge.mjs \
+    /opt/fomo/bin/fomo-runtime-preflight.mjs \
     /opt/fomo/bin/fomo-structured-output.ts \
     /opt/fomo/bin/fomo-request-user-input.ts
 

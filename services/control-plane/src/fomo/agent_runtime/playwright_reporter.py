@@ -15,11 +15,27 @@ import json
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from fomo.text_safety import bounded_diagnostic_text
+
 # Reporter output is bounded well below the command output cap so a truncated
 # or hostile stream can never be parsed as a valid report.
 _MAX_PLAYWRIGHT_REPORT_BYTES = 2_000_000
+_MAX_ASSERTION_SOURCE_CHARACTERS = 4_096
+_MAX_ASSERTION_MESSAGE_CHARACTERS = 1_200
+_MAX_ASSERTION_LOCATOR_CHARACTERS = 500
+_MAX_ASSERTION_TEST_NAME_CHARACTERS = 300
 
 PlaywrightTestStatus = Literal["passed", "failed", "did_not_run"]
+
+
+@dataclass(frozen=True, slots=True)
+class PlaywrightAssertionDiagnostic:
+    """Safe high-signal projection of one failed assertion."""
+
+    message: str
+    locator: str | None
+    test_name: str
+    line: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,10 +47,13 @@ class PlaywrightReport:
     status: PlaywrightTestStatus | None
     top_level_errors: int
     load_errors: int
+    assertion: PlaywrightAssertionDiagnostic | None = None
 
 
-def _result_status(test: dict[str, Any]) -> tuple[bool, str | None]:
-    """Return ``(valid, last_result_status)`` after validating every result.
+def _result_status(
+    test: dict[str, Any],
+) -> tuple[bool, str | None, dict[str, Any] | None]:
+    """Return the validated last result and status.
 
     ``valid=False`` means the results structure is missing, empty, or
     malformed and the caller must fail closed (``None``). ``valid=True``
@@ -43,16 +62,80 @@ def _result_status(test: dict[str, Any]) -> tuple[bool, str | None]:
     """
     results = test.get("results")
     if not isinstance(results, list) or not results:
-        return False, None
+        return False, None, None
     statuses: list[str] = []
     for result in results:
         if not isinstance(result, dict):
-            return False, None
+            return False, None, None
         status = result.get("status")
         if not isinstance(status, str):
-            return False, None
+            return False, None, None
         statuses.append(status)
-    return True, statuses[-1]
+    return True, statuses[-1], results[-1]
+
+
+def _assertion_diagnostic(
+    title: str, result: dict[str, Any]
+) -> PlaywrightAssertionDiagnostic | None:
+    """Project only bounded assertion fields, never stack/trace/attachments."""
+
+    error = result.get("error")
+    if not isinstance(error, dict) or not isinstance(error.get("message"), str):
+        return None
+    source = bounded_diagnostic_text(
+        error["message"], limit=_MAX_ASSERTION_SOURCE_CHARACTERS
+    )
+    message_lines: list[str] = []
+    locator: str | None = None
+    in_call_log = False
+    for raw_line in source.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        lowered = line.casefold()
+        if lowered.startswith(("trace:", "stack:", "attachment:")):
+            break
+        if lowered.startswith("call log:"):
+            in_call_log = True
+            continue
+        if in_call_log:
+            waiting_marker = "waiting for "
+            marker_at = lowered.find(waiting_marker)
+            if locator is None and marker_at >= 0:
+                locator_value = line[marker_at + len(waiting_marker) :].strip()
+                if locator_value:
+                    locator = bounded_diagnostic_text(
+                        locator_value, limit=_MAX_ASSERTION_LOCATOR_CHARACTERS
+                    )
+            continue
+        if lowered.startswith("locator:"):
+            locator_value = line.split(":", 1)[1].strip()
+            if locator_value:
+                locator = bounded_diagnostic_text(
+                    locator_value, limit=_MAX_ASSERTION_LOCATOR_CHARACTERS
+                )
+        message_lines.append(line)
+    message = bounded_diagnostic_text(
+        " | ".join(message_lines) or "Playwright assertion failed.",
+        limit=_MAX_ASSERTION_MESSAGE_CHARACTERS,
+    )
+    location = error.get("location")
+    raw_line = location.get("line") if isinstance(location, dict) else None
+    location_line = (
+        raw_line
+        if isinstance(raw_line, int)
+        and not isinstance(raw_line, bool)
+        and 1 <= raw_line <= 10_000_000
+        else None
+    )
+    return PlaywrightAssertionDiagnostic(
+        message=message,
+        locator=locator,
+        test_name=bounded_diagnostic_text(
+            title, limit=_MAX_ASSERTION_TEST_NAME_CHARACTERS
+        ),
+        line=location_line,
+    )
 
 
 def parse_playwright_json(
@@ -105,7 +188,7 @@ def parse_playwright_json(
             return None
         specs.extend(suite_specs)
 
-    tests: list[tuple[str, str, str | None]] = []
+    tests: list[tuple[str, str, str | None, dict[str, Any]]] = []
     for spec in specs:
         spec_errors = spec.get("errors")
         if spec_errors:
@@ -128,17 +211,20 @@ def parse_playwright_json(
             overall = test.get("status")
             if not isinstance(overall, str):
                 return None
-            valid_results, result_status = _result_status(test)
+            valid_results, result_status, last_result = _result_status(test)
             if not valid_results:
                 return None
-            tests.append((title, overall, result_status))
+            assert last_result is not None
+            tests.append((title, overall, result_status, last_result))
 
+    assertion: PlaywrightAssertionDiagnostic | None = None
     if len(tests) == 1:
-        title, overall, result_status = tests[0]
+        title, overall, result_status, last_result = tests[0]
         if overall == "expected" and result_status == "passed":
             mapped: PlaywrightTestStatus = "passed"
         elif overall == "unexpected" and result_status == "failed":
             mapped = "failed"
+            assertion = _assertion_diagnostic(title, last_result)
         else:
             mapped = "did_not_run"
     else:
@@ -150,4 +236,5 @@ def parse_playwright_json(
         status=mapped,
         top_level_errors=len(top_level_errors),
         load_errors=load_errors,
+        assertion=assertion,
     )

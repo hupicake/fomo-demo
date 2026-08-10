@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import replace
 from datetime import timedelta
 from unittest.mock import AsyncMock
@@ -14,6 +15,7 @@ from fomo.persistence import RunLeaseLost
 from fomo.sandbox.fake import FakeSandboxProvider
 from fomo.schemas import RunStatus
 from fomo.worker.runner import WorkerRunner
+from tests.helpers import create_user_session
 
 
 def _acceptance(identifier: str):
@@ -110,8 +112,16 @@ class _FailingCleanupSandbox(FakeSandboxProvider):
         raise RuntimeError("cleanup unavailable")
 
 
+class _RecordingOrchestrator:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str | None]] = []
+
+    async def run(self, run_id: str, *, lease_token: str | None = None) -> None:
+        self.calls.append((run_id, lease_token))
+
+
 async def _running_run(repository, *, message_id: str, lease_seconds: int = 60):
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
         project.id,
@@ -125,7 +135,7 @@ async def _running_run(repository, *, message_id: str, lease_seconds: int = 60):
 
 
 async def _queued_run(repository, *, message_id: str):
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
         project.id,
@@ -134,6 +144,74 @@ async def _queued_run(repository, *, message_id: str):
         "Create a book management system",
     )
     return project, run
+
+
+@pytest.mark.asyncio
+async def test_worker_preflight_failure_does_not_claim_and_recovery_claims(
+    repository,
+    settings,
+    caplog,
+) -> None:
+    _project, run = await _queued_run(repository, message_id="preflight-recovery")
+    attempts = 0
+
+    async def runtime_preflight() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("master-secret private provider response")
+
+    clock = [100.0]
+    orchestrator = _RecordingOrchestrator()
+    worker = WorkerRunner(
+        repository,
+        replace(settings, agent_framework="direct_pi"),
+        sandbox=FakeSandboxProvider(),
+        direct_orchestrator=orchestrator,
+        runtime_preflight=runtime_preflight,
+        monotonic=lambda: clock[0],
+        worker_id="preflight-worker",
+    )
+    caplog.set_level(logging.WARNING)
+
+    assert not await worker.run_once()
+    assert attempts == 1
+    assert (await repository.get_run(run.id)).status == RunStatus.queued
+    assert orchestrator.calls == []
+    assert "master-secret" not in caplog.text
+    assert "private provider response" not in caplog.text
+
+    clock[0] += 1.1
+    assert await worker.run_once()
+    assert attempts == 2
+    assert (await repository.get_run(run.id)).status == RunStatus.running
+    assert len(orchestrator.calls) == 1
+    assert orchestrator.calls[0][0] == run.id
+    assert orchestrator.calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_worker_does_not_spend_on_preflight_while_queue_is_empty(
+    repository,
+    settings,
+) -> None:
+    attempts = 0
+
+    async def runtime_preflight() -> None:
+        nonlocal attempts
+        attempts += 1
+
+    worker = WorkerRunner(
+        repository,
+        replace(settings, agent_framework="direct_pi"),
+        sandbox=FakeSandboxProvider(),
+        direct_orchestrator=_RecordingOrchestrator(),
+        runtime_preflight=runtime_preflight,
+        worker_id="idle-preflight-worker",
+    )
+
+    assert not await worker.run_once()
+    assert attempts == 0
 
 
 @pytest.mark.asyncio
@@ -202,6 +280,8 @@ async def test_recovered_lease_cancels_blocking_model_without_post_terminal_even
     terminal_events = await repository.list_events(run.id)
     terminal_seq = terminal_events[-1].seq
     assert terminal_events[-1].kind == "run.failed"
+    assert terminal_events[-1].payload["code"] == "worker_lease_expired"
+    assert terminal_events[-1].payload["message"].startswith("执行 Worker")
 
     assert await asyncio.wait_for(task, timeout=2)
     assert model.cancelled.is_set()

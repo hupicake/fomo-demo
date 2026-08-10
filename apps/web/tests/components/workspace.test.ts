@@ -42,7 +42,6 @@ function renderWorkspace(preview?: PreviewRef) {
   return render(createElement(Workspace, {
     device: "desktop" as DeviceViewport,
     files: [],
-    isDemo: false,
     onDeviceChange: () => undefined,
     onRestore: () => undefined,
     onSave: () => undefined,
@@ -123,5 +122,34 @@ describe("Workspace preview iframe", () => {
       }));
     });
     await waitFor(() => expect(screen.queryByText("forged log line")).toBeNull());
+  });
+});
+
+describe("Workspace tabs", () => {
+  it("keeps a main tab reachable from Problems and supports arrow-key navigation", () => {
+    const setSelectedTab = vi.fn();
+    render(createElement(Workspace, {
+      device: "desktop" as DeviceViewport,
+      files: [],
+      onDeviceChange: () => undefined,
+      onRestore: () => undefined,
+      onSave: () => undefined,
+      onSelectFile: () => undefined,
+      onVersionChange: () => undefined,
+      presentation: presentationWithPreview(),
+      saving: false,
+      selectedTab: "problems" as WorkspaceTab,
+      setSelectedTab,
+    }));
+
+    const preview = screen.getByRole("tab", { name: "预览" });
+    const code = screen.getByRole("tab", { name: "代码" });
+    expect(preview.tabIndex).toBe(0);
+
+    preview.focus();
+    fireEvent.keyDown(preview, { key: "ArrowRight" });
+
+    expect(setSelectedTab).toHaveBeenCalledWith("code");
+    expect(document.activeElement).toBe(code);
   });
 });

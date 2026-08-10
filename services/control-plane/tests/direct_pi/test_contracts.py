@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 
 import pytest
 from pydantic import ValidationError
@@ -8,8 +9,11 @@ from pydantic import ValidationError
 from fomo.direct_pi import PlanningBundle, compile_acceptance
 from fomo.direct_pi.acceptance import (
     ACCEPTANCE_CONFIG_PATH,
+    ADVISORY_ACCEPTANCE_CONFIG_PATH,
     FOMO_HARNESS_PATH,
     FOMO_PLAYWRIGHT_TEST_MODULE,
+    compile_goal_acceptance,
+    compile_goal_advisory_acceptance,
 )
 
 
@@ -129,6 +133,77 @@ def test_text_visibility_is_existential_without_relaxing_unique_operations() -> 
     )
 
 
+def test_select_adapts_to_native_select_and_exact_aria_options() -> None:
+    value = _bundle()
+    actions = value["acceptanceContract"]["tests"][0]["actions"]  # type: ignore[index]
+    actions.append(  # type: ignore[union-attr]
+        {
+            "kind": "select",
+            "target": {"by": "label", "value": "票种"},
+            "value": "VIP Pass",
+        }
+    )
+
+    bundle = PlanningBundle.model_validate(value)
+    compiled = compile_acceptance(bundle.acceptance_contract)
+    source = next(
+        item.content
+        for item in compiled.changes
+        if item.path == "tests/fomo-acceptance/create-book.smoke.spec.ts"
+    )
+
+    assert (
+        'const fomoSelectTarget = page.getByLabel("票种", { exact: true });'
+        in source
+    )
+    assert 'fomoSelectControl.tagName === "select"' in source
+    assert 'await fomoSelectTarget.selectOption("VIP Pass");' in source
+    assert 'fomoSelectControl.role === "listbox"' in source
+    assert (
+        'fomoSelectTarget\n        .getByRole("option", { name: "VIP Pass", exact: true })'
+        in source
+    )
+    assert 'fomoSelectControl.role === "combobox"' in source
+    assert 'fomoSelectControl.popup === "listbox"' in source
+    assert (
+        'page.getByRole("option", { name: "VIP Pass", exact: true }).click()'
+        in source
+    )
+
+
+def test_select_values_remain_quoted_inside_frozen_test_source() -> None:
+    value = _bundle()
+    target = '票种");\nawait page.reload();\n//'
+    option = 'VIP Pass");\nawait page.goto("/pwned");\n//'
+    actions = value["acceptanceContract"]["tests"][0]["actions"]  # type: ignore[index]
+    actions.append(  # type: ignore[union-attr]
+        {
+            "kind": "select",
+            "target": {"by": "label", "value": target},
+            "value": option,
+        }
+    )
+
+    bundle = PlanningBundle.model_validate(value)
+    compiled = compile_acceptance(bundle.acceptance_contract)
+    source = next(
+        item.content
+        for item in compiled.changes
+        if item.path == "tests/fomo-acceptance/create-book.smoke.spec.ts"
+    )
+    quoted_target = json.dumps(target, ensure_ascii=False)
+    quoted_option = json.dumps(option, ensure_ascii=False)
+
+    assert (
+        f"const fomoSelectTarget = page.getByLabel({quoted_target}, {{ exact: true }});"
+        in source
+    )
+    assert f"selectOption({quoted_option})" in source
+    assert f'{{ name: {quoted_option}, exact: true }}' in source
+    assert '\nawait page.goto("/pwned")' not in source
+    assert "\nawait page.reload();\n//" not in source
+
+
 def test_compiled_verification_assets_share_the_root_owned_playwright_module() -> None:
     bundle = PlanningBundle.model_validate(_bundle())
     compiled = compile_acceptance(bundle.acceptance_contract)
@@ -143,6 +218,38 @@ def test_compiled_verification_assets_share_the_root_owned_playwright_module() -
     for source in sources.values():
         assert trusted_import in source
         assert 'from "@playwright/test"' not in source
+
+
+def test_goal_advisory_compiler_emits_only_workspace_playwright_specs() -> None:
+    bundle = PlanningBundle.model_validate(_bundle())
+    authoritative = compile_goal_acceptance("G-1", bundle.acceptance_contract)
+    advisory = compile_goal_advisory_acceptance("G-1", bundle.acceptance_contract)
+
+    path = "tests/fomo-acceptance/G-1/create-book.smoke.spec.ts"
+    advisory_sources = {item.path: item.content for item in advisory.changes}
+    authoritative_sources = {item.path: item.content for item in authoritative.changes}
+
+    assert set(advisory_sources) == {ADVISORY_ACCEPTANCE_CONFIG_PATH, path}
+    assert ACCEPTANCE_CONFIG_PATH not in advisory_sources
+    assert FOMO_HARNESS_PATH not in advisory_sources
+    assert advisory.test_path_by_acceptance_id == {"G-1:AC-1": path}
+    assert advisory.test_name_by_acceptance_id == {"G-1:AC-1": "creates a book"}
+    assert advisory.acceptance_key_by_id == {"AC-1": "G-1:AC-1"}
+
+    advisory_source = advisory_sources[path]
+    authoritative_source = authoritative_sources[path]
+    assert advisory_source.startswith(
+        f'import {{ expect, test }} from "{FOMO_PLAYWRIGHT_TEST_MODULE}";\n\n'
+    )
+    assert authoritative_source.startswith(
+        f'import {{ expect, test }} from "{FOMO_PLAYWRIGHT_TEST_MODULE}";\n\n'
+    )
+    assert advisory_source.split("\n\n", 1)[1] == authoritative_source.split("\n\n", 1)[1]
+    assert advisory.sha256_by_path[path] == hashlib.sha256(advisory_source.encode()).hexdigest()
+    advisory_config = advisory_sources[ADVISORY_ACCEPTANCE_CONFIG_PATH]
+    assert FOMO_PLAYWRIGHT_TEST_MODULE in advisory_config
+    assert "/opt/fomo/runtime-cache/fomo-next-radix-v2/node_modules/next" in advisory_config
+    assert "webServer" in advisory_config
 
 
 def test_contract_rejects_unmapped_acceptance_and_external_navigation() -> None:

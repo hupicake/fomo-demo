@@ -22,6 +22,7 @@ from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from fomo.config import Settings
+from fomo.fomo_pi_ds.gateway import InferenceGatewayError, LiteLLMRunKeyClient
 from fomo.persistence import (
     AuthenticationError,
     ConflictError,
@@ -31,12 +32,18 @@ from fomo.persistence import (
     OwnershipError,
     Repository,
 )
+from fomo.runtime_contract import (
+    DEFAULT_PROFILE_ID,
+    RUNTIME_PROFILES,
+    RuntimeContractError,
+    legacy_runtime_contract,
+    resolve_runtime_contract,
+)
 from fomo.schemas import (
     ArtifactDetailResponse,
     AuthSessionResponse,
     FileContentResponse,
     FileContentUpdate,
-    GuestSessionResponse,
     MessageCreate,
     MessageRunResponse,
     PreviewResponse,
@@ -45,6 +52,8 @@ from fomo.schemas import (
     ProjectResponse,
     ProjectSnapshotResponse,
     RunResponse,
+    RuntimeOptionsResponse,
+    RuntimeProfileOption,
     TraceResponse,
     UserInputAnswerCreate,
     UserInputAnswerResponse,
@@ -109,6 +118,16 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         await repository.initialize()
+        if (
+            settings.app_env == "development"
+            and settings.dev_account_email
+            and settings.dev_account_password
+        ):
+            await repository.ensure_development_user(
+                settings.dev_account_email,
+                settings.dev_account_password,
+                settings.dev_account_display_name,
+            )
         yield
         if owns_database:
             await database.dispose()
@@ -121,7 +140,7 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
         allow_origins=[settings.web_origin],
         allow_credentials=True,
         allow_methods=["GET", "POST", "PATCH", "PUT"],
-        allow_headers=["Content-Type", "Idempotency-Key", "X-FOMO-Session", "Last-Event-ID"],
+        allow_headers=["Content-Type", "Idempotency-Key", "Last-Event-ID"],
     )
 
     @app.exception_handler(NotFoundError)
@@ -152,34 +171,20 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
     async def _validation_error(_: Request, _exc: RequestValidationError) -> JSONResponse:
         return problem(422, "Validation Error", "The request did not match the API contract.")
 
-    async def session_id(
-        request: Request,
-        x_fomo_session: Annotated[str | None, Header()] = None,
-    ) -> str:
-        candidate = x_fomo_session or request.cookies.get(settings.session_cookie_key)
+    async def session_id(request: Request) -> str:
+        candidate = request.cookies.get(settings.session_cookie_key)
         if not candidate:
-            raise HTTPException(status_code=401, detail="guest session is required")
+            raise HTTPException(status_code=401, detail="authenticated session is required")
         try:
-            await repository.get_session(candidate)
-        except NotFoundError as exc:
-            raise HTTPException(status_code=401, detail="guest session is invalid or expired") from exc
+            await repository.get_current_user(candidate)
+        except (AuthenticationError, NotFoundError) as exc:
+            raise HTTPException(
+                status_code=401,
+                detail="authenticated session is invalid or expired",
+            ) from exc
         return candidate
 
     SessionId = Annotated[str, Depends(session_id)]
-
-    async def claimable_guest_session_id(request: Request) -> str | None:
-        candidate = request.headers.get("X-FOMO-Session") or request.cookies.get(
-            settings.session_cookie_key
-        )
-        if candidate is None:
-            return None
-        try:
-            record = await repository.get_session(candidate)
-        except NotFoundError:
-            return None
-        if record.kind != "guest" or record.user_id is not None:
-            return None
-        return record.id
 
     def set_session_cookie(response: Response, session_value: str, max_age: int) -> None:
         response.set_cookie(
@@ -194,7 +199,6 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
 
     def auth_session_response(user, auth_session) -> AuthSessionResponse:
         return AuthSessionResponse(
-            session_id=auth_session.id,
             expires_at=auth_session.expires_at,
             user=UserResponse(
                 id=user.id,
@@ -208,15 +212,71 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
-    @app.post("/v1/sessions/guest", response_model=GuestSessionResponse, status_code=status.HTTP_201_CREATED)
-    async def create_guest(response: Response) -> GuestSessionResponse:
-        record = await repository.create_guest_session()
-        set_session_cookie(
-            response,
-            record.id,
-            14 * 24 * 60 * 60,
+    async def runtime_availability() -> tuple[set[str], bool]:
+        """Resolve public availability without exposing provider routing details."""
+        enabled = set(settings.runtime_enabled_profiles)
+        if settings.agent_framework != "direct_pi":
+            return set(), True
+        if not settings.litellm_api_key:
+            return set(), False
+        gateway = LiteLLMRunKeyClient(
+            management_url=settings.litellm_management_url,
+            master_key=settings.litellm_api_key,
+            timeout_seconds=settings.inference_management_timeout_seconds,
         )
-        return GuestSessionResponse(id=record.id, expires_at=record.expires_at)
+        try:
+            discovered = await gateway.discover_model_aliases()
+        except InferenceGatewayError:
+            return set(), False
+        return {
+            profile.profile_id
+            for profile in RUNTIME_PROFILES
+            if profile.profile_id in enabled and profile.litellm_alias in discovered
+        }, True
+
+    @app.get("/v1/runtime/options", response_model=RuntimeOptionsResponse)
+    async def runtime_options() -> RuntimeOptionsResponse:
+        available_profiles, discovery_succeeded = await runtime_availability()
+        configured_default = settings.runtime_default_profile
+        if configured_default in available_profiles:
+            default_profile_id: str | None = configured_default
+        elif DEFAULT_PROFILE_ID in available_profiles:
+            default_profile_id = DEFAULT_PROFILE_ID
+        else:
+            default_profile_id = min(available_profiles, default=None)
+        enabled = set(settings.runtime_enabled_profiles)
+        options: list[RuntimeProfileOption] = []
+        for profile in RUNTIME_PROFILES:
+            available = profile.profile_id in available_profiles
+            disabled_reason: str | None = None
+            if not available:
+                if profile.profile_id not in enabled:
+                    disabled_reason = "Not enabled by the server."
+                elif not discovery_succeeded:
+                    disabled_reason = "Model availability could not be verified."
+                else:
+                    disabled_reason = "The configured model route is unavailable."
+            options.append(
+                RuntimeProfileOption(
+                    profile_id=profile.profile_id,
+                    label=profile.label,
+                    thinking_levels=list(profile.thinking_levels),
+                    default_thinking=profile.default_thinking,
+                    context_window=profile.context_window,
+                    run_token_budget=None,
+                    run_token_budget_unlimited=True,
+                    inference_tpm_limit=min(
+                        profile.inference_tpm_limit,
+                        settings.run_inference_tpm_limit,
+                    ),
+                    available=available,
+                    disabled_reason=disabled_reason,
+                )
+            )
+        return RuntimeOptionsResponse(
+            default_profile_id=default_profile_id,
+            profiles=options,
+        )
 
     @app.post(
         "/v1/auth/register",
@@ -225,14 +285,12 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
     )
     async def register(
         payload: UserRegister,
-        request: Request,
         response: Response,
     ) -> AuthSessionResponse:
         user, auth_session = await repository.register_user(
             payload.email,
             payload.password,
             payload.display_name,
-            claim_guest_session_id=await claimable_guest_session_id(request),
         )
         set_session_cookie(response, auth_session.id, 30 * 24 * 60 * 60)
         return auth_session_response(user, auth_session)
@@ -240,13 +298,11 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
     @app.post("/v1/auth/login", response_model=AuthSessionResponse)
     async def login(
         payload: UserLogin,
-        request: Request,
         response: Response,
     ) -> AuthSessionResponse:
         user, auth_session = await repository.authenticate_user(
             payload.email,
             payload.password,
-            claim_guest_session_id=await claimable_guest_session_id(request),
         )
         set_session_cookie(response, auth_session.id, 30 * 24 * 60 * 60)
         return auth_session_response(user, auth_session)
@@ -278,7 +334,9 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
         return await repository.list_projects(owner_session_id)
 
     @app.post("/v1/projects", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
-    async def create_project(payload: ProjectCreate, owner_session_id: SessionId) -> ProjectResponse:
+    async def create_project(
+        payload: ProjectCreate, owner_session_id: SessionId
+    ) -> ProjectResponse:
         return await repository.create_project(owner_session_id, payload.title)
 
     @app.get("/v1/projects/{project_id}", response_model=ProjectSnapshotResponse)
@@ -321,13 +379,98 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ) -> MessageRunResponse:
         if idempotency_key and idempotency_key != payload.client_message_id:
-            raise HTTPException(status_code=422, detail="Idempotency-Key must match clientMessageId")
+            raise HTTPException(
+                status_code=422, detail="Idempotency-Key must match clientMessageId"
+            )
+        existing = await repository.get_message_run_by_client_id(
+            project_id,
+            owner_session_id,
+            payload.client_message_id,
+        )
+        if existing is not None:
+            existing_message, existing_run = existing
+            if (
+                payload.content != existing_message.content
+                or (
+                    payload.base_version_id is not None
+                    and payload.base_version_id != existing_run.base_version_id
+                )
+                or (
+                    payload.profile_id is not None
+                    and payload.profile_id != existing_run.runtime.profile_id
+                )
+                or (
+                    payload.thinking is not None
+                    and payload.thinking != existing_run.runtime.thinking
+                )
+            ):
+                raise ConflictError(
+                    "Idempotency-Key was already used with a different request"
+                )
+            response.status_code = status.HTTP_200_OK
+            return MessageRunResponse(message=existing_message, run=existing_run)
+        if settings.agent_framework != "direct_pi":
+            if payload.profile_id is not None or payload.thinking is not None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="runtime model selection requires the Direct Pi framework",
+                )
+            message, run, created = await repository.create_message_and_run(
+                project_id,
+                owner_session_id,
+                payload.client_message_id,
+                payload.content,
+                payload.base_version_id,
+                runtime_contract=legacy_runtime_contract(),
+            )
+            response.status_code = status.HTTP_202_ACCEPTED if created else status.HTTP_200_OK
+            return MessageRunResponse(message=message, run=run)
+        available_profiles, discovery_succeeded = await runtime_availability()
+        selected_profile = payload.profile_id
+        if selected_profile is None:
+            if settings.runtime_default_profile in available_profiles:
+                selected_profile = settings.runtime_default_profile
+            elif DEFAULT_PROFILE_ID in available_profiles:
+                selected_profile = DEFAULT_PROFILE_ID
+            else:
+                selected_profile = min(available_profiles, default=None)
+        if selected_profile is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "runtime model availability could not be verified"
+                    if not discovery_succeeded
+                    else "no runtime profile is available"
+                ),
+            )
+        if selected_profile not in settings.runtime_enabled_profiles:
+            raise HTTPException(status_code=422, detail="runtime profile is not enabled")
+        if not discovery_succeeded:
+            raise HTTPException(
+                status_code=503,
+                detail="runtime model availability could not be verified",
+            )
+        if selected_profile not in available_profiles:
+            raise HTTPException(status_code=422, detail="runtime profile is unavailable")
+        try:
+            runtime_contract = resolve_runtime_contract(
+                selected_profile,
+                payload.thinking,
+                inference_tpm_limit=settings.run_inference_tpm_limit,
+                max_spend_micros=int(settings.run_max_spend * 1_000_000),
+            )
+        except RuntimeContractError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         message, run, created = await repository.create_message_and_run(
             project_id,
             owner_session_id,
             payload.client_message_id,
             payload.content,
             payload.base_version_id,
+            runtime_contract=runtime_contract,
+            enforce_runtime_match=bool(
+                {"profile_id", "thinking"}.intersection(payload.model_fields_set)
+            ),
         )
         response.status_code = status.HTTP_202_ACCEPTED if created else status.HTTP_200_OK
         return MessageRunResponse(message=message, run=run)
@@ -362,7 +505,9 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
         try:
             cursor = max(after, int(last_event_id or "0"))
         except ValueError as exc:
-            raise HTTPException(status_code=422, detail="Last-Event-ID must be an integer sequence") from exc
+            raise HTTPException(
+                status_code=422, detail="Last-Event-ID must be an integer sequence"
+            ) from exc
 
         return EventSourceResponse(
             _stream_run_events(
@@ -406,9 +551,7 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
             payload.client_message_id,
             payload.answer,
         )
-        response.status_code = (
-            status.HTTP_202_ACCEPTED if created else status.HTTP_200_OK
-        )
+        response.status_code = status.HTTP_202_ACCEPTED if created else status.HTTP_200_OK
         return UserInputAnswerResponse(
             message=message,
             request=input_request,

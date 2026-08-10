@@ -51,8 +51,74 @@ model_list:
       thinking:
         type: disabled
 
-  # Direct Pi route. Keep this separate from the legacy structured-JSON alias:
-  # Pi uses reasoning and the virtual key restricts every run to this model.
+  # Canonical Direct Pi catalog. Public profile ids map to these aliases; the
+  # bridge still applies the per-profile context and thinking policy.
+  - model_name: fomo-pi-gpt-5.6
+    litellm_params:
+      # The configured OpenAI-compatible upstream advertises this concrete id.
+      model: openai/gpt-5.6-sol
+      api_key: os.environ/OPENAI_API_KEY
+      api_base: os.environ/OPENAI_API_BASE
+
+  - model_name: fomo-pi-gpt-5.5
+    litellm_params:
+      model: openai/gpt-5.5
+      api_key: os.environ/OPENAI_API_KEY
+      api_base: os.environ/OPENAI_API_BASE
+
+  - model_name: fomo-pi-deepseek-flash
+    litellm_params:
+      model: deepseek/deepseek-v4-flash
+      api_key: os.environ/DEEPSEEK_API_KEY
+      api_base: https://api.deepseek.com
+      # Canonical profile thinking is selected per request. LiteLLM maps
+      # reasoning_effort=none to disabled and other supported efforts to enabled.
+
+  # Optional provider routes are normalized behind FOMO's Chat Completions
+  # endpoint. Enabled profiles must pass the sandbox streaming tool-call canary
+  # before a worker is started.
+  - model_name: fomo-pi-grok-4.5
+    litellm_params:
+      # yieldsum exposes Grok through an OpenAI-compatible Chat Completions API.
+      model: openai/grok-4.5
+      api_key: os.environ/GROK_API_KEY
+      api_base: https://sub.yieldsum.com/v1
+    model_info:
+      # Conservative accounting guardrail for run-scoped LiteLLM budgets.
+      input_cost_per_token: 0.000004
+      output_cost_per_token: 0.000012
+
+  - model_name: fomo-pi-kimi-k2.7-code
+    litellm_params:
+      model: openai/kimi-k2.7-code
+      api_key: os.environ/OPENCODE_API_KEY
+      api_base: https://opencode.ai/zen/v1
+    model_info:
+      input_cost_per_token: 0.00000095
+      output_cost_per_token: 0.000004
+
+  - model_name: fomo-pi-gemini-3.6-flash
+    litellm_params:
+      # The Gemini adapter uses native generateContent/streamGenerateContent
+      # paths and x-goog-api-key authentication required by OpenCode Zen.
+      model: gemini/gemini-3.6-flash
+      api_key: os.environ/OPENCODE_API_KEY
+      api_base: https://opencode.ai/zen/v1
+    model_info:
+      input_cost_per_token: 0.0000015
+      output_cost_per_token: 0.0000075
+
+  - model_name: fomo-pi-gemini-3.1-pro
+    litellm_params:
+      model: gemini/gemini-3.1-pro
+      api_key: os.environ/OPENCODE_API_KEY
+      api_base: https://opencode.ai/zen/v1
+    model_info:
+      # Conservatively charge the documented >200K OpenCode Zen tier.
+      input_cost_per_token: 0.000004
+      output_cost_per_token: 0.000018
+
+  # Compatibility aliases for persisted runs and the current bridge contract.
   - model_name: fomo-pi-flash
     litellm_params:
       model: deepseek/deepseek-v4-flash
@@ -61,8 +127,6 @@ model_list:
       thinking:
         type: enabled
 
-  # Default Direct Pi implementation/repair route. Planning remains on the
-  # fast DeepSeek route; code-producing turns favor GPT-5.5 tool reliability.
   - model_name: fomo-pi-build
     litellm_params:
       model: openai/gpt-5.5

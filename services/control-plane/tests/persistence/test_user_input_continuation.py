@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import pytest
 
+from fomo.direct_pi.failures import CODING_AGENT_FAILED, WORKSPACE_CONTRACT_FAILED
 from fomo.persistence import ConflictError
 from fomo.schemas import RunStatus, UserInputRequestDraft
+from tests.helpers import create_user_session
 
 
 async def _running_run(repository, suffix: str):
-    owner = await repository.create_guest_session()
+    owner = await create_user_session(repository)
     project = await repository.create_project(owner.id, f"Project {suffix}")
     _message, run, _created = await repository.create_message_and_run(
         project.id,
@@ -141,3 +143,42 @@ async def test_waiting_run_cancels_immediately_without_a_worker(repository) -> N
     assert cancelled.status is RunStatus.cancelled
     assert cancelled.pending_input_request is None
     assert (await repository.list_events(run.id))[-1].kind == "run.cancelled"
+
+
+@pytest.mark.asyncio
+async def test_terminal_failure_event_uses_only_the_closed_public_code(repository) -> None:
+    _owner, _project, run, lease = await _running_run(repository, "safe-failure")
+    secret = "provider body api_key=do-not-persist-in-event"
+
+    await repository.mark_terminal(
+        run.id,
+        RunStatus.failed,
+        error_code="workspace_contract_failed",
+        summary=secret,
+        lease_token=lease,
+    )
+
+    terminal = (await repository.list_events(run.id))[-1]
+    assert terminal.kind == "run.failed"
+    assert terminal.payload == {
+        "status": "failed",
+        "code": WORKSPACE_CONTRACT_FAILED.code,
+        "message": WORKSPACE_CONTRACT_FAILED.message,
+        "summary": WORKSPACE_CONTRACT_FAILED.message,
+    }
+    assert secret not in str(terminal.payload)
+
+    _owner, _project, unknown_run, unknown_lease = await _running_run(
+        repository, "unknown-failure"
+    )
+    await repository.mark_terminal(
+        unknown_run.id,
+        RunStatus.failed,
+        error_code="provider_returned_private_body",
+        summary=secret,
+        lease_token=unknown_lease,
+    )
+    unknown = (await repository.list_events(unknown_run.id))[-1]
+    assert unknown.payload["code"] == CODING_AGENT_FAILED.code
+    assert unknown.payload["message"] == CODING_AGENT_FAILED.message
+    assert secret not in str(unknown.payload)

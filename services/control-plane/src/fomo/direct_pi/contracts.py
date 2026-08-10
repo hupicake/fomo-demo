@@ -52,7 +52,7 @@ _ALLOWED_ROLES = {
 class BuildFile(SchemaModel):
     path: str = Field(min_length=1, max_length=512)
     purpose: BoundedText
-    acceptance_ids: list[Identifier] = Field(min_length=1, max_length=8)
+    acceptance_ids: list[Identifier] = Field(min_length=1)
 
     @field_validator("path")
     @classmethod
@@ -71,8 +71,8 @@ class BuildPlan(SchemaModel):
     title: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)]
     summary: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=1000)]
     visual_preset: Literal["neutral", "indigo", "emerald", "amber"] = "neutral"
-    routes: list[str] = Field(min_length=1, max_length=8)
-    files: list[BuildFile] = Field(min_length=1, max_length=24)
+    routes: list[str] = Field(min_length=1)
+    files: list[BuildFile] = Field(min_length=1)
 
     @field_validator("routes")
     @classmethod
@@ -198,13 +198,13 @@ class AcceptanceTest(SchemaModel):
     id: Identifier
     acceptance_id: Identifier
     title: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
-    actions: list[AcceptanceAction] = Field(min_length=1, max_length=12)
-    assertions: list[AcceptanceAssertion] = Field(min_length=1, max_length=12)
+    actions: list[AcceptanceAction] = Field(min_length=1)
+    assertions: list[AcceptanceAssertion] = Field(min_length=1)
 
 
 class AcceptanceContract(SchemaModel):
-    criteria: list[AcceptanceItem] = Field(min_length=1, max_length=8)
-    tests: list[AcceptanceTest] = Field(min_length=1, max_length=8)
+    criteria: list[AcceptanceItem] = Field(min_length=1)
+    tests: list[AcceptanceTest] = Field(min_length=1)
 
     @model_validator(mode="after")
     def exact_test_per_criterion(self) -> AcceptanceContract:

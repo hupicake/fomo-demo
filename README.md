@@ -19,28 +19,32 @@ tests.
 **Transition state (honest):** GoalGraph, deterministic multi-goal execution,
 goal-scoped acceptance, durable verified checkpoints/recovery, and the workbench
 Goal panel are implemented behind `DIRECT_PI_GOAL_GRAPH_ENABLED` (enabled by
-default). Context OS (Manifest/Capsule/Inspector), Verified Reuse Registry, and
-Policy/Micro-tuning are **not implemented**. See `DESIGN.md` for the staged
-plan. The legacy native
+default). A reusable Pi session, automatic compaction, verified checkpoint
+capsules, and bounded repair diagnostics are implemented; a standalone Context
+Inspector, semantic reuse registry, and benchmark-driven routing policy are
+**not implemented**. The legacy native
 four-role SOP still exists as a **non-default writable compatibility path**
 (explicit `AGENT_FRAMEWORK=native`) and is not the production chain
 (`AGENT_FRAMEWORK=direct_pi` is the default).
 
-Current regression evidence is 385 backend tests, 134 Web Vitest tests, 18 Pi
-bridge tests, and 2/2 local Web Playwright tests covering the workbench smoke
-and account/session isolation, with Web typecheck/build and Ruff also green.
-Gateway unit/integration coverage is part of the backend suite; the real
-OpenSandbox and Chrome checks are separate runtime evidence. No public
-DNS/TLS/Tunnel browser acceptance has completed yet.
+The release-candidate verification results and known limitations are recorded
+in [SUBMISSION.md](SUBMISSION.md). Gateway unit/integration coverage, a real
+OpenSandbox run, and public DNS/TLS/Tunnel acceptance are distinct evidence
+levels; no public HTTPS browser acceptance has completed yet.
 
 ## One-command local delivery
 
 Prerequisites:
 
 - Docker Desktop with Linux containers enabled (Apple Silicon is supported).
-- A model route configured for LiteLLM. Keep real provider credentials only in
-  `.env.local`; never commit or print that file. Node and Python are bundled in
-  the application images, so they are not required on the host for this path.
+- A working model route configured for LiteLLM. The repository default is
+  `FOMO_RUNTIME_ENABLED_PROFILES=deepseek-flash`, backed by
+  `DEEPSEEK_API_KEY`; override the enabled/default profile to match the route
+  you have actually verified. GPT profiles use `OPENAI_API_KEY`, Grok uses
+  `GROK_API_KEY`, and Kimi/Gemini use `OPENCODE_API_KEY`. Keep real provider
+  credentials only in `.env.local`; never commit or print that file. Provider
+  credentials are injected only into LiteLLM, never the control plane or a
+  generation sandbox.
 
 If a local environment file does not already exist, copy `.env.example` to
 `.env.local` and fill in only the model credentials you use. Do not overwrite an
@@ -53,10 +57,21 @@ Start the complete stack:
 ```
 
 The script validates Compose configuration, builds the sandbox image before the
-application images, then starts PostgreSQL, Redis, MinIO, LiteLLM,
-OpenSandbox, API, worker, and Web. It intentionally invokes Compose with
-`--env-file .env.local`: plain `docker compose up` does not automatically load
-that private file and therefore may not use your configured model route.
+application images, waits for PostgreSQL, Redis, MinIO, LiteLLM, and OpenSandbox,
+then runs a bounded Direct Pi runtime preflight before starting API, worker, and
+Web. The preflight creates a short-lived OpenSandbox, executes a silent probe
+inside it against `SANDBOX_LITELLM_BASE_URL`, and proves a bounded streamed
+function call through every explicitly enabled alias. It then revokes the
+temporary key and destroys the sandbox, so it can incur a very small provider
+charge. Optional profiles remain disabled until they are added to the
+comma-separated `FOMO_RUNTIME_ENABLED_PROFILES` allowlist; an enabled profile
+that fails its canary keeps the worker from starting rather than silently
+falling back. On a repeated
+launch it first stops prior Compose API, worker, and Web containers so a stale
+worker cannot claim work before the canary passes. The script intentionally
+invokes Compose with `--env-file .env.local`:
+plain `docker compose up` does not automatically load that private file and
+therefore may not use your configured model route.
 
 Local endpoints:
 
@@ -89,7 +104,8 @@ A run is executed by `WorkerRunner → DirectPiOrchestrator → fomo-pi-ds`:
   in-workspace paths; `.env*` files are rejected outright; `.git/**` (the
   G-internal checkpoint) is excluded; no symlinks/devices or non-regular
   files; only real changed/new files enter the diff (`pnpm-lock.yaml` is
-  allowed up to the 512 KiB persistence limit); bounded changed-file counts;
+  allowed up to the 512 KiB persistence limit); no business-file count or
+  ordinary source-size development quota;
   FOMO-owned roots (`tests/fomo-acceptance/**`, `tests/harness/**` —
   present-and-unchanged files are excluded, any add/modify/delete fails);
   and the system `.gitignore`. There is no full-content secret scanner, only
@@ -129,10 +145,8 @@ A run is executed by `WorkerRunner → DirectPiOrchestrator → fomo-pi-ds`:
   `preview.available` is emitted (unverified) as soon as the dev server is
   healthy. Preview semantics are precise: entering repair destroys the
   current V, clears the URL, and emits `preview.expired` (no preview during
-  repair); only when repair rounds are exhausted with a healthy preview
-  already present is it kept best-effort (NEEDS_ATTENTION does not guarantee
-  a preview), and infrastructure failures clear it. It is never upgraded
-  without full gate evidence. A fully verified OpenSandbox Preview is renewed
+  repair), and infrastructure failures clear it. It is never upgraded without
+  full gate evidence. A fully verified OpenSandbox Preview is renewed
   to the bounded seven-day retention window before publication. When
   `PUBLIC_PREVIEW_BASE_DOMAIN` is configured, the final atomic publish stores
   `https://<sandbox-id>.<domain>/`; internal health checks still use the direct
@@ -144,14 +158,16 @@ package store**. A dependency that is not in the store will fail the install
 gate honestly; arbitrary `pnpm add` is not yet a supported release path.
 
 The bridge (`infra/opensandbox/fomo-pi-rpc-bridge.mjs`) is a transport/
-observation/cancellation/budget layer only: JSONL protocol, event and usage
+observation/cancellation layer only: JSONL protocol, event and usage
 observation (including A/B telemetry such as first-tool and
 first-edit/write-tool timing — `firstEditOrWriteToolElapsedMs`; bash-side
 writes are not counted because the bridge does not interpret tool
-semantics), cancellation, wall-clock/silence/timeout budgets, redaction,
-fail-closed parsing, and session reuse. It does not proxy or rewrite Pi tool
-semantics. The per-run virtual key is blocked at run end as a best-effort
-step, with the key TTL as the fallback.
+semantics), cancellation, heartbeats, redaction, fail-closed parsing, and
+session reuse. Provider context/output limits, spend limits, sandbox lifetime,
+lease loss, cancellation, and transport failure remain real boundaries; FOMO
+does not impose a cumulative run-token ceiling. The bridge does not proxy or
+rewrite Pi tool semantics. The per-run virtual key is blocked at run end as a
+best-effort step, with the key TTL as the fallback.
 
 ## Legacy native SOP path (non-default, writable)
 
@@ -220,7 +236,7 @@ On macOS Docker Desktop this runs the Docker `runc` runtime, which is suitable
 for trusted local development and acceptance testing only. It is not a strong
 isolation boundary for hostile code and must not be exposed publicly. A public
 deployment needs a dedicated Linux runner plus a stronger runtime such as
-gVisor, as documented in `DESIGN.md`.
+gVisor and an authenticated egress policy.
 
 **Egress isolation is not implemented.** The local OpenSandbox config has
 no authenticated `dns+nft` egress sidecar, the policy API is unauthenticated

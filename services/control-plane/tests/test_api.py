@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from io import BytesIO
 from zipfile import ZipFile
 
@@ -9,7 +10,13 @@ import pytest
 
 from fomo.api import create_app
 from fomo.direct_pi.goalgraph import parse_goal_graph_draft
+from fomo.fomo_pi_ds import InferenceGatewayError
 from fomo.schemas import UserInputRequestDraft
+from tests.helpers import create_user_session
+
+
+def _session_headers(settings, session_id: str) -> dict[str, str]:
+    return {"Cookie": f"{settings.session_cookie_key}={session_id}"}
 
 
 def _single_goal_draft():
@@ -61,19 +68,22 @@ def _single_goal_draft():
 
 
 @pytest.mark.asyncio
-async def test_guest_project_idempotent_message_and_persistent_event_replay(repository, settings) -> None:
+async def test_authenticated_project_idempotent_message_and_persistent_event_replay(
+    repository, settings
+) -> None:
     app = create_app(settings, repository)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        session_response = await client.post("/v1/sessions/guest")
-        assert session_response.status_code == 201
-        session_id = session_response.json()["id"]
-        headers = {"X-FOMO-Session": session_id}
+        session_id = (await create_user_session(repository)).id
+        headers = _session_headers(settings, session_id)
         project_response = await client.post("/v1/projects", headers=headers, json={"title": "Library"})
         assert project_response.status_code == 201
         project_id = project_response.json()["id"]
 
-        body = {"clientMessageId": "msg-1", "content": "Build a library manager"}
+        body = {
+            "clientMessageId": "msg-1",
+            "content": "Build a library manager",
+        }
         first = await client.post(
             f"/v1/projects/{project_id}/messages",
             headers={**headers, "Idempotency-Key": "msg-1"},
@@ -81,6 +91,15 @@ async def test_guest_project_idempotent_message_and_persistent_event_replay(repo
         )
         assert first.status_code == 202
         run_id = first.json()["run"]["id"]
+        assert first.json()["run"]["runtime"] == {
+            "profileId": "deepseek-flash",
+            "thinking": "high",
+            "contextWindow": 200_000,
+            "policyVersion": "direct-pi-legacy-v0",
+            "runTokenBudget": 400_000,
+            "runTokenBudgetUnlimited": False,
+            "inferenceTpmLimit": 1_000_000,
+        }
         project_snapshot = await client.get(f"/v1/projects/{project_id}", headers=headers)
         assert project_snapshot.status_code == 200
         snapshot_payload = project_snapshot.json()
@@ -104,6 +123,12 @@ async def test_guest_project_idempotent_message_and_persistent_event_replay(repo
         )
         assert duplicate.status_code == 200
         assert duplicate.json()["run"]["id"] == run_id
+        conflicting = await client.post(
+            f"/v1/projects/{project_id}/messages",
+            headers={**headers, "Idempotency-Key": "msg-1"},
+            json={**body, "content": "Build a different product"},
+        )
+        assert conflicting.status_code == 409
 
         await repository.append_event(
             run_id,
@@ -146,15 +171,121 @@ async def test_guest_project_idempotent_message_and_persistent_event_replay(repo
 
 
 @pytest.mark.asyncio
+async def test_runtime_options_fail_closed_without_management_discovery(
+    repository, settings
+) -> None:
+    app = create_app(
+        replace(settings, agent_framework="direct_pi", litellm_api_key=None),
+        repository,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get("/v1/runtime/options")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["defaultProfileId"] is None
+    assert all(option["available"] is False for option in payload["profiles"])
+    assert not any("fomo-pi-" in json.dumps(option) for option in payload["profiles"])
+
+
+@pytest.mark.asyncio
+async def test_runtime_selection_uses_enabled_discovered_profile_and_replays_when_gateway_fails(
+    repository, settings, monkeypatch
+) -> None:
+    async def discovered(_self) -> set[str]:
+        return {"fomo-pi-deepseek-flash", "fomo-pi-gpt-5.6"}
+
+    monkeypatch.setattr(
+        "fomo.api.app.LiteLLMRunKeyClient.discover_model_aliases",
+        discovered,
+    )
+    direct_settings = replace(
+        settings,
+        agent_framework="direct_pi",
+        litellm_api_key="sk-test-management",
+        runtime_enabled_profiles=("deepseek-flash", "gpt-5.6"),
+        runtime_default_profile="gpt-5.6",
+    )
+    app = create_app(direct_settings, repository)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        session_id = (await create_user_session(repository)).id
+        headers = _session_headers(direct_settings, session_id)
+        project_id = (
+            await client.post("/v1/projects", headers=headers, json={"title": "Runtime"})
+        ).json()["id"]
+
+        options = (await client.get("/v1/runtime/options")).json()
+        assert options["defaultProfileId"] == "gpt-5.6"
+        gpt = next(
+            option for option in options["profiles"] if option["profileId"] == "gpt-5.6"
+        )
+        assert gpt["available"] is True
+        assert gpt["contextWindow"] == 250_000
+        assert gpt["runTokenBudget"] is None
+        assert gpt["runTokenBudgetUnlimited"] is True
+        assert "xhigh" in gpt["thinkingLevels"]
+
+        body = {
+            "clientMessageId": "runtime-message",
+            "content": "Build a runtime-aware product",
+            "profileId": "gpt-5.6",
+            "thinking": "xhigh",
+        }
+        created = await client.post(
+            f"/v1/projects/{project_id}/messages",
+            headers={**headers, "Idempotency-Key": "runtime-message"},
+            json=body,
+        )
+        assert created.status_code == 202
+        assert created.json()["run"]["runtime"] == {
+            "profileId": "gpt-5.6",
+            "thinking": "xhigh",
+            "contextWindow": 250_000,
+            "policyVersion": "direct-pi-runtime-v2",
+            "runTokenBudget": None,
+            "runTokenBudgetUnlimited": True,
+            "inferenceTpmLimit": 1_000_000,
+        }
+
+        async def unavailable(_self) -> set[str]:
+            raise InferenceGatewayError("synthetic discovery failure")
+
+        monkeypatch.setattr(
+            "fomo.api.app.LiteLLMRunKeyClient.discover_model_aliases",
+            unavailable,
+        )
+        replay = await client.post(
+            f"/v1/projects/{project_id}/messages",
+            headers={**headers, "Idempotency-Key": "runtime-message"},
+            json=body,
+        )
+        assert replay.status_code == 200
+        assert replay.json()["run"]["id"] == created.json()["run"]["id"]
+
+        blocked = await client.post(
+            f"/v1/projects/{project_id}/messages",
+            headers={**headers, "Idempotency-Key": "new-message"},
+            json={**body, "clientMessageId": "new-message"},
+        )
+        assert blocked.status_code == 503
+
+
+@pytest.mark.asyncio
 async def test_answer_endpoint_is_owned_idempotent_and_requeues_the_same_run(
     repository, settings
 ) -> None:
     app = create_app(settings, repository)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        owner_id = (await client.post("/v1/sessions/guest")).json()["id"]
-        other_id = (await client.post("/v1/sessions/guest")).json()["id"]
-        owner_headers = {"X-FOMO-Session": owner_id}
+        owner_id = (await create_user_session(repository)).id
+        other_id = (await create_user_session(repository)).id
+        owner_headers = _session_headers(settings, owner_id)
         project_id = (
             await client.post(
                 "/v1/projects",
@@ -215,7 +346,7 @@ async def test_answer_endpoint_is_owned_idempotent_and_requeues_the_same_run(
         answer_url = f"/v1/runs/{run_id}/input-requests/{request.id}/answer"
         forbidden = await client.post(
             answer_url,
-            headers={"X-FOMO-Session": other_id},
+            headers=_session_headers(settings, other_id),
             json={"clientMessageId": "answer-1", "answer": "Grid"},
         )
         assert forbidden.status_code == 403
@@ -260,8 +391,8 @@ async def test_project_snapshot_exposes_authoritative_goal_graph_projection(
     app = create_app(settings, repository)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        session_id = (await client.post("/v1/sessions/guest")).json()["id"]
-        headers = {"X-FOMO-Session": session_id}
+        session_id = (await create_user_session(repository)).id
+        headers = _session_headers(settings, session_id)
         project_id = (
             await client.post("/v1/projects", headers=headers, json={"title": "Goals"})
         ).json()["id"]
@@ -324,8 +455,8 @@ async def test_versioned_file_edits_restore_download_and_acceptance_projection(r
     app = create_app(settings, repository)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        session_id = (await client.post("/v1/sessions/guest")).json()["id"]
-        headers = {"X-FOMO-Session": session_id}
+        session_id = (await create_user_session(repository)).id
+        headers = _session_headers(settings, session_id)
         project_id = (
             await client.post("/v1/projects", headers=headers, json={"title": "Library"})
         ).json()["id"]
@@ -476,8 +607,8 @@ async def test_preview_endpoint_returns_typed_ready_url_and_requires_project_own
     app = create_app(settings, repository)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        session_id = (await client.post("/v1/sessions/guest")).json()["id"]
-        headers = {"X-FOMO-Session": session_id}
+        session_id = (await create_user_session(repository)).id
+        headers = _session_headers(settings, session_id)
         project_id = (
             await client.post("/v1/projects", headers=headers, json={"title": "Library"})
         ).json()["id"]
@@ -511,7 +642,7 @@ async def test_preview_endpoint_returns_typed_ready_url_and_requires_project_own
         }
 
         # Ownership is enforced before any preview data is disclosed.
-        other_session_id = (await client.post("/v1/sessions/guest")).json()["id"]
-        other_headers = {"X-FOMO-Session": other_session_id}
+        other_session_id = (await create_user_session(repository)).id
+        other_headers = _session_headers(settings, other_session_id)
         forbidden = await client.get(f"/v1/projects/{project_id}/preview", headers=other_headers)
         assert forbidden.status_code == 403

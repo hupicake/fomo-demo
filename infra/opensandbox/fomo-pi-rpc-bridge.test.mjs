@@ -178,6 +178,7 @@ process.stdin.on("data", (chunk) => {
         }, 300);
       } else if (mode === "silent") {
         settleImmediately = false;
+        setTimeout(() => send({ type: "agent_settled" }), 1_200);
       } else if (mode !== "missing-structured") {
         send({
           type: "message_update",
@@ -304,19 +305,18 @@ test("high-thinking stream activity prevents a false inactivity timeout", () => 
   assert.equal(records.at(-1).type, "completed");
 });
 
-test("a genuinely silent Pi stream still fails closed", () => {
+test("a silent but connected Pi stream stays alive until it settles", () => {
   const { completed, records } = runBridge({
     mode: "silent",
     thinkingLevel: "high",
     activitySilenceSeconds: 1,
   });
 
-  assert.notEqual(completed.status, 0);
+  assert.equal(completed.status, 0, completed.stderr);
   assert.ok(records.some(
     (record) => record.type === "pi.event" && record.payload.kind === "inference_heartbeat",
   ));
-  assert.equal(records.at(-1).type, "failed");
-  assert.equal(records.at(-1).payload.code, "agent_inactivity_timeout");
+  assert.equal(records.at(-1).type, "completed");
 });
 
 test("user-input mode exposes one trusted terminating form and publishes a safe request", () => {
@@ -437,7 +437,7 @@ test("required session continuation proceeds when Pi reports prior messages", ()
 
 test("structured mode exposes only the terminating schema tool and preserves its complete arguments", () => {
   const extensionSource = readFileSync(EXTENSION, "utf8");
-  assert.match(extensionSource, /at most 3 total attempts/);
+  assert.doesNotMatch(extensionSource, /at most 3 total attempts/);
   assert.match(extensionSource, /Stop immediately after submit_structured_output succeeds/);
   assert.doesNotMatch(extensionSource, /exactly once as the final action/);
   const schema = {
@@ -494,7 +494,7 @@ test("structured mode preserves a failed form result and accepts one corrected r
   assert.equal(records.at(-1).type, "completed");
 });
 
-test("structured mode fails closed after three unsuccessful form attempts", () => {
+test("structured mode fails closed when the agent settles without a valid form", () => {
   const schema = { type: "object", properties: {}, additionalProperties: false };
   const { completed, records } = runBridge({ schema, mode: "structured-all-failed" });
 
@@ -521,13 +521,12 @@ test("structured mode rejects any tool call after its successful submission", ()
   assert.equal(records.at(-1).payload.code, "invalid_structured_output");
 });
 
-test("structured mode rejects a fourth form attempt", () => {
+test("structured mode allows a fourth form attempt to self-correct", () => {
   const schema = { type: "object", properties: {}, additionalProperties: false };
   const { completed, records } = runBridge({ schema, mode: "structured-too-many" });
 
-  assert.notEqual(completed.status, 0);
-  assert.equal(records.at(-1).type, "failed");
-  assert.equal(records.at(-1).payload.code, "invalid_structured_output");
+  assert.equal(completed.status, 0, completed.stderr);
+  assert.equal(records.at(-1).type, "completed");
 });
 
 for (const [mode, name] of [

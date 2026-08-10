@@ -162,15 +162,15 @@ def test_graph_rejects_duplicate_and_non_topological_dependencies() -> None:
         parse_goal_graph_draft(value)
 
 
-def test_graph_enforces_goal_and_total_acceptance_bounds() -> None:
+def test_graph_size_follows_product_complexity_without_count_caps() -> None:
     value = _graph()
     value["goals"][0]["acceptance"] = _acceptance(1, criteria_count=8)  # type: ignore[index]
     parsed = parse_goal_graph_draft(value)
     assert len(parsed.goals[0].acceptance.criteria) == 8
 
     value["goals"][0]["acceptance"] = _acceptance(1, criteria_count=9)  # type: ignore[index]
-    with pytest.raises(ValidationError, match="at most 8 items"):
-        parse_goal_graph_draft(value)
+    parsed = parse_goal_graph_draft(value)
+    assert len(parsed.goals[0].acceptance.criteria) == 9
 
     value = {
         "schemaVersion": 1,
@@ -180,8 +180,8 @@ def test_graph_enforces_goal_and_total_acceptance_bounds() -> None:
             _goal(2, depends_on=["G-1"], criteria_count=6),
         ],
     }
-    with pytest.raises(ValidationError, match="at most 12 acceptance criteria"):
-        parse_goal_graph_draft(value)
+    parsed = parse_goal_graph_draft(value)
+    assert sum(len(goal.acceptance.criteria) for goal in parsed.goals) == 13
 
 
 def test_acceptance_scope_has_durable_keys_and_isolated_test_paths() -> None:

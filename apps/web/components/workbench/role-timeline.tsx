@@ -42,8 +42,8 @@ export function RunTimeline({ stages }: { stages: Record<AgentStage, StageActivi
   const current = agentStages.find((stage) => stages[stage].status === "working")
     || agentStages.find((stage) => stages[stage].status === "failed");
   return (
-    <section aria-label="Run stages" className="space-y-1.5" data-current-stage={current || "none"}>
-      <ol className="grid grid-cols-4 gap-1.5">
+    <section aria-label="运行阶段" data-current-stage={current || "none"}>
+      <ol className="grid grid-cols-4 gap-0.5">
         {agentStages.map((stage) => {
           const activity = stages[stage];
           const display = stageDisplay[stage];
@@ -54,27 +54,23 @@ export function RunTimeline({ stages }: { stages: Record<AgentStage, StageActivi
                 <HoverCardTrigger asChild>
                   <Button
                     aria-label={`${display.label}: ${activity.status}`}
-                    className="h-auto w-full min-w-0 flex-col items-stretch gap-1.5 rounded-md px-1 py-1 hover:bg-muted/60"
+                    className="h-7 w-full min-w-0 gap-1 rounded-md px-1 text-left hover:bg-muted/60"
                     variant="ghost"
                   >
-                    <span className={cn("h-1 w-full rounded-full transition-colors", railTone[activity.status], activity.status === "working" && "animate-pulse")} />
-                    <span className="flex min-w-0 items-center gap-1">
-                      <span className={cn(
-                        "shrink-0",
-                        activity.status === "completed" && "text-emerald-600",
-                        activity.status === "failed" && "text-destructive",
-                        activity.status === "working" && "text-primary",
-                        (activity.status === "idle" || activity.status === "queued") && "text-muted-foreground/60",
-                      )}>
-                        <StatusMark status={activity.status} />
-                      </span>
-                      <span className={cn(
-                        "truncate text-[11px] leading-4",
-                        active ? "font-semibold text-foreground" : "font-medium text-muted-foreground",
-                      )}>
-                        {display.label}
-                      </span>
+                    <span className={cn("size-1.5 shrink-0 rounded-full transition-colors", railTone[activity.status], activity.status === "working" && "animate-pulse")} />
+                    <span className={cn(
+                      "truncate text-[10px] leading-4",
+                      active ? "font-semibold text-foreground" : "font-medium text-muted-foreground",
+                    )}>
+                      {display.label}
                     </span>
+                    <span className={cn(
+                      "ml-auto shrink-0",
+                      activity.status === "completed" && "text-emerald-600 dark:text-emerald-400",
+                      activity.status === "failed" && "text-destructive",
+                      activity.status === "working" && "text-primary",
+                      (activity.status === "idle" || activity.status === "queued") && "text-muted-foreground/60",
+                    )}><StatusMark status={activity.status} /></span>
                   </Button>
                 </HoverCardTrigger>
                 <HoverCardContent align="center" className="w-72 space-y-2">

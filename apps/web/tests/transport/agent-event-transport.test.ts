@@ -1,6 +1,8 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { AgentEventTransport } from "@/lib/transport/agent-event-transport";
+
+afterEach(() => vi.unstubAllGlobals());
 
 function terminalEventStream() {
   const encoder = new TextEncoder();
@@ -43,5 +45,49 @@ describe("AgentEventTransport", () => {
 
     await expect(transport.reconnectToStream({ abortSignal: undefined } as Parameters<typeof transport.reconnectToStream>[0])).resolves.toBeNull();
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("forwards the resolved runtime selection and surfaces the immutable runtime", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(
+      JSON.stringify({
+        message: { id: "message-2", role: "user", content: "Refactor" },
+        run: {
+          id: "run-2",
+          project_id: "project-2",
+          status: "queued",
+          last_seq: 1,
+          runtime: {
+            profile_id: "gpt-5.6",
+            thinking: "low",
+            context_window: 250_000,
+            policy_version: "direct-pi-runtime-v1",
+            run_token_budget: 600_000,
+            inference_tpm_limit: 1_000_000,
+          },
+        },
+      }),
+      { headers: { "Content-Type": "application/json" }, status: 202 },
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+    const onRunStarted = vi.fn();
+    const getRuntimeSelection = vi.fn((clientMessageId: string) => ({ profileId: "gpt-5.6", thinking: "low" }));
+
+    const transport = new AgentEventTransport({
+      getLastSeq: () => 0,
+      getRuntimeSelection,
+      onEvent: vi.fn(),
+      onRunStarted,
+      projectId: "project-2",
+    });
+
+    await transport.sendMessages({
+      abortSignal: undefined,
+      messages: [{ id: "message-2", role: "user", parts: [{ type: "text", text: "Refactor" }] }],
+    } as Parameters<typeof transport.sendMessages>[0]);
+
+    expect(getRuntimeSelection).toHaveBeenCalledWith("message-2");
+    const body = JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit).body));
+    expect(body).toMatchObject({ profileId: "gpt-5.6", thinking: "low" });
+    expect(onRunStarted).toHaveBeenCalledWith("run-2", expect.objectContaining({ profileId: "gpt-5.6", thinking: "low" }));
   });
 });

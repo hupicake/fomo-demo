@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import (
 from .models import Base
 
 P0_REVISION = "0001_p0_baseline"
-HEAD_REVISION = "0004_accounts"
+HEAD_REVISION = "0006_unlimited_run_tokens"
 P0_TABLE_COLUMNS: dict[str, frozenset[str]] = {
     "sessions": frozenset({"id", "kind", "expires_at", "created_at"}),
     "projects": frozenset({"id", "owner_session_id", "title", "status", "created_at", "updated_at"}),

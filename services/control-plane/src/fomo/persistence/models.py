@@ -26,6 +26,15 @@ from sqlalchemy import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from fomo.ids import utcnow
+from fomo.runtime_contract import (
+    DEFAULT_PROFILE_ID,
+    LEGACY_CONTEXT_WINDOW,
+    LEGACY_INFERENCE_TPM_LIMIT,
+    LEGACY_MAX_SPEND_MICROS,
+    LEGACY_MODEL_REF,
+    LEGACY_RUNTIME_POLICY_VERSION,
+    LEGACY_THINKING,
+)
 
 
 class Base(DeclarativeBase):
@@ -51,7 +60,7 @@ class SessionRecord(Base):
     __table_args__ = (Index("ix_sessions_user_expires", "user_id", "expires_at"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    kind: Mapped[str] = mapped_column(String(24), default="guest")
+    kind: Mapped[str] = mapped_column(String(24), default="user")
     user_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -112,6 +121,32 @@ class RunRecord(Base):
     repair_round: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    # Frozen when the run is queued. Provider aliases never enter the public API,
+    # and a clarification resume must use this exact runtime tuple.
+    runtime_profile_id: Mapped[str] = mapped_column(
+        String(64), nullable=False, default=DEFAULT_PROFILE_ID
+    )
+    runtime_model_ref: Mapped[str] = mapped_column(
+        String(160), nullable=False, default=LEGACY_MODEL_REF
+    )
+    runtime_thinking: Mapped[str] = mapped_column(
+        String(32), nullable=False, default=LEGACY_THINKING
+    )
+    runtime_context_window: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=LEGACY_CONTEXT_WINDOW
+    )
+    runtime_policy_version: Mapped[str] = mapped_column(
+        String(64), nullable=False, default=LEGACY_RUNTIME_POLICY_VERSION
+    )
+    # NULL is the explicit runtime-v2 unlimited cumulative-token contract;
+    # historical runtime-v0/v1 rows retain their frozen integer value.
+    runtime_run_max_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    runtime_inference_tpm_limit: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=LEGACY_INFERENCE_TPM_LIMIT
+    )
+    runtime_max_spend_micros: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=LEGACY_MAX_SPEND_MICROS
+    )
     lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     sandbox_id: Mapped[str | None] = mapped_column(String(128), nullable=True)

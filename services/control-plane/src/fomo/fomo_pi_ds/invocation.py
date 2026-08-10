@@ -21,6 +21,15 @@ import re
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
+from fomo.runtime_contract import (
+    MAX_CONTEXT_WINDOW as RUNTIME_MAX_CONTEXT_WINDOW,
+)
+from fomo.runtime_contract import (
+    allowed_model_refs,
+    context_limit_for_model_ref,
+    thinking_levels_for_model_ref,
+)
+
 # Environment contract shared with infra/opensandbox/fomo-pi-rpc-bridge.mjs.
 FOMO_PI_PROMPT_B64 = "FOMO_PI_PROMPT_B64"
 FOMO_PI_SESSION_ID = "FOMO_PI_SESSION_ID"
@@ -48,17 +57,21 @@ DEFAULT_WORKSPACE = "/workspace"
 FOMO_PI_PLANNING_MODEL = "fomo-litellm/fomo-pi-flash"
 FOMO_PI_BUILD_MODEL = "fomo-litellm/fomo-pi-build"
 FOMO_PI_MODEL = FOMO_PI_BUILD_MODEL
-FOMO_PI_MODELS = frozenset({FOMO_PI_PLANNING_MODEL, FOMO_PI_BUILD_MODEL})
+FOMO_PI_MODELS = allowed_model_refs()
 # Default thinking must be legal for the default model (fomo-pi-build):
 # "high" is the shared level between the flash and build aliases.
 FOMO_PI_THINKING = "high"
-FOMO_PI_THINKING_LEVELS = frozenset({"off", "medium", "high", "max"})
+FOMO_PI_THINKING_LEVELS = frozenset(
+    level
+    for model_ref in FOMO_PI_MODELS
+    for level in thinking_levels_for_model_ref(model_ref)
+)
 # Mirror the bridge's model-specific thinking maps so invalid combinations
 # fail in Python instead of waiting for the bridge. (The bridge accepts "off"
 # for both aliases because neither map declares it, so it is included here.)
 _MODEL_THINKING_LEVELS = {
-    FOMO_PI_PLANNING_MODEL: frozenset({"off", "high", "max"}),
-    FOMO_PI_BUILD_MODEL: frozenset({"off", "medium", "high"}),
+    model_ref: thinking_levels_for_model_ref(model_ref)
+    for model_ref in FOMO_PI_MODELS
 }
 
 # Mirrors the bridge's own limits so validation fails before any sandbox call.
@@ -72,7 +85,7 @@ MAX_STRUCTURED_OUTPUT_SCHEMA_BYTES = 64 * 1024
 # supports more. The bridge couples this window to explicit compaction settings
 # so output headroom is reserved before the product budget is exhausted.
 DEFAULT_CONTEXT_WINDOW = 200_000
-MAX_CONTEXT_WINDOW = 8_000_000
+MAX_CONTEXT_WINDOW = RUNTIME_MAX_CONTEXT_WINDOW
 MAX_ACTIVITY_SILENCE_SECONDS = 3_600
 
 # Pi validates session ids with this exact pattern (core/session-manager.ts).
@@ -200,6 +213,11 @@ class PiRequest:
             )
         if not 1 <= self.context_window <= MAX_CONTEXT_WINDOW:
             raise ValueError(f"context_window must be between 1 and {MAX_CONTEXT_WINDOW}")
+        model_context_limit = context_limit_for_model_ref(self.model)
+        if self.context_window > model_context_limit:
+            raise ValueError(
+                f"context_window exceeds the {model_context_limit} limit for {self.model}"
+            )
         if self.activity_silence_seconds is not None and not (
             1 <= self.activity_silence_seconds <= MAX_ACTIVITY_SILENCE_SECONDS
         ):

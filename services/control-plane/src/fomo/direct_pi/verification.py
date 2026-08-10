@@ -18,7 +18,7 @@ from fomo.ids import utcnow, uuid7
 from fomo.persistence import Repository
 from fomo.sandbox.base import Command, ExecResult, PreviewRef, SandboxProvider, SandboxRef
 from fomo.sandbox.fake import FakeSandboxProvider
-from fomo.schemas import GateResult, GateStatus
+from fomo.schemas import GateDiagnostic, GateResult, GateStatus
 
 from .acceptance import (
     ACCEPTANCE_CONFIG_PATH,
@@ -49,7 +49,7 @@ from .workspace import (
 # image PATH, so a candidate cannot swap or hijack the runner. This is
 # container-level hardening only: candidate Next config/app and the tests run
 # in the same V user/process boundary, so external QA runner or read-only test
-# mounts remain the public-deployment blocker (see DESIGN).
+# mounts remain the public-deployment blocker (see the root README).
 _RUNNER_PROBE = (
     f"test -x {FOMO_RUNNER_NODE} "
     f"&& test -x {FOMO_RUNNER_BIN}/tsc "
@@ -317,7 +317,7 @@ class Verifier:
         # Candidate code has now executed (install/typecheck/build/start).
         # Re-inject and re-verify FOMO-owned acceptance tests and restore the
         # trusted harness before any Playwright gate. This is hardening, not a
-        # host-level read-only boundary (see DESIGN: external QA runner /
+        # host-level read-only boundary (see the root README: external QA runner /
         # read-only mounts remain a release blocker).
         if all(item.status == GateStatus.passed for item in gates):
             restore = await self._restore_fomo_owned(ref, compiled)
@@ -626,6 +626,18 @@ class Verifier:
         else:
             outcome = "failed"
             summary = "Acceptance workflow assertion failed."
+        diagnostic = (
+            GateDiagnostic(
+                message=report.assertion.message,
+                locator=report.assertion.locator,
+                test_name=report.assertion.test_name,
+                line=report.assertion.line,
+            )
+            if outcome == "failed"
+            and report is not None
+            and report.assertion is not None
+            else None
+        )
         return GateResult(
             gate="acceptance_test",
             scope="acceptance",
@@ -637,6 +649,7 @@ class Verifier:
             test_name=test_name,
             exit_code=result.exit_code if outcome != "infrastructure_failed" else None,
             evidence=[f"command:{command}"],
+            diagnostic=diagnostic,
         )
 
     async def _record_acceptance_evidence(

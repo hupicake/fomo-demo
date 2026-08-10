@@ -36,87 +36,39 @@ describe("control plane client contract", () => {
     expect(normalizeApiBase("https://api.example.test/v1/")).toBe("https://api.example.test/v1");
   });
 
-  it("bootstraps a guest session once before retrying the first projects request", async () => {
+  it("fails closed on an unauthenticated projects request without retrying", async () => {
     process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
-    const fetchMock = installFetch(
-      jsonResponse({ detail: "guest session required" }, 401),
-      jsonResponse({ id: "guest-1" }, 201),
-      jsonResponse([]),
-    );
+    const fetchMock = installFetch(jsonResponse({ detail: "authentication required" }, 401));
 
-    await expect(controlPlane.getProjects()).resolves.toEqual([]);
+    await expect(controlPlane.getProjects()).rejects.toMatchObject({ status: 401 });
 
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(requestUrl(fetchMock, 0).pathname).toBe("/v1/projects");
-    expect(requestUrl(fetchMock, 1).pathname).toBe("/v1/sessions/guest");
-    expect(requestUrl(fetchMock, 2).pathname).toBe("/v1/projects");
-    for (const [, init] of fetchMock.mock.calls) {
-      expect((init as RequestInit).credentials).toBe("include");
-    }
+    expect((fetchMock.mock.calls[0]?.[1] as RequestInit).credentials).toBe("include");
   });
 
-  it("shares a single guest bootstrap across concurrent first project reads", async () => {
+  it("creates a project once with the server's title payload", async () => {
     process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
-    const fetchMock = installFetch(
-      jsonResponse({ detail: "guest session required" }, 401),
-      jsonResponse({ detail: "guest session required" }, 401),
-      jsonResponse({ id: "guest-1" }, 201),
-      jsonResponse([]),
-      jsonResponse([]),
-    );
-
-    await expect(Promise.all([controlPlane.getProjects(), controlPlane.getProjects()])).resolves.toEqual([[], []]);
-
-    expect(fetchMock.mock.calls.filter(([url]) => new URL(String(url)).pathname === "/v1/sessions/guest")).toHaveLength(1);
-    expect(fetchMock).toHaveBeenCalledTimes(5);
-  });
-
-  it("retries a project creation once with the server's title payload", async () => {
-    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
-    const fetchMock = installFetch(
-      jsonResponse({ detail: "guest session required" }, 401),
-      jsonResponse({ id: "guest-1" }, 201),
-      jsonResponse({ id: "project-1", title: "Library" }, 201),
-    );
+    const fetchMock = installFetch(jsonResponse({ id: "project-1", title: "Library" }, 201));
 
     await controlPlane.createProject({ title: "Library" });
 
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(requestUrl(fetchMock, 0).pathname).toBe("/v1/projects");
-    expect(requestUrl(fetchMock, 1).pathname).toBe("/v1/sessions/guest");
-    expect(requestUrl(fetchMock, 2).pathname).toBe("/v1/projects");
-    const init = fetchMock.mock.calls[2]?.[1] as RequestInit;
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
     expect(init.credentials).toBe("include");
     expect(JSON.parse(String(init.body))).toEqual({ title: "Library" });
   });
 
-  it("does not recursively retry after the post-bootstrap request is still unauthorized", async () => {
-    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
-    const fetchMock = installFetch(
-      jsonResponse({ detail: "guest session required" }, 401),
-      jsonResponse({ id: "guest-1" }, 201),
-      jsonResponse({ detail: "still unauthorized" }, 401),
-    );
-
-    await expect(controlPlane.getProjects()).rejects.toMatchObject({ status: 401 });
-
-    expect(fetchMock).toHaveBeenCalledTimes(3);
-    expect(requestUrl(fetchMock, 0).pathname).toBe("/v1/projects");
-    expect(requestUrl(fetchMock, 1).pathname).toBe("/v1/sessions/guest");
-    expect(requestUrl(fetchMock, 2).pathname).toBe("/v1/projects");
-  });
-
-  it("uses versionId for files and runId for trace requests", async () => {
+  it("uses versionId for file requests", async () => {
     process.env.NEXT_PUBLIC_API_URL = "https://api.example.test/v1";
     const fetchMock = installFetch(
       jsonResponse({ files: [] }),
       jsonResponse({ path: "app/page.tsx", content: "export default null" }),
-      jsonResponse({ runId: "run-9", links: [], evidence: [] }),
     );
 
     await controlPlane.getFiles("project 1", "version 2");
     await controlPlane.getFileContent("project 1", "app/page.tsx", "version 2");
-    await controlPlane.getTrace("project 1", "run 9");
 
     const filesUrl = requestUrl(fetchMock, 0);
     expect(filesUrl.pathname).toBe("/v1/projects/project%201/files");
@@ -124,9 +76,6 @@ describe("control plane client contract", () => {
     const contentUrl = requestUrl(fetchMock, 1);
     expect(contentUrl.searchParams.get("path")).toBe("app/page.tsx");
     expect(contentUrl.searchParams.get("versionId")).toBe("version 2");
-    const traceUrl = requestUrl(fetchMock, 2);
-    expect(traceUrl.pathname).toBe("/v1/projects/project%201/trace");
-    expect(traceUrl.searchParams.get("runId")).toBe("run 9");
   });
 
   it("uses the file query and optimistic fields expected by the current API", async () => {
@@ -171,15 +120,6 @@ describe("control plane client contract", () => {
         { id: "run-old", projectId: "project-1", status: "failed", lastSeq: 4 },
         { id: "run-active", projectId: "project-1", status: "succeeded", lastSeq: 19 },
       ],
-      trace: {
-        acceptanceTrace: [{
-          acceptanceId: "AC-LIBRARY-1",
-          criterion: { then: "Readers can borrow an available book." },
-          status: "passed",
-          links: [{ id: "link-1", targetKind: "file", targetRef: "lib/loans.ts" }],
-          evidence: [{ id: "evidence-1", kind: "test", status: "passed", summary: "loan flow passes" }],
-        }],
-      },
     }));
 
     const snapshot = await controlPlane.getProject("project-1");
@@ -188,15 +128,6 @@ describe("control plane client contract", () => {
     expect(snapshot.activeRun).toEqual(expect.objectContaining({ id: "run-active", status: "completed", lastSeq: 19 }));
     expect(snapshot.lastSeq).toBe(19);
     expect(snapshot.runs).toHaveLength(2);
-    expect(snapshot.trace).toEqual([expect.objectContaining({
-      id: "AC-LIBRARY-1",
-      status: "passed",
-      title: "Readers can borrow an available book.",
-      evidence: expect.arrayContaining([
-        expect.objectContaining({ id: "link-1", type: "file" }),
-        expect.objectContaining({ id: "evidence-1", type: "test", status: "passed" }),
-      ]),
-    })]);
   });
 
   it("keeps an idle project distinct from its latest failed run", async () => {
@@ -204,13 +135,23 @@ describe("control plane client contract", () => {
     installFetch(jsonResponse({
       project: { id: "project-1", status: "idle", title: "Library" },
       messages: [],
-      runs: [{ id: "run-failed", projectId: "project-1", status: "failed", lastSeq: 3 }],
+      runs: [{
+        id: "run-failed",
+        projectId: "project-1",
+        status: "failed",
+        error_code: "model_runtime_protocol_failed",
+        lastSeq: 3,
+      }],
     }));
 
     const snapshot = await controlPlane.getProject("project-1");
 
     expect(snapshot.project.status).toBe("idle");
-    expect(snapshot.activeRun).toEqual(expect.objectContaining({ id: "run-failed", status: "failed" }));
+    expect(snapshot.activeRun).toEqual(expect.objectContaining({
+      id: "run-failed",
+      status: "failed",
+      errorCode: "model_runtime_protocol_failed",
+    }));
   });
 
   it("normalizes only the public pending-input fields from project and run snapshots", async () => {
@@ -279,12 +220,9 @@ describe("control plane client contract", () => {
     expect(normalizeUserInputRequest({ ...valid, allowFreeform: "false" })).toBeUndefined();
   });
 
-  it("answers the same run idempotently and preserves the key through guest-session retry", async () => {
+  it("answers the same run idempotently and sends the caller key once", async () => {
     process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
-    const fetchMock = installFetch(
-      jsonResponse({ detail: "guest session required" }, 401),
-      jsonResponse({ id: "guest-1" }, 201),
-      jsonResponse({
+    const fetchMock = installFetch(jsonResponse({
         message: { id: "message-1", role: "user", content: "Grid" },
         request: {
           id: "input-1",
@@ -298,8 +236,7 @@ describe("control plane client contract", () => {
           reason: "must stay private",
         },
         run: { id: "run-1", projectId: "project-1", status: "queued", lastSeq: 9 },
-      }, 202),
-    );
+      }, 202));
 
     const result = await controlPlane.answerRunInputRequest("run-1", "input-1", {
       clientMessageId: "client-answer-1",
@@ -307,12 +244,10 @@ describe("control plane client contract", () => {
     });
 
     expect(requestUrl(fetchMock, 0).pathname).toBe("/v1/runs/run-1/input-requests/input-1/answer");
-    expect(requestUrl(fetchMock, 2).pathname).toBe("/v1/runs/run-1/input-requests/input-1/answer");
-    for (const call of [0, 2]) {
-      const init = fetchMock.mock.calls[call]?.[1] as RequestInit;
-      expect(new Headers(init.headers).get("Idempotency-Key")).toBe("client-answer-1");
-      expect(JSON.parse(String(init.body))).toEqual({ clientMessageId: "client-answer-1", answer: "Grid" });
-    }
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    expect(new Headers(init.headers).get("Idempotency-Key")).toBe("client-answer-1");
+    expect(JSON.parse(String(init.body))).toEqual({ clientMessageId: "client-answer-1", answer: "Grid" });
     expect(result.run.status).toBe("queued");
     expect(result.request).toEqual(expect.objectContaining({ id: "input-1", status: "answered" }));
     expect(result.request).not.toHaveProperty("reason");
@@ -365,191 +300,6 @@ describe("control plane client contract", () => {
     expect(legacy.goalGraph).toBeNull();
   });
 
-  it("maps unverified validation and link-derived implementation status from the trace", async () => {
-    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
-    installFetch(jsonResponse({
-      project: { id: "project-1", title: "Library" },
-      messages: [],
-      runs: [],
-      trace: {
-        acceptanceTrace: [{
-          acceptanceId: "AC-1",
-          criterion: { then: "Readers can search." },
-          status: "unverified",
-          implementationStatus: "implemented",
-          links: [{ id: "link-has-test", relation: "has_test", targetKind: "file", targetRef: "tests/generated/library.smoke.spec.ts" }],
-          evidence: [{
-            id: "evidence-1",
-            kind: "playwright_smoke",
-            status: "passed",
-            summary: '{"runId":"run-9","acceptanceId":"AC-1","testPath":"tests/generated/library.smoke.spec.ts","testName":"library keeps a searchable catalog","result":"passed","recordedAt":"2026-08-07T10:00:00Z","exitCode":0,"artifactRef":null}',
-          }],
-        }],
-      },
-    }));
-
-    const snapshot = await controlPlane.getProject("project-1");
-
-    expect(snapshot.trace).toEqual([expect.objectContaining({
-      id: "AC-1",
-      status: "unverified",
-      implementationStatus: "implemented",
-      evidence: expect.arrayContaining([
-        // The bounded structured summary renders as a compact human label.
-        expect.objectContaining({ id: "evidence-1", type: "test", status: "passed", label: "library keeps a searchable catalog · passed" }),
-      ]),
-    })]);
-  });
-
-  it("keeps implementation unknown when the graph fallback has no implemented_in proof", async () => {
-    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
-    installFetch(jsonResponse({
-      project: { id: "project-1", title: "Library" },
-      messages: [],
-      runs: [],
-      trace: {
-        links: [{ id: "link-1", sourceKind: "acceptance_criterion", sourceRef: "AC-1", relation: "has_test", targetKind: "file", targetRef: "tests/generated/library.smoke.spec.ts" }],
-        evidence: [],
-      },
-    }));
-
-    const snapshot = await controlPlane.getProject("project-1");
-
-    expect(snapshot.trace).toEqual([expect.objectContaining({ id: "AC-1" })]);
-    expect(snapshot.trace?.[0]).not.toHaveProperty("implementationStatus");
-  });
-
-  it("projects the successful Direct Pi verified_in response without inventing implementation proof", async () => {
-    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
-    installFetch(jsonResponse({
-      project: { id: "project-1", title: "Library" },
-      messages: [],
-      runs: [{ id: "run-success", projectId: "project-1", status: "succeeded", lastSeq: 42 }],
-      trace: {
-        acceptanceTrace: [],
-        links: [{
-          id: "verified-version",
-          sourceKind: "acceptance_criterion",
-          sourceRef: "AC-1",
-          relation: "verified_in",
-          targetKind: "version",
-          targetRef: "version-1",
-        }],
-        evidence: [{
-          id: "evidence-1",
-          acceptanceId: "AC-1",
-          kind: "playwright_smoke",
-          status: "passed",
-          summary: "verified interaction",
-        }],
-      },
-    }));
-
-    const snapshot = await controlPlane.getProject("project-1");
-
-    expect(snapshot.trace).toEqual([expect.objectContaining({
-      id: "AC-1",
-      status: "passed",
-      evidence: expect.arrayContaining([
-        expect.objectContaining({ id: "verified-version", type: "version", status: "passed" }),
-        expect.objectContaining({ id: "evidence-1", type: "test", status: "passed" }),
-      ]),
-    })]);
-    expect(snapshot.trace?.[0]).not.toHaveProperty("implementationStatus");
-  });
-
-  it("does not mark implemented from a test-file implemented_in link in the graph fallback", async () => {
-    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
-    installFetch(jsonResponse({
-      project: { id: "project-1", title: "Library" },
-      messages: [],
-      runs: [],
-      trace: {
-        links: [{ id: "link-test", sourceKind: "acceptance_criterion", sourceRef: "AC-1", relation: "implemented_in", targetKind: "file", targetRef: "tests/generated/library.smoke.spec.ts" }],
-        evidence: [],
-      },
-    }));
-
-    const snapshot = await controlPlane.getProject("project-1");
-
-    expect(snapshot.trace).toEqual([expect.objectContaining({ id: "AC-1" })]);
-    expect(snapshot.trace?.[0]).not.toHaveProperty("implementationStatus");
-  });
-
-  it("does not mark implemented from a malformed implemented_in link in the graph fallback", async () => {
-    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
-    installFetch(jsonResponse({
-      project: { id: "project-1", title: "Library" },
-      messages: [],
-      runs: [],
-      trace: {
-        links: [
-          // implemented_in with a non-file target kind: not a business link.
-          { id: "link-bad", sourceKind: "acceptance_criterion", sourceRef: "AC-1", relation: "implemented_in", targetKind: "artifact", targetRef: "artifact-1" },
-        ],
-        evidence: [],
-      },
-    }));
-
-    const snapshot = await controlPlane.getProject("project-1");
-
-    expect(snapshot.trace).toEqual([expect.objectContaining({ id: "AC-1" })]);
-    expect(snapshot.trace?.[0]).not.toHaveProperty("implementationStatus");
-  });
-
-  it("marks implemented only from a well-formed business-file implemented_in link", async () => {
-    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
-    installFetch(jsonResponse({
-      project: { id: "project-1", title: "Library" },
-      messages: [],
-      runs: [],
-      trace: {
-        links: [{ id: "link-real", sourceKind: "acceptance_criterion", sourceRef: "AC-1", relation: "implemented_in", targetKind: "file", targetRef: "components/features/library.tsx" }],
-        evidence: [],
-      },
-    }));
-
-    const snapshot = await controlPlane.getProject("project-1");
-
-    expect(snapshot.trace).toEqual([expect.objectContaining({
-      id: "AC-1",
-      implementationStatus: "implemented",
-    })]);
-  });
-
-  it("applies the business-file predicate to acceptanceTrace links and keeps explicit status authoritative", async () => {
-    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
-    installFetch(jsonResponse({
-      project: { id: "project-1", title: "Library" },
-      messages: [],
-      runs: [],
-      trace: {
-        acceptanceTrace: [
-          {
-            acceptanceId: "AC-1",
-            criterion: { then: "Readers can search." },
-            status: "unverified",
-            links: [{ id: "link-snake", source_kind: "acceptance_criterion", source_ref: "AC-1", relation: "implemented_in", target_kind: "file", target_ref: "tests/generated/library.smoke.spec.ts" }],
-          },
-          {
-            acceptanceId: "AC-2",
-            criterion: { then: "Readers can borrow." },
-            status: "unverified",
-            implementationStatus: "implemented",
-            links: [{ id: "link-test-only", source_kind: "acceptance_criterion", source_ref: "AC-2", relation: "implemented_in", target_kind: "file", target_ref: "tests/generated/library-2.smoke.spec.ts" }],
-          },
-        ],
-      },
-    }));
-
-    const snapshot = await controlPlane.getProject("project-1");
-
-    expect(snapshot.trace?.[0]).toEqual(expect.objectContaining({ id: "AC-1" }));
-    expect(snapshot.trace?.[0]).not.toHaveProperty("implementationStatus");
-    // Explicit backend implementationStatus wins over link-derived fallback.
-    expect(snapshot.trace?.[1]).toEqual(expect.objectContaining({ id: "AC-2", implementationStatus: "implemented" }));
-  });
-
   it("normalizes a ready preview from the snapshot without preserving a second origin field", async () => {
     process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
     installFetch(jsonResponse({
@@ -592,156 +342,111 @@ describe("control plane client contract", () => {
       verificationStatus: "unverified",
     });
   });
-});
 
-describe("artifact ref and detail contract", () => {
-  const ref = {
-    id: "artifact-1",
-    runId: "run-1",
-    kind: "product_spec",
-    role: "product_manager",
-    stage: "product",
-    schemaVersion: 1,
-    title: "Library product spec",
-    summary: "Readers can manage books.",
-    createdAt: "2026-08-07T12:00:00.000Z",
-  };
-
-  it("normalizes valid snapshot refs and fails closed on hidden kinds and malformed required fields", async () => {
+  it("fetches runtime options and normalizes only the public profile fields", async () => {
     process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
-    installFetch(jsonResponse({
-      project: { id: "project-1", title: "Library" },
-      messages: [],
-      runs: [],
-      artifactRefs: [
-        ref,
-        { ...ref, id: "artifact-2", kind: "technical_spec", role: "architect", stage: "architecture" },
-        { ...ref, id: "artifact-3", kind: "diagnostic_report", role: "reviewer" },
-        { ...ref, id: "artifact-4", summary: "" },
-        { ...ref, id: "artifact-5", schemaVersion: "one" },
-        { ...ref, id: "artifact-6", runId: undefined },
+    const fetchMock = installFetch(jsonResponse({
+      default_profile_id: "deepseek-flash",
+      profiles: [
+        { profile_id: "deepseek-flash", label: "DeepSeek Flash", thinking_levels: ["off", "high"], default_thinking: "high", context_window: 1_000_000, run_token_budget: null, run_token_budget_unlimited: true, inference_tpm_limit: 1_250_000, available: true },
+        { profile_id: "gpt-5.6", label: "GPT-5.6", thinking_levels: ["off", "low", "high"], default_thinking: "high", context_window: 250_000, run_token_budget: 600_000, inference_tpm_limit: 1_000_000, available: false, disabled_reason: "配额已用尽" },
       ],
     }));
 
-    const snapshot = await controlPlane.getProject("project-1");
+    const options = await controlPlane.getRuntimeOptions();
 
-    expect(snapshot.artifactRefs).toEqual([
-      ref,
-      { ...ref, id: "artifact-2", kind: "technical_spec", role: "architect", stage: "architecture" },
-    ]);
-    const refs = snapshot.artifactRefs;
-    expect(refs).toBeDefined();
-    expect(refs).toHaveLength(2);
-    if (!refs) {
-      throw new Error("snapshot.artifactRefs must be present");
-    }
-    expect(refs[0]).not.toHaveProperty("content");
+    expect(requestUrl(fetchMock, 0).pathname).toBe("/v1/runtime/options");
+    expect(options.defaultProfileId).toBe("deepseek-flash");
+    expect(options.profiles).toHaveLength(2);
+    expect(options.profiles[0]).toEqual(expect.objectContaining({
+      profileId: "deepseek-flash",
+      label: "DeepSeek Flash",
+      thinkingLevels: ["off", "high"],
+      defaultThinking: "high",
+      contextWindow: 1_000_000,
+      runTokenBudget: null,
+      runTokenBudgetUnlimited: true,
+      available: true,
+    }));
+    expect(options.profiles[1]?.available).toBe(false);
+    expect(options.profiles[1]?.disabledReason).toBe("配额已用尽");
   });
 
-  it("normalizes snake_case refs identically to camelCase refs", async () => {
+  it("captures the immutable run runtime from a project snapshot", async () => {
     process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
     installFetch(jsonResponse({
       project: { id: "project-1", title: "Library" },
       messages: [],
-      runs: [],
-      artifact_refs: [{
-        id: "artifact-1",
-        run_id: "run-1",
-        kind: "technical_spec",
-        role: "architect",
-        stage: "architecture",
-        schema_version: 2,
-        title: "Tech spec",
-        summary: "Next.js",
-        created_at: "2026-08-07T12:00:00.000Z",
+      runs: [{
+        id: "run-1",
+        projectId: "project-1",
+        status: "running",
+        lastSeq: 4,
+        runtime: {
+          profile_id: "deepseek-flash",
+          thinking: "high",
+          context_window: 1_000_000,
+          policy_version: "direct-pi-runtime-v2",
+          run_token_budget: null,
+          run_token_budget_unlimited: true,
+          inference_tpm_limit: 1_250_000,
+        },
       }],
     }));
 
     const snapshot = await controlPlane.getProject("project-1");
 
-    expect(snapshot.artifactRefs).toEqual([{
-      id: "artifact-1",
-      runId: "run-1",
-      kind: "technical_spec",
-      role: "architect",
-      stage: "architecture",
-      schemaVersion: 2,
-      title: "Tech spec",
-      summary: "Next.js",
-      createdAt: "2026-08-07T12:00:00.000Z",
-    }]);
-  });
-
-  it("returns detail content as a strict JSON object", async () => {
-    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
-    const content = { problem: "Readers cannot manage books.", visualDirection: { tone: "calm" } };
-    installFetch(jsonResponse({ ...ref, content }));
-
-    await expect(controlPlane.getArtifact("run-1", "artifact-1")).resolves.toEqual({
-      ...ref,
-      content,
-    });
-  });
-
-  it("fails closed when detail content is not a JSON object", async () => {
-    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
-    installFetch(jsonResponse({ ...ref, content: JSON.stringify({ problem: "x" }) }));
-
-    await expect(controlPlane.getArtifact("run-1", "artifact-1")).rejects.toMatchObject({ status: 502 });
-  });
-
-  it("fails closed on null or array detail content", async () => {
-    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
-    installFetch(jsonResponse({ ...ref, content: null }));
-    await expect(controlPlane.getArtifact("run-1", "artifact-1")).rejects.toMatchObject({ status: 502 });
-
-    installFetch(jsonResponse({ ...ref, content: ["not", "an", "object"] }));
-    await expect(controlPlane.getArtifact("run-1", "artifact-1")).rejects.toMatchObject({ status: 502 });
-  });
-
-  it("fails closed when the response run or artifact id does not match the request", async () => {
-    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
-    installFetch(jsonResponse({ ...ref, runId: "run-other" }));
-    await expect(controlPlane.getArtifact("run-1", "artifact-1")).rejects.toMatchObject({ status: 502 });
-
-    installFetch(jsonResponse({ ...ref, id: "artifact-other" }));
-    await expect(controlPlane.getArtifact("run-1", "artifact-1")).rejects.toMatchObject({ status: 502 });
-  });
-
-  it("fails closed on hidden kinds and malformed refs in detail responses", async () => {
-    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
-    installFetch(jsonResponse({ ...ref, kind: "implementation_plan", role: "engineer" }));
-    await expect(controlPlane.getArtifact("run-1", "artifact-1")).rejects.toMatchObject({ status: 502 });
-
-    installFetch(jsonResponse({ ...ref, summary: "" }));
-    await expect(controlPlane.getArtifact("run-1", "artifact-1")).rejects.toMatchObject({ status: 502 });
-  });
-
-  it("fails closed on snapshot refs whose role mismatches the fixed kind mapping", async () => {
-    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
-    installFetch(jsonResponse({
-      project: { id: "project-1", title: "Library" },
-      messages: [],
-      runs: [],
-      artifactRefs: [
-        ref,
-        { ...ref, id: "artifact-2", kind: "technical_spec", role: "product_manager" },
-        { ...ref, id: "artifact-3", kind: "product_spec", role: "architect" },
-        { ...ref, id: "artifact-4", kind: "product_spec", role: "engineer" },
-      ],
+    expect(snapshot.activeRun?.runtime).toEqual(expect.objectContaining({
+      profileId: "deepseek-flash",
+      thinking: "high",
+      contextWindow: 1_000_000,
+      runTokenBudget: null,
+      runTokenBudgetUnlimited: true,
     }));
-
-    const snapshot = await controlPlane.getProject("project-1");
-
-    expect(snapshot.artifactRefs).toEqual([ref]);
   });
 
-  it("fails closed on detail responses whose role mismatches the fixed kind mapping", async () => {
+  it("sends the chosen runtime selection and reads the resolved runtime back", async () => {
     process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
-    installFetch(jsonResponse({ ...ref, role: "architect" }));
-    await expect(controlPlane.getArtifact("run-1", "artifact-1")).rejects.toMatchObject({ status: 502 });
+    const fetchMock = installFetch(jsonResponse({
+      message: { id: "message-1", role: "user", content: "Build a thing" },
+      run: {
+        id: "run-new",
+        project_id: "project-1",
+        status: "queued",
+        last_seq: 1,
+        runtime: {
+          profile_id: "deepseek-flash",
+          thinking: "high",
+          context_window: 1_000_000,
+          policy_version: "direct-pi-runtime-v2",
+          run_token_budget: null,
+          run_token_budget_unlimited: true,
+          inference_tpm_limit: 1_250_000,
+        },
+      },
+    }, 202));
 
-    installFetch(jsonResponse({ ...ref, kind: "technical_spec", role: "product_manager" }));
-    await expect(controlPlane.getArtifact("run-1", "artifact-1")).rejects.toMatchObject({ status: 502 });
+    const result = await controlPlane.startRun("project-1", {
+      clientMessageId: "client-1",
+      content: "Build a thing",
+      profileId: "deepseek-flash",
+      thinking: "high",
+    });
+
+    expect(result.runId).toBe("run-new");
+    expect(result.runtime).toEqual(expect.objectContaining({
+      profileId: "deepseek-flash",
+      thinking: "high",
+      contextWindow: 1_000_000,
+    }));
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    expect(new Headers(init.headers).get("Idempotency-Key")).toBe("client-1");
+    expect(JSON.parse(String(init.body))).toEqual({
+      clientMessageId: "client-1",
+      content: "Build a thing",
+      profileId: "deepseek-flash",
+      thinking: "high",
+      attachments: [],
+    });
   });
 });
