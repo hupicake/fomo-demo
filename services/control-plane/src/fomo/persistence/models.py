@@ -113,7 +113,7 @@ class RunRecord(Base):
             sqlite_where=text("status = 'running'"),
         ),
         CheckConstraint(
-            "agent_framework IN ('pi', 'opencode')",
+            "agent_framework IN ('pi', 'opencode', 'codex')",
             name="ck_runs_agent_framework",
         ),
     )

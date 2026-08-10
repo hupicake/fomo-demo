@@ -1,0 +1,102 @@
+{
+  "models": [
+    {
+      "slug": "fomo-pi-gpt-5.6",
+      "display_name": "GPT-5.6",
+      "description": "FOMO GPT-5.6 coding route.",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "low",
+          "description": "Fast responses with lighter reasoning"
+        },
+        {
+          "effort": "medium",
+          "description": "Balanced reasoning for everyday development"
+        },
+        {
+          "effort": "high",
+          "description": "Greater reasoning depth for complex development"
+        },
+        {
+          "effort": "xhigh",
+          "description": "Extra reasoning depth for the hardest development tasks"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 1,
+      "availability_nux": null,
+      "upgrade": null,
+      "support_verbosity": false,
+      "default_verbosity": null,
+      "apply_patch_tool_type": "freeform",
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": true,
+      "supports_reasoning_summaries": true,
+      "context_window": 250000,
+      "max_context_window": 250000,
+      "auto_compact_token_limit": null,
+      "experimental_supported_tools": [],
+      "input_modalities": [
+        "text"
+      ],
+      "supports_search_tool": false,
+      "use_responses_lite": false,
+      "base_instructions": "You are FOMO's coding agent inside an isolated generation sandbox. Work directly in /workspace. Inspect the existing project before editing, preserve user work, implement the requested product end to end, verify high-value behavior with available tools, and report real failures clearly."
+    },
+    {
+      "slug": "fomo-pi-gpt-5.5",
+      "display_name": "GPT-5.5",
+      "description": "FOMO GPT-5.5 coding route.",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "low",
+          "description": "Fast responses with lighter reasoning"
+        },
+        {
+          "effort": "medium",
+          "description": "Balanced reasoning for everyday development"
+        },
+        {
+          "effort": "high",
+          "description": "Greater reasoning depth for complex development"
+        },
+        {
+          "effort": "xhigh",
+          "description": "Extra reasoning depth for the hardest development tasks"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 2,
+      "availability_nux": null,
+      "upgrade": null,
+      "support_verbosity": false,
+      "default_verbosity": null,
+      "apply_patch_tool_type": "freeform",
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": true,
+      "supports_reasoning_summaries": true,
+      "context_window": 250000,
+      "max_context_window": 250000,
+      "auto_compact_token_limit": null,
+      "experimental_supported_tools": [],
+      "input_modalities": [
+        "text"
+      ],
+      "supports_search_tool": false,
+      "use_responses_lite": false,
+      "base_instructions": "You are FOMO's coding agent inside an isolated generation sandbox. Work directly in /workspace. Inspect the existing project before editing, preserve user work, implement the requested product end to end, verify high-value behavior with available tools, and report real failures clearly."
+    }
+  ]
+}

@@ -14,6 +14,7 @@ from fomo.agent_framework import (
 from fomo.direct_pi import DirectPiOrchestrator
 from fomo.direct_pi.session import DirectPiSession
 from fomo.fomo_pi_ds import RunVirtualKey
+from fomo.runtime_contract import resolve_runtime_contract
 from fomo.sandbox.fake import FakeSandboxProvider
 from fomo.schemas import RunStatus
 from fomo.worker.runner import WorkerRunner
@@ -137,7 +138,7 @@ def test_agent_transport_registry_is_closed_and_framework_specific() -> None:
     assert normalize_agent_framework(" OpenCode ") == "opencode"
     assert registry.require("pi") is pi_transport
     assert registry.require("opencode") is opencode_transport
-    with pytest.raises(ValueError, match="pi or opencode"):
+    with pytest.raises(ValueError, match="pi, opencode, or codex"):
         normalize_agent_framework("unknown")
 
 
@@ -245,6 +246,43 @@ async def test_opencode_turn_disables_unsupported_user_input_tool(settings) -> N
 
     assert transport.request is not None
     assert transport.request.user_input_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_codex_turn_keeps_resume_independent_from_user_input(settings) -> None:
+    transport = _RequestProbeTransport()
+    contract = resolve_runtime_contract("gpt-5.6", "xhigh")
+    session = DirectPiSession(
+        _ActiveSessionRepository(),  # type: ignore[arg-type]
+        transport,  # type: ignore[arg-type]
+        settings,
+        RunVirtualKey(
+            run_id="run-codex",
+            key_alias="fomo-run-codex",
+            duration_seconds=300,
+            secret="sk-test-run-key",
+            model_aliases=(contract.litellm_alias,),
+        ),
+        runtime_contract=contract,
+        agent_framework="codex",
+        run_id="run-codex",
+        lease_token="lease-token",
+        started_at=0.0,
+    )
+
+    with pytest.raises(RuntimeError, match="request captured"):
+        await session.invoke(
+            SimpleNamespace(id="sandbox", project_id="project"),  # type: ignore[arg-type]
+            "Continue the implementation",
+            stage="building",
+            require_existing_session=True,
+        )
+
+    assert transport.request is not None
+    assert transport.request.user_input_enabled is False
+    assert transport.request.require_resume is True
+    assert transport.request.model == contract.model_ref
+    assert transport.request.thinking == "xhigh"
 
 
 @pytest.mark.asyncio

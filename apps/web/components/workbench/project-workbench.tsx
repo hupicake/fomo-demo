@@ -300,7 +300,6 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
   );
   const availableProfiles = runtimeOptions?.profiles.filter((profile) => profile.available) ?? [];
   const availableFrameworks = runtimeOptions?.agentFrameworks.filter((framework) => framework.available) ?? [];
-  const hasAvailableModel = availableProfiles.length > 0;
   const hasAvailableFramework = availableFrameworks.length > 0;
   const runtimeOptionsLoading = !runtimeOptions && !runtimeOptionsError;
 
@@ -309,11 +308,6 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
   const [selectedAgentFramework, setSelectedAgentFramework] = useState<AgentFrameworkId>();
   const [selectedProfileId, setSelectedProfileId] = useState<string>();
   const [selectedThinking, setSelectedThinking] = useState<string>();
-  const activeProfileId = selectedProfileId
-    ?? runtimeOptions?.defaultProfileId
-    ?? availableProfiles[0]?.profileId;
-  const activeThinking = selectedThinking
-    ?? runtimeOptions?.profiles.find((profile) => profile.profileId === activeProfileId)?.defaultThinking;
   const selectedAvailableFramework = runtimeOptions?.agentFrameworks.find(
     (framework) => framework.id === selectedAgentFramework && framework.available,
   );
@@ -323,6 +317,30 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
   const activeAgentFramework = selectedAvailableFramework?.id
     ?? defaultAvailableFramework?.id
     ?? availableFrameworks[0]?.id;
+  const activeFramework = runtimeOptions?.agentFrameworks.find(
+    (framework) => framework.id === activeAgentFramework,
+  );
+  const compatibleAvailableProfiles = availableProfiles.filter(
+    (profile) => !activeFramework
+      || activeFramework.compatibleProfileIds.length === 0
+      || activeFramework.compatibleProfileIds.includes(profile.profileId),
+  );
+  const hasAvailableModel = compatibleAvailableProfiles.length > 0;
+  const activeProfile = compatibleAvailableProfiles.find(
+    (profile) => profile.profileId === selectedProfileId,
+  ) ?? compatibleAvailableProfiles.find(
+    (profile) => profile.profileId === runtimeOptions?.defaultProfileId,
+  ) ?? compatibleAvailableProfiles[0];
+  const activeProfileId = activeProfile?.profileId;
+  const compatibleThinkingLevels = activeProfile?.thinkingLevels.filter(
+    (level) => activeFramework?.compatibleThinkingLevels == null
+      || activeFramework.compatibleThinkingLevels.includes(level),
+  ) ?? [];
+  const activeThinking = compatibleThinkingLevels.includes(selectedThinking ?? "")
+    ? selectedThinking
+    : compatibleThinkingLevels.includes(activeProfile?.defaultThinking ?? "")
+      ? activeProfile?.defaultThinking
+      : compatibleThinkingLevels[0];
   useEffect(() => {
     if (!runtimeOptions || selectedAgentFramework) return;
     const framework = runtimeOptions.agentFrameworks.find(
@@ -332,13 +350,14 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
   }, [runtimeOptions, selectedAgentFramework]);
   useEffect(() => {
     if (!runtimeOptions || selectedProfileId) return;
-    const profile = runtimeOptions.profiles.find((candidate) => candidate.profileId === runtimeOptions.defaultProfileId && candidate.available)
-      ?? runtimeOptions.profiles.find((candidate) => candidate.available);
+    const profile = compatibleAvailableProfiles.find(
+      (candidate) => candidate.profileId === runtimeOptions.defaultProfileId,
+    ) ?? compatibleAvailableProfiles[0];
     if (profile) {
       setSelectedProfileId(profile.profileId);
       setSelectedThinking(profile.defaultThinking);
     }
-  }, [runtimeOptions, selectedProfileId]);
+  }, [compatibleAvailableProfiles, runtimeOptions, selectedProfileId]);
 
   // Retries reuse the first selection for a given clientMessageId. useChat may
   // resend the same message id on reconnect; capture it once so the backend's
@@ -772,8 +791,8 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
                       onSelectThinking={setSelectedThinking}
                       options={runtimeOptions}
                       selectedAgentFramework={activeAgentFramework}
-                      selectedProfileId={selectedProfileId}
-                      selectedThinking={selectedThinking}
+                      selectedProfileId={activeProfileId}
+                      selectedThinking={activeThinking}
                     />
                     {isWaitingForUser ? (
                       <PromptInputTools className="basis-full sm:basis-auto">

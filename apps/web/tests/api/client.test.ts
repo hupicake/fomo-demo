@@ -348,8 +348,9 @@ describe("control plane client contract", () => {
     const fetchMock = installFetch(jsonResponse({
       default_agent_framework: "pi",
       agent_frameworks: [
-        { id: "pi", label: "Pi", available: true },
-        { id: "opencode", label: "OpenCode", available: true },
+        { id: "pi", label: "Pi", compatible_profile_ids: ["deepseek-flash", "gpt-5.6"], compatible_thinking_levels: null, available: true },
+        { id: "opencode", label: "OpenCode", compatible_profile_ids: ["deepseek-flash", "gpt-5.6"], compatible_thinking_levels: null, available: true },
+        { id: "codex", label: "Codex", compatible_profile_ids: ["gpt-5.6"], compatible_thinking_levels: ["low", "medium", "high", "xhigh"], available: true },
       ],
       default_profile_id: "deepseek-flash",
       profiles: [
@@ -363,8 +364,9 @@ describe("control plane client contract", () => {
     expect(requestUrl(fetchMock, 0).pathname).toBe("/v1/runtime/options");
     expect(options.defaultAgentFramework).toBe("pi");
     expect(options.agentFrameworks).toEqual([
-      { id: "pi", label: "Pi", available: true },
-      { id: "opencode", label: "OpenCode", available: true },
+      { id: "pi", label: "Pi", compatibleProfileIds: ["deepseek-flash", "gpt-5.6"], compatibleThinkingLevels: null, available: true },
+      { id: "opencode", label: "OpenCode", compatibleProfileIds: ["deepseek-flash", "gpt-5.6"], compatibleThinkingLevels: null, available: true },
+      { id: "codex", label: "Codex", compatibleProfileIds: ["gpt-5.6"], compatibleThinkingLevels: ["low", "medium", "high", "xhigh"], available: true },
     ]);
     expect(options.defaultProfileId).toBe("deepseek-flash");
     expect(options.profiles).toHaveLength(2);

@@ -20,7 +20,12 @@ from fomo.fomo_pi_ds import (
 )
 from fomo.ids import uuid7
 from fomo.persistence import Repository, RunLeaseLost
-from fomo.runtime_contract import RuntimeContract, legacy_runtime_contract
+from fomo.runtime_contract import (
+    CODEX_COMPATIBLE_PROFILE_IDS,
+    CODEX_COMPATIBLE_THINKING_LEVELS,
+    RuntimeContract,
+    legacy_runtime_contract,
+)
 from fomo.sandbox.base import SandboxRef
 from fomo.schemas import UserInputRequestDraft
 
@@ -81,8 +86,13 @@ class DirectPiSession:
         if self.runtime_contract.litellm_alias not in virtual_key.model_aliases:
             raise ValueError("virtual key does not authorize the run runtime profile")
         self.run_id = run_id
-        if agent_framework not in {"pi", "opencode"}:
-            raise ValueError("agent framework must be pi or opencode")
+        if agent_framework not in {"pi", "opencode", "codex"}:
+            raise ValueError("agent framework must be pi, opencode, or codex")
+        if agent_framework == "codex":
+            if self.runtime_contract.profile_id not in CODEX_COMPATIBLE_PROFILE_IDS:
+                raise ValueError("Codex requires a GPT runtime profile")
+            if self.runtime_contract.thinking not in CODEX_COMPATIBLE_THINKING_LEVELS:
+                raise ValueError("Codex does not support the selected thinking level")
         self.agent_framework = agent_framework
         self.lease_token = lease_token
         self.started_at = started_at
@@ -129,8 +139,8 @@ class DirectPiSession:
             # connection, and spend boundary own termination—not a FOMO wall.
             timeout_seconds=None,
             structured_output_schema=structured_output_schema,
-            # OpenCode MVP can resume its durable session, but its bridge does
-            # not yet implement FOMO's request_user_input virtual tool.
+            # Pi alone exposes FOMO's request_user_input virtual tool. OpenCode
+            # and Codex still support exact durable-session resume without it.
             user_input_enabled=self.agent_framework == "pi",
             require_resume=resume_request_id is not None or require_existing_session,
         )

@@ -67,7 +67,7 @@ CODING_AGENT_RUNTIME_FAILED = PublicRunFailure(
     code="coding_agent_runtime_failed",
     message=(
         "Coding Agent 运行环境暂时不可用，请重试；若问题持续发生，"
-        "请检查 OpenCode 服务状态。"
+        "请检查当前选择的 Agent 框架状态。"
     ),
 )
 PLANNING_CONTRACT_FAILED = PublicRunFailure(
@@ -220,6 +220,17 @@ _BRIDGE_FAILURES_BY_INTERNAL_CODE = {
     # bodies are never copied into the public contract.
     "opencode_model_failed": MODEL_RESPONSE_FAILED,
     "opencode_runtime_failed": CODING_AGENT_RUNTIME_FAILED,
+    # Codex CLI failures are reduced to this closed set by the root-owned
+    # JSONL bridge; arbitrary stderr/provider text never crosses the boundary.
+    "codex_model_failed": MODEL_RESPONSE_FAILED,
+    "codex_protocol_failed": MODEL_RUNTIME_PROTOCOL_FAILED,
+    "codex_structured_output_invalid": PLANNING_CONTRACT_FAILED,
+    "codex_runtime_failed": CODING_AGENT_RUNTIME_FAILED,
+    "codex_invalid_environment": CODING_AGENT_RUNTIME_FAILED,
+    "codex_spawn_failed": CODING_AGENT_RUNTIME_FAILED,
+    "codex_bridge_failed": CODING_AGENT_RUNTIME_FAILED,
+    "codex_profile_unsupported": CODING_AGENT_RUNTIME_FAILED,
+    "codex_thinking_unsupported": CODING_AGENT_RUNTIME_FAILED,
 }
 
 

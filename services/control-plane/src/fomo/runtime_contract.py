@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from fomo.agent_framework import AgentFramework, normalize_agent_framework
+
 RUNTIME_POLICY_VERSION = "direct-pi-runtime-v2"
 PREVIOUS_RUNTIME_POLICY_VERSION = "direct-pi-runtime-v1"
 LEGACY_RUNTIME_POLICY_VERSION = "direct-pi-legacy-v0"
@@ -132,6 +134,17 @@ _PROFILE_BY_ID = {profile.profile_id: profile for profile in RUNTIME_PROFILES}
 _PROFILE_BY_MODEL_REF = {profile.model_ref: profile for profile in RUNTIME_PROFILES}
 _PROFILE_BY_ALIAS = {profile.litellm_alias: profile for profile in RUNTIME_PROFILES}
 
+# Codex transport is intentionally restricted to the audited GPT routes. Keep
+# this as a closed profile-id allowlist: adding a future profile named "gpt-*"
+# must not silently make it eligible before its transport contract is checked.
+CODEX_COMPATIBLE_PROFILE_IDS = frozenset({"gpt-5.5", "gpt-5.6"})
+CODEX_COMPATIBLE_THINKING_LEVELS = (
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+)
+
 # Runtime v1 froze a cumulative token ceiling. It remains accepted only when
 # reading historical runs; runtime v2 stores ``NULL`` to mean that cumulative
 # usage is unlimited. Context windows, per-minute throughput, provider output
@@ -187,6 +200,51 @@ def runtime_profile(profile_id: str) -> RuntimeProfile:
         return _PROFILE_BY_ID[profile_id]
     except KeyError as exc:
         raise RuntimeContractError("unknown runtime profile") from exc
+
+
+def compatible_profile_ids_for_agent_framework(
+    agent_framework: object,
+) -> frozenset[str]:
+    """Return the server-owned profile allowlist for one public framework."""
+
+    try:
+        framework = normalize_agent_framework(agent_framework)
+    except ValueError as exc:
+        raise RuntimeContractError(str(exc)) from exc
+    if framework == AgentFramework.codex.value:
+        return CODEX_COMPATIBLE_PROFILE_IDS
+    return frozenset(_PROFILE_BY_ID)
+
+
+def validate_agent_framework_profile(
+    agent_framework: object,
+    profile_id: str,
+) -> None:
+    """Reject unsupported framework/profile pairs before a run is persisted."""
+
+    runtime_profile(profile_id)
+    if profile_id not in compatible_profile_ids_for_agent_framework(agent_framework):
+        raise RuntimeContractError(
+            "codex agent framework requires a GPT runtime profile"
+        )
+
+
+def validate_agent_framework_runtime(
+    agent_framework: object,
+    profile_id: str,
+    thinking: str,
+) -> None:
+    """Validate the complete framework-owned inference boundary."""
+
+    validate_agent_framework_profile(agent_framework, profile_id)
+    framework = normalize_agent_framework(agent_framework)
+    if (
+        framework == AgentFramework.codex.value
+        and thinking not in CODEX_COMPATIBLE_THINKING_LEVELS
+    ):
+        raise RuntimeContractError(
+            "codex agent framework does not support this thinking level"
+        )
 
 
 def runtime_profile_for_model_ref(model_ref: str) -> RuntimeProfile | None:
@@ -388,6 +446,8 @@ def validate_invocation_contract(
 
 
 __all__ = [
+    "CODEX_COMPATIBLE_PROFILE_IDS",
+    "CODEX_COMPATIBLE_THINKING_LEVELS",
     "DEFAULT_PROFILE_ID",
     "DEFAULT_MAX_SPEND_MICROS",
     "DEFAULT_THINKING",
@@ -412,6 +472,7 @@ __all__ = [
     "RuntimeProfile",
     "allowed_litellm_aliases",
     "allowed_model_refs",
+    "compatible_profile_ids_for_agent_framework",
     "context_limit_for_model_ref",
     "parse_enabled_profile_ids",
     "legacy_runtime_contract",
@@ -422,5 +483,7 @@ __all__ = [
     "selectable_litellm_aliases",
     "thinking_levels_for_model_ref",
     "validated_default_profile_id",
+    "validate_agent_framework_profile",
+    "validate_agent_framework_runtime",
     "validate_invocation_contract",
 ]

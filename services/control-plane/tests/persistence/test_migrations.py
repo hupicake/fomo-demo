@@ -112,6 +112,64 @@ async def test_pre_model_selection_run_upgrades_with_legacy_execution_contract(
 
 
 @pytest.mark.asyncio
+async def test_codex_framework_constraint_upgrade_preserves_old_runs_and_fails_closed(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "codex-framework.db"
+    database = Database(f"sqlite+aiosqlite:///{path}")
+    try:
+        await asyncio.to_thread(
+            database._alembic_command,
+            "upgrade",
+            "0007_run_agent_framework",
+        )
+        with sqlite3.connect(path) as connection:
+            connection.execute(
+                "INSERT INTO sessions (id, kind, user_id, expires_at, created_at) "
+                "VALUES ('session-1', 'guest', NULL, '2099-01-01', '2026-01-01')"
+            )
+            connection.execute(
+                "INSERT INTO projects "
+                "(id, owner_session_id, title, status, created_at, updated_at) "
+                "VALUES ('project-1', 'session-1', 'Existing', 'queued', "
+                "'2026-01-01', '2026-01-01')"
+            )
+            connection.execute(
+                "INSERT INTO runs "
+                "(id, project_id, status, phase, repair_round, agent_framework, "
+                "created_at, updated_at) VALUES "
+                "('run-pi', 'project-1', 'queued', 'queued', 0, 'pi', "
+                "'2026-01-01', '2026-01-01')"
+            )
+            connection.commit()
+
+        await database.upgrade()
+        assert await database.current_revision() == HEAD_REVISION
+    finally:
+        await database.dispose()
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT agent_framework FROM runs WHERE id = 'run-pi'"
+        ).fetchone() == ("pi",)
+        connection.execute(
+            "INSERT INTO runs "
+            "(id, project_id, status, phase, repair_round, agent_framework, "
+            "created_at, updated_at) VALUES "
+            "('run-codex', 'project-1', 'queued', 'queued', 0, 'codex', "
+            "'2026-01-02', '2026-01-02')"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO runs "
+                "(id, project_id, status, phase, repair_round, agent_framework, "
+                "created_at, updated_at) VALUES "
+                "('run-unknown', 'project-1', 'queued', 'queued', 0, 'unknown', "
+                "'2026-01-03', '2026-01-03')"
+            )
+
+
+@pytest.mark.asyncio
 async def test_unversioned_p0_database_is_fingerprinted_stamped_and_preserved(
     tmp_path: Path,
 ) -> None:

@@ -39,6 +39,7 @@ from fomo.runtime_contract import (
     RuntimeContract,
     resolve_runtime_contract,
     runtime_contract_from_storage,
+    validate_agent_framework_runtime,
 )
 from fomo.schemas import (
     ARTIFACT_KIND_TO_ROLE,
@@ -744,6 +745,11 @@ class Repository:
                     )
 
             frozen_runtime = runtime_contract or resolve_runtime_contract()
+            validate_agent_framework_runtime(
+                frozen_agent_framework,
+                frozen_runtime.profile_id,
+                frozen_runtime.thinking,
+            )
             run_id = uuid7()
             run = RunRecord(
                 id=run_id,

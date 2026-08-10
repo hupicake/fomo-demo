@@ -7,6 +7,7 @@ FROM node:22-bookworm-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0
 ARG PNPM_VERSION=10.17.1
 ARG PI_VERSION=0.84.1
 ARG OPENCODE_VERSION=1.18.16
+ARG CODEX_VERSION=0.147.0
 
 ENV PNPM_HOME=/opt/fomo/pnpm \
     npm_config_store_dir=/opt/fomo/pnpm/store \
@@ -33,14 +34,17 @@ RUN apt-get update \
         ca-certificates \
         curl \
         git \
+        ripgrep \
     && node -e 'const [major, minor] = process.versions.node.split(".").map(Number); if (major < 22 || (major === 22 && minor < 19)) process.exit(1)' \
-    && mkdir -p /workspace "${PNPM_HOME}" "${COREPACK_HOME}" /opt/fomo/bin /var/lib/fomo-pi /var/lib/fomo-opencode \
+    && mkdir -p /workspace "${PNPM_HOME}" "${COREPACK_HOME}" /opt/fomo/bin /var/lib/fomo-pi /var/lib/fomo-opencode /var/lib/fomo-codex \
     && corepack enable \
     && corepack prepare "pnpm@${PNPM_VERSION}" --activate \
     && npm install --global --ignore-scripts "@earendil-works/pi-coding-agent@${PI_VERSION}" \
     && npm install --global "opencode-ai@${OPENCODE_VERSION}" "@opencode-ai/sdk@${OPENCODE_VERSION}" \
+    && npm install --global "@openai/codex@${CODEX_VERSION}" \
     && /opt/fomo/pi/bin/pi --version \
     && /opt/fomo/pi/bin/opencode --version \
+    && /opt/fomo/pi/bin/codex --version \
     && node -e 'import("/opt/fomo/pi/lib/node_modules/@opencode-ai/sdk/dist/v2/index.js").then(() => process.exit(0), () => process.exit(1))' \
     && pnpm dlx playwright@1.55.1 install --with-deps chromium \
     # Fixed toolchain directories are root-owned and read-only: PNPM_HOME
@@ -53,8 +57,8 @@ RUN apt-get update \
     # parent dirs are locked so the parent stays non-writable.
     && chown -R root:root /opt/fomo/pi /opt/fomo/bin "${PNPM_HOME}" "${COREPACK_HOME}" /ms-playwright \
     && chmod -R a-w /opt/fomo/pi /opt/fomo/bin "${PNPM_HOME}" "${COREPACK_HOME}" /ms-playwright \
-    && chown -R node:node /workspace /var/lib/fomo-pi /var/lib/fomo-opencode \
-    && chmod 0700 /var/lib/fomo-pi /var/lib/fomo-opencode \
+    && chown -R node:node /workspace /var/lib/fomo-pi /var/lib/fomo-opencode /var/lib/fomo-codex \
+    && chmod 0700 /var/lib/fomo-pi /var/lib/fomo-opencode /var/lib/fomo-codex \
     && chown -R node:node "${npm_config_store_dir}" \
     && chmod -R u+rwX "${npm_config_store_dir}" \
     && rm -rf /var/lib/apt/lists/*
@@ -64,6 +68,8 @@ RUN apt-get update \
 # the unprivileged node user.
 COPY --chown=root:root fomo-pi-rpc-bridge.mjs /opt/fomo/bin/fomo-pi-rpc-bridge.mjs
 COPY --chown=root:root fomo-opencode-rpc-bridge.mjs /opt/fomo/bin/fomo-opencode-rpc-bridge.mjs
+COPY --chown=root:root fomo-codex-rpc-bridge.mjs /opt/fomo/bin/fomo-codex-rpc-bridge.mjs
+COPY --chown=root:root fomo-codex-models.json /opt/fomo/bin/fomo-codex-models.json
 COPY --chown=root:root fomo-runtime-preflight.mjs /opt/fomo/bin/fomo-runtime-preflight.mjs
 COPY --chown=root:root fomo-structured-output.ts /opt/fomo/bin/fomo-structured-output.ts
 COPY --chown=root:root fomo-request-user-input.ts /opt/fomo/bin/fomo-request-user-input.ts
@@ -73,6 +79,8 @@ COPY --chown=root:root fomo-delegate-readonly-guard.ts /opt/fomo/bin/fomo-delega
 RUN chmod 0555 \
     /opt/fomo/bin/fomo-pi-rpc-bridge.mjs \
     /opt/fomo/bin/fomo-opencode-rpc-bridge.mjs \
+    /opt/fomo/bin/fomo-codex-rpc-bridge.mjs \
+    /opt/fomo/bin/fomo-codex-models.json \
     /opt/fomo/bin/fomo-runtime-preflight.mjs \
     /opt/fomo/bin/fomo-structured-output.ts \
     /opt/fomo/bin/fomo-request-user-input.ts \

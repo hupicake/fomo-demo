@@ -236,8 +236,6 @@ class PiRequest:
             raise ValueError(f"grace_seconds must be between 1 and {MAX_GRACE_SECONDS}")
         schema, _encoded = _canonical_structured_output_schema(self.structured_output_schema)
         object.__setattr__(self, "structured_output_schema", schema)
-        if self.require_resume and not self.user_input_enabled:
-            raise ValueError("require_resume requires the user-input continuation tool")
 
 
 @dataclass(frozen=True, slots=True)

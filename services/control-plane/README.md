@@ -1,7 +1,7 @@
 # FOMO Control Plane
 
 FastAPI control plane plus an independent durable worker for FOMO's coding
-agent runtimes. Each run freezes `pi` or `opencode`; both execute inside an
+agent runtimes. Each run freezes `pi`, `opencode`, or `codex`; all execute inside an
 OpenSandbox generation sandbox and reuse the same GoalGraph, safety audit,
 clean verification and publication pipeline. The runtime contains the **P0 Pi
 baseline** and the **P1-A GoalGraph vertical slice**.
@@ -22,7 +22,7 @@ run in the worker through a `SandboxProvider`.
 
 ## Runtime
 
-- `FOMO_AGENT_ENABLED_FRAMEWORKS` controls the `pi,opencode` allowlist and
+- `FOMO_AGENT_ENABLED_FRAMEWORKS` controls the `pi,opencode,codex` allowlist and
   `FOMO_AGENT_DEFAULT_FRAMEWORK` controls the default. The browser submits a
   public framework id; the server freezes it on the Run and workers fail closed
   if the selected adapter is unavailable.
@@ -30,6 +30,10 @@ run in the worker through a `SandboxProvider`.
   SDK server. Its bridge maps sessions, structured planning, tools, usage and
   cancellation into FOMO's durable event contract; OpenSandbox remains the
   hard process/filesystem boundary.
+- Codex CLI is pinned in the same sandbox image and accessed through its JSONL
+  `exec`/`resume` protocol. The server only permits GPT-5.5 or GPT-5.6 profiles;
+  a root-owned adapter maps its session, tool and usage events into the same
+  durable contract without exposing provider credentials.
 
 - Python is pinned to **3.11** (`>=3.11,<3.12`).
 - Direct Pi model egress goes through LiteLLM with a per-run opaque virtual

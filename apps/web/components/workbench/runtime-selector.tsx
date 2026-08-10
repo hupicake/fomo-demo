@@ -1,6 +1,7 @@
 "use client";
 
 import { BotIcon, CpuIcon } from "lucide-react";
+import { useEffect } from "react";
 
 import {
   PromptInputSelect,
@@ -59,13 +60,86 @@ export function RuntimeSelector({
 }) {
   const frameworks = options?.agentFrameworks ?? [];
   const profiles = options?.profiles ?? [];
+  const selectedFrameworkOption = frameworks.find(
+    (framework) => framework.id === selectedAgentFramework,
+  );
+  const compatibleProfileIds = selectedFrameworkOption?.compatibleProfileIds ?? [];
+  const visibleProfiles = compatibleProfileIds.length > 0
+    ? profiles.filter((profile) => compatibleProfileIds.includes(profile.profileId))
+    : profiles;
   const selectedProfile = findRuntimeProfile(options, selectedProfileId);
-  const thinkingLevels = selectedProfile?.thinkingLevels ?? [];
+  const frameworkThinkingLevels = selectedFrameworkOption?.compatibleThinkingLevels;
+  const thinkingLevels = (selectedProfile?.thinkingLevels ?? []).filter(
+    (level) => frameworkThinkingLevels == null || frameworkThinkingLevels.includes(level),
+  );
+
+  useEffect(() => {
+    if (!selectedFrameworkOption?.available) return;
+    const allowedProfiles = profiles.filter(
+      (profile) => profile.available && (
+        selectedFrameworkOption.compatibleProfileIds.length === 0
+        || selectedFrameworkOption.compatibleProfileIds.includes(profile.profileId)
+      ),
+    );
+    const profile = allowedProfiles.find((candidate) => candidate.profileId === selectedProfileId)
+      ?? allowedProfiles.find((candidate) => candidate.profileId === options?.defaultProfileId)
+      ?? allowedProfiles[0];
+    if (!profile) return;
+    if (profile.profileId !== selectedProfileId) onSelectProfile(profile.profileId);
+
+    const allowedThinking = profile.thinkingLevels.filter(
+      (level) => selectedFrameworkOption.compatibleThinkingLevels == null
+        || selectedFrameworkOption.compatibleThinkingLevels.includes(level),
+    );
+    const thinking = allowedThinking.includes(selectedThinking ?? "")
+      ? selectedThinking
+      : allowedThinking.includes(profile.defaultThinking)
+        ? profile.defaultThinking
+        : allowedThinking[0];
+    if (thinking && thinking !== selectedThinking) onSelectThinking(thinking);
+  }, [
+    onSelectProfile,
+    onSelectThinking,
+    options?.defaultProfileId,
+    profiles,
+    selectedFrameworkOption,
+    selectedProfileId,
+    selectedThinking,
+  ]);
+
+  const selectFramework = (frameworkId: AgentFrameworkId) => {
+    const framework = frameworks.find((candidate) => candidate.id === frameworkId);
+    onSelectAgentFramework(frameworkId);
+    if (!framework) return;
+
+    const allowedProfiles = profiles.filter(
+      (profile) => profile.available && (
+        framework.compatibleProfileIds.length === 0
+        || framework.compatibleProfileIds.includes(profile.profileId)
+      ),
+    );
+    const profile = allowedProfiles.find((candidate) => candidate.profileId === selectedProfileId)
+      ?? allowedProfiles.find((candidate) => candidate.profileId === options?.defaultProfileId)
+      ?? allowedProfiles[0];
+    if (!profile) return;
+    if (profile.profileId !== selectedProfileId) onSelectProfile(profile.profileId);
+
+    const allowedThinking = profile.thinkingLevels.filter(
+      (level) => framework.compatibleThinkingLevels == null
+        || framework.compatibleThinkingLevels.includes(level),
+    );
+    const thinking = allowedThinking.includes(selectedThinking ?? "")
+      ? selectedThinking
+      : allowedThinking.includes(profile.defaultThinking)
+        ? profile.defaultThinking
+        : allowedThinking[0];
+    if (thinking && thinking !== selectedThinking) onSelectThinking(thinking);
+  };
   return (
     <div className="flex min-w-0 flex-wrap items-center gap-1">
       <PromptInputSelect
         disabled={disabled || frameworks.length === 0}
-        onValueChange={(value) => onSelectAgentFramework(value as AgentFrameworkId)}
+        onValueChange={(value) => selectFramework(value as AgentFrameworkId)}
         value={selectedAgentFramework ?? ""}
       >
         <PromptInputSelectTrigger
@@ -92,7 +166,7 @@ export function RuntimeSelector({
         </PromptInputSelectContent>
       </PromptInputSelect>
       <PromptInputSelect
-        disabled={disabled || profiles.length === 0}
+        disabled={disabled || visibleProfiles.length === 0}
         onValueChange={onSelectProfile}
         value={selectedProfileId ?? ""}
       >
@@ -105,7 +179,7 @@ export function RuntimeSelector({
           <PromptInputSelectValue placeholder="选择模型" />
         </PromptInputSelectTrigger>
         <PromptInputSelectContent>
-          {profiles.map((profile) => (
+          {visibleProfiles.map((profile) => (
             <PromptInputSelectItem
               disabled={!profile.available}
               key={profile.profileId}
@@ -145,7 +219,11 @@ export function RuntimeSelector({
 
 /** Read-only presentation of the resolved run contract, shown after creation. */
 export function RuntimeBadge({ agentFramework, profileLabel, runtime }: { agentFramework?: AgentFrameworkId; profileLabel: string; runtime: RunRuntimeResponse }) {
-  const frameworkLabel = agentFramework === "opencode" ? "OpenCode" : "Pi";
+  const frameworkLabel = agentFramework === "opencode"
+    ? "OpenCode"
+    : agentFramework === "codex"
+      ? "Codex"
+      : "Pi";
   const detail = `${frameworkLabel} · ${profileLabel} · 思考 ${thinkingLabel(runtime.thinking)} · 上下文 ${formatTokenBudget(runtime.contextWindow)}`;
   return (
     <span

@@ -14,6 +14,13 @@ def test_agent_framework_allowlist_defaults_and_legacy_environment_mapping(monke
     assert defaults.agent_enabled_frameworks == ("pi", "opencode")
     assert defaults.agent_default_framework == "pi"
 
+    codex_rollout = Settings(
+        agent_enabled_frameworks=("pi", "codex"),
+        agent_default_framework="codex",
+    )
+    assert codex_rollout.agent_enabled_frameworks == ("pi", "codex")
+    assert codex_rollout.agent_default_framework == "codex"
+
     monkeypatch.setenv("AGENT_FRAMEWORK", "opencode")
     from_legacy_switch = Settings.from_env()
     assert from_legacy_switch.agent_framework == "direct_pi"

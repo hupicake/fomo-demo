@@ -17,6 +17,7 @@ from uuid import UUID
 
 from fomo.agent_framework import (
     DEFAULT_AGENT_FRAMEWORK,
+    DEFAULT_ENABLED_AGENT_FRAMEWORKS,
     legacy_framework_mode,
     parse_enabled_agent_frameworks,
     public_framework_from_legacy,
@@ -275,7 +276,9 @@ class Settings:
     runtime_default_profile: str = DEFAULT_PROFILE_ID
     # Public, per-run Coding Agent choices. These identifiers are frozen on a
     # run and are independent from the retired process-wide compatibility mode.
-    agent_enabled_frameworks: tuple[str, ...] = ("pi", "opencode")
+    # Codex is supported by the public contract but remains an explicit rollout
+    # choice until its transport is configured in the worker.
+    agent_enabled_frameworks: tuple[str, ...] = DEFAULT_ENABLED_AGENT_FRAMEWORKS
     agent_default_framework: str = DEFAULT_AGENT_FRAMEWORK
     # Direct Pi receives only a short-lived LiteLLM virtual key. The master key
     # stays in the control plane and provider credentials stay inside LiteLLM.

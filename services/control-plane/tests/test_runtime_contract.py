@@ -3,10 +3,13 @@ from __future__ import annotations
 import pytest
 
 from fomo.runtime_contract import (
+    CODEX_COMPATIBLE_PROFILE_IDS,
     PREVIOUS_RUNTIME_POLICY_VERSION,
     RuntimeContractError,
+    compatible_profile_ids_for_agent_framework,
     resolve_runtime_contract,
     runtime_contract_from_storage,
+    validate_agent_framework_runtime,
 )
 
 
@@ -63,3 +66,17 @@ def test_historical_runtime_v1_integer_budget_remains_readable() -> None:
             policy_version="direct-pi-runtime-v2",
             run_max_tokens=600_000,
         )
+
+
+def test_codex_runtime_compatibility_is_a_closed_gpt_only_contract() -> None:
+    assert compatible_profile_ids_for_agent_framework("codex") == (
+        CODEX_COMPATIBLE_PROFILE_IDS
+    )
+    validate_agent_framework_runtime("codex", "gpt-5.6", "xhigh")
+
+    with pytest.raises(RuntimeContractError, match="requires a GPT"):
+        validate_agent_framework_runtime("codex", "deepseek-flash", "high")
+    with pytest.raises(RuntimeContractError, match="thinking level"):
+        validate_agent_framework_runtime("codex", "gpt-5.6", "off")
+    with pytest.raises(RuntimeContractError, match="pi, opencode, or codex"):
+        compatible_profile_ids_for_agent_framework("unknown")

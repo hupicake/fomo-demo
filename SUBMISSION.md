@@ -1,6 +1,6 @@
 # FOMO Demo — 交付总结
 
-FOMO 是一个本地运行的 AI Coding Agent 工作台：用户登录后输入产品需求并选择模型，控制面驱动 Pi 在 OpenSandbox 中规划、开发和修复，再由独立干净沙箱执行确定性验收，最终保存版本并提供可交互 Preview。
+FOMO 是一个 AI Coding Agent 工作台：用户登录后输入产品需求，可为每次任务选择 Pi、OpenCode 或 Codex CLI 以及兼容模型。控制面在 OpenSandbox 中统一驱动规划、开发和修复，再由独立干净沙箱执行确定性验收，最终保存版本并提供可交互 Preview。
 
 ## 交付入口
 

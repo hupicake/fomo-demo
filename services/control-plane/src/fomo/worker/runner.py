@@ -22,6 +22,7 @@ from fomo.direct_pi import DirectPiOrchestrator
 from fomo.direct_pi.failures import CODING_AGENT_FAILED
 from fomo.fomo_pi_ds import (
     LiteLLMRunKeyClient,
+    OpenSandboxCodexTransport,
     OpenSandboxOpenCodeTransport,
     OpenSandboxPiTransport,
 )
@@ -143,6 +144,12 @@ class WorkerRunner:
                     transports["pi"] = pi_transport
                 if "opencode" in enabled_frameworks:
                     transports["opencode"] = OpenSandboxOpenCodeTransport(
+                        self.sandbox,
+                        default_timeout_seconds=settings.opensandbox_lifetime_seconds,
+                        stderr_limit_bytes=settings.command_output_limit_bytes,
+                    )
+                if "codex" in enabled_frameworks:
+                    transports["codex"] = OpenSandboxCodexTransport(
                         self.sandbox,
                         default_timeout_seconds=settings.opensandbox_lifetime_seconds,
                         stderr_limit_bytes=settings.command_output_limit_bytes,

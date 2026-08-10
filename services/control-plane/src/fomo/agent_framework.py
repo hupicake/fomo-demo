@@ -11,10 +11,15 @@ from typing import Generic, Protocol, TypeVar, cast
 class AgentFramework(StrEnum):
     pi = "pi"
     opencode = "opencode"
+    codex = "codex"
 
 
 SUPPORTED_AGENT_FRAMEWORKS = frozenset(framework.value for framework in AgentFramework)
 DEFAULT_AGENT_FRAMEWORK = AgentFramework.pi.value
+DEFAULT_ENABLED_AGENT_FRAMEWORKS = (
+    AgentFramework.pi.value,
+    AgentFramework.opencode.value,
+)
 
 
 def parse_enabled_agent_frameworks(
@@ -23,7 +28,7 @@ def parse_enabled_agent_frameworks(
     """Parse a deployment allowlist and reject empty or unknown identifiers."""
 
     if values is None:
-        candidates = [framework.value for framework in AgentFramework]
+        candidates = list(DEFAULT_ENABLED_AGENT_FRAMEWORKS)
     elif isinstance(values, str):
         candidates = [part.strip().lower() for part in values.split(",")]
     else:
@@ -76,7 +81,7 @@ def normalize_agent_framework(value: object) -> str:
         raise ValueError("run agent framework must be a string")
     framework = value.strip().lower()
     if framework not in SUPPORTED_AGENT_FRAMEWORKS:
-        raise ValueError("run agent framework must be pi or opencode")
+        raise ValueError("run agent framework must be pi, opencode, or codex")
     return framework
 
 

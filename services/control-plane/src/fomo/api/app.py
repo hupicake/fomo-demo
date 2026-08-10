@@ -34,11 +34,15 @@ from fomo.persistence import (
     Repository,
 )
 from fomo.runtime_contract import (
+    CODEX_COMPATIBLE_THINKING_LEVELS,
     DEFAULT_PROFILE_ID,
     RUNTIME_PROFILES,
     RuntimeContractError,
+    compatible_profile_ids_for_agent_framework,
     legacy_runtime_contract,
     resolve_runtime_contract,
+    validate_agent_framework_profile,
+    validate_agent_framework_runtime,
 )
 from fomo.schemas import (
     AgentFrameworkOption,
@@ -275,29 +279,63 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
                     disabled_reason=disabled_reason,
                 )
             )
+        enabled_profile_ids = set(settings.runtime_enabled_profiles)
+        framework_labels = {
+            AgentFramework.pi: "Pi",
+            AgentFramework.opencode: "OpenCode",
+            AgentFramework.codex: "Codex",
+        }
+        framework_options: list[AgentFrameworkOption] = []
+        for framework in AgentFramework:
+            compatible_profile_ids = compatible_profile_ids_for_agent_framework(
+                framework.value
+            )
+            framework_configured = (
+                settings.agent_framework == "direct_pi"
+                and framework.value in settings.agent_enabled_frameworks
+            )
+            has_compatible_available_profile = bool(
+                compatible_profile_ids.intersection(available_profiles)
+            )
+            framework_available = (
+                framework_configured and has_compatible_available_profile
+            )
+            if not framework_configured:
+                framework_disabled_reason = "Not enabled by the server."
+            elif not discovery_succeeded:
+                framework_disabled_reason = (
+                    "Model availability could not be verified."
+                )
+            elif not has_compatible_available_profile:
+                framework_disabled_reason = (
+                    "No compatible runtime profile is available."
+                )
+            else:
+                framework_disabled_reason = None
+            framework_options.append(
+                AgentFrameworkOption(
+                    id=framework,
+                    label=framework_labels[framework],
+                    compatible_profile_ids=[
+                        profile.profile_id
+                        for profile in RUNTIME_PROFILES
+                        if profile.profile_id in enabled_profile_ids
+                        and profile.profile_id in compatible_profile_ids
+                    ],
+                    compatible_thinking_levels=(
+                        list(CODEX_COMPATIBLE_THINKING_LEVELS)
+                        if framework is AgentFramework.codex
+                        else None
+                    ),
+                    available=framework_available,
+                    disabled_reason=framework_disabled_reason,
+                )
+            )
         return RuntimeOptionsResponse(
             default_profile_id=default_profile_id,
             profiles=options,
             default_agent_framework=AgentFramework(settings.agent_default_framework),
-            agent_frameworks=[
-                AgentFrameworkOption(
-                    id=framework,
-                    label="Pi" if framework is AgentFramework.pi else "OpenCode",
-                    available=(
-                        settings.agent_framework == "direct_pi"
-                        and framework.value in settings.agent_enabled_frameworks
-                    ),
-                    disabled_reason=(
-                        None
-                        if (
-                            settings.agent_framework == "direct_pi"
-                            and framework.value in settings.agent_enabled_frameworks
-                        )
-                        else "Not enabled by the server."
-                    ),
-                )
-                for framework in AgentFramework
-            ],
+            agent_frameworks=framework_options,
         )
 
     @app.post(
@@ -457,6 +495,15 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
                     status_code=422,
                     detail="runtime selection requires the Direct Pi framework",
                 )
+            legacy_runtime = legacy_runtime_contract()
+            try:
+                validate_agent_framework_runtime(
+                    selected_agent_framework,
+                    legacy_runtime.profile_id,
+                    legacy_runtime.thinking,
+                )
+            except RuntimeContractError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
             message, run, created = await repository.create_message_and_run(
                 project_id,
                 owner_session_id,
@@ -464,29 +511,50 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
                 payload.content,
                 payload.base_version_id,
                 agent_framework=selected_agent_framework,
-                runtime_contract=legacy_runtime_contract(),
+                runtime_contract=legacy_runtime,
                 enforce_agent_framework_match=(
                     "agent_framework" in payload.model_fields_set
                 ),
             )
             response.status_code = status.HTTP_202_ACCEPTED if created else status.HTTP_200_OK
             return MessageRunResponse(message=message, run=run)
+        try:
+            compatible_profile_ids = compatible_profile_ids_for_agent_framework(
+                selected_agent_framework
+            )
+            if payload.profile_id is not None:
+                validate_agent_framework_profile(
+                    selected_agent_framework,
+                    payload.profile_id,
+                )
+        except RuntimeContractError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         available_profiles, discovery_succeeded = await runtime_availability()
+        compatible_available_profiles = available_profiles.intersection(
+            compatible_profile_ids
+        )
         selected_profile = payload.profile_id
         if selected_profile is None:
-            if settings.runtime_default_profile in available_profiles:
+            if settings.runtime_default_profile in compatible_available_profiles:
                 selected_profile = settings.runtime_default_profile
-            elif DEFAULT_PROFILE_ID in available_profiles:
+            elif DEFAULT_PROFILE_ID in compatible_available_profiles:
                 selected_profile = DEFAULT_PROFILE_ID
             else:
-                selected_profile = min(available_profiles, default=None)
+                selected_profile = next(
+                    (
+                        profile.profile_id
+                        for profile in RUNTIME_PROFILES
+                        if profile.profile_id in compatible_available_profiles
+                    ),
+                    None,
+                )
         if selected_profile is None:
             raise HTTPException(
                 status_code=503,
                 detail=(
                     "runtime model availability could not be verified"
                     if not discovery_succeeded
-                    else "no runtime profile is available"
+                    else "no compatible runtime profile is available"
                 ),
             )
         if selected_profile not in settings.runtime_enabled_profiles:
@@ -504,6 +572,11 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
                 payload.thinking,
                 inference_tpm_limit=settings.run_inference_tpm_limit,
                 max_spend_micros=int(settings.run_max_spend * 1_000_000),
+            )
+            validate_agent_framework_runtime(
+                selected_agent_framework,
+                runtime_contract.profile_id,
+                runtime_contract.thinking,
             )
         except RuntimeContractError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc

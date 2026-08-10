@@ -617,7 +617,7 @@ describe("run presentation reducer", () => {
 
     expect(state.worklog.at(-1)).toEqual(expect.objectContaining({
       title: "Coding Agent 运行环境问题",
-      detail: "Coding Agent 运行环境暂时不可用，请重试；若问题持续发生，请检查 OpenCode 服务状态。",
+      detail: "Coding Agent 运行环境暂时不可用，请重试；若问题持续发生，请检查所选 Agent 框架状态。",
     }));
     expect(JSON.stringify(state)).not.toContain("private-value");
   });
