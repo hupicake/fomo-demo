@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
+from fomo.agent_framework import AgentFramework
 from fomo.runtime_contract import (
     DEFAULT_PROFILE_ID,
     DEFAULT_THINKING,
@@ -569,6 +570,7 @@ class MessageCreate(SchemaModel):
     attachments: list[dict[str, Any]] = Field(default_factory=list, max_length=0)
     profile_id: str | None = Field(default=None, min_length=1, max_length=64)
     thinking: str | None = Field(default=None, min_length=1, max_length=32)
+    agent_framework: AgentFramework | None = None
 
     @model_validator(mode="after")
     def _supported_runtime(self) -> MessageCreate:
@@ -706,9 +708,18 @@ class RuntimeProfileOption(SchemaModel):
         return self
 
 
+class AgentFrameworkOption(SchemaModel):
+    id: AgentFramework
+    label: str
+    available: bool
+    disabled_reason: str | None = None
+
+
 class RuntimeOptionsResponse(SchemaModel):
     default_profile_id: str | None
     profiles: list[RuntimeProfileOption]
+    default_agent_framework: AgentFramework
+    agent_frameworks: list[AgentFrameworkOption]
 
 
 class RunResponse(SchemaModel):
@@ -724,6 +735,7 @@ class RunResponse(SchemaModel):
     preview_url: str | None = None
     pending_input_request: UserInputRequestResponse | None = None
     execution_started_at: datetime | None = None
+    agent_framework: AgentFramework = AgentFramework.pi
     runtime: RunRuntimeResponse = Field(default_factory=_legacy_run_runtime_response)
     created_at: datetime
     updated_at: datetime

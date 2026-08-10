@@ -23,6 +23,8 @@ x-control-plane-environment: &control-plane-environment
   RUN_INFERENCE_TPM_LIMIT: ${RUN_INFERENCE_TPM_LIMIT:-1250000}
   FOMO_RUNTIME_ENABLED_PROFILES: ${FOMO_RUNTIME_ENABLED_PROFILES:-deepseek-flash}
   FOMO_RUNTIME_DEFAULT_PROFILE: ${FOMO_RUNTIME_DEFAULT_PROFILE:-deepseek-flash}
+  FOMO_AGENT_ENABLED_FRAMEWORKS: ${FOMO_AGENT_ENABLED_FRAMEWORKS:-pi,opencode}
+  FOMO_AGENT_DEFAULT_FRAMEWORK: ${FOMO_AGENT_DEFAULT_FRAMEWORK:-pi}
   MODEL_PM: ${MODEL_PM:-pm}
   MODEL_ARCHITECT: ${MODEL_ARCHITECT:-architect}
   MODEL_ENGINEER: ${MODEL_ENGINEER:-engineer}
@@ -37,6 +39,7 @@ x-control-plane-environment: &control-plane-environment
   OPENSANDBOX_LIFETIME_SECONDS: ${OPENSANDBOX_LIFETIME_SECONDS:-21600}
   OPENSANDBOX_READY_TIMEOUT_SECONDS: ${OPENSANDBOX_READY_TIMEOUT_SECONDS:-120}
   VERIFIED_PREVIEW_LIFETIME_SECONDS: ${VERIFIED_PREVIEW_LIFETIME_SECONDS:-604800}
+  PUBLIC_PREVIEW_BASE_URL: ${PUBLIC_PREVIEW_BASE_URL:-}
   PUBLIC_PREVIEW_BASE_DOMAIN: ${PUBLIC_PREVIEW_BASE_DOMAIN:-}
   PI_CONTEXT_WINDOW: ${PI_CONTEXT_WINDOW:-200000}
   # Generated-code sandboxes never inherit generic container proxy variables.
@@ -261,10 +264,9 @@ services:
       start_period: 10s
     restart: unless-stopped
 
-  # Optional host-based proxy for verified generated previews. A named
-  # wildcard DNS/TLS ingress should route *.PUBLIC_PREVIEW_BASE_DOMAIN here;
-  # the gateway itself stays bound to loopback and never receives the Docker
-  # socket or forwards account/model credentials into generated applications.
+  # Optional verified-preview proxy. It supports either an isolated wildcard
+  # host or the same-origin /preview path; it never receives model/object-store
+  # credentials or forwards account cookies into generated applications.
   preview-gateway:
     profiles: ["public-preview"]
     image: fomo-control-plane:local
@@ -274,11 +276,12 @@ services:
     # it must never receive model, object-store, or Redis credentials.
     environment:
       DATABASE_URL: ${DATABASE_URL_DOCKER:-postgresql+asyncpg://fomo:fomo-local-only@postgres:5432/fomo}
+      APP_ENV: ${APP_ENV:-development}
+      WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost:3000}
       OPENSANDBOX_BASE_URL: ${OPENSANDBOX_BASE_URL_DOCKER:-http://opensandbox:8080}
       OPENSANDBOX_API_KEY: ${OPENSANDBOX_API_KEY:-fomo-opensandbox-local-development-only}
-      # Local profile placeholder only.  It must not share the localhost site
-      # with WEB_ORIGIN; production supplies a real independent preview root.
-      PUBLIC_PREVIEW_BASE_DOMAIN: ${PUBLIC_PREVIEW_BASE_DOMAIN:-fomo-previews.test}
+      PUBLIC_PREVIEW_BASE_URL: ${PUBLIC_PREVIEW_BASE_URL:-}
+      PUBLIC_PREVIEW_BASE_DOMAIN: ${PUBLIC_PREVIEW_BASE_DOMAIN:-}
       PREVIEW_UPSTREAM_HOST_OVERRIDE: ${PREVIEW_UPSTREAM_HOST_OVERRIDE:-host.docker.internal}
       PREVIEW_GATEWAY_PORT: "8001"
     depends_on:
@@ -315,6 +318,7 @@ services:
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
         NEXT_PUBLIC_DEV_ACCOUNT_EMAIL: ${NEXT_PUBLIC_DEV_ACCOUNT_EMAIL:-dev@fomo.local}
         NEXT_PUBLIC_DEV_ACCOUNT_PASSWORD: ${NEXT_PUBLIC_DEV_ACCOUNT_PASSWORD:-fomo-dev-password}
+        PREVIEW_GATEWAY_INTERNAL_URL: ${PREVIEW_GATEWAY_INTERNAL_URL:-http://preview-gateway:8001}
         HTTP_PROXY: ${DOCKER_HTTP_PROXY:-}
         HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-}
         NO_PROXY: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,::1,postgres,redis,minio,minio-init,litellm,opensandbox,api,worker,web,api.deepseek.com}

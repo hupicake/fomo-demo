@@ -121,7 +121,19 @@ export interface RuntimeProfileOption {
   disabledReason?: string | null;
 }
 
+export const agentFrameworkIds = ["pi", "opencode"] as const;
+export type AgentFrameworkId = (typeof agentFrameworkIds)[number];
+
+export interface AgentFrameworkOption {
+  id: AgentFrameworkId;
+  label: string;
+  available: boolean;
+  disabledReason?: string | null;
+}
+
 export interface RuntimeOptionsResponse {
+  defaultAgentFramework: AgentFrameworkId | null;
+  agentFrameworks: AgentFrameworkOption[];
   defaultProfileId: string | null;
   profiles: RuntimeProfileOption[];
 }
@@ -152,6 +164,7 @@ export interface RunSnapshot {
   createdAt?: string;
   updatedAt?: string;
   pendingInputRequest?: UserInputRequest;
+  agentFramework?: AgentFrameworkId;
   runtime?: RunRuntimeResponse;
 }
 
@@ -387,6 +400,7 @@ export interface RunPresentation {
   goalGraph: GoalGraphProjection | null;
   contextUsage?: ContextUsageSnapshot;
   /** Immutable actual configuration, shown read-only after the run is created. */
+  agentFramework?: AgentFrameworkId;
   runtime?: RunRuntimeResponse;
   disconnected?: boolean;
 }

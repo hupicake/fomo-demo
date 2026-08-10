@@ -46,6 +46,7 @@ _RUNNER_PROBE = (
     "&& test -r /opt/fomo/runtime-cache/fomo-next-radix-v2/node_modules/next/package.json"
 )
 _NEXT_RUNTIME_PROBE = verification_module._NEXT_RUNTIME_PROBE
+_with_preview_asset_prefix = verification_module._with_preview_asset_prefix
 _WORKSPACE_NEXT = (
     "env PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin "
     "/usr/local/bin/node /workspace/node_modules/next/dist/bin/next"
@@ -241,6 +242,13 @@ def test_fixed_runner_contract_pins_absolute_wrappers_and_trusted_path() -> None
             "/opt/fomo/runtime-cache/fomo-next-radix-v2/node_modules/next/dist/bin/next"
             not in command
         )
+
+
+def test_preview_asset_prefix_wraps_only_path_mode_commands() -> None:
+    assert _with_preview_asset_prefix(_WORKSPACE_NEXT_BUILD, None) == _WORKSPACE_NEXT_BUILD
+    assert _with_preview_asset_prefix(
+        _WORKSPACE_NEXT_BUILD, "/preview/sandbox-id"
+    ) == f"FOMO_PREVIEW_ASSET_PREFIX=/preview/sandbox-id {_WORKSPACE_NEXT_BUILD}"
 
 
 async def _run_context(repository, message_id: str = "verify-test"):

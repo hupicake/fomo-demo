@@ -192,6 +192,114 @@ async def test_runtime_options_fail_closed_without_management_discovery(
 
 
 @pytest.mark.asyncio
+async def test_agent_framework_is_available_frozen_and_idempotent(
+    repository, settings
+) -> None:
+    configured = replace(
+        settings,
+        agent_enabled_frameworks=("pi", "opencode"),
+        agent_default_framework="opencode",
+    )
+    app = create_app(configured, repository)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        session_id = (await create_user_session(repository)).id
+        headers = _session_headers(configured, session_id)
+        project_id = (
+            await client.post(
+                "/v1/projects",
+                headers=headers,
+                json={"title": "Framework contract"},
+            )
+        ).json()["id"]
+
+        options = (await client.get("/v1/runtime/options")).json()
+        assert options["defaultAgentFramework"] == "opencode"
+        assert options["agentFrameworks"] == [
+            {
+                "id": "pi",
+                "label": "Pi",
+                "available": True,
+                "disabledReason": None,
+            },
+            {
+                "id": "opencode",
+                "label": "OpenCode",
+                "available": True,
+                "disabledReason": None,
+            },
+        ]
+
+        body = {
+            "clientMessageId": "framework-message",
+            "content": "Build with the configured framework",
+        }
+        created = await client.post(
+            f"/v1/projects/{project_id}/messages",
+            headers={**headers, "Idempotency-Key": "framework-message"},
+            json=body,
+        )
+        assert created.status_code == 202
+        run_id = created.json()["run"]["id"]
+        assert created.json()["run"]["agentFramework"] == "opencode"
+        assert await repository.get_run_agent_framework(run_id) == "opencode"
+
+        replay = await client.post(
+            f"/v1/projects/{project_id}/messages",
+            headers={**headers, "Idempotency-Key": "framework-message"},
+            json=body,
+        )
+        assert replay.status_code == 200
+        assert replay.json()["run"]["agentFramework"] == "opencode"
+
+        conflicting = await client.post(
+            f"/v1/projects/{project_id}/messages",
+            headers={**headers, "Idempotency-Key": "framework-message"},
+            json={**body, "agentFramework": "pi"},
+        )
+        assert conflicting.status_code == 409
+
+        disabled_app = create_app(
+            replace(
+                configured,
+                agent_enabled_frameworks=("pi",),
+                agent_default_framework="pi",
+            ),
+            repository,
+        )
+        disabled_client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=disabled_app),
+            base_url="http://test",
+        )
+        try:
+            disabled = await disabled_client.post(
+                f"/v1/projects/{project_id}/messages",
+                headers={**headers, "Idempotency-Key": "disabled-framework"},
+                json={
+                    "clientMessageId": "disabled-framework",
+                    "content": "Do not silently downgrade",
+                    "agentFramework": "opencode",
+                },
+            )
+            assert disabled.status_code == 422
+
+            unknown = await disabled_client.post(
+                f"/v1/projects/{project_id}/messages",
+                headers={**headers, "Idempotency-Key": "unknown-framework"},
+                json={
+                    "clientMessageId": "unknown-framework",
+                    "content": "Reject an unknown runtime",
+                    "agentFramework": "mystery",
+                },
+            )
+            assert unknown.status_code == 422
+        finally:
+            await disabled_client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_runtime_selection_uses_enabled_discovered_profile_and_replays_when_gateway_fails(
     repository, settings, monkeypatch
 ) -> None:

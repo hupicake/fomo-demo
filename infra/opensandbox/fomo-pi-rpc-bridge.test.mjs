@@ -18,6 +18,7 @@ const DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const BRIDGE = join(DIRECTORY, "fomo-pi-rpc-bridge.mjs");
 const EXTENSION = join(DIRECTORY, "fomo-structured-output.ts");
 const USER_INPUT_EXTENSION = join(DIRECTORY, "fomo-request-user-input.ts");
+const DELEGATE_EXTENSION = join(DIRECTORY, "fomo-delegate-subtasks.ts");
 
 const FAKE_PI = String.raw`#!/usr/bin/env node
 import { appendFileSync, readFileSync, statSync } from "node:fs";
@@ -44,7 +45,17 @@ const state = () => ({
   isStreaming: false,
   isCompacting: false,
 });
-const stats = () => ({
+let delegationDone = false;
+const stats = () => delegationDone ? ({
+  sessionId,
+  userMessages: 1,
+  assistantMessages: 1,
+  toolCalls: 1,
+  toolResults: 1,
+  totalMessages: 3,
+  tokens: { input: 30, output: 10, cacheRead: 3, cacheWrite: 1, total: 44 },
+  cost: 0.044,
+}) : ({
   sessionId,
   userMessages: 0,
   assistantMessages: 0,
@@ -106,7 +117,56 @@ process.stdin.on("data", (chunk) => {
           isError,
         });
       };
-      if (mode === "structured") {
+      const delegate = (invalid = false) => {
+        const tasks = [
+          { id: "architecture", task: "inspect private repository detail test-virtual-key" },
+          { id: "tests", task: "inspect independent tests" },
+        ];
+        const childUsage = [
+          {
+            input: 10, output: 4, cacheRead: 1, cacheWrite: 0, totalTokens: 15,
+            cost: { input: 0.01, output: 0.004, cacheRead: 0.001, cacheWrite: 0, total: 0.015 },
+            toolCalls: 2, turns: 1,
+          },
+          {
+            input: 20, output: 6, cacheRead: 2, cacheWrite: 1, totalTokens: 29,
+            cost: { input: 0.02, output: 0.006, cacheRead: 0.002, cacheWrite: 0.001, total: 0.029 },
+            toolCalls: 3, turns: 1,
+          },
+        ];
+        const aggregate = {
+          input: 30, output: 10, cacheRead: 3, cacheWrite: 1,
+          totalTokens: invalid ? 43 : 44,
+          cost: { input: 0.03, output: 0.01, cacheRead: 0.003, cacheWrite: 0.001, total: 0.044 },
+        };
+        send({ type: "tool_execution_start", toolCallId: "delegate-1", toolName: "delegate_subtasks", args: { tasks } });
+        send({
+          type: "tool_execution_update",
+          toolCallId: "delegate-1",
+          toolName: "delegate_subtasks",
+          args: { tasks },
+          partialResult: { content: [{ type: "text", text: "Read-only parallel research: 1/2 complete." }] },
+        });
+        send({
+          type: "tool_execution_end",
+          toolCallId: "delegate-1",
+          toolName: "delegate_subtasks",
+          isError: false,
+          result: {
+            content: [{ type: "text", text: "private child findings test-virtual-key" }],
+            details: {
+              schemaVersion: 1,
+              kind: "fomo.delegate_subtasks.result",
+              results: tasks.map((task, index) => ({ id: task.id, status: "succeeded", usage: childUsage[index] })),
+            },
+            usage: aggregate,
+          },
+        });
+        delegationDone = true;
+      };
+      if (mode === "delegate" || mode === "delegate-invalid") {
+        delegate(mode === "delegate-invalid");
+      } else if (mode === "structured") {
         submit("structured-1", output, false);
       } else if (mode === "structured-retry") {
         submit("structured-1", { answer: 42 }, true);
@@ -267,11 +327,17 @@ function runBridge({
   return { completed, records, argv, settings, stateEntries, sessionEntries };
 }
 
-test("non-planning mode keeps the native Pi tool contract", () => {
+test("non-planning mode adds only the trusted read-only delegation tool", () => {
   const { completed, records, argv, settings, stateEntries, sessionEntries } = runBridge();
   assert.equal(completed.status, 0, completed.stderr);
-  assert.equal(argv[argv.indexOf("--tools") + 1], "read,write,edit,bash,grep,find,ls");
-  assert.equal(argv.includes("--extension"), false);
+  assert.equal(
+    argv[argv.indexOf("--tools") + 1],
+    "read,write,edit,bash,grep,find,ls,delegate_subtasks",
+  );
+  assert.deepEqual(
+    argv.flatMap((value, index) => value === "--extension" ? [argv[index + 1]] : []),
+    [DELEGATE_EXTENSION],
+  );
   assert.equal(argv.includes("--no-extensions"), true);
   assert.equal(records.find((record) => record.type === "started").payload.contextWindow, 200_000);
   assert.deepEqual(settings, {
@@ -319,6 +385,52 @@ test("a silent but connected Pi stream stays alive until it settles", () => {
   assert.equal(records.at(-1).type, "completed");
 });
 
+test("delegation publishes bounded progress and preserves usage in parent stats", () => {
+  const { completed, records } = runBridge({ mode: "delegate" });
+
+  assert.equal(completed.status, 0, completed.stderr);
+  const start = records.find(
+    (record) => record.type === "pi.event" &&
+      record.payload.kind === "tool_start" &&
+      record.payload.toolName === "delegate_subtasks",
+  );
+  assert.deepEqual(start.payload.args, {
+    tasks: [{ id: "architecture" }, { id: "tests" }],
+  });
+  const output = records.find(
+    (record) => record.type === "pi.event" &&
+      record.payload.kind === "tool_output" &&
+      record.payload.toolName === "delegate_subtasks",
+  );
+  assert.equal(output.payload.text, "Read-only parallel research: 1/2 complete.");
+  assert.equal(JSON.stringify(records).includes("private repository detail"), false);
+  assert.equal(JSON.stringify(records).includes("private child findings"), false);
+  assert.equal(JSON.stringify(records).includes("test-virtual-key"), false);
+
+  const result = records.at(-1);
+  assert.equal(result.type, "completed");
+  assert.deepEqual(result.payload.stats.tokens, {
+    input: 30, output: 10, cacheRead: 3, cacheWrite: 1, total: 44,
+  });
+  assert.equal(result.payload.stats.cost, 0.044);
+  // Child activity is telemetry rather than fake persisted Pi session rows.
+  assert.equal(result.payload.stats.toolCalls, 1);
+  assert.deepEqual(result.payload.telemetry.delegation, {
+    requestedTasks: 2,
+    completedTasks: 2,
+    childTurns: 2,
+    childToolCalls: 5,
+  });
+});
+
+test("delegation fails closed when child and aggregate usage disagree", () => {
+  const { completed, records } = runBridge({ mode: "delegate-invalid" });
+
+  assert.notEqual(completed.status, 0);
+  assert.equal(records.at(-1).type, "failed");
+  assert.equal(records.at(-1).payload.code, "invalid_delegation");
+});
+
 test("user-input mode exposes one trusted terminating form and publishes a safe request", () => {
   const extensionSource = readFileSync(USER_INPUT_EXTENSION, "utf8");
   assert.match(extensionSource, /additionalProperties: false/);
@@ -339,9 +451,10 @@ test("user-input mode exposes one trusted terminating form and publishes a safe 
   assert.equal(completed.status, 0, completed.stderr);
   assert.equal(
     argv[argv.indexOf("--tools") + 1],
-    "read,write,edit,bash,grep,find,ls,request_user_input",
+    "read,write,edit,bash,grep,find,ls,delegate_subtasks,request_user_input",
   );
-  assert.equal(argv[argv.indexOf("--extension") + 1], USER_INPUT_EXTENSION);
+  const extensions = argv.flatMap((value, index) => value === "--extension" ? [argv[index + 1]] : []);
+  assert.deepEqual(extensions, [DELEGATE_EXTENSION, USER_INPUT_EXTENSION]);
   const toolEndIndex = records.findIndex(
     (record) => record.type === "pi.event" &&
       record.payload.kind === "tool_end" &&

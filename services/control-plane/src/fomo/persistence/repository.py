@@ -18,6 +18,7 @@ from sqlalchemy import and_, case, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from fomo.agent_framework import DEFAULT_AGENT_FRAMEWORK, AgentFramework
 from fomo.auth import hash_password, new_session_id, normalize_email, verify_password
 from fomo.direct_pi.failures import public_failure_for_code
 from fomo.direct_pi.goalgraph import (
@@ -358,6 +359,7 @@ def _run_response(
         execution_started_at=(
             _as_utc(record.execution_started_at) if record.execution_started_at else None
         ),
+        agent_framework=AgentFramework(record.agent_framework),
         runtime=RunRuntimeResponse(
             profile_id=record.runtime_profile_id,
             thinking=record.runtime_thinking,
@@ -685,10 +687,16 @@ class Repository:
         content: str,
         base_version_id: str | None = None,
         *,
+        agent_framework: AgentFramework | str = DEFAULT_AGENT_FRAMEWORK,
         runtime_contract: RuntimeContract | None = None,
         enforce_runtime_match: bool = False,
+        enforce_agent_framework_match: bool = False,
     ) -> tuple[MessageResponse, RunResponse, bool]:
         """Save a message and queued run atomically; duplicate client IDs are idempotent."""
+        try:
+            frozen_agent_framework = AgentFramework(agent_framework).value
+        except ValueError:
+            raise ValueError(f"unsupported agent framework: {agent_framework}") from None
         async with self.database.session_factory() as session:
             project = await self._require_project_in_session(session, project_id, owner_session_id)
             existing_message = await session.scalar(
@@ -713,6 +721,10 @@ class Repository:
                         enforce_runtime_match
                         and runtime_contract is not None
                         and _runtime_contract(existing_run) != runtime_contract
+                    )
+                    or (
+                        enforce_agent_framework_match
+                        and existing_run.agent_framework != frozen_agent_framework
                     )
                 ):
                     raise ConflictError(
@@ -740,6 +752,7 @@ class Repository:
                 status=RunStatus.queued.value,
                 phase=RunPhase.queued.value,
                 pi_session_id=f"fomo-{run_id}",
+                agent_framework=frozen_agent_framework,
                 runtime_profile_id=frozen_runtime.profile_id,
                 runtime_model_ref=frozen_runtime.model_ref,
                 runtime_thinking=frozen_runtime.thinking,
@@ -769,6 +782,7 @@ class Repository:
                 payload={
                     "messageId": message.id,
                     "baseVersionId": run.base_version_id,
+                    "agentFramework": frozen_agent_framework,
                     "profileId": frozen_runtime.profile_id,
                     "thinking": frozen_runtime.thinking,
                     "contextWindow": frozen_runtime.context_window,
@@ -880,6 +894,14 @@ class Repository:
             if record is None:
                 raise NotFoundError("run not found")
             return _runtime_contract(record)
+
+    async def get_run_agent_framework(self, run_id: str) -> str:
+        """Return the run's immutable, public Coding Agent framework."""
+        async with self.database.session_factory() as session:
+            record = await session.get(RunRecord, run_id)
+            if record is None:
+                raise NotFoundError("run not found")
+            return AgentFramework(record.agent_framework).value
 
     async def get_run_prompt(self, run_id: str) -> str:
         async with self.database.session_factory() as session:

@@ -39,6 +39,15 @@ def _config(
     )
 
 
+def _path_config() -> PreviewGatewayConfig:
+    return PreviewGatewayConfig(
+        base_url="https://app.example.test/preview",
+        opensandbox_base_url="http://opensandbox.test:8080",
+        opensandbox_api_key="server-secret",
+        upstream_host_override="host.docker.internal",
+    )
+
+
 def _target(sandbox_id: str, preview_url: str | None = None) -> VerifiedPreviewTarget:
     return VerifiedPreviewTarget(
         run_id=uuid7(),
@@ -46,6 +55,112 @@ def _target(sandbox_id: str, preview_url: str | None = None) -> VerifiedPreviewT
         sandbox_id=sandbox_id,
         preview_url=preview_url or f"https://{sandbox_id}.preview.example.test/",
     )
+
+
+@pytest.mark.asyncio
+async def test_path_gateway_strips_prefix_isolates_credentials_and_sandboxes_html(
+    repository,
+) -> None:
+    sandbox_id = str(uuid4())
+    public_url = f"https://app.example.test/preview/{sandbox_id}/"
+    repository.require_verified_preview_target = AsyncMock(
+        return_value=_target(sandbox_id, public_url)
+    )
+
+    async def outbound(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "opensandbox.test":
+            return httpx.Response(200, json={"endpoint": "localhost:55546"})
+        assert request.url.path == "/"
+        assert request.headers["host"] == "app.example.test"
+        assert request.headers["x-forwarded-proto"] == "https"
+        assert "cookie" not in request.headers
+        assert "authorization" not in request.headers
+        return httpx.Response(
+            200,
+            content=(
+                b'<link href="/_next/app.css"><script src=\'/_next/app.js\'></script>'
+                + f'<script src="/preview/{sandbox_id}/_next/already.js"></script>'.encode()
+                + b'<script>const untouched = \'src="/_next/not-an-attribute.js"\';</script>'
+            ),
+            headers={
+                "content-type": "text/html; charset=utf-8",
+                "set-cookie": "generated=secret",
+            },
+        )
+
+    outbound_client = httpx.AsyncClient(transport=httpx.MockTransport(outbound))
+    app = create_preview_gateway(
+        repository=repository,
+        config=_path_config(),
+        http_client=outbound_client,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="https://app.example.test",
+    ) as browser:
+        response = await browser.get(
+            f"/preview/{sandbox_id}/",
+            headers={"Cookie": "fomo_session=private", "Authorization": "Bearer private"},
+        )
+
+    assert response.status_code == 200
+    assert f'href="/preview/{sandbox_id}/_next/app.css"' in response.text
+    assert f"src='/preview/{sandbox_id}/_next/app.js'" in response.text
+    assert response.text.count(f"/preview/{sandbox_id}/_next/already.js") == 1
+    assert 'src="/_next/not-an-attribute.js"' in response.text
+    assert "set-cookie" not in response.headers
+    csp = response.headers["content-security-policy"]
+    assert "sandbox allow-scripts" in csp
+    assert "allow-same-origin" not in csp
+    assert f"connect-src {public_url}" in csp
+    assert "form-action 'none'" in csp
+    assert response.headers["cache-control"] == "private, no-store, max-age=0"
+    repository.require_verified_preview_target.assert_awaited_once_with(sandbox_id)
+    await outbound_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_path_gateway_requires_exact_published_url_and_rewrites_internal_location(
+    repository,
+) -> None:
+    sandbox_id = str(uuid4())
+    public_url = f"https://app.example.test/preview/{sandbox_id}/"
+    repository.require_verified_preview_target = AsyncMock(
+        side_effect=[
+            _target(sandbox_id, "https://app.example.test/preview/other/"),
+            _target(sandbox_id, public_url),
+        ]
+    )
+
+    async def outbound(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "opensandbox.test":
+            return httpx.Response(200, json={"endpoint": "localhost:55546"})
+        assert request.url.path == "/account"
+        return httpx.Response(
+            307,
+            headers={"location": "http://host.docker.internal:55546/login?next=%2F"},
+        )
+
+    outbound_client = httpx.AsyncClient(transport=httpx.MockTransport(outbound))
+    app = create_preview_gateway(
+        repository=repository,
+        config=_path_config(),
+        http_client=outbound_client,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="https://app.example.test",
+        follow_redirects=False,
+    ) as browser:
+        rejected = await browser.get(f"/preview/{sandbox_id}/account")
+        redirected = await browser.get(f"/preview/{sandbox_id}/account")
+
+    assert rejected.status_code == 404
+    assert redirected.status_code == 307
+    assert redirected.headers["location"] == (
+        f"https://app.example.test/preview/{sandbox_id}/login?next=%2F"
+    )
+    await outbound_client.aclose()
 
 
 @pytest.mark.asyncio

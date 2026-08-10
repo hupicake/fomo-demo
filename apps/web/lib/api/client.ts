@@ -1,10 +1,13 @@
 import {
+  agentFrameworkIds,
   toProjectStatus,
   toRunStatus,
   userInputRequestStages,
   userInputRequestStatuses,
 } from "@/lib/contracts";
 import type {
+  AgentFrameworkId,
+  AgentFrameworkOption,
   DomainEvent,
   FileContent,
   FileManifestEntry,
@@ -210,6 +213,9 @@ export function normalizeRun(value: unknown): RunSnapshot | undefined {
   }
   const pendingInputRequest = normalizeUserInputRequest(source.pendingInputRequest || source.pending_input_request);
   const runtime = normalizeRunRuntime(source.runtime);
+  const agentFramework = normalizeAgentFrameworkId(
+    source.agentFramework || source.agent_framework,
+  );
   return {
     id,
     projectId: text(source.projectId || source.project_id),
@@ -220,7 +226,29 @@ export function normalizeRun(value: unknown): RunSnapshot | undefined {
     createdAt: text(source.createdAt || source.created_at) || undefined,
     updatedAt: text(source.updatedAt || source.updated_at) || undefined,
     ...(pendingInputRequest ? { pendingInputRequest } : {}),
+    ...(agentFramework ? { agentFramework } : {}),
     ...(runtime ? { runtime } : {}),
+  };
+}
+
+function normalizeAgentFrameworkId(value: unknown): AgentFrameworkId | undefined {
+  const id = text(value);
+  return agentFrameworkIds.includes(id as AgentFrameworkId)
+    ? id as AgentFrameworkId
+    : undefined;
+}
+
+function normalizeAgentFramework(value: unknown): AgentFrameworkOption | undefined {
+  const source = record(value);
+  const id = normalizeAgentFrameworkId(source.id || source.agentFramework || source.agent_framework);
+  const label = text(source.label);
+  if (!id || !label) return undefined;
+  const disabledReason = text(source.disabledReason || source.disabled_reason) || undefined;
+  return {
+    id,
+    label,
+    available: Boolean(source.available),
+    ...(disabledReason ? { disabledReason } : {}),
   };
 }
 
@@ -435,8 +463,8 @@ export const controlPlane = {
 
   async startRun(
     projectId: string,
-    input: { clientMessageId: string; content: string; baseVersionId?: string; profileId?: string; thinking?: string },
-  ): Promise<{ runId: string; runtime?: RunRuntimeResponse }> {
+    input: { clientMessageId: string; content: string; baseVersionId?: string; agentFramework?: AgentFrameworkId; profileId?: string; thinking?: string },
+  ): Promise<{ runId: string; agentFramework?: AgentFrameworkId; runtime?: RunRuntimeResponse }> {
     // A message always carries attachments: []. The runtime selection is sent
     // only when the caller chose one; when omitted the server applies its own
     // default and the UI still renders the resolved contract from the response.
@@ -454,18 +482,42 @@ export const controlPlane = {
       throw new ApiProblem({ status: 502, title: "Control plane did not return a run ID" });
     }
     const runtime = normalizeRunRuntime(record(source.run).runtime);
-    return { runId, ...(runtime ? { runtime } : {}) };
+    const agentFramework = normalizeAgentFrameworkId(
+      record(source.run).agentFramework
+        || record(source.run).agent_framework
+        || source.agentFramework
+        || source.agent_framework,
+    );
+    return {
+      runId,
+      ...(agentFramework ? { agentFramework } : {}),
+      ...(runtime ? { runtime } : {}),
+    };
   },
 
   async getRuntimeOptions(): Promise<RuntimeOptionsResponse> {
     const response = await request<unknown>("/runtime/options");
     const source = record(response);
+    const defaultAgentFramework = normalizeAgentFrameworkId(
+      source.defaultAgentFramework || source.default_agent_framework,
+    ) || null;
+    const agentFrameworks = toArray(
+      source.agentFrameworks || source.agent_frameworks,
+    ).flatMap((item) => {
+      const framework = normalizeAgentFramework(item);
+      return framework ? [framework] : [];
+    });
     const defaultProfileId = text(source.defaultProfileId || source.default_profile_id) || null;
     const profiles = toArray(source.profiles || source.options).flatMap((item) => {
       const profile = normalizeRuntimeProfile(item);
       return profile ? [profile] : [];
     });
-    return { defaultProfileId: defaultProfileId || null, profiles };
+    return {
+      defaultAgentFramework,
+      agentFrameworks,
+      defaultProfileId: defaultProfileId || null,
+      profiles,
+    };
   },
 
   async answerRunInputRequest(

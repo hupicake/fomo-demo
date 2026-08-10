@@ -128,6 +128,30 @@ async def test_pi_failed_projects_only_a_closed_public_failure_contract() -> Non
     }
     assert "private-value" not in json.dumps(payload, ensure_ascii=False)
 
+    await writer(
+        PiBridgeEnvelope(
+            seq=5,
+            type="failed",
+            payload={
+                "code": "opencode_runtime_failed",
+                "phase": "running",
+                "message": "OpenCode SDK leaked api_key=private-value",
+            },
+        ),
+        stage="building",
+    )
+    _, runtime_payload = _persisted(repository)
+    assert runtime_payload == {
+        "stage": "building",
+        "bridgeSeq": 5,
+        "code": "coding_agent_runtime_failed",
+        "message": (
+            "Coding Agent 运行环境暂时不可用，请重试；若问题持续发生，"
+            "请检查 OpenCode 服务状态。"
+        ),
+    }
+    assert "private-value" not in json.dumps(runtime_payload, ensure_ascii=False)
+
 
 @pytest.mark.asyncio
 async def test_pi_event_writer_projects_tool_events_without_commands_or_output() -> None:

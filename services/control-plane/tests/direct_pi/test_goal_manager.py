@@ -387,6 +387,10 @@ def test_goal_prompts_bind_revision_and_exclude_raw_diagnostics() -> None:
     assert '"testName":"shows the registered attendee"' in repair
     assert "Make the smallest root-cause edits" not in repair
     assert "every root-cause, architectural, state, and product-integrity edit" in repair
+    for prompt in (build, repair):
+        assert "delegate_subtasks" in prompt
+        assert "genuinely independent codebase questions" in prompt
+        assert "You remain the only writer and integrator" in prompt
 
 
 def test_goal_prompts_preserve_product_scope_and_apply_design_baseline() -> None:
@@ -416,6 +420,9 @@ def test_goal_prompts_preserve_product_scope_and_apply_design_baseline() -> None
         assert "as many or as few files and components" in prompt
         assert "verbatim JSON string" in prompt
         assert "Apple-inspired" not in prompt
+
+    assert "delegate_subtasks" not in planning
+    assert "delegate_subtasks" in building
 
     assert "GoalGraph structures delivery order, not product ambition" in planning
     assert "derive the number and granularity" in planning

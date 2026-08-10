@@ -132,7 +132,9 @@ class LiteLLMRunKeyClient:
             "models": list(resolved_aliases),
             "duration": f"{duration_seconds}s",
             "max_budget": max_budget,
-            "max_parallel_requests": 1,
+            # The foreground model is idle while delegate_subtasks runs up to
+            # three read-only child Pi processes against this same run key.
+            "max_parallel_requests": 3,
             "rpm_limit": rpm_limit,
             "tpm_limit": tpm_limit,
             "metadata": {"fomo_run_id": run_id, "scope": "fomo-pi-ds"},

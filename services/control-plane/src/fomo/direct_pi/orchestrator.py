@@ -13,6 +13,10 @@ from typing import Protocol
 
 from pydantic import ValidationError
 
+from fomo.agent_framework import (
+    AgentTransportRegistry,
+    resolve_run_agent_framework,
+)
 from fomo.config import Settings
 from fomo.fomo_pi_ds import RunVirtualKey
 from fomo.ids import utcnow
@@ -40,6 +44,7 @@ from .execution import (
     assert_run_active,
 )
 from .failures import (
+    CODING_AGENT_FAILED,
     DirectPiOrchestrationError,
     PlanningContractError,
     classify_direct_pi_failure,
@@ -116,27 +121,75 @@ class DirectPiOrchestrator:
         sandbox: SandboxProvider,
         settings: Settings,
         gateway: RunKeyGateway,
-        transport: PiTransport,
+        transport: PiTransport | AgentTransportRegistry[PiTransport],
     ) -> None:
         self.repository = repository
         self.sandbox = sandbox
         self.settings = settings
         self.gateway = gateway
-        self.transport = transport
+        self.transports = (
+            transport
+            if isinstance(transport, AgentTransportRegistry)
+            else AgentTransportRegistry.pi_only(transport)
+        )
+        # Kept for narrow compatibility with code that inspects the original
+        # Pi-only orchestrator. All turns use the immutable registry instead.
+        self.transport = self.transports.transports.get("pi")
 
     async def run(self, run_id: str, *, lease_token: str | None = None) -> None:
-        if (
-            self.settings.direct_pi_goal_graph_enabled
-            and self.settings.agent_framework == "direct_pi"
-        ):
-            await self._run_goal_graph(run_id, lease_token=lease_token)
+        framework: str | None = None
+        try:
+            framework = await resolve_run_agent_framework(self.repository, run_id)
+            transport = self.transports.require(framework)
+        except ValueError:
+            # A deployment allowlist may change while an older run is queued.
+            # Fail that run explicitly instead of leaving it running until its
+            # lease expires, and never silently switch to a different agent.
+            try:
+                active_lease = lease_token or await self.repository.get_active_lease_token(
+                    run_id
+                )
+                payload = CODING_AGENT_FAILED.event_payload()
+                payload["reason"] = "agent_framework_unavailable"
+                if framework is not None:
+                    payload["framework"] = framework
+                await self.repository.append_event(
+                    run_id,
+                    "pi.failed",
+                    payload=payload,
+                    lease_token=active_lease,
+                )
+                await self.repository.mark_terminal(
+                    run_id,
+                    RunStatus.failed,
+                    error_code=CODING_AGENT_FAILED.code,
+                    summary=CODING_AGENT_FAILED.summary,
+                    lease_token=active_lease,
+                )
+            except RunLeaseLost:
+                pass
             return
-        await self._run_p0(run_id, lease_token=lease_token)
+        if self.settings.direct_pi_goal_graph_enabled:
+            await self._run_goal_graph(
+                run_id,
+                transport=transport,
+                agent_framework=framework,
+                lease_token=lease_token,
+            )
+            return
+        await self._run_p0(
+            run_id,
+            transport=transport,
+            agent_framework=framework,
+            lease_token=lease_token,
+        )
 
     async def _run_goal_graph(
         self,
         run_id: str,
         *,
+        transport: PiTransport,
+        agent_framework: str,
         lease_token: str | None = None,
     ) -> None:
         """Execute a frozen GoalGraph one server-selected goal at a time."""
@@ -207,6 +260,7 @@ class DirectPiOrchestrator:
                         "starterVersion": starter.version,
                         "starterCapabilities": list(starter.capability_ids),
                         "goalGraph": True,
+                        "agentFramework": agent_framework,
                         "planningPolicy": GOAL_GRAPH_PLANNING_POLICY,
                         "productDesignPolicy": PRODUCT_DESIGN_POLICY,
                         **runtime_contract.cache_fingerprint(),
@@ -337,10 +391,11 @@ class DirectPiOrchestrator:
             )
             pi = DirectPiSession(
                 self.repository,
-                self.transport,
+                transport,
                 self.settings,
                 virtual_key,
                 runtime_contract=runtime_contract,
+                agent_framework=agent_framework,
                 run_id=run_id,
                 lease_token=active_lease,
                 started_at=started_at,
@@ -1078,7 +1133,14 @@ class DirectPiOrchestrator:
                         extra={"run_id": run_id},
                     )
 
-    async def _run_p0(self, run_id: str, *, lease_token: str | None = None) -> None:
+    async def _run_p0(
+        self,
+        run_id: str,
+        *,
+        transport: PiTransport,
+        agent_framework: str,
+        lease_token: str | None = None,
+    ) -> None:
         run = await self.repository.get_run(run_id)
         runtime_contract = await self.repository.get_run_runtime_contract(run_id)
         if run.status in {
@@ -1133,6 +1195,7 @@ class DirectPiOrchestrator:
                     "starterId": starter.id,
                     "starterVersion": starter.version,
                     "starterCapabilities": list(starter.capability_ids),
+                    "agentFramework": agent_framework,
                     "productDesignPolicy": PRODUCT_DESIGN_POLICY,
                     **runtime_contract.cache_fingerprint(),
                 },
@@ -1174,10 +1237,11 @@ class DirectPiOrchestrator:
             )
             pi = DirectPiSession(
                 self.repository,
-                self.transport,
+                transport,
                 self.settings,
                 virtual_key,
                 runtime_contract=runtime_contract,
+                agent_framework=agent_framework,
                 run_id=run_id,
                 lease_token=active_lease,
                 started_at=started_at,

@@ -63,6 +63,13 @@ MODEL_RESPONSE_FAILED = PublicRunFailure(
     code="model_response_failed",
     message="模型未返回可用的公开结果。请重试、切换模型或缩小任务范围。",
 )
+CODING_AGENT_RUNTIME_FAILED = PublicRunFailure(
+    code="coding_agent_runtime_failed",
+    message=(
+        "Coding Agent 运行环境暂时不可用，请重试；若问题持续发生，"
+        "请检查 OpenCode 服务状态。"
+    ),
+)
 PLANNING_CONTRACT_FAILED = PublicRunFailure(
     code="planning_contract_failed",
     message="模型未能按要求返回有效的产品规划合约。请重试或切换模型。",
@@ -158,6 +165,7 @@ PUBLIC_FAILURES_BY_CODE = {
         RUN_OUTPUT_BUDGET_EXCEEDED,
         MODEL_RUNTIME_PROTOCOL_FAILED,
         MODEL_RESPONSE_FAILED,
+        CODING_AGENT_RUNTIME_FAILED,
         PLANNING_CONTRACT_FAILED,
         WORKSPACE_CONTRACT_FAILED,
         DIRECT_PI_VERIFICATION_FAILED,
@@ -208,6 +216,10 @@ _BRIDGE_FAILURES_BY_INTERNAL_CODE = {
     "invalid_message_delta": MODEL_RUNTIME_PROTOCOL_FAILED,
     "unknown_message_delta": MODEL_RUNTIME_PROTOCOL_FAILED,
     "unknown_pi_event": MODEL_RUNTIME_PROTOCOL_FAILED,
+    # OpenCode emits only these stable internal codes. Provider/model response
+    # bodies are never copied into the public contract.
+    "opencode_model_failed": MODEL_RESPONSE_FAILED,
+    "opencode_runtime_failed": CODING_AGENT_RUNTIME_FAILED,
 }
 
 

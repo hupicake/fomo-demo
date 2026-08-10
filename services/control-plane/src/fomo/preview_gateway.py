@@ -1,10 +1,12 @@
-"""Host-based gateway for verified generated-application previews.
+"""Gateway for verified generated-application previews.
 
-The browser sees a stable, isolated origin such as
-``<sandbox-id>.preview.example.com``.  The gateway resolves the sandbox's
-short-lived Docker endpoint server-side, after persistence confirms that the
-sandbox still backs a successfully verified run.  Control-plane credentials
-and account cookies never cross into generated applications.
+The preferred security boundary remains an isolated wildcard origin. A
+same-origin ``/preview/<sandbox-id>/`` route is also supported as a deployment-
+light compromise: HTML receives a CSP sandbox without ``allow-same-origin`` and
+cannot submit forms or connect back to the control plane. In both modes the
+gateway resolves the short-lived Docker endpoint only after persistence proves
+that it still backs a successfully verified run. Account cookies and control-
+plane credentials never cross into generated applications.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from ipaddress import ip_address
-from urllib.parse import SplitResult, urlsplit, urlunsplit
+from urllib.parse import SplitResult, urljoin, urlsplit, urlunsplit
 from uuid import UUID
 
 import httpx
@@ -30,6 +32,9 @@ _APPLICATION_PORT = 8080
 _MIN_UPSTREAM_PORT = 40_000
 _MAX_UPSTREAM_PORT = 60_000
 _DOMAIN_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_PREVIEW_PATH = re.compile(
+    r"^/(?:[A-Za-z0-9][A-Za-z0-9._~-]*)(?:/[A-Za-z0-9][A-Za-z0-9._~-]*)*$"
+)
 _REQUEST_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 _HOP_BY_HOP_HEADERS = {
     "connection",
@@ -108,8 +113,9 @@ class PreviewBodyTooLarge(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class PreviewGatewayConfig:
-    base_domain: str
     opensandbox_base_url: str
+    base_domain: str | None = None
+    base_url: str | None = None
     opensandbox_api_key: str | None = None
     upstream_host_override: str | None = None
     application_port: int = _APPLICATION_PORT
@@ -118,7 +124,14 @@ class PreviewGatewayConfig:
     max_response_body_bytes: int = 32 * 1024 * 1024
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "base_domain", _normalize_domain(self.base_domain))
+        base_domain = _normalize_domain(self.base_domain) if self.base_domain else None
+        base_url = _normalize_base_url(self.base_url) if self.base_url else None
+        if bool(base_domain) == bool(base_url):
+            raise ValueError(
+                "exactly one of PUBLIC_PREVIEW_BASE_URL or PUBLIC_PREVIEW_BASE_DOMAIN is required"
+            )
+        object.__setattr__(self, "base_domain", base_domain)
+        object.__setattr__(self, "base_url", base_url)
         parsed = urlsplit(self.opensandbox_base_url.rstrip("/"))
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise ValueError("OpenSandbox base URL must be an absolute http(s) URL")
@@ -141,6 +154,12 @@ class PreviewGatewayConfig:
             ):
                 raise ValueError("preview upstream host override must be a hostname without a port")
 
+    @property
+    def path_prefix(self) -> str | None:
+        if not self.base_url:
+            return None
+        return urlsplit(self.base_url).path.rstrip("/")
+
 
 def _normalize_domain(value: str) -> str:
     domain = value.strip().lower().rstrip(".")
@@ -150,6 +169,29 @@ def _normalize_domain(value: str) -> str:
     if any(not _DOMAIN_LABEL.fullmatch(label) for label in labels):
         raise ValueError("PUBLIC_PREVIEW_BASE_DOMAIN must be a DNS domain")
     return domain
+
+
+def _normalize_base_url(value: str) -> str:
+    candidate = value.strip()
+    if candidate != value or "\\" in candidate:
+        raise ValueError("PUBLIC_PREVIEW_BASE_URL must be an absolute http(s) URL")
+    parsed = urlsplit(candidate)
+    try:
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("PUBLIC_PREVIEW_BASE_URL must be an absolute http(s) URL") from exc
+    path = parsed.path.rstrip("/")
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or (path and not _PREVIEW_PATH.fullmatch(path))
+    ):
+        raise ValueError("PUBLIC_PREVIEW_BASE_URL must be an absolute http(s) URL")
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}"
 
 
 def _sandbox_id_from_host(host: str | None, base_domain: str) -> str | None:
@@ -173,7 +215,7 @@ def _canonical_public_origin(sandbox_id: str, base_domain: str) -> str:
     return f"https://{sandbox_id}.{base_domain}"
 
 
-def _request_headers(headers: Mapping[str, str], public_host: str) -> dict[str, str]:
+def _request_headers(headers: Mapping[str, str], public_origin: str) -> dict[str, str]:
     forwarded = {
         name: value
         for name, value in headers.items()
@@ -182,12 +224,14 @@ def _request_headers(headers: Mapping[str, str], public_host: str) -> dict[str, 
     # Never trust forwarding metadata supplied by the browser or ingress.  The
     # generated Next server needs one coherent public origin for Server Action
     # origin checks and absolute URL construction, so the gateway writes it.
+    public = urlsplit(public_origin)
+    port = public.port or (443 if public.scheme == "https" else 80)
     forwarded.update(
         {
-            "Host": public_host,
-            "X-Forwarded-Host": public_host,
-            "X-Forwarded-Proto": "https",
-            "X-Forwarded-Port": "443",
+            "Host": public.netloc,
+            "X-Forwarded-Host": public.netloc,
+            "X-Forwarded-Proto": public.scheme,
+            "X-Forwarded-Port": str(port),
         }
     )
     return forwarded
@@ -278,6 +322,114 @@ def _rewrite_location(location: str, upstream_origin: str, public_origin: str) -
     )
 
 
+def _rewrite_path_location(
+    location: str,
+    *,
+    upstream_url: str,
+    upstream_origin: str,
+    public_url: str,
+) -> str:
+    """Keep every internal redirect inside one verified preview path."""
+
+    resolved = urlsplit(urljoin(upstream_url, location))
+    upstream = urlsplit(upstream_origin)
+    if resolved.username is not None or resolved.password is not None:
+        return location
+    try:
+        resolved_port = resolved.port or (443 if resolved.scheme == "https" else 80)
+        upstream_port = upstream.port or (443 if upstream.scheme == "https" else 80)
+    except ValueError:
+        return location
+    if (
+        resolved.scheme.casefold() != upstream.scheme.casefold()
+        or not resolved.hostname
+        or not upstream.hostname
+        or resolved.hostname.casefold() != upstream.hostname.casefold()
+        or resolved_port != upstream_port
+    ):
+        return location
+    public = urlsplit(public_url)
+    preview_root = public.path.rstrip("/")
+    path = resolved.path if resolved.path.startswith("/") else f"/{resolved.path}"
+    return urlunsplit(
+        SplitResult(
+            public.scheme,
+            public.netloc,
+            f"{preview_root}{path}",
+            resolved.query,
+            resolved.fragment,
+        )
+    )
+
+
+def _path_mode_csp(public_url: str) -> str:
+    # A path cannot provide origin isolation. The response sandbox deliberately
+    # omits allow-same-origin/forms and prevents generated code from fetching or
+    # submitting data back to the control plane. Scripts and styles are limited
+    # to this preview's exact public path so ordinary client-side UI still runs.
+    source = public_url.rstrip("/") + "/"
+    return "; ".join(
+        (
+            "sandbox allow-scripts",
+            "default-src 'none'",
+            f"script-src 'unsafe-inline' 'unsafe-eval' {source} blob:",
+            f"style-src 'unsafe-inline' {source}",
+            f"img-src {source} data: blob:",
+            f"font-src {source} data:",
+            f"worker-src {source} blob:",
+            f"connect-src {source}",
+            "form-action 'none'",
+            "base-uri 'none'",
+            "frame-ancestors 'self'",
+        )
+    )
+
+
+def _rewrite_legacy_next_assets(body: bytes, public_url: str) -> bytes:
+    """Narrow compatibility for retained builds created before assetPrefix."""
+
+    prefix = urlsplit(public_url).path.rstrip("/").encode("ascii")
+    output = bytearray()
+    cursor = 0
+    while True:
+        opening = body.find(b"<", cursor)
+        if opening < 0:
+            output.extend(body[cursor:])
+            break
+        output.extend(body[cursor:opening])
+        quote: int | None = None
+        closing = opening + 1
+        while closing < len(body):
+            value = body[closing]
+            if quote is None and value in {ord('"'), ord("'")}:
+                quote = value
+            elif quote == value:
+                quote = None
+            elif quote is None and value == ord(">"):
+                break
+            closing += 1
+        if closing >= len(body):
+            output.extend(body[opening:])
+            break
+        tag = body[opening : closing + 1]
+        for attribute in (b"src", b"href"):
+            for delimiter in (b'"', b"'"):
+                needle = attribute + b"=" + delimiter + b"/_next/"
+                replacement = attribute + b"=" + delimiter + prefix + b"/_next/"
+                tag = tag.replace(needle, replacement)
+        output.extend(tag)
+        cursor = closing + 1
+    return bytes(output)
+
+
+def _canonical_sandbox_id(value: str) -> str | None:
+    try:
+        canonical = str(UUID(value))
+    except ValueError:
+        return None
+    return canonical if canonical == value else None
+
+
 async def _bounded_request_body(request: Request, limit: int) -> bytes:
     body = bytearray()
     async for chunk in request.stream():
@@ -353,11 +505,16 @@ def create_preview_gateway(
     settings = settings or Settings.from_env()
     if config is None:
         base_domain = settings.public_preview_base_domain
-        if not base_domain:
-            raise ValueError("PUBLIC_PREVIEW_BASE_DOMAIN is required for the preview gateway")
+        base_url = settings.public_preview_base_url
+        if not base_domain and not base_url:
+            raise ValueError(
+                "PUBLIC_PREVIEW_BASE_URL or PUBLIC_PREVIEW_BASE_DOMAIN is required "
+                "for the preview gateway"
+            )
         config = PreviewGatewayConfig(
-            base_domain=base_domain,
             opensandbox_base_url=settings.opensandbox_base_url,
+            base_domain=base_domain,
+            base_url=base_url,
             opensandbox_api_key=settings.opensandbox_api_key,
             upstream_host_override=(
                 os.getenv("PREVIEW_UPSTREAM_HOST_OVERRIDE", "").strip() or None
@@ -406,12 +563,16 @@ def create_preview_gateway(
             headers=_NO_STORE_HEADERS,
         )
 
-    async def proxy(request: Request, full_path: str = "") -> Response:
-        sandbox_id = _sandbox_id_from_host(request.url.hostname, config.base_domain)
-        if sandbox_id is None:
-            return gateway_error(404, "preview not found")
-        public_origin = _canonical_public_origin(sandbox_id, config.base_domain)
-        public_url = f"{public_origin}/"
+    async def proxy_verified(
+        request: Request,
+        *,
+        sandbox_id: str,
+        public_url: str,
+        upstream_path: str,
+        path_mode: bool,
+    ) -> Response:
+        public = urlsplit(public_url)
+        public_origin = urlunsplit(SplitResult(public.scheme, public.netloc, "", "", ""))
         try:
             target = await repository.require_verified_preview_target(sandbox_id)
         except NotFoundError:
@@ -436,9 +597,7 @@ def create_preview_gateway(
         except PreviewEndpointUnavailable:
             return gateway_error(502, "preview unavailable")
 
-        raw_path = request.scope.get("raw_path", request.url.path.encode("ascii", "ignore"))
-        path = bytes(raw_path).decode("ascii", "surrogateescape") or "/"
-        upstream_url = f"{upstream_origin}{path}"
+        upstream_url = f"{upstream_origin}{upstream_path}"
         try:
             async with http_client.stream(
                 request.method,
@@ -447,15 +606,24 @@ def create_preview_gateway(
                 content=request_body,
                 headers=_request_headers(
                     request.headers,
-                    f"{sandbox_id}.{config.base_domain}",
+                    public_origin,
                 ),
             ) as upstream:
                 response_headers = _response_headers(upstream.headers)
                 if "location" in response_headers:
-                    response_headers["location"] = _rewrite_location(
-                        response_headers["location"],
-                        upstream_origin,
-                        public_origin,
+                    response_headers["location"] = (
+                        _rewrite_path_location(
+                            response_headers["location"],
+                            upstream_url=upstream_url,
+                            upstream_origin=upstream_origin,
+                            public_url=public_url,
+                        )
+                        if path_mode
+                        else _rewrite_location(
+                            response_headers["location"],
+                            upstream_origin,
+                            public_origin,
+                        )
                     )
                 response_body = bytearray()
                 async for chunk in upstream.aiter_bytes():
@@ -463,19 +631,86 @@ def create_preview_gateway(
                         raise PreviewBodyTooLarge("preview response body is too large")
                     response_body.extend(chunk)
                 response_status = upstream.status_code
+                response_content_type = upstream.headers.get("content-type", "")
         except httpx.HTTPError:
             return gateway_error(502, "preview unavailable")
         except PreviewBodyTooLarge:
             return gateway_error(502, "preview response too large")
+        body = bytes(response_body)
+        if path_mode and response_content_type.casefold().startswith("text/html"):
+            body = _rewrite_legacy_next_assets(body, public_url)
+            for name in tuple(response_headers):
+                if name.casefold() == "content-security-policy":
+                    response_headers.pop(name)
+            response_headers["Content-Security-Policy"] = _path_mode_csp(public_url)
         return Response(
-            content=bytes(response_body),
+            content=body,
             status_code=response_status,
             headers=response_headers,
             media_type=None,
         )
 
-    app.add_api_route("/", proxy, methods=_REQUEST_METHODS)
-    app.add_api_route("/{full_path:path}", proxy, methods=_REQUEST_METHODS)
+    if config.base_domain:
+        async def proxy_host(request: Request, full_path: str = "") -> Response:
+            sandbox_id = _sandbox_id_from_host(request.url.hostname, config.base_domain)
+            if sandbox_id is None:
+                return gateway_error(404, "preview not found")
+            public_origin = _canonical_public_origin(sandbox_id, config.base_domain)
+            raw_path = request.scope.get(
+                "raw_path", request.url.path.encode("ascii", "ignore")
+            )
+            upstream_path = bytes(raw_path).decode("ascii", "surrogateescape") or "/"
+            return await proxy_verified(
+                request,
+                sandbox_id=sandbox_id,
+                public_url=f"{public_origin}/",
+                upstream_path=upstream_path,
+                path_mode=False,
+            )
+
+        app.add_api_route("/", proxy_host, methods=_REQUEST_METHODS)
+        app.add_api_route("/{full_path:path}", proxy_host, methods=_REQUEST_METHODS)
+    else:
+        assert config.base_url is not None
+        route_prefix = config.path_prefix or ""
+
+        async def proxy_path(
+            request: Request,
+            sandbox_id: str,
+            full_path: str = "",
+        ) -> Response:
+            canonical_id = _canonical_sandbox_id(sandbox_id)
+            if canonical_id is None:
+                return gateway_error(404, "preview not found")
+            raw_path = request.scope.get(
+                "raw_path", request.url.path.encode("ascii", "ignore")
+            )
+            path = bytes(raw_path).decode("ascii", "surrogateescape")
+            public_root = f"{route_prefix}/{canonical_id}"
+            if path == public_root:
+                upstream_path = "/"
+            elif path.startswith(f"{public_root}/"):
+                upstream_path = path[len(public_root):] or "/"
+            else:
+                return gateway_error(404, "preview not found")
+            return await proxy_verified(
+                request,
+                sandbox_id=canonical_id,
+                public_url=f"{config.base_url}/{canonical_id}/",
+                upstream_path=upstream_path,
+                path_mode=True,
+            )
+
+        app.add_api_route(
+            f"{route_prefix}/{{sandbox_id}}",
+            proxy_path,
+            methods=_REQUEST_METHODS,
+        )
+        app.add_api_route(
+            f"{route_prefix}/{{sandbox_id}}/{{full_path:path}}",
+            proxy_path,
+            methods=_REQUEST_METHODS,
+        )
     return app
 
 

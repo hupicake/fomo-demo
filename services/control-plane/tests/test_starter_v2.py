@@ -42,7 +42,7 @@ def test_v2_bare_manifest_is_digest_pinned_and_keeps_a_generic_buildable_boundar
     manifest = default_starter_manifest()
 
     assert manifest.id == "fomo-next-radix-v2"
-    assert manifest.version == "2.0.0"
+    assert manifest.version == "2.0.1"
     assert manifest.selected_capabilities == ()
     assert manifest.is_protected_path("app/page.tsx")
     assert manifest.is_protected_path("components/system/app-shell.tsx")
@@ -93,6 +93,9 @@ def test_v2_bare_manifest_is_digest_pinned_and_keeps_a_generic_buildable_boundar
         ".next/dev/types/**/*.ts",
     ]
     next_config = files["next.config.ts"]._content.decode("utf-8")
+    assert "assetPrefix: previewAssetPrefix()" in next_config
+    assert "FOMO_PREVIEW_ASSET_PREFIX" in next_config
+    assert "basePath" not in next_config
     allowed_dev_origins = re.search(
         r"allowedDevOrigins:\s*\[(?P<origins>[^]]*)\]",
         next_config,

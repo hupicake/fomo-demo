@@ -346,6 +346,11 @@ describe("control plane client contract", () => {
   it("fetches runtime options and normalizes only the public profile fields", async () => {
     process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
     const fetchMock = installFetch(jsonResponse({
+      default_agent_framework: "pi",
+      agent_frameworks: [
+        { id: "pi", label: "Pi", available: true },
+        { id: "opencode", label: "OpenCode", available: true },
+      ],
       default_profile_id: "deepseek-flash",
       profiles: [
         { profile_id: "deepseek-flash", label: "DeepSeek Flash", thinking_levels: ["off", "high"], default_thinking: "high", context_window: 1_000_000, run_token_budget: null, run_token_budget_unlimited: true, inference_tpm_limit: 1_250_000, available: true },
@@ -356,6 +361,11 @@ describe("control plane client contract", () => {
     const options = await controlPlane.getRuntimeOptions();
 
     expect(requestUrl(fetchMock, 0).pathname).toBe("/v1/runtime/options");
+    expect(options.defaultAgentFramework).toBe("pi");
+    expect(options.agentFrameworks).toEqual([
+      { id: "pi", label: "Pi", available: true },
+      { id: "opencode", label: "OpenCode", available: true },
+    ]);
     expect(options.defaultProfileId).toBe("deepseek-flash");
     expect(options.profiles).toHaveLength(2);
     expect(options.profiles[0]).toEqual(expect.objectContaining({

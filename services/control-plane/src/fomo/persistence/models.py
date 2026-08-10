@@ -25,6 +25,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from fomo.agent_framework import DEFAULT_AGENT_FRAMEWORK
 from fomo.ids import utcnow
 from fomo.runtime_contract import (
     DEFAULT_PROFILE_ID,
@@ -111,6 +112,10 @@ class RunRecord(Base):
             postgresql_where=text("status = 'running'"),
             sqlite_where=text("status = 'running'"),
         ),
+        CheckConstraint(
+            "agent_framework IN ('pi', 'opencode')",
+            name="ck_runs_agent_framework",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -121,6 +126,11 @@ class RunRecord(Base):
     repair_round: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    # Immutable public framework selected when the run is queued. Historical
+    # rows are Pi because it was the only production Coding Agent at the time.
+    agent_framework: Mapped[str] = mapped_column(
+        String(24), nullable=False, default=DEFAULT_AGENT_FRAMEWORK
+    )
     # Frozen when the run is queued. Provider aliases never enter the public API,
     # and a clarification resume must use this exact runtime tuple.
     runtime_profile_id: Mapped[str] = mapped_column(

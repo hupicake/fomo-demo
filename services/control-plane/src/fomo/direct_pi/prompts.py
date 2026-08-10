@@ -59,6 +59,12 @@ _PRODUCT_DESIGN_BRIEF = f"""FOMO product-design policy {PRODUCT_DESIGN_POLICY}:
 - Let code topology follow coherent domain, state, and UI responsibilities. Use as many or as few files and components as the product architecture warrants; neither add filler nor compress the product merely to minimize changed paths."""
 
 
+_READ_ONLY_DELEGATION_BRIEF = """Optional read-only parallel research:
+- `delegate_subtasks` may run up to three isolated read-only children in parallel. Use it only when genuinely independent codebase questions can be investigated concurrently and doing so is likely to save meaningful wall time. Skip it for small tasks, tightly coupled questions, or work you can answer with one direct inspection.
+- Give each child one bounded, non-overlapping investigation. Children can only read/search/list; they cannot write, run commands, load repository instructions/extensions/skills, keep a session, request input, or delegate again.
+- You remain the only writer and integrator. Treat child findings as bounded evidence, inspect anything consequential yourself, make all edits, resolve conflicts, and run the required advisory checks in the foreground session. Never delegate implementation, integration, or QA ownership."""
+
+
 def _json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
@@ -249,6 +255,8 @@ The Goal Manager selected the active goal. Deliver that goal as a complete, prod
 
 You may create, edit, move, and delete project files as implementation evidence requires. Use the official builtin tools. Prefer existing offline-installable dependencies. Keep the frozen graph revision, active goal outcome, dependencies, and acceptance contract unchanged.
 
+{_READ_ONLY_DELEGATION_BRIEF}
+
 FOMO has placed a current-goal advisory mirror under `tests/fomo-acceptance/**`. It is generated from the frozen acceptance DSL and is protected system input: inspect and run it, but never edit, delete, replace, bypass, or duplicate it. Before claiming completion, run the exact command below. If typecheck or any Playwright workflow fails, fix the product source and rerun the same command until it passes. The Playwright config manages the app server on port 8080; do not leave a competing manual dev server running.
 
 Advisory self-check command:
@@ -293,6 +301,8 @@ def goal_repair_prompt(
     return f"""Continue the same FOMO session and repair the server-selected active goal after deterministic verification round {round_number}.
 
 Do not select or switch goals, weaken acceptance behavior, or edit FOMO-owned acceptance tests. The candidate remains only a claim until FOMO-owned QA verifies the current goal and conservatively reruns all previously verified goals. Make every root-cause, architectural, state, and product-integrity edit needed for a durable repair, while preserving verified outcomes.
+
+{_READ_ONLY_DELEGATION_BRIEF}
 
 {_FRONTEND_ONLY_BRIEF}
 
@@ -357,6 +367,8 @@ def build_prompt(
 
 You have full project development permission: you may create, edit, move, and delete any project file, including package.json, lockfiles, config files, starter base files, routes, app shell, components, and tests. Use the official builtin read/write/edit/bash tools. You may run pnpm commands, dev servers, and your own self-checks; your self-checks are advisory only and never count as release evidence.
 
+{_READ_ONLY_DELEGATION_BRIEF}
+
 The original source request and user-visible product outcomes are authoritative. The frozen acceptance criteria and their FOMO-owned Playwright tests (injected only into FOMO's clean verification sandbox) are a non-negotiable verification floor and must not be weakened. Implement the complete product contract, including necessary behavior and polish that is not directly asserted; do not add hidden fake success.
 
 The BuildPlan below is ADVISORY only: follow its product intent, but freely adjust architecture, file topology, routes, component boundaries, or package/config/starter files as implementation evidence demands. Do not shrink the user requirement or weaken acceptance behavior.
@@ -395,6 +407,8 @@ def build_repair_prompt(*, diagnostic: str) -> str:
 
 You may inspect and edit any project file in /workspace; you do not need permission lists. Do not weaken behavior, delete required acceptance coverage, or touch FOMO-owned acceptance tests (they live only in FOMO's verification sandbox). Use the bounded compiler output as evidence, then make every implementation, architecture, or integration change needed for a durable fix. Run any useful sandbox-supported self-checks and provide a concise handoff.
 
+{_READ_ONLY_DELEGATION_BRIEF}
+
 {_FRONTEND_ONLY_BRIEF}
 
 Bounded typecheck diagnostic:
@@ -423,6 +437,8 @@ def repair_prompt(
     return f"""Continue the same FOMO session. Deterministic verification round {round_number} failed.
 
 Repair the implementation using the supplied bounded evidence as a starting point, then inspect any relevant project source needed to understand the root cause. You may edit any project file in /workspace, including package/config/starter files; the BuildPlan is advisory, so refactor architecture and topology as needed. Keep the frozen acceptance criteria and FOMO-owned acceptance tests unchanged (they live only in FOMO's verification sandbox). Fix root causes without deleting behavior, weakening assertions, hiding errors, or replacing the product with a stub. Verification installs offline from FOMO's prefetched package store, so added dependencies must be available there. Run any useful sandbox-supported self-checks; FOMO will independently re-verify from a new clean sandbox. Reply with a concise summary when the edits are complete.
+
+{_READ_ONLY_DELEGATION_BRIEF}
 
 {_FRONTEND_ONLY_BRIEF}
 

@@ -7,7 +7,7 @@ import json
 import shlex
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from typing import Any
 
@@ -18,7 +18,13 @@ from fomo.sandbox.opensandbox import OpenSandboxProvider
 
 from .gateway import RunVirtualKey
 from .invocation import PiInvocation
-from .rpc import PiBridgeEnvelope, PiBridgeResult, PiBridgeStreamReducer
+from .rpc import (
+    PiBridgeEnvelope,
+    PiBridgeFailed,
+    PiBridgeProtocolError,
+    PiBridgeResult,
+    PiBridgeStreamReducer,
+)
 
 PiEventSink = Callable[[PiBridgeEnvelope], Awaitable[None]]
 PiDiagnosticSink = Callable[[str], Awaitable[None]]
@@ -313,3 +319,52 @@ class OpenSandboxPiTransport:
             exit_code=int(exit_code),
             stderr="\n".join(chunk for chunk in stderr_chunks if chunk),
         )
+
+
+_OPENCODE_BRIDGE_BIN = "/opt/fomo/bin/fomo-opencode-rpc-bridge.mjs"
+_OPENCODE_BIN = "/opt/fomo/pi/bin/opencode"
+_OPENCODE_STATE_DIR = "/var/lib/fomo-opencode"
+
+
+class OpenSandboxOpenCodeTransport(OpenSandboxPiTransport):
+    """Run one OpenCode turn behind the existing strict bridge protocol.
+
+    OpenCode is deliberately a transport-level alternative, not a fallback.
+    The immutable request keeps FOMO's model, thinking, timeout, prompt, and
+    run-scoped key contract while this adapter selects the root-owned OpenCode
+    bridge and its isolated persistent state directory.
+    """
+
+    async def run(
+        self,
+        ref: SandboxRef,
+        invocation: PiInvocation,
+        *,
+        on_event: PiEventSink | None = None,
+        on_diagnostic: PiDiagnosticSink | None = None,
+        cancel_event: asyncio.Event | None = None,
+    ) -> PiTransportResult:
+        request = replace(
+            invocation.request,
+            bridge_bin=_OPENCODE_BRIDGE_BIN,
+            pi_bin=_OPENCODE_BIN,
+            state_dir=_OPENCODE_STATE_DIR,
+        )
+        try:
+            return await super().run(
+                ref,
+                PiInvocation(request),
+                on_event=on_event,
+                on_diagnostic=on_diagnostic,
+                cancel_event=cancel_event,
+            )
+        except (PiBridgeFailed, PiTransportCancelled):
+            raise
+        except (PiBridgeProtocolError, PiTransportError):
+            raise PiBridgeFailed(
+                {
+                    "code": "opencode_runtime_failed",
+                    "message": "OpenCode runtime could not complete the request.",
+                    "phase": "transport",
+                }
+            ) from None

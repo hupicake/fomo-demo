@@ -14,7 +14,7 @@ import { ThemeToggle } from "@/components/theme/theme-toggle";
 import { AccountEntry } from "@/components/workbench/account-entry";
 import { RuntimeSelector } from "@/components/workbench/runtime-selector";
 import { ApiProblem, controlPlane } from "@/lib/api/client";
-import type { ProjectSummary, RuntimeOptionsResponse } from "@/lib/contracts";
+import type { AgentFrameworkId, ProjectSummary, RuntimeOptionsResponse } from "@/lib/contracts";
 import { projectStatusLabel } from "@/lib/project-status";
 import { useAuthStore } from "@/lib/store/auth-store";
 
@@ -124,9 +124,12 @@ export function HomeScreen() {
     { revalidateOnFocus: false },
   );
   const availableProfiles = runtimeOptions?.profiles.filter((profile) => profile.available) ?? [];
+  const availableFrameworks = runtimeOptions?.agentFrameworks.filter((framework) => framework.available) ?? [];
   const hasAvailableModel = availableProfiles.length > 0;
+  const hasAvailableFramework = availableFrameworks.length > 0;
   const runtimeLoading = !runtimeOptions && !runtimeError;
 
+  const [selectedAgentFramework, setSelectedAgentFramework] = useState<AgentFrameworkId>();
   const [selectedProfileId, setSelectedProfileId] = useState<string>();
   const [selectedThinking, setSelectedThinking] = useState<string>();
   // Resolve the effective selection: the user's pick, else the first available
@@ -142,6 +145,23 @@ export function HomeScreen() {
     ?? availableProfiles[0]?.profileId;
   const activeThinking = selectedThinking
     ?? runtimeOptions?.profiles.find((profile) => profile.profileId === activeProfileId)?.defaultThinking;
+  const selectedAvailableFramework = runtimeOptions?.agentFrameworks.find(
+    (framework) => framework.id === selectedAgentFramework && framework.available,
+  );
+  const defaultAvailableFramework = runtimeOptions?.agentFrameworks.find(
+    (framework) => framework.id === runtimeOptions.defaultAgentFramework && framework.available,
+  );
+  const activeAgentFramework = selectedAvailableFramework?.id
+    ?? defaultAvailableFramework?.id
+    ?? availableFrameworks[0]?.id;
+
+  useEffect(() => {
+    if (!runtimeOptions || selectedAgentFramework) return;
+    const framework = runtimeOptions.agentFrameworks.find(
+      (candidate) => candidate.id === runtimeOptions.defaultAgentFramework && candidate.available,
+    ) ?? runtimeOptions.agentFrameworks.find((candidate) => candidate.available);
+    if (framework) setSelectedAgentFramework(framework.id);
+  }, [runtimeOptions, selectedAgentFramework]);
 
   useEffect(() => {
     if (!runtimeOptions || selectedProfileId) return;
@@ -177,8 +197,12 @@ export function HomeScreen() {
         router.push("/login?mode=signin&redirect=%2F");
         return;
       }
+      if (!hasAvailableFramework || !activeAgentFramework) {
+        setSubmitError("还没有可用的 Coding Agent 框架，请稍后重试。");
+        return;
+      }
       if (!hasAvailableModel || !activeProfileId || !activeThinking) {
-        setSubmitError("还没有可用的运行时模型，请稍后重试。");
+        setSubmitError("还没有可用的模型，请稍后重试。");
         return;
       }
       setCreating(true);
@@ -188,6 +212,7 @@ export function HomeScreen() {
         const run = await controlPlane.startRun(project.id, {
           clientMessageId: globalThis.crypto?.randomUUID?.() || `home-${Date.now()}`,
           content,
+          agentFramework: activeAgentFramework,
           profileId: activeProfileId,
           thinking: activeThinking,
         });
@@ -204,7 +229,7 @@ export function HomeScreen() {
         setCreating(false);
       }
     },
-    [activeProfileId, activeThinking, hasAvailableModel, invalidateSession, mutate, router, userId],
+    [activeAgentFramework, activeProfileId, activeThinking, hasAvailableFramework, hasAvailableModel, invalidateSession, mutate, router, userId],
   );
 
   if (checkingAuth || !userId) {
@@ -248,6 +273,7 @@ export function HomeScreen() {
               <PromptInputFooter>
                 <RuntimeSelector
                   disabled={creating || runtimeLoading}
+                  onSelectAgentFramework={setSelectedAgentFramework}
                   onSelectProfile={(profileId) => {
                     setSelectedProfileId(profileId);
                     const profile = runtimeOptions?.profiles.find((candidate) => candidate.profileId === profileId);
@@ -255,6 +281,7 @@ export function HomeScreen() {
                   }}
                   onSelectThinking={setSelectedThinking}
                   options={runtimeOptions}
+                  selectedAgentFramework={activeAgentFramework}
                   selectedProfileId={activeProfileId}
                   selectedThinking={activeThinking}
                 />
@@ -262,7 +289,7 @@ export function HomeScreen() {
                   <span className="hidden text-xs text-muted-foreground sm:inline">⌘↵ 开始运行</span>
                 </PromptInputTools>
                 <PromptInputSubmit
-                  disabled={creating || !hasAvailableModel}
+                  disabled={creating || !hasAvailableFramework || !hasAvailableModel}
                   status={creating ? "submitted" : "ready"}
                 />
               </PromptInputFooter>
@@ -276,10 +303,10 @@ export function HomeScreen() {
             </div>
           ) : null}
 
-          {!runtimeError && !hasAvailableModel && !runtimeLoading ? (
+          {!runtimeError && (!hasAvailableFramework || !hasAvailableModel) && !runtimeLoading ? (
             <div className="mt-3 flex items-start gap-2 rounded-xl border border-destructive/25 bg-destructive/5 p-3 text-sm text-destructive" role="alert">
               <CircleAlertIcon aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
-              <span>当前没有可用的运行时模型，请稍后重试。</span>
+              <span>当前没有可用的 Coding Agent 或模型，请稍后重试。</span>
             </div>
           ) : null}
 
@@ -294,7 +321,7 @@ export function HomeScreen() {
             {examples.map((example) => (
               <Button
                 className="h-auto rounded-full px-3 py-1.5 text-left text-xs font-normal text-muted-foreground"
-                disabled={creating || !hasAvailableModel}
+                disabled={creating || !hasAvailableFramework || !hasAvailableModel}
                 key={example.label}
                 onClick={() => startProject(example.prompt)}
                 size="sm"

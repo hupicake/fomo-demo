@@ -11,7 +11,9 @@ import pytest
 from fomo.fomo_pi_ds import (
     FOMO_PI_MODEL,
     FOMO_PI_THINKING,
+    OpenSandboxOpenCodeTransport,
     OpenSandboxPiTransport,
+    PiBridgeFailed,
     PiBridgeProtocolError,
     PiInvocation,
     PiRequest,
@@ -287,6 +289,59 @@ async def test_transport_streams_protocol_and_keeps_secrets_out_of_diagnostics(
     assert "sk-run-secret" not in result.stderr
     assert all("private prompt" not in value for value in diagnostics)
     assert all("sk-run-secret" not in value for value in diagnostics)
+
+
+@pytest.mark.asyncio
+async def test_opencode_transport_selects_root_owned_bridge_and_isolated_state(
+    tmp_path: Path,
+) -> None:
+    commands = _FakeCommands(stdout=_successful_lines())
+    provider = _FakeProvider(commands)
+    transport = OpenSandboxOpenCodeTransport(  # type: ignore[arg-type]
+        provider,
+        default_timeout_seconds=300,
+    )
+    original = _invocation(tmp_path)
+
+    result = await transport.run(
+        SandboxRef(id="sandbox-1", project_id="project-1"),
+        original,
+    )
+
+    assert result.bridge.completed["sessionId"] == "session-1"
+    assert commands.command == "/opt/fomo/bin/fomo-opencode-rpc-bridge.mjs"
+    assert commands.opts.envs["FOMO_PI_STATE_DIR"] == "/var/lib/fomo-opencode"
+    assert commands.opts.envs["FOMO_PI_BIN"] == "/opt/fomo/pi/bin/opencode"
+    assert commands.opts.envs["FOMO_PI_VIRTUAL_KEY"] == "sk-run-secret"
+    # The caller's immutable Pi invocation is unchanged and can still be used
+    # by the Pi runtime after framework dispatch.
+    assert original.command_line() == ("/opt/fomo/bin/fomo-pi-rpc-bridge.mjs",)
+    assert original.request.state_dir == str(tmp_path / "state")
+
+
+@pytest.mark.asyncio
+async def test_opencode_transport_projects_protocol_failure_as_runtime_failure(
+    tmp_path: Path,
+) -> None:
+    commands = _FakeCommands(stdout=["{provider_body: password=private-value}"])
+    provider = _FakeProvider(commands)
+    transport = OpenSandboxOpenCodeTransport(  # type: ignore[arg-type]
+        provider,
+        default_timeout_seconds=300,
+    )
+
+    with pytest.raises(PiBridgeFailed) as failure:
+        await transport.run(
+            SandboxRef(id="sandbox-1", project_id="project-1"),
+            _invocation(tmp_path),
+        )
+
+    assert failure.value.payload == {
+        "code": "opencode_runtime_failed",
+        "message": "OpenCode runtime could not complete the request.",
+        "phase": "transport",
+    }
+    assert "private-value" not in str(failure.value)
 
 
 @pytest.mark.asyncio

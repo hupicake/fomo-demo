@@ -1,6 +1,6 @@
 "use client";
 
-import { CpuIcon } from "lucide-react";
+import { BotIcon, CpuIcon } from "lucide-react";
 
 import {
   PromptInputSelect,
@@ -9,7 +9,7 @@ import {
   PromptInputSelectTrigger,
   PromptInputSelectValue,
 } from "@/components/ai-elements/prompt-input";
-import type { RuntimeOptionsResponse, RuntimeProfileOption, RunRuntimeResponse } from "@/lib/contracts";
+import type { AgentFrameworkId, RuntimeOptionsResponse, RuntimeProfileOption, RunRuntimeResponse } from "@/lib/contracts";
 
 const thinkingLevelLabels: Record<string, string> = {
   off: "关闭",
@@ -41,23 +41,56 @@ export function findRuntimeProfile(options: RuntimeOptionsResponse | undefined, 
 export function RuntimeSelector({
   disabled,
   options,
+  selectedAgentFramework,
   selectedProfileId,
   selectedThinking,
+  onSelectAgentFramework,
   onSelectProfile,
   onSelectThinking,
 }: {
   disabled?: boolean;
   options?: RuntimeOptionsResponse;
+  selectedAgentFramework?: AgentFrameworkId;
   selectedProfileId?: string;
   selectedThinking?: string;
+  onSelectAgentFramework: (framework: AgentFrameworkId) => void;
   onSelectProfile: (profileId: string) => void;
   onSelectThinking: (thinking: string) => void;
 }) {
+  const frameworks = options?.agentFrameworks ?? [];
   const profiles = options?.profiles ?? [];
   const selectedProfile = findRuntimeProfile(options, selectedProfileId);
   const thinkingLevels = selectedProfile?.thinkingLevels ?? [];
   return (
     <div className="flex min-w-0 flex-wrap items-center gap-1">
+      <PromptInputSelect
+        disabled={disabled || frameworks.length === 0}
+        onValueChange={(value) => onSelectAgentFramework(value as AgentFrameworkId)}
+        value={selectedAgentFramework ?? ""}
+      >
+        <PromptInputSelectTrigger
+          aria-label="Coding Agent 框架"
+          className="h-8 max-w-[8rem] shrink-0 gap-1 px-2"
+          size="sm"
+        >
+          <BotIcon aria-hidden="true" className="size-3.5 shrink-0 text-muted-foreground" />
+          <PromptInputSelectValue placeholder="选择 Agent" />
+        </PromptInputSelectTrigger>
+        <PromptInputSelectContent>
+          {frameworks.map((framework) => (
+            <PromptInputSelectItem
+              disabled={!framework.available}
+              key={framework.id}
+              value={framework.id}
+            >
+              <span className="font-medium">{framework.label}</span>
+              {!framework.available
+                ? <span className="ml-1 text-xs text-muted-foreground">{framework.disabledReason ? ` · ${framework.disabledReason}` : " · 暂不可用"}</span>
+                : null}
+            </PromptInputSelectItem>
+          ))}
+        </PromptInputSelectContent>
+      </PromptInputSelect>
       <PromptInputSelect
         disabled={disabled || profiles.length === 0}
         onValueChange={onSelectProfile}
@@ -111,16 +144,20 @@ export function RuntimeSelector({
 }
 
 /** Read-only presentation of the resolved run contract, shown after creation. */
-export function RuntimeBadge({ profileLabel, runtime }: { profileLabel: string; runtime: RunRuntimeResponse }) {
-  const detail = `${profileLabel} · 思考 ${thinkingLabel(runtime.thinking)} · 上下文 ${formatTokenBudget(runtime.contextWindow)}`;
+export function RuntimeBadge({ agentFramework, profileLabel, runtime }: { agentFramework?: AgentFrameworkId; profileLabel: string; runtime: RunRuntimeResponse }) {
+  const frameworkLabel = agentFramework === "opencode" ? "OpenCode" : "Pi";
+  const detail = `${frameworkLabel} · ${profileLabel} · 思考 ${thinkingLabel(runtime.thinking)} · 上下文 ${formatTokenBudget(runtime.contextWindow)}`;
   return (
     <span
       className="inline-flex max-w-full min-w-0 items-center gap-1 rounded-full border bg-muted/60 px-2 py-0.5 text-[11px] text-muted-foreground"
       data-runtime={runtime.profileId}
+      data-agent-framework={agentFramework ?? "pi"}
       data-thinking={runtime.thinking}
       title={detail}
     >
-      <CpuIcon aria-hidden="true" className="size-3 shrink-0 text-muted-foreground" />
+      <BotIcon aria-hidden="true" className="size-3 shrink-0 text-muted-foreground" />
+      <span className="shrink-0 font-medium text-foreground/80">{frameworkLabel}</span>
+      <span aria-hidden="true" className="shrink-0 text-border">·</span>
       <span className="truncate font-medium text-foreground/80">{profileLabel}</span>
       <span aria-hidden="true" className="shrink-0 text-border">·</span>
       <span className="shrink-0">{thinkingLabel(runtime.thinking)}</span>
