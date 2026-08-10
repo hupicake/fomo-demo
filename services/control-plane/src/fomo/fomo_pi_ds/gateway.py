@@ -132,9 +132,10 @@ class LiteLLMRunKeyClient:
             "models": list(resolved_aliases),
             "duration": f"{duration_seconds}s",
             "max_budget": max_budget,
-            # The foreground model is idle while delegate_subtasks runs up to
-            # three read-only child Pi processes against this same run key.
-            "max_parallel_requests": 3,
+            # Do not add LiteLLM's max_parallel_requests here. Its streaming
+            # Responses accounting can retain completed tool rounds long
+            # enough to reject a healthy Codex loop. RPM, TPM, spend, TTL, and
+            # the model allowlist remain the run-scoped inference fences.
             "rpm_limit": rpm_limit,
             "tpm_limit": tpm_limit,
             "metadata": {"fomo_run_id": run_id, "scope": "fomo-pi-ds"},
