@@ -15,8 +15,9 @@ settle audit enforces only real safety invariants:
 - changed/new files are not subject to FOMO development quotas; the audit
   still requires complete regular UTF-8 text without NUL bytes.
 
-FOMO-owned acceptance tests are never seeded into G; they are injected by
-FOMO into the clean verification sandbox V after the audited candidate diff
+G receives a protected current-goal advisory mirror for early feedback. The
+authoritative acceptance suite is still independently compiled and injected
+only into the clean verification sandbox V after the audited candidate diff
 is applied.
 """
 
@@ -24,16 +25,25 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shlex
 from contextlib import suppress
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import PurePosixPath
 from typing import Protocol
 
 from fomo.config import Settings
 from fomo.persistence import Repository
-from fomo.sandbox.base import ExecResult, FileChange, SandboxProvider, SandboxRef
+from fomo.sandbox.base import (
+    ExecResult,
+    FileChange,
+    SandboxProvider,
+    SandboxRef,
+    validate_workspace_path,
+)
 from fomo.starter import StarterIntegrityError, StarterManifest
+from fomo.text_safety import redact
 
 from .acceptance import (
     ACCEPTANCE_ROOT,
@@ -101,8 +111,102 @@ def fomo_runner_command(*, bin_name: str, args: str) -> str:
     return f"env PATH={shlex.quote(FOMO_RUNNER_PATH)} {shlex.quote(runner_path)} {args}"
 
 
+class WorkspaceRepairCode(StrEnum):
+    PROTECTED_FILE_CHANGED = "protected_file_changed"
+    PROTECTED_FILE_MISSING = "protected_file_missing"
+    REJECTED_SECRET_FILE = "rejected_secret_file"
+    UNSUPPORTED_SOURCE_TYPE = "unsupported_source_type"
+    INVALID_SOURCE_ENCODING = "invalid_source_encoding"
+
+
+_SAFE_DIAGNOSTIC_PATH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/@+()=-]{0,255}")
+_WORKSPACE_REPAIR_POLICY: dict[
+    WorkspaceRepairCode,
+    tuple[str, tuple[str, ...], bool],
+] = {
+    WorkspaceRepairCode.PROTECTED_FILE_CHANGED: (
+        "A FOMO-owned validation file changed during development.",
+        (),
+        True,
+    ),
+    WorkspaceRepairCode.PROTECTED_FILE_MISSING: (
+        "A FOMO-owned validation file is missing.",
+        (),
+        True,
+    ),
+    WorkspaceRepairCode.REJECTED_SECRET_FILE: (
+        "The candidate contains a forbidden environment or secret file.",
+        (
+            "Find and remove every .env* path without reading or copying its contents.",
+            "Use ordinary typed source or public sample data instead of environment files.",
+        ),
+        False,
+    ),
+    WorkspaceRepairCode.UNSUPPORTED_SOURCE_TYPE: (
+        "The candidate contains a symlink or another unsupported source entry.",
+        (
+            "Replace symlinks and special entries with regular project files or remove them.",
+            "Keep every deliverable source path inside /workspace.",
+        ),
+        False,
+    ),
+    WorkspaceRepairCode.INVALID_SOURCE_ENCODING: (
+        "A changed candidate path is not a complete regular UTF-8 text file.",
+        (
+            "Rewrite the affected path as regular UTF-8 text or remove it.",
+        ),
+        False,
+    ),
+}
+
+
+def _safe_affected_files(path: str) -> tuple[str, ...]:
+    """Project a normal code path without forwarding arbitrary filenames."""
+
+    if _SAFE_DIAGNOSTIC_PATH.fullmatch(path) is None or redact(path) != path:
+        return ()
+    try:
+        candidate = validate_workspace_path(path)
+    except ValueError:
+        return ()
+    if str(candidate) != path:
+        return ()
+    return (path,)
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceRepairDiagnostic:
+    """Closed, prompt-safe guidance for one repairable settle-audit failure."""
+
+    code: WorkspaceRepairCode
+    affected_files: tuple[str, ...] = ()
+
+    @property
+    def restore_protected_files(self) -> bool:
+        return _WORKSPACE_REPAIR_POLICY[self.code][2]
+
+    def as_prompt_context(self) -> dict[str, object]:
+        summary, suggested_actions, _restore = _WORKSPACE_REPAIR_POLICY[self.code]
+        return {
+            "gate": "workspace_audit",
+            "code": self.code.value,
+            "summary": summary,
+            "affectedFiles": list(self.affected_files),
+            "suggestedActions": list(suggested_actions),
+        }
+
+
 class WorkspaceContractError(RuntimeError):
     """The candidate violated a server-owned workspace boundary."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        repair: WorkspaceRepairDiagnostic | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.repair = repair
 
 
 @dataclass(frozen=True, slots=True)
@@ -418,9 +522,26 @@ class WorkspaceManager:
             if str(item["path"]).startswith(f"{ACCEPTANCE_ROOT}/")
         }
         if current_hashes != previous_hashes:
-            raise WorkspaceContractError(
-                "generation advisory acceptance specs changed outside FOMO"
+            source_types = await self.commands.run(
+                ref,
+                _REGULAR_SOURCE_TREE,
+                label="Inspect advisory source file types",
+                stage="repairing",
+                timeout_seconds=30,
             )
+            if source_types.timed_out or source_types.exit_code != 0:
+                raise WorkspaceContractError(
+                    "generation advisory contains an unsupported source entry"
+                )
+            restored = await self.restore_generation_protected_files(
+                ref,
+                compiled,
+                baseline=baseline,
+            )
+            if not restored:
+                raise WorkspaceContractError(
+                    "generation advisory acceptance specs changed outside FOMO"
+                )
 
         changes = [
             FileChange(path=path, operation="delete")
@@ -461,6 +582,83 @@ class WorkspaceManager:
             ),
         )
         return refreshed_baseline, f"{typecheck} && {playwright}"
+
+    async def restore_generation_protected_files(
+        self,
+        ref: SandboxRef,
+        compiled: CompiledAcceptance,
+        *,
+        baseline: dict[str, str],
+    ) -> bool:
+        """Restore only server-owned G files from trusted in-process sources.
+
+        This is deliberately narrower than a workspace reset: candidate-owned
+        product files are never touched.  The method is used only after audit
+        has identified protected-file drift, so a model mistake can heal
+        without discarding its implementation or Pi session.
+        """
+
+        expected_sources: dict[str, str] = {
+            SYSTEM_GITIGNORE_PATH: SYSTEM_GITIGNORE,
+        }
+        for entry in self.starter.files:
+            if self._is_fomo_owned_path(entry.path):
+                expected_sources[entry.path] = entry._content.decode(
+                    "utf-8", errors="strict"
+                )
+        for change in compiled.changes:
+            if (
+                change.operation not in {"create", "modify"}
+                or not self._is_fomo_owned_path(change.path)
+            ):
+                raise WorkspaceContractError(
+                    "generation protected restore received an invalid source"
+                )
+            expected_sources[change.path] = change.content
+
+        expected_hashes = {
+            path: hashlib.sha256(content.encode("utf-8")).hexdigest()
+            for path, content in expected_sources.items()
+        }
+        protected_baseline = {
+            path: digest
+            for path, digest in baseline.items()
+            if path == SYSTEM_GITIGNORE_PATH or self._is_fomo_owned_path(path)
+        }
+        if protected_baseline != expected_hashes:
+            raise WorkspaceContractError(
+                "generation protected baseline does not match canonical sources"
+            )
+
+        current_hashes = {
+            str(item["path"]): str(item["sha256"])
+            for item in await self._list_files(ref)
+            if str(item["path"]) == SYSTEM_GITIGNORE_PATH
+            or self._is_fomo_owned_path(str(item["path"]))
+        }
+        changes = [
+            FileChange(path=path, operation="delete")
+            for path in sorted(set(current_hashes) - set(expected_sources))
+            if self._is_fomo_owned_path(path)
+        ]
+        changes.extend(
+            FileChange(path=path, content=content, operation="create")
+            for path, content in sorted(expected_sources.items())
+            if current_hashes.get(path) != expected_hashes[path]
+        )
+        if not changes:
+            return False
+
+        await self.sandbox.apply_changes(ref, changes)
+        restored_hashes = {
+            str(item["path"]): str(item["sha256"])
+            for item in await self._list_files(ref)
+            if str(item["path"]) == SYSTEM_GITIGNORE_PATH
+            or self._is_fomo_owned_path(str(item["path"]))
+        }
+        if restored_hashes != expected_hashes:
+            raise WorkspaceContractError("generation protected restore failed")
+        return True
 
     async def checkpoint_workspace(self, ref: SandboxRef) -> str:
         result = await self.commands.run(
@@ -550,9 +748,21 @@ class WorkspaceManager:
         """Settle audit: safety invariants and the real full-project diff."""
         try:
             if await self.sandbox.read_file(ref, SYSTEM_GITIGNORE_PATH) != SYSTEM_GITIGNORE.encode():
-                raise WorkspaceContractError("system .gitignore changed")
+                raise WorkspaceContractError(
+                    "system .gitignore changed",
+                    repair=WorkspaceRepairDiagnostic(
+                        code=WorkspaceRepairCode.PROTECTED_FILE_CHANGED,
+                        affected_files=(SYSTEM_GITIGNORE_PATH,),
+                    ),
+                )
         except FileNotFoundError as exc:
-            raise WorkspaceContractError("system .gitignore is missing") from exc
+            raise WorkspaceContractError(
+                "system .gitignore is missing",
+                repair=WorkspaceRepairDiagnostic(
+                    code=WorkspaceRepairCode.PROTECTED_FILE_MISSING,
+                    affected_files=(SYSTEM_GITIGNORE_PATH,),
+                ),
+            ) from exc
         symlinks = await self.commands.run(
             ref,
             _REGULAR_SOURCE_TREE,
@@ -560,8 +770,15 @@ class WorkspaceManager:
             stage="building",
             timeout_seconds=30,
         )
-        if symlinks.exit_code != 0 or symlinks.timed_out:
-            raise WorkspaceContractError("candidate source contains a symlink")
+        if symlinks.timed_out:
+            raise WorkspaceContractError("source file type audit timed out")
+        if symlinks.exit_code != 0:
+            raise WorkspaceContractError(
+                "candidate source contains a symlink",
+                repair=WorkspaceRepairDiagnostic(
+                    code=WorkspaceRepairCode.UNSUPPORTED_SOURCE_TYPE,
+                ),
+            )
 
         listed = await self._list_files(ref)
         current_hashes: dict[str, str] = {
@@ -576,7 +793,10 @@ class WorkspaceManager:
                 continue
             if self._is_secret_path(path):
                 raise WorkspaceContractError(
-                    f"candidate contains a rejected secret file: {path}"
+                    "candidate contains a rejected secret file",
+                    repair=WorkspaceRepairDiagnostic(
+                        code=WorkspaceRepairCode.REJECTED_SECRET_FILE,
+                    ),
                 )
             if self._is_fomo_owned_path(path):
                 # FOMO-owned files are allowed only when present in the seed
@@ -584,7 +804,11 @@ class WorkspaceManager:
                 # rejected and never enters the candidate diff.
                 if baseline.get(path) != current_hashes.get(path):
                     raise WorkspaceContractError(
-                        f"candidate added, modified, or deleted a FOMO-owned file: {path}"
+                        "candidate changed a FOMO-owned file",
+                        repair=WorkspaceRepairDiagnostic(
+                            code=WorkspaceRepairCode.PROTECTED_FILE_CHANGED,
+                            affected_files=_safe_affected_files(path),
+                        ),
                     )
                 continue
             if baseline.get(path) == current_hashes.get(path):
@@ -594,10 +818,20 @@ class WorkspaceManager:
                 content = (await self.sandbox.read_file(ref, path)).decode("utf-8", errors="strict")
             except (FileNotFoundError, UnicodeDecodeError) as exc:
                 raise WorkspaceContractError(
-                    "changed candidate files must be regular UTF-8 text"
+                    "changed candidate files must be regular UTF-8 text",
+                    repair=WorkspaceRepairDiagnostic(
+                        code=WorkspaceRepairCode.INVALID_SOURCE_ENCODING,
+                        affected_files=_safe_affected_files(path),
+                    ),
                 ) from exc
             if "\x00" in content:
-                raise WorkspaceContractError("changed candidate files must not contain NUL bytes")
+                raise WorkspaceContractError(
+                    "changed candidate files must not contain NUL bytes",
+                    repair=WorkspaceRepairDiagnostic(
+                        code=WorkspaceRepairCode.INVALID_SOURCE_ENCODING,
+                        affected_files=_safe_affected_files(path),
+                    ),
+                )
             changes.append(FileChange(path=path, content=content, operation="create"))
             changed_paths.append(path)
 
@@ -607,7 +841,11 @@ class WorkspaceManager:
             if self._is_fomo_owned_path(path):
                 if path not in current_hashes:
                     raise WorkspaceContractError(
-                        f"candidate deleted a FOMO-owned file: {path}"
+                        "candidate deleted a FOMO-owned file",
+                        repair=WorkspaceRepairDiagnostic(
+                            code=WorkspaceRepairCode.PROTECTED_FILE_MISSING,
+                            affected_files=_safe_affected_files(path),
+                        ),
                     )
                 continue
             if path not in current_hashes:

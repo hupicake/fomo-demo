@@ -85,6 +85,7 @@ from .workspace import (
     AuditedWorkspace,
     CandidateCheckpoint,
     VerificationSnapshot,
+    WorkspaceContractError,
     WorkspaceManager,
 )
 
@@ -636,7 +637,84 @@ class DirectPiOrchestrator:
 
                 while True:
                     await assert_run_active(self.repository, run_id, active_lease)
-                    audited = await workspaces.audit(generation, baseline=baseline)
+                    while True:
+                        try:
+                            audited = await workspaces.audit(
+                                generation,
+                                baseline=baseline,
+                            )
+                            break
+                        except WorkspaceContractError as exc:
+                            diagnostic = exc.repair
+                            if diagnostic is None:
+                                raise
+                            if diagnostic.restore_protected_files:
+                                restored = (
+                                    await workspaces.restore_generation_protected_files(
+                                        generation,
+                                        advisory,
+                                        baseline=baseline,
+                                    )
+                                )
+                                if restored:
+                                    continue
+                                raise
+
+                            total_repair_round = (
+                                await self.repository.increment_repair_round(
+                                    run_id,
+                                    phase=RunPhase.repairing,
+                                    lease_token=active_lease,
+                                )
+                            )
+                            await self.repository.append_event(
+                                run_id,
+                                "workspace.audit_repairing",
+                                payload={
+                                    "goalId": current_goal_id,
+                                    "code": diagnostic.code.value,
+                                    "affectedFileCount": len(
+                                        diagnostic.affected_files
+                                    ),
+                                },
+                                lease_token=active_lease,
+                            )
+                            projection = await self.repository.resume_goal(
+                                run_id,
+                                current_goal_id,
+                                lease_token=active_lease,
+                            )
+                            _, repair_plan = plan_goal_execution(
+                                projection.graph,
+                                graph_revision=projection.revision,
+                                verified_evidence=evidence_summaries,
+                            )
+                            await pi.invoke(
+                                generation,
+                                goal_repair_prompt(
+                                    execution_plan=repair_plan,
+                                    diagnostic=diagnostic.as_prompt_context(),
+                                    round_number=total_repair_round,
+                                    advisory_self_check_command=(
+                                        advisory_self_check_command
+                                    ),
+                                ),
+                                stage="repairing",
+                                goal_id=current_goal_id,
+                                continuation_key="goal_graph.workspace_audit_repair",
+                                continuation_context=turn_continuation_context,
+                                require_existing_session=True,
+                            )
+                            projection = await self.repository.claim_goal(
+                                run_id,
+                                current_goal_id,
+                                lease_token=active_lease,
+                            )
+                            await assert_run_active(
+                                self.repository,
+                                run_id,
+                                active_lease,
+                            )
                     await assert_run_active(self.repository, run_id, active_lease)
                     await self._persist_goal_diff(
                         run_id,

@@ -98,6 +98,7 @@ class DirectPiSession:
         continuation_key: str | None = None,
         continuation_context: dict[str, object] | None = None,
         resume_request_id: str | None = None,
+        require_existing_session: bool = False,
     ) -> str:
         if structured_output_schema is not None and stage != "planning":
             raise DirectPiSessionError(
@@ -125,7 +126,7 @@ class DirectPiSession:
             timeout_seconds=None,
             structured_output_schema=structured_output_schema,
             user_input_enabled=True,
-            require_resume=resume_request_id is not None,
+            require_resume=resume_request_id is not None or require_existing_session,
         )
         usage_token = await self._reserve_usage(
             request=request,

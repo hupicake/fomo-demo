@@ -190,6 +190,7 @@ _ADVISORY_CONFIG_SOURCE = (
   },
   webServer: {
     command: "/usr/local/bin/node /opt/fomo/runtime-cache/fomo-next-radix-v2/node_modules/next/dist/bin/next dev --hostname 0.0.0.0 --port 8080",
+    cwd: "../..",
     url: "http://127.0.0.1:8080",
     reuseExistingServer: false,
     timeout: 30_000,

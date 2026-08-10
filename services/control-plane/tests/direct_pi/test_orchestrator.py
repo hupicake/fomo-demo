@@ -484,14 +484,22 @@ def test_legacy_build_and_repair_prompts_allow_complete_sandbox_work() -> None:
 
 
 class _GoalGraphTransport:
-    def __init__(self, sandbox: GitAwareSandbox) -> None:
+    def __init__(
+        self,
+        sandbox: GitAwareSandbox,
+        *,
+        workspace_audit_repair: bool = False,
+    ) -> None:
         self.sandbox = sandbox
         self.calls = 0
         self.session_ids: list[str] = []
+        self.require_resumes: list[bool] = []
+        self.workspace_audit_repair = workspace_audit_repair
 
     async def run(self, ref, invocation, *, on_event=None, **_kwargs):
         self.calls += 1
         self.session_ids.append(invocation.request.session_id)
+        self.require_resumes.append(invocation.request.require_resume)
         structured = invocation.request.structured_output_schema is not None
         if self.calls == 1:
             text = json.dumps(_goal_graph_plan(), separators=(",", ":"))
@@ -509,7 +517,12 @@ class _GoalGraphTransport:
                     )
                 ],
             )
+            if self.workspace_audit_repair:
+                self.sandbox.sandboxes[ref.id].files["lib/domain/broken.ts"] = b"bad\x00source"
             text = "Claimed G-1 implementation."
+        elif self.workspace_audit_repair and self.calls == 3:
+            self.sandbox.sandboxes[ref.id].files.pop("lib/domain/broken.ts", None)
+            text = "Removed the invalid source file."
         else:
             await self.sandbox.apply_changes(
                 ref,
@@ -1573,6 +1586,63 @@ async def test_goal_graph_runs_two_goals_with_scoped_full_regression_and_checkpo
     } == {
         ("G-1:AC-1", "components/features/library-desk.tsx"),
         ("G-2:AC-2", "lib/domain/books.ts"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_goal_graph_repairs_workspace_audit_in_same_session(
+    repository, settings
+) -> None:
+    _project, run, lease = await _new_project_run(
+        repository,
+        "Build a library with search and durable create.",
+        "goal-graph-workspace-audit-repair",
+    )
+    harness = _playwright_report("starter renders a stable application shell")
+    search = _playwright_report("searches books by title")
+    create = _playwright_report("creates and persists a book")
+    sandbox = GitAwareSandbox(
+        {
+            _playwright_command(_HARNESS_PATH): [
+                ExecResult(0, harness, ""),
+                ExecResult(0, harness, ""),
+            ],
+            _playwright_command(
+                "tests/fomo-acceptance/G-1/search-books.smoke.spec.ts"
+            ): [ExecResult(0, search, ""), ExecResult(0, search, "")],
+            _playwright_command(
+                "tests/fomo-acceptance/G-2/create-book.smoke.spec.ts"
+            ): ExecResult(0, create, ""),
+        }
+    )
+    transport = _GoalGraphTransport(sandbox, workspace_audit_repair=True)
+    orchestrator = DirectPiOrchestrator(
+        repository,
+        sandbox,
+        replace(
+            settings,
+            agent_framework="direct_pi",
+            direct_pi_goal_graph_enabled=True,
+        ),
+        _Gateway(),
+        transport,
+    )
+
+    await orchestrator.run(run.id, lease_token=lease)
+
+    final = await repository.get_run(run.id)
+    assert final.status is RunStatus.succeeded
+    assert transport.calls == 4
+    assert len(set(transport.session_ids)) == 1
+    assert transport.require_resumes == [False, False, True, False]
+    events = await repository.list_events(run.id)
+    repair_event = next(
+        event for event in events if event.kind == "workspace.audit_repairing"
+    )
+    assert repair_event.payload == {
+        "goalId": "G-1",
+        "code": "invalid_source_encoding",
+        "affectedFileCount": 1,
     }
 
 
