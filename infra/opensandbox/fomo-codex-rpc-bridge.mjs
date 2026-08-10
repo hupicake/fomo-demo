@@ -670,6 +670,9 @@ function handleRecord(record) {
   if (!record || typeof record !== "object" || Array.isArray(record) || typeof record.type !== "string") {
     throw new Error("Codex emitted an invalid JSONL record");
   }
+  if (awaitingRecoveryThread && record.type !== "thread.started") {
+    throw new Error("Codex recovery did not identify its resumed thread");
+  }
   if (record.type === "thread.started") {
     if (awaitingRecoveryThread) {
       if (record.thread_id !== threadId) throw new Error("Codex recovery resumed a different thread");
