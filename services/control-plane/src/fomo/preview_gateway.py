@@ -637,6 +637,14 @@ def create_preview_gateway(
         except PreviewBodyTooLarge:
             return gateway_error(502, "preview response too large")
         body = bytes(response_body)
+        if path_mode:
+            # A CSP sandbox without allow-same-origin gives the generated page
+            # an opaque origin.  Next.js module chunks and fonts therefore need
+            # explicit anonymous CORS permission even though their public URLs
+            # live under the same preview path.  Keep credentials stripped and
+            # preserve the opaque-origin isolation instead of weakening the CSP.
+            response_headers["Access-Control-Allow-Origin"] = "*"
+            response_headers["Cross-Origin-Resource-Policy"] = "cross-origin"
         if path_mode and response_content_type.casefold().startswith("text/html"):
             body = _rewrite_legacy_next_assets(body, public_url)
             for name in tuple(response_headers):
