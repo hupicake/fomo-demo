@@ -1097,11 +1097,24 @@ async function main() {
     if (sseAbortController) sseAbortController.abort();
     await Promise.race([eventTask, new Promise((resolve) => setTimeout(resolve, 100))]);
 
-    const finalMessages = unwrap(
-      await runtimeStep(() => sdkClient.session.messages({ sessionID: sdkSessionId, directory: workspace })),
-      "OpenCode final message query",
-    );
-    if (!Array.isArray(finalMessages)) throw new OpenCodeRuntimeFailure({ reason: "invalid_final_messages" });
+    let finalMessages;
+    try {
+      finalMessages = unwrap(
+        await runtimeStep(() => sdkClient.session.messages({ sessionID: sdkSessionId, directory: workspace })),
+        "OpenCode final message query",
+      );
+      if (!Array.isArray(finalMessages)) throw new OpenCodeRuntimeFailure({ reason: "invalid_final_messages" });
+    } catch {
+      // The prompt response is the authoritative completed turn. A follow-up
+      // history read only improves cumulative telemetry and must not overturn
+      // a successful result (notably OpenCode structured-output turns).
+      diagnostic("OpenCode final message telemetry unavailable; using completed-turn fallback");
+      finalMessages = [
+        ...initialMessages,
+        { info: { role: "user" }, parts: [] },
+        response,
+      ];
+    }
     const stats = summarizeMessages(finalMessages);
     const state = stateFromStats(stats);
     await cleanup({ abort: false });

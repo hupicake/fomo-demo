@@ -103,6 +103,9 @@ export function createOpencodeClient() {
       async messages() {
         messageQueryCount += 1;
         if (messageQueryCount === 1) return { data: [] };
+        if (process.env.FOMO_TEST_FINAL_MESSAGES_FAILURE === "1") {
+          return { error: { message: "history leaked api_key=history-private-value" } };
+        }
         const info = process.env.FOMO_PI_STRUCTURED_OUTPUT_SCHEMA_B64
           ? { ...assistant, structured: { answer: "ok" } }
           : assistant;
@@ -245,6 +248,25 @@ test("OpenCode bridge exposes SDK JSON Schema result as the existing terminating
   assert.equal(toolEnd.payload.isError, false);
   assert.equal(records.at(-2).payload.kind, "agent_settled");
   assert.equal(records.at(-1).type, "completed");
+});
+
+test("OpenCode bridge keeps a successful structured result when final telemetry is unavailable", async () => {
+  const paths = await fixture();
+  const schema = { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] };
+  const result = await runBridge({
+    ...baseEnvironment(paths),
+    FOMO_PI_STRUCTURED_OUTPUT_SCHEMA_B64: Buffer.from(JSON.stringify(schema)).toString("base64"),
+    FOMO_TEST_FINAL_MESSAGES_FAILURE: "1",
+  });
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.doesNotMatch(result.stdout, /history-private-value|api_key/);
+  assert.doesNotMatch(result.stderr, /history-private-value|api_key/);
+  const records = envelopes(result.stdout);
+  assert.equal(records.at(-2).payload.kind, "agent_settled");
+  assert.equal(records.at(-1).type, "completed");
+  assert.equal(records.at(-1).payload.stats.userMessages, 1);
+  assert.equal(records.at(-1).payload.stats.assistantMessages, 1);
 });
 
 test("OpenCode bridge classifies provider responses without exposing their body", async () => {
