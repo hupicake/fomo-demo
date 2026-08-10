@@ -42,6 +42,7 @@ def _config(
 def _path_config() -> PreviewGatewayConfig:
     return PreviewGatewayConfig(
         base_url="https://app.example.test/preview",
+        web_origin="https://app.example.test",
         opensandbox_base_url="http://opensandbox.test:8080",
         opensandbox_api_key="server-secret",
         upstream_host_override="host.docker.internal",
@@ -84,6 +85,10 @@ async def test_path_gateway_strips_prefix_isolates_credentials_and_sandboxes_htm
             ),
             headers={
                 "content-type": "text/html; charset=utf-8",
+                "clear-site-data": '"storage"',
+                "content-security-policy": "default-src *",
+                "content-security-policy-report-only": "default-src *; report-uri /leak",
+                "service-worker-allowed": "/",
                 "set-cookie": "generated=secret",
             },
         )
@@ -109,6 +114,10 @@ async def test_path_gateway_strips_prefix_isolates_credentials_and_sandboxes_htm
     assert response.text.count(f"/preview/{sandbox_id}/_next/already.js") == 1
     assert 'src="/_next/not-an-attribute.js"' in response.text
     assert "set-cookie" not in response.headers
+    assert "clear-site-data" not in response.headers
+    assert "content-security-policy-report-only" not in response.headers
+    assert "service-worker-allowed" not in response.headers
+    assert response.headers["x-content-type-options"] == "nosniff"
     csp = response.headers["content-security-policy"]
     assert "sandbox allow-scripts" in csp
     assert "allow-same-origin" not in csp
@@ -118,6 +127,145 @@ async def test_path_gateway_strips_prefix_isolates_credentials_and_sandboxes_htm
     assert response.headers["access-control-allow-origin"] == "*"
     assert response.headers["cross-origin-resource-policy"] == "cross-origin"
     repository.require_verified_preview_target.assert_awaited_once_with(sandbox_id)
+    await outbound_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cross_site_path_gateway_allows_interaction_only_inside_exact_preview(
+    repository,
+) -> None:
+    sandbox_id = str(uuid4())
+    base_url = "https://preview.203-0-113-10.sslip.io/preview"
+    public_url = f"{base_url}/{sandbox_id}/"
+    repository.require_verified_preview_target = AsyncMock(
+        return_value=_target(sandbox_id, public_url)
+    )
+
+    async def outbound(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "opensandbox.test":
+            return httpx.Response(200, json={"endpoint": "localhost:55546"})
+        assert request.headers["host"] == "preview.203-0-113-10.sslip.io"
+        assert "cookie" not in request.headers
+        assert "authorization" not in request.headers
+        return httpx.Response(
+            200,
+            content=b"<html><body>interactive preview</body></html>",
+            headers={
+                "content-type": "text/html; charset=utf-8",
+                "set-cookie": "generated=secret",
+            },
+        )
+
+    config = PreviewGatewayConfig(
+        base_url=base_url,
+        web_origin="https://fomo.yieldsum.com/",
+        opensandbox_base_url="http://opensandbox.test:8080",
+        opensandbox_api_key="server-secret",
+        upstream_host_override="host.docker.internal",
+    )
+    assert config.cross_site_path_mode is True
+    outbound_client = httpx.AsyncClient(transport=httpx.MockTransport(outbound))
+    app = create_preview_gateway(
+        repository=repository,
+        config=config,
+        http_client=outbound_client,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="https://preview.203-0-113-10.sslip.io",
+    ) as browser:
+        rejected = await browser.get(
+            f"https://fomo.yieldsum.com/preview/{sandbox_id}/",
+        )
+        response = await browser.get(
+            f"/preview/{sandbox_id}/",
+            headers={"Cookie": "preview=private", "Authorization": "Bearer private"},
+        )
+
+    assert rejected.status_code == 404
+    assert response.status_code == 200
+    assert "set-cookie" not in response.headers
+    assert response.headers["cache-control"] == "private, no-store, max-age=0"
+    assert "access-control-allow-origin" not in response.headers
+    assert "clear-site-data" not in response.headers
+    assert "content-security-policy-report-only" not in response.headers
+    assert "service-worker-allowed" not in response.headers
+    assert response.headers["x-content-type-options"] == "nosniff"
+    csp = {
+        directive.split(" ", 1)[0]: directive.split(" ", 1)[1]
+        for directive in response.headers["content-security-policy"].split("; ")
+    }
+    assert csp["sandbox"] == "allow-scripts allow-same-origin allow-forms"
+    assert csp["script-src"] == f"'unsafe-inline' 'unsafe-eval' {public_url} blob:"
+    assert csp["style-src"] == f"'unsafe-inline' {public_url}"
+    assert csp["img-src"] == f"{public_url} data: blob:"
+    assert csp["font-src"] == f"{public_url} data:"
+    assert csp["worker-src"] == "'none'"
+    assert csp["connect-src"] == public_url
+    assert csp["form-action"] == public_url
+    assert csp["frame-ancestors"] == "https://fomo.yieldsum.com"
+    repository.require_verified_preview_target.assert_awaited_once_with(sandbox_id)
+    await outbound_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_path_gateway_sandboxes_non_html_executable_documents_without_rewriting(
+    repository,
+) -> None:
+    sandbox_id = str(uuid4())
+    public_url = f"https://app.example.test/preview/{sandbox_id}/"
+    repository.require_verified_preview_target = AsyncMock(
+        return_value=_target(sandbox_id, public_url)
+    )
+    documents = {
+        "/document.xhtml": (
+            "application/xhtml+xml",
+            b'<html xmlns="http://www.w3.org/1999/xhtml"><script src="/_next/x.js"/></html>',
+        ),
+        "/image.svg": (
+            "image/svg+xml",
+            b'<svg xmlns="http://www.w3.org/2000/svg"><script href="/_next/x.js"/></svg>',
+        ),
+    }
+
+    async def outbound(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "opensandbox.test":
+            return httpx.Response(200, json={"endpoint": "localhost:55546"})
+        content_type, content = documents[request.url.path]
+        return httpx.Response(
+            200,
+            content=content,
+            headers={
+                "content-type": content_type,
+                "content-security-policy": "default-src *",
+                "content-security-policy-report-only": "default-src *; report-uri /leak",
+                "x-content-type-options": "sniff",
+            },
+        )
+
+    outbound_client = httpx.AsyncClient(transport=httpx.MockTransport(outbound))
+    app = create_preview_gateway(
+        repository=repository,
+        config=_path_config(),
+        http_client=outbound_client,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="https://app.example.test",
+    ) as browser:
+        responses = {
+            path: await browser.get(f"/preview/{sandbox_id}{path}")
+            for path in documents
+        }
+
+    for path, response in responses.items():
+        assert response.status_code == 200
+        assert response.content == documents[path][1]
+        assert "sandbox allow-scripts" in response.headers["content-security-policy"]
+        assert "default-src *" not in response.headers["content-security-policy"]
+        assert "content-security-policy-report-only" not in response.headers
+        assert response.headers["x-content-type-options"] == "nosniff"
+    assert repository.require_verified_preview_target.await_count == 2
     await outbound_client.aclose()
 
 
@@ -163,6 +311,73 @@ async def test_path_gateway_requires_exact_published_url_and_rewrites_internal_l
         f"https://app.example.test/preview/{sandbox_id}/login?next=%2F"
     )
     await outbound_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_path_gateway_drops_external_and_cross_preview_locations(repository) -> None:
+    sandbox_id = str(uuid4())
+    other_sandbox_id = str(uuid4())
+    public_url = f"https://app.example.test/preview/{sandbox_id}/"
+    repository.require_verified_preview_target = AsyncMock(
+        return_value=_target(sandbox_id, public_url)
+    )
+
+    async def outbound(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "opensandbox.test":
+            return httpx.Response(200, json={"endpoint": "localhost:55546"})
+        location = (
+            "https://external.example.net/escape"
+            if request.url.path == "/external"
+            else f"https://app.example.test/preview/{other_sandbox_id}/"
+        )
+        return httpx.Response(307, headers={"location": location})
+
+    outbound_client = httpx.AsyncClient(transport=httpx.MockTransport(outbound))
+    app = create_preview_gateway(
+        repository=repository,
+        config=_path_config(),
+        http_client=outbound_client,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="https://app.example.test",
+        follow_redirects=False,
+    ) as browser:
+        external = await browser.get(f"/preview/{sandbox_id}/external")
+        cross_preview = await browser.get(f"/preview/{sandbox_id}/cross-preview")
+
+    assert external.status_code == 307
+    assert "location" not in external.headers
+    assert cross_preview.status_code == 307
+    assert "location" not in cross_preview.headers
+    assert repository.require_verified_preview_target.await_count == 2
+    await outbound_client.aclose()
+
+
+def test_path_gateway_config_requires_https_and_unambiguous_site_boundary() -> None:
+    common = {
+        "opensandbox_base_url": "http://opensandbox.test:8080",
+        "upstream_host_override": "host.docker.internal",
+    }
+    with pytest.raises(ValueError, match="HTTPS outside loopback"):
+        PreviewGatewayConfig(
+            base_url="http://preview.example.net/preview",
+            web_origin="https://app.example.test",
+            **common,
+        )
+    with pytest.raises(ValueError, match="WEB_ORIGIN itself or a different registrable site"):
+        PreviewGatewayConfig(
+            base_url="https://preview.example.test/preview",
+            web_origin="https://app.example.test",
+            **common,
+        )
+
+    loopback = PreviewGatewayConfig(
+        base_url="http://localhost:3000/preview",
+        web_origin="http://localhost:3000",
+        **common,
+    )
+    assert loopback.cross_site_path_mode is False
 
 
 @pytest.mark.asyncio
