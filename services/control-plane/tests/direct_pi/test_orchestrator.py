@@ -414,7 +414,7 @@ def test_goal_graph_planning_prompts_use_complexity_driven_product_scope() -> No
     )
     correction = goal_graph_planning_correction_prompt(validation_error="invalid graph")
 
-    assert GOAL_GRAPH_PLANNING_POLICY == "adaptive-v4"
+    assert GOAL_GRAPH_PLANNING_POLICY == "frontend-ui-v5"
     assert "derive the number and granularity" in prompt
     assert "actual requirement complexity" in prompt
     assert "Use enough goals to express the complete product" in prompt
@@ -425,6 +425,8 @@ def test_goal_graph_planning_prompts_use_complexity_driven_product_scope() -> No
     assert "prefer exactly one goal" not in prompt
     assert "at most 12 criteria total" not in prompt
     assert GOAL_GRAPH_PLANNING_POLICY in correction
+    assert "FOMO frontend-only runtime contract" in correction
+    assert "Do not create backend services, API/route handlers" in correction
     assert "requirement complexity and coherent user outcomes" in correction
     assert "without shrinking the source request" in correction
 
@@ -440,6 +442,7 @@ def test_structured_planning_prompts_allow_schema_refills_until_success() -> Non
     for prompt in prompts:
         assert "succeeds exactly once" in prompt
         assert "resubmit until it succeeds" in prompt
+        assert "FOMO frontend-only runtime contract" in prompt
         assert "at most 3 total attempts" not in prompt
         assert "Stop immediately after the successful submission" in prompt
         assert "emit prose or JSON as assistant text" in prompt
@@ -481,6 +484,9 @@ def test_legacy_build_and_repair_prompts_allow_complete_sandbox_work() -> None:
     assert "tool silence and budget limits" not in type_repair
     assert "inspect any relevant project source" in verification_repair
     assert "Run any useful sandbox-supported self-checks" in verification_repair
+    for prompt in (build, type_repair, verification_repair):
+        assert "FOMO frontend-only runtime contract" in prompt
+        assert "business logic and mutable product data must remain client-side" in prompt
 
 
 class _GoalGraphTransport:

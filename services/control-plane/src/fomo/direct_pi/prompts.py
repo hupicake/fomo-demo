@@ -17,10 +17,18 @@ from fomo.text_safety import bounded_diagnostic_text
 
 from .goal_manager import GoalExecutionPlan
 
-GOAL_GRAPH_PLANNING_POLICY = "adaptive-v4"
-PRODUCT_REQUIREMENTS_POLICY = "product-requirements-v2"
-PRODUCT_DESIGN_POLICY = "product-design-v3"
+GOAL_GRAPH_PLANNING_POLICY = "frontend-ui-v5"
+PRODUCT_REQUIREMENTS_POLICY = "frontend-product-v3"
+PRODUCT_DESIGN_POLICY = "frontend-design-v4"
 _MAX_REPAIR_DIAGNOSTIC_JSON_CHARACTERS = 12_000
+
+
+_FRONTEND_ONLY_BRIEF = """FOMO frontend-only runtime contract:
+- Build only a polished frontend web application inside the existing Next.js workspace. Product behavior must run in the browser; concentrate effort on UI quality, information architecture, responsive interaction, accessibility, and convincing product states.
+- Do not create backend services, API/route handlers, Server Actions, databases, ORM models, queues, cron jobs, server-side authentication, email delivery, external service integrations, or infrastructure. Do not add server frameworks or read/write environment files.
+- Implement requested data and workflows with typed browser state plus deterministic local fixtures. Use versioned localStorage only for non-sensitive product data when persistence across refresh is required; use in-memory state when persistence is not required. Never store passwords, access tokens, API keys, or other secrets. Simulate loading, success, error, permissions, and other product states locally and visibly.
+- If the source request mentions a backend-dependent capability, preserve its user-facing journey as a high-fidelity frontend prototype backed by local data rather than inventing a server. Never claim that a real remote side effect occurred.
+- Next.js routes, layouts, and static rendering are allowed as presentation structure, but business logic and mutable product data must remain client-side. Keep the result self-contained and runnable without credentials or network APIs."""
 
 
 _PRODUCT_MANAGER_BRIEF = f"""FOMO product-requirements policy {PRODUCT_REQUIREMENTS_POLICY}:
@@ -196,6 +204,8 @@ The GoalGraph structures delivery order, not product ambition. Preserve every ex
 
 {_PRODUCT_MANAGER_BRIEF}
 
+{_FRONTEND_ONLY_BRIEF}
+
 Each goal must deliver a usable product outcome, declare only earlier dependsOn goals, and provide observable acceptance coverage proportional to its workflows and risk. The structured contract requires one deterministic restricted-DSL Playwright test per criterion. Treat those criteria as the verification floor: preserve all source requirements even when they are not directly asserted. Use stable local routes and role/label/text locators; test complete workflows and persistence, never implementation details or screenshots.
 
 The product will use Next.js, TypeScript, Tailwind, existing shadcn/ui Radix primitives and Lucide icons. Goals freeze outcomes and acceptance behavior, not file topology. Do not invent package availability or prescribe a build file allowlist.
@@ -216,6 +226,8 @@ def goal_graph_planning_correction_prompt(*, validation_error: str) -> str:
     return f"""Correct your immediately previous GoalGraphDraft submission.
 
 Fill the submit_structured_output form until that virtual tool succeeds exactly once. If it returns a form or schema validation error, use the feedback to correct the fields and resubmit until it succeeds. Stop immediately after the successful submission. It is the only allowed tool. Do not change files, emit prose or JSON as assistant text, add lifecycle status/quality policy/revision/evidence, or choose an active goal. Preserve the complete intended product outcome and acceptance behavior while enforcing planning policy {GOAL_GRAPH_PLANNING_POLICY}: let requirement complexity and coherent user outcomes determine goal granularity and coverage. Revise goals, dependencies, or criteria as needed to satisfy the structured contract without shrinking the source request. The form enforces the JSON shape; FOMO will revalidate all semantic constraints.
+
+{_FRONTEND_ONLY_BRIEF}
 
 Bounded contract validation failure:
 {validation_error[:4000]}
@@ -247,6 +259,8 @@ This self-check is fast implementation feedback only. It never verifies the goal
 Keep the user informed through public progress text that FOMO can stream over SSE. Before the first tool batch and at each important decision or new related group of tool calls, write 1-2 concise sentences stating what you will do and the practical reason. Do not reveal hidden chain-of-thought, narrate every minor operation, or make any extra tool call solely to report progress.
 
 {_PRODUCT_DELIVERY_BRIEF}
+
+{_FRONTEND_ONLY_BRIEF}
 
 {_PRODUCT_DESIGN_BRIEF}
 
@@ -280,6 +294,8 @@ def goal_repair_prompt(
 
 Do not select or switch goals, weaken acceptance behavior, or edit FOMO-owned acceptance tests. The candidate remains only a claim until FOMO-owned QA verifies the current goal and conservatively reruns all previously verified goals. Make every root-cause, architectural, state, and product-integrity edit needed for a durable repair, while preserving verified outcomes.
 
+{_FRONTEND_ONLY_BRIEF}
+
 The protected `tests/fomo-acceptance/**` files are the current goal's advisory mirror. After repairing product source, run the exact command below. If it fails, continue repairing and rerun it until it passes; never modify, delete, replace, bypass, or duplicate the advisory tests. Ensure no competing manual dev server remains on port 8080.
 
 Advisory self-check command:
@@ -307,6 +323,8 @@ PLANNING TURN ONLY. Fill the submit_structured_output form until that virtual to
 Plan a polished, usable React product rather than a component showcase. Use Next.js, TypeScript, Tailwind, existing shadcn/ui Radix primitives, Lucide icons, and the selected starter capabilities. Plan an architecture and as many or as few files as the complete product warrants, including retained files when editing an existing version and the required extension contract. Organize responsibilities coherently and order implementation dependencies clearly. Use accessible labels and names. Every destructive action needs confirmation. Include loading/empty/error/success feedback and responsive behavior.
 
 {_PRODUCT_MANAGER_BRIEF}
+
+{_FRONTEND_ONLY_BRIEF}
 
 {_PRODUCT_DESIGN_BRIEF}
 
@@ -349,6 +367,8 @@ Use explicit TypeScript types, accessible labels/names, versioned local persiste
 
 {_PRODUCT_DELIVERY_BRIEF}
 
+{_FRONTEND_ONLY_BRIEF}
+
 {_PRODUCT_DESIGN_BRIEF}
 
 Inspect the workspace as broadly as needed and run any useful local self-checks that the sandbox supports, including typecheck, build, or focused interaction tests. FOMO will independently repeat verification from a clean sandbox. When complete, provide a concise integration handoff; the filesystem is authoritative.
@@ -375,18 +395,23 @@ def build_repair_prompt(*, diagnostic: str) -> str:
 
 You may inspect and edit any project file in /workspace; you do not need permission lists. Do not weaken behavior, delete required acceptance coverage, or touch FOMO-owned acceptance tests (they live only in FOMO's verification sandbox). Use the bounded compiler output as evidence, then make every implementation, architecture, or integration change needed for a durable fix. Run any useful sandbox-supported self-checks and provide a concise handoff.
 
+{_FRONTEND_ONLY_BRIEF}
+
 Bounded typecheck diagnostic:
 {diagnostic[:12000]}
 """
 
 
 def planning_correction_prompt(*, validation_error: str) -> str:
-    return """Correct your immediately previous PlanningBundle submission.
+    return f"""Correct your immediately previous PlanningBundle submission.
 
 It did not satisfy FOMO's structured planning contract. Fill the submit_structured_output form until that virtual tool succeeds exactly once. If it returns a form or schema validation error, use the feedback to correct the fields and resubmit until it succeeds. Stop immediately after the successful submission; it is the only allowed tool. Do not change files or emit prose or JSON as assistant text. Preserve the complete product intent, but revise routes, architecture, files, criteria, and deterministic tests as needed to satisfy the contract without reducing the source request. The form enforces the JSON shape; FOMO will revalidate all semantic constraints.
 
+{_FRONTEND_ONLY_BRIEF}
+
 Bounded contract validation failure:
-""" + validation_error
+{validation_error[:4000]}
+"""
 
 
 def repair_prompt(
@@ -398,6 +423,8 @@ def repair_prompt(
     return f"""Continue the same FOMO session. Deterministic verification round {round_number} failed.
 
 Repair the implementation using the supplied bounded evidence as a starting point, then inspect any relevant project source needed to understand the root cause. You may edit any project file in /workspace, including package/config/starter files; the BuildPlan is advisory, so refactor architecture and topology as needed. Keep the frozen acceptance criteria and FOMO-owned acceptance tests unchanged (they live only in FOMO's verification sandbox). Fix root causes without deleting behavior, weakening assertions, hiding errors, or replacing the product with a stub. Verification installs offline from FOMO's prefetched package store, so added dependencies must be available there. Run any useful sandbox-supported self-checks; FOMO will independently re-verify from a new clean sandbox. Reply with a concise summary when the edits are complete.
+
+{_FRONTEND_ONLY_BRIEF}
 
 Preserve the coherent hierarchy, accessibility, responsive behavior, and purposeful visual decisions established under {PRODUCT_DESIGN_POLICY}. Repair the root cause without degrading the product into generic test-oriented UI.
 

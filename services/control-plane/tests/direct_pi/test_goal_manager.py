@@ -405,6 +405,9 @@ def test_goal_prompts_preserve_product_scope_and_apply_design_baseline() -> None
     for prompt in (planning, building):
         assert PRODUCT_DESIGN_POLICY in prompt
         assert PRODUCT_REQUIREMENTS_POLICY in prompt
+        assert "FOMO frontend-only runtime contract" in prompt
+        assert "Do not create backend services, API/route handlers" in prompt
+        assert "high-fidelity frontend prototype backed by local data" in prompt
         assert "Preserve the requested product breadth across the plan" in prompt
         assert "If the user specifies a visual direction, follow it" in prompt
         assert "Do not force an Apple" in prompt
