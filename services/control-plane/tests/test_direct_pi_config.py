@@ -207,12 +207,31 @@ def test_public_preview_path_url_is_normalized_exclusive_and_defaults_in_product
         )
     for invalid in (
         "//app.example.test/preview",
+        "http://preview.example.net/preview",
         "https://user:secret@app.example.test/preview",
         "https://app.example.test/preview?token=secret",
         "https://app.example.test/../preview",
     ):
         with pytest.raises(ValueError, match="PUBLIC_PREVIEW_BASE_URL"):
             Settings(public_preview_base_url=invalid)
+
+    assert Settings(
+        web_origin="http://localhost:3000",
+        public_preview_base_url="http://localhost:3000/preview",
+    ).public_preview_base_url == "http://localhost:3000/preview"
+
+
+def test_public_preview_path_rejects_same_site_different_origin() -> None:
+    with pytest.raises(ValueError, match="WEB_ORIGIN itself or a different registrable site"):
+        Settings(
+            web_origin="https://app.example.test",
+            public_preview_base_url="https://preview.example.test/preview",
+        )
+
+    assert Settings(
+        web_origin="https://app.example.test",
+        public_preview_base_url="https://preview.example.net/preview",
+    ).public_preview_base_url == "https://preview.example.net/preview"
 
 
 @pytest.mark.parametrize(
@@ -258,12 +277,21 @@ def test_public_preview_requires_a_conservatively_isolated_site(
     assert isolated.public_preview_base_domain == "preview.example.net"
 
 
-def test_public_preview_rejects_invalid_web_origin_without_echoing_it() -> None:
+@pytest.mark.parametrize(
+    "preview_setting",
+    [
+        {"public_preview_base_domain": "preview.example.net"},
+        {"public_preview_base_url": "https://preview.example.net/preview"},
+    ],
+)
+def test_public_preview_rejects_invalid_web_origin_without_echoing_it(
+    preview_setting: dict[str, str],
+) -> None:
     sensitive_origin = "https://user:private-token@app.example.com"
     with pytest.raises(ValueError, match="WEB_ORIGIN") as captured:
         Settings(
             web_origin=sensitive_origin,
-            public_preview_base_domain="preview.example.net",
+            **preview_setting,
         )
 
     assert sensitive_origin not in str(captured.value)

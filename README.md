@@ -273,10 +273,11 @@ failed run rather than a false preview success.
 ## Controlled public Preview gateway
 
 The optional `public-preview` Compose profile starts `fomo-preview-gateway` on
-loopback port `8001`. It supports either the existing wildcard-host mode or a
-same-origin `/preview/<sandbox-id>/` path routed through Web's official Next.js
-external rewrite. Production derives `WEB_ORIGIN/preview` when neither public
-Preview setting is explicit, so no new DNS entry is required. For every request the gateway:
+loopback port `8001`. It supports the existing wildcard-host mode, a same-site
+`/preview/<sandbox-id>/` path routed through Web's official Next.js external
+rewrite, or that path on a fixed dedicated cross-site tunnel origin. Production
+derives `WEB_ORIGIN/preview` when neither public Preview setting is explicit, so
+no new DNS entry is required. For every request the gateway:
 
 - accepts one canonical sandbox UUID host label or path segment only;
 - requires that persistence still identifies it as the live, uncleaned
@@ -286,10 +287,12 @@ Preview setting is explicit, so no new DNS entry is required. For every request 
   keep working;
 - strips FOMO cookies, authorization, forwarding headers, the OpenSandbox key,
   and generated-app `Set-Cookie` responses;
-- applies `no-store`; same-origin HTML additionally receives a CSP sandbox
-  without `allow-same-origin` or forms, and network connections are limited to
-  that exact Preview path. This preserves ordinary client-side UI while making
-  the reduced isolation explicit;
+- applies `no-store`; same-site path HTML receives an opaque CSP sandbox without
+  `allow-same-origin` or forms. A configured URL on a different registrable site
+  permits same-origin hydration/storage and forms, but allows only `WEB_ORIGIN`
+  to frame it, disables workers, and strips `Service-Worker-Allowed` and
+  `Clear-Site-Data`. Resource, connection, and form CSP paths are defense in
+  depth only; redirect handling means URL paths are not an isolation boundary;
 - records `preview.expired` and removes the durable URL only after an
   authoritative OpenSandbox 404/410; transient provider failures return 502.
 
@@ -327,6 +330,19 @@ Cloudflare cache so an expired/replaced sandbox is never served from edge
 cache. Use a named Tunnel plus Access policy for the workbench; a random Quick
 Tunnel is not a release URL. Validate the completed configuration with
 `cloudflared tunnel ingress validate` before starting it.
+
+As a deployment-light alternative, a fixed authenticated tunnel can route a
+dedicated HTTPS origin, such as an sslip.io hostname, to the
+loopback Preview Gateway and set that value as `PUBLIC_PREVIEW_BASE_URL`. The
+registrable site must differ from `WEB_ORIGIN`; otherwise the gateway deliberately
+accepts only the exact `WEB_ORIGIN` for opaque path mode and rejects a different
+same-site origin. Non-loopback Preview URLs must use HTTPS. Cross-site mode
+restores forms, Next hydration, and
+localStorage without exposing the origin port, but every `/preview/<uuid>/`
+under that hostname shares one browser origin, script-visible cookies, and
+localStorage. Workers are disabled, but this remains a trusted,
+single-tenant demo mode rather than isolation between Preview IDs. Do not use it
+for mutually untrusted previews; wildcard mode gives each Preview its own origin.
 
 The public surface is HTTPS at the Cloudflare edge only. With Tunnel, the
 origin needs no inbound Internet port; otherwise its firewall may expose only

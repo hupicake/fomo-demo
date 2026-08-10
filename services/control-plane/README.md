@@ -187,14 +187,21 @@ be weakened by agent output.
 
 For a controlled public deployment, run `fomo-preview-gateway` (the Compose
 `public-preview` profile exposes it only on loopback port 8001). Configure either
-`PUBLIC_PREVIEW_BASE_URL` for a same-origin path or the stronger isolated
+`PUBLIC_PREVIEW_BASE_URL` for a path URL or the stronger isolated
 `PUBLIC_PREVIEW_BASE_DOMAIN` wildcard mode; production defaults to
-`WEB_ORIGIN/preview` when both are unset. QA continues to verify the direct
+`WEB_ORIGIN/preview` when both are unset. A URL on the same registrable site as
+`WEB_ORIGIN` keeps the opaque CSP sandbox without storage/forms. A fixed URL on
+a different registrable site (including a dedicated authenticated tunnel)
+permits hydration, forms, and localStorage, is framed only by `WEB_ORIGIN`, and
+disables workers. Resource, connection, and form CSP paths are defense in depth,
+not isolation: URL redirects can invalidate path assumptions. All Preview IDs
+share that fixed URL's browser origin and storage, so URL mode is for a trusted
+single-tenant demo only. A non-loopback URL must use HTTPS; a URL on the same
+registrable site must use the exact `WEB_ORIGIN`, not another subdomain or port.
+QA continues to verify the direct
 internal endpoint first. The gateway requires an exact canonical UUID and
 verified persisted URL, strips credentials/cookies, adds no-store, and maps
-confirmed provider expiry to durable `preview.expired` state. Path HTML is CSP-
-sandboxed without same-origin/forms and may connect only inside its own Preview
-path. It is an HTTP proxy; generated apps
+confirmed provider expiry to durable `preview.expired` state. It is an HTTP proxy; generated apps
 that require WebSocket, SSE, or streaming transport are outside the current
 demo contract.
 

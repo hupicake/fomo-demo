@@ -1,12 +1,13 @@
 """Gateway for verified generated-application previews.
 
-The preferred security boundary remains an isolated wildcard origin. A
-same-origin ``/preview/<sandbox-id>/`` route is also supported as a deployment-
-light compromise: HTML receives a CSP sandbox without ``allow-same-origin`` and
-cannot submit forms or connect back to the control plane. In both modes the
-gateway resolves the short-lived Docker endpoint only after persistence proves
-that it still backs a successfully verified run. Account cookies and control-
-plane credentials never cross into generated applications.
+The preferred security boundary remains an isolated wildcard origin. URL mode
+also supports either a same-site ``/preview/<sandbox-id>/`` route with an opaque
+CSP sandbox, or a dedicated cross-site origin that permits storage and forms.
+The latter protects the workbench origin but shares one browser storage origin
+between all preview paths, so wildcard mode remains the stronger boundary. In
+all modes the gateway resolves the short-lived Docker endpoint only after
+persistence proves that it still backs a successfully verified run. Account
+cookies and control-plane credentials never cross into generated applications.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
-from fomo.config import Settings
+from fomo.config import Settings, _origin_identity, _registrable_site
 from fomo.persistence import Database, NotFoundError, Repository
 
 _APPLICATION_PORT = 8080
@@ -116,6 +117,7 @@ class PreviewGatewayConfig:
     opensandbox_base_url: str
     base_domain: str | None = None
     base_url: str | None = None
+    web_origin: str | None = None
     opensandbox_api_key: str | None = None
     upstream_host_override: str | None = None
     application_port: int = _APPLICATION_PORT
@@ -132,6 +134,20 @@ class PreviewGatewayConfig:
             )
         object.__setattr__(self, "base_domain", base_domain)
         object.__setattr__(self, "base_url", base_url)
+        web_origin = _normalize_web_origin(self.web_origin) if self.web_origin else None
+        if base_url and web_origin:
+            preview_host = urlsplit(base_url).hostname
+            web_host = urlsplit(web_origin).hostname
+            assert preview_host is not None and web_host is not None
+            if (
+                _registrable_site(preview_host) == _registrable_site(web_host)
+                and _origin_identity(base_url) != _origin_identity(web_origin)
+            ):
+                raise ValueError(
+                    "PUBLIC_PREVIEW_BASE_URL must use WEB_ORIGIN itself or a different "
+                    "registrable site"
+                )
+        object.__setattr__(self, "web_origin", web_origin)
         parsed = urlsplit(self.opensandbox_base_url.rstrip("/"))
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise ValueError("OpenSandbox base URL must be an absolute http(s) URL")
@@ -159,6 +175,17 @@ class PreviewGatewayConfig:
         if not self.base_url:
             return None
         return urlsplit(self.base_url).path.rstrip("/")
+
+    @property
+    def cross_site_path_mode(self) -> bool:
+        """Whether URL mode has a browser-site boundary from the workbench."""
+
+        if not self.base_url or not self.web_origin:
+            return False
+        preview_host = urlsplit(self.base_url).hostname
+        web_host = urlsplit(self.web_origin).hostname
+        assert preview_host is not None and web_host is not None
+        return _registrable_site(preview_host) != _registrable_site(web_host)
 
 
 def _normalize_domain(value: str) -> str:
@@ -191,7 +218,33 @@ def _normalize_base_url(value: str) -> str:
         or (path and not _PREVIEW_PATH.fullmatch(path))
     ):
         raise ValueError("PUBLIC_PREVIEW_BASE_URL must be an absolute http(s) URL")
+    if parsed.scheme.lower() != "https" and not _is_loopback_host(parsed.hostname):
+        raise ValueError("PUBLIC_PREVIEW_BASE_URL must use HTTPS outside loopback")
     return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}"
+
+
+def _normalize_web_origin(value: str) -> str:
+    candidate = value.strip()
+    if candidate != value or "\\" in candidate:
+        raise ValueError("WEB_ORIGIN must be an absolute http(s) origin")
+    parsed = urlsplit(candidate)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("WEB_ORIGIN must be an absolute http(s) origin") from exc
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or port is not None
+        and not 1 <= port <= 65_535
+    ):
+        raise ValueError("WEB_ORIGIN must be an absolute http(s) origin")
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
 
 
 def _sandbox_id_from_host(host: str | None, base_domain: str) -> str | None:
@@ -213,6 +266,33 @@ def _sandbox_id_from_host(host: str | None, base_domain: str) -> str | None:
 
 def _canonical_public_origin(sandbox_id: str, base_domain: str) -> str:
     return f"https://{sandbox_id}.{base_domain}"
+
+
+def _request_host_matches_public_url(host: str | None, public_url: str) -> bool:
+    """Fail closed when a cross-site path is reached through another hostname."""
+
+    if host is None or "\\" in host:
+        return False
+    incoming = urlsplit(f"//{host}")
+    expected = urlsplit(public_url)
+    try:
+        default_port = 443 if expected.scheme == "https" else 80
+        expected_port = expected.port or default_port
+        incoming_port = incoming.port or default_port
+    except ValueError:
+        return False
+    return bool(
+        incoming.hostname
+        and expected.hostname
+        and incoming.username is None
+        and incoming.password is None
+        and incoming.path == ""
+        and incoming.query == ""
+        and incoming.fragment == ""
+        and incoming.hostname.casefold().rstrip(".")
+        == expected.hostname.casefold().rstrip(".")
+        and incoming_port == expected_port
+    )
 
 
 def _request_headers(headers: Mapping[str, str], public_origin: str) -> dict[str, str]:
@@ -328,18 +408,18 @@ def _rewrite_path_location(
     upstream_url: str,
     upstream_origin: str,
     public_url: str,
-) -> str:
+) -> str | None:
     """Keep every internal redirect inside one verified preview path."""
 
     resolved = urlsplit(urljoin(upstream_url, location))
     upstream = urlsplit(upstream_origin)
     if resolved.username is not None or resolved.password is not None:
-        return location
+        return None
     try:
         resolved_port = resolved.port or (443 if resolved.scheme == "https" else 80)
         upstream_port = upstream.port or (443 if upstream.scheme == "https" else 80)
     except ValueError:
-        return location
+        return None
     if (
         resolved.scheme.casefold() != upstream.scheme.casefold()
         or not resolved.hostname
@@ -347,7 +427,7 @@ def _rewrite_path_location(
         or resolved.hostname.casefold() != upstream.hostname.casefold()
         or resolved_port != upstream_port
     ):
-        return location
+        return None
     public = urlsplit(public_url)
     preview_root = public.path.rstrip("/")
     path = resolved.path if resolved.path.startswith("/") else f"/{resolved.path}"
@@ -362,25 +442,30 @@ def _rewrite_path_location(
     )
 
 
-def _path_mode_csp(public_url: str) -> str:
-    # A path cannot provide origin isolation. The response sandbox deliberately
-    # omits allow-same-origin/forms and prevents generated code from fetching or
-    # submitting data back to the control plane. Scripts and styles are limited
-    # to this preview's exact public path so ordinary client-side UI still runs.
+def _path_mode_csp(public_url: str, *, web_origin: str | None = None) -> str:
+    # A same-site path cannot provide isolation from the workbench. Keep its
+    # opaque sandbox unchanged. A dedicated cross-site URL may use same-origin
+    # storage and forms, while every network/resource directive remains scoped
+    # to this preview's exact path and framing remains limited to the workbench.
     source = public_url.rstrip("/") + "/"
+    interactive = web_origin is not None
     return "; ".join(
         (
-            "sandbox allow-scripts",
+            (
+                "sandbox allow-scripts allow-same-origin allow-forms"
+                if interactive
+                else "sandbox allow-scripts"
+            ),
             "default-src 'none'",
             f"script-src 'unsafe-inline' 'unsafe-eval' {source} blob:",
             f"style-src 'unsafe-inline' {source}",
             f"img-src {source} data: blob:",
             f"font-src {source} data:",
-            f"worker-src {source} blob:",
+            "worker-src 'none'" if interactive else f"worker-src {source} blob:",
             f"connect-src {source}",
-            "form-action 'none'",
+            f"form-action {source}" if interactive else "form-action 'none'",
             "base-uri 'none'",
-            "frame-ancestors 'self'",
+            f"frame-ancestors {web_origin}" if interactive else "frame-ancestors 'self'",
         )
     )
 
@@ -515,6 +600,7 @@ def create_preview_gateway(
             opensandbox_base_url=settings.opensandbox_base_url,
             base_domain=base_domain,
             base_url=base_url,
+            web_origin=settings.web_origin,
             opensandbox_api_key=settings.opensandbox_api_key,
             upstream_host_override=(
                 os.getenv("PREVIEW_UPSTREAM_HOST_OVERRIDE", "").strip() or None
@@ -611,20 +697,23 @@ def create_preview_gateway(
             ) as upstream:
                 response_headers = _response_headers(upstream.headers)
                 if "location" in response_headers:
-                    response_headers["location"] = (
-                        _rewrite_path_location(
+                    if path_mode:
+                        rewritten_location = _rewrite_path_location(
                             response_headers["location"],
                             upstream_url=upstream_url,
                             upstream_origin=upstream_origin,
                             public_url=public_url,
                         )
-                        if path_mode
-                        else _rewrite_location(
+                        if rewritten_location is None:
+                            response_headers.pop("location")
+                        else:
+                            response_headers["location"] = rewritten_location
+                    else:
+                        response_headers["location"] = _rewrite_location(
                             response_headers["location"],
                             upstream_origin,
                             public_origin,
                         )
-                    )
                 response_body = bytearray()
                 async for chunk in upstream.aiter_bytes():
                     if len(response_body) + len(chunk) > config.max_response_body_bytes:
@@ -637,7 +726,7 @@ def create_preview_gateway(
         except PreviewBodyTooLarge:
             return gateway_error(502, "preview response too large")
         body = bytes(response_body)
-        if path_mode:
+        if path_mode and not config.cross_site_path_mode:
             # A CSP sandbox without allow-same-origin gives the generated page
             # an opaque origin.  Next.js module chunks and fonts therefore need
             # explicit anonymous CORS permission even though their public URLs
@@ -645,12 +734,24 @@ def create_preview_gateway(
             # preserve the opaque-origin isolation instead of weakening the CSP.
             response_headers["Access-Control-Allow-Origin"] = "*"
             response_headers["Cross-Origin-Resource-Policy"] = "cross-origin"
-        if path_mode and response_content_type.casefold().startswith("text/html"):
-            body = _rewrite_legacy_next_assets(body, public_url)
+        if path_mode:
+            if response_content_type.casefold().startswith("text/html"):
+                body = _rewrite_legacy_next_assets(body, public_url)
             for name in tuple(response_headers):
-                if name.casefold() == "content-security-policy":
+                normalized_name = name.casefold()
+                if normalized_name in {
+                    "clear-site-data",
+                    "content-security-policy",
+                    "content-security-policy-report-only",
+                    "service-worker-allowed",
+                    "x-content-type-options",
+                }:
                     response_headers.pop(name)
-            response_headers["Content-Security-Policy"] = _path_mode_csp(public_url)
+            response_headers["Content-Security-Policy"] = _path_mode_csp(
+                public_url,
+                web_origin=config.web_origin if config.cross_site_path_mode else None,
+            )
+            response_headers["X-Content-Type-Options"] = "nosniff"
         return Response(
             content=body,
             status_code=response_status,
@@ -687,6 +788,13 @@ def create_preview_gateway(
             sandbox_id: str,
             full_path: str = "",
         ) -> Response:
+            if config.cross_site_path_mode and not _request_host_matches_public_url(
+                request.headers.get("host"),
+                config.base_url,
+            ):
+                # The workbench's legacy /preview rewrite can still reach this
+                # service. Never serve an interactive CSP through that origin.
+                return gateway_error(404, "preview not found")
             canonical_id = _canonical_sandbox_id(sandbox_id)
             if canonical_id is None:
                 return gateway_error(404, "preview not found")

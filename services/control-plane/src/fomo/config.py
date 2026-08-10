@@ -107,7 +107,19 @@ def _public_preview_base_url(value: str | None) -> str | None:
         or (path and not _PREVIEW_PATH.fullmatch(path))
     ):
         raise ValueError("PUBLIC_PREVIEW_BASE_URL must be an absolute http(s) URL")
+    if parsed.scheme.lower() != "https" and not _is_loopback_hostname(parsed.hostname):
+        raise ValueError("PUBLIC_PREVIEW_BASE_URL must use HTTPS outside loopback")
     return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}"
+
+
+def _is_loopback_hostname(hostname: str) -> bool:
+    candidate = hostname.casefold().rstrip(".")
+    if candidate == "localhost" or candidate.endswith(".localhost"):
+        return True
+    try:
+        return ip_address(candidate).is_loopback
+    except ValueError:
+        return False
 
 
 def _registrable_site(hostname: str) -> str:
@@ -120,6 +132,17 @@ def _registrable_site(hostname: str) -> str:
         labels = candidate.split(".")
         return ".".join(labels[-2:]) if len(labels) >= 2 else candidate
     return candidate
+
+
+def _origin_identity(value: str) -> tuple[str, str, int]:
+    parsed = urlparse(value)
+    assert parsed.hostname is not None
+    scheme = parsed.scheme.lower()
+    return (
+        scheme,
+        parsed.hostname.casefold().rstrip("."),
+        parsed.port or (443 if scheme == "https" else 80),
+    )
 
 
 def _web_origin_site(value: str) -> str:
@@ -336,9 +359,9 @@ class Settings:
     opensandbox_image: str = DEFAULT_OPENSANDBOX_IMAGE
     opensandbox_lifetime_seconds: int = DEFAULT_OPENSANDBOX_LIFETIME_SECONDS
     opensandbox_ready_timeout_seconds: int = DEFAULT_OPENSANDBOX_READY_TIMEOUT_SECONDS
-    # Verified previews can use either an isolated wildcard host or a same-origin
-    # path. Path mode is the deployment-light compromise and is CSP-sandboxed by
-    # fomo-preview-gateway; the two public routing modes are mutually exclusive.
+    # Verified previews can use either an isolated wildcard host or a path URL.
+    # Same-site paths stay opaque; a dedicated cross-site URL permits interactive
+    # previews but shares one browser origin. The two modes are mutually exclusive.
     public_preview_base_domain: str | None = None
     public_preview_base_url: str | None = None
     # Successful, fully verified previews outlive their build sandboxes. The
@@ -407,7 +430,9 @@ class Settings:
             "session_cookie_name",
             _validated_session_cookie_name(self.session_cookie_name),
         )
+        web_site: str | None = None
         if normalized_preview_domain or normalized_preview_url:
+            web_site = _web_origin_site(self.web_origin)
             if (
                 self.sandbox_provider != "opensandbox"
                 or self.agent_framework != "direct_pi"
@@ -420,7 +445,7 @@ class Settings:
                 )
         if normalized_preview_domain:
             preview_site = _registrable_site(normalized_preview_domain)
-            web_site = _web_origin_site(self.web_origin)
+            assert web_site is not None
             if preview_site == web_site:
                 if preview_site == "localhost":
                     raise ValueError(
@@ -430,6 +455,17 @@ class Settings:
                 raise ValueError(
                     "PUBLIC_PREVIEW_BASE_DOMAIN must use a different registrable site "
                     "from WEB_ORIGIN"
+                )
+        if normalized_preview_url:
+            preview_host = urlparse(normalized_preview_url).hostname
+            assert preview_host is not None and web_site is not None
+            if (
+                _registrable_site(preview_host) == web_site
+                and _origin_identity(normalized_preview_url) != _origin_identity(self.web_origin)
+            ):
+                raise ValueError(
+                    "PUBLIC_PREVIEW_BASE_URL must use WEB_ORIGIN itself or a different "
+                    "registrable site"
                 )
         _litellm_endpoints(self.litellm_base_url)
         if self.sandbox_litellm_base_url:
