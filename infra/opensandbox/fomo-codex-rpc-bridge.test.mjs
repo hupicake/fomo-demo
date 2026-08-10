@@ -47,8 +47,8 @@ process.stdin.on("end", () => {
     return;
   }
   if (mode === "command-eof-recovery" && !args.includes("resume")) {
-    send({ type: "item.started", item: { id: "cmd-failed", type: "command_execution", command: "false" } });
-    send({ type: "item.completed", item: { id: "cmd-failed", type: "command_execution", status: "failed", exit_code: 1, aggregated_output: "expected failure" } });
+    send({ type: "item.started", item: { id: "cmd-reused", type: "command_execution", command: "false" } });
+    send({ type: "item.completed", item: { id: "cmd-reused", type: "command_execution", status: "failed", exit_code: 1, aggregated_output: "expected failure" } });
     return;
   }
   const text = mode === "structured" ? '{"answer":{"label":"ok","priority":"must"}}'
@@ -61,8 +61,8 @@ process.stdin.on("end", () => {
     send({ type: "error", message: "transient private provider error" });
   }
   if (mode === "command-eof-recovery") {
-    send({ type: "item.started", item: { id: "cmd-fixed", type: "command_execution", command: "true" } });
-    send({ type: "item.completed", item: { id: "cmd-fixed", type: "command_execution", status: "completed", exit_code: 0, aggregated_output: "fixed" } });
+    send({ type: "item.started", item: { id: "cmd-reused", type: "command_execution", command: "true" } });
+    send({ type: "item.completed", item: { id: "cmd-reused", type: "command_execution", status: "completed", exit_code: 0, aggregated_output: "fixed" } });
   }
   send({ type: "item.completed", item: { id: "message-1", type: "agent_message", text } });
   if (mode !== "protocol-eof") {
@@ -238,6 +238,11 @@ test("Codex bridge gives an incomplete failed command one bounded same-thread re
     events.filter((event) => event.payload.kind === "tool_end")
       .map((event) => event.payload.isError),
     [true, false],
+  );
+  assert.deepEqual(
+    events.filter((event) => event.payload.kind === "tool_start")
+      .map((event) => event.payload.toolCallId),
+    ["cmd-reused", "recovery-1-cmd-reused"],
   );
 
   const calls = await invocations(paths.log);

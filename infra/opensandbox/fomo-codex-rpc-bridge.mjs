@@ -121,7 +121,7 @@ let assistantText = "";
 let childUsage = null;
 let toolCalls = 0;
 let toolResults = 0;
-let failedToolResults = 0;
+let failedCommandResults = 0;
 let startedAt = 0;
 let recoveryAttempts = 0;
 let awaitingRecoveryThread = false;
@@ -493,10 +493,13 @@ function spawnCodex(input = prompt, forceResume = false) {
 }
 
 function safeToolId(value) {
-  if (typeof value === "string" && value && value.length <= MAX.identifier && IDENTIFIER.test(value)) {
-    return value;
+  const attemptPrefix = recoveryAttempts ? `recovery-${recoveryAttempts}-` : "";
+  const raw = typeof value === "string" ? value : "";
+  const candidate = `${attemptPrefix}${raw}`;
+  if (raw && candidate.length <= MAX.identifier && IDENTIFIER.test(candidate)) {
+    return candidate;
   }
-  return `codex-${createHash("sha256").update(String(value)).digest("hex").slice(0, 24)}`;
+  return `${attemptPrefix}codex-${createHash("sha256").update(String(value)).digest("hex").slice(0, 24)}`;
 }
 
 function toolKind(item) {
@@ -566,7 +569,7 @@ function endTool(item) {
   const failed = item.status === "failed" ||
     (Number.isInteger(item.exit_code) && item.exit_code !== 0) ||
     (item.type === "mcp_tool_call" && item.error != null);
-  if (failed) failedToolResults += 1;
+  if (failed && item.type === "command_execution") failedCommandResults += 1;
   emitPi("tool_end", {
     toolCallId: active.publicId,
     toolName: active.name,
@@ -853,8 +856,7 @@ function finalizeSuccess() {
 function recoverIncompleteCommandFailure() {
   if (
     recoveryAttempts !== 0 || structuredMode || !sawThread ||
-    failedToolResults === 0 || activeTools.size || sawTurnFailure || sawModelError ||
-    assistantText.trim()
+    failedCommandResults === 0 || activeTools.size || sawTurnFailure || sawModelError
   ) return false;
 
   // Codex 0.147 treats a non-zero command exit as a normal tool result and is
@@ -871,6 +873,7 @@ function recoverIncompleteCommandFailure() {
   sawTurnComplete = false;
   sawTurnFailure = false;
   sawModelError = false;
+  assistantText = "";
   childUsage = null;
   emitPi("inference_heartbeat", { elapsedMs: elapsedMs() });
   spawnCodex(COMMAND_FAILURE_RECOVERY_PROMPT, true);
@@ -897,14 +900,14 @@ function onClose(code, signal) {
     (!sawTurnComplete || !assistantText.trim()) &&
     recoverIncompleteCommandFailure()
   ) return;
-  if (code === 0 && signal === null && (!sawThread || !sawTurnComplete || !childUsage)) {
+  if (
+    code === 0 && signal === null &&
+    (!sawThread || !sawTurnComplete || !childUsage || !assistantText.trim())
+  ) {
     fail("codex_protocol_failed", "Codex ended without a valid terminal turn.", sawThread ? "running" : "booting");
     return;
   }
-  if (
-    code !== 0 || signal !== null || !sawThread || !sawTurnComplete ||
-    !childUsage || !assistantText.trim()
-  ) {
+  if (code !== 0 || signal !== null || !sawThread || !sawTurnComplete || !childUsage) {
     fail("codex_runtime_failed", "Codex runtime could not complete the request.", sawThread ? "running" : "booting");
     return;
   }
