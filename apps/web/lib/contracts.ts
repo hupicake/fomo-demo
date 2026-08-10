@@ -121,12 +121,14 @@ export interface RuntimeProfileOption {
   disabledReason?: string | null;
 }
 
-export const agentFrameworkIds = ["pi", "opencode"] as const;
+export const agentFrameworkIds = ["pi", "opencode", "codex"] as const;
 export type AgentFrameworkId = (typeof agentFrameworkIds)[number];
 
 export interface AgentFrameworkOption {
   id: AgentFrameworkId;
   label: string;
+  compatibleProfileIds: string[];
+  compatibleThinkingLevels: string[] | null;
   available: boolean;
   disabledReason?: string | null;
 }

@@ -711,6 +711,8 @@ class RuntimeProfileOption(SchemaModel):
 class AgentFrameworkOption(SchemaModel):
     id: AgentFramework
     label: str
+    compatible_profile_ids: list[str]
+    compatible_thinking_levels: list[str] | None = None
     available: bool
     disabled_reason: str | None = None
 

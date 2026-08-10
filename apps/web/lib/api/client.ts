@@ -244,9 +244,24 @@ function normalizeAgentFramework(value: unknown): AgentFrameworkOption | undefin
   const label = text(source.label);
   if (!id || !label) return undefined;
   const disabledReason = text(source.disabledReason || source.disabled_reason) || undefined;
+  const compatibleProfileIds = toArray(
+    source.compatibleProfileIds ?? source.compatible_profile_ids,
+  ).flatMap((item) => {
+    const value = text(item);
+    return value ? [value] : [];
+  });
+  const rawThinkingLevels = source.compatibleThinkingLevels ?? source.compatible_thinking_levels;
+  const compatibleThinkingLevels = rawThinkingLevels == null
+    ? null
+    : toArray(rawThinkingLevels).flatMap((item) => {
+        const value = text(item);
+        return value ? [value] : [];
+      });
   return {
     id,
     label,
+    compatibleProfileIds,
+    compatibleThinkingLevels,
     available: Boolean(source.available),
     ...(disabledReason ? { disabledReason } : {}),
   };

@@ -188,17 +188,35 @@ async def test_runtime_options_fail_closed_without_management_discovery(
     payload = response.json()
     assert payload["defaultProfileId"] is None
     assert all(option["available"] is False for option in payload["profiles"])
+    frameworks = {option["id"]: option for option in payload["agentFrameworks"]}
+    assert frameworks["pi"]["available"] is False
+    assert frameworks["pi"]["disabledReason"] == (
+        "Model availability could not be verified."
+    )
+    assert frameworks["opencode"]["available"] is False
+    assert frameworks["codex"]["available"] is False
+    assert frameworks["codex"]["disabledReason"] == "Not enabled by the server."
     assert not any("fomo-pi-" in json.dumps(option) for option in payload["profiles"])
 
 
 @pytest.mark.asyncio
 async def test_agent_framework_is_available_frozen_and_idempotent(
-    repository, settings
+    repository, settings, monkeypatch
 ) -> None:
+    async def discovered(_self) -> set[str]:
+        return {"fomo-pi-deepseek-flash", "fomo-pi-gpt-5.6"}
+
+    monkeypatch.setattr(
+        "fomo.api.app.LiteLLMRunKeyClient.discover_model_aliases",
+        discovered,
+    )
     configured = replace(
         settings,
+        agent_framework="direct_pi",
         agent_enabled_frameworks=("pi", "opencode"),
         agent_default_framework="opencode",
+        litellm_api_key="sk-test-management",
+        runtime_enabled_profiles=("deepseek-flash", "gpt-5.6"),
     )
     app = create_app(configured, repository)
     async with httpx.AsyncClient(
@@ -221,14 +239,31 @@ async def test_agent_framework_is_available_frozen_and_idempotent(
             {
                 "id": "pi",
                 "label": "Pi",
+                "compatibleProfileIds": ["gpt-5.6", "deepseek-flash"],
+                "compatibleThinkingLevels": None,
                 "available": True,
                 "disabledReason": None,
             },
             {
                 "id": "opencode",
                 "label": "OpenCode",
+                "compatibleProfileIds": ["gpt-5.6", "deepseek-flash"],
+                "compatibleThinkingLevels": None,
                 "available": True,
                 "disabledReason": None,
+            },
+            {
+                "id": "codex",
+                "label": "Codex",
+                "compatibleProfileIds": ["gpt-5.6"],
+                "compatibleThinkingLevels": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                ],
+                "available": False,
+                "disabledReason": "Not enabled by the server.",
             },
         ]
 
@@ -297,6 +332,127 @@ async def test_agent_framework_is_available_frozen_and_idempotent(
             assert unknown.status_code == 422
         finally:
             await disabled_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_codex_framework_requires_gpt_and_replays_after_rollout_is_disabled(
+    repository, settings, monkeypatch
+) -> None:
+    async def discovered(_self) -> set[str]:
+        return {"fomo-pi-deepseek-flash", "fomo-pi-gpt-5.6"}
+
+    monkeypatch.setattr(
+        "fomo.api.app.LiteLLMRunKeyClient.discover_model_aliases",
+        discovered,
+    )
+    configured = replace(
+        settings,
+        agent_framework="direct_pi",
+        agent_enabled_frameworks=("pi", "codex"),
+        agent_default_framework="pi",
+        litellm_api_key="sk-test-management",
+        runtime_enabled_profiles=("deepseek-flash", "gpt-5.6"),
+        runtime_default_profile="deepseek-flash",
+    )
+    app = create_app(configured, repository)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        session_id = (await create_user_session(repository)).id
+        headers = _session_headers(configured, session_id)
+        project_id = (
+            await client.post(
+                "/v1/projects",
+                headers=headers,
+                json={"title": "Codex contract"},
+            )
+        ).json()["id"]
+
+        codex_option = next(
+            option
+            for option in (await client.get("/v1/runtime/options")).json()[
+                "agentFrameworks"
+            ]
+            if option["id"] == "codex"
+        )
+        assert codex_option == {
+            "id": "codex",
+            "label": "Codex",
+            "compatibleProfileIds": ["gpt-5.6"],
+            "compatibleThinkingLevels": [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+            ],
+            "available": True,
+            "disabledReason": None,
+        }
+
+        body = {
+            "clientMessageId": "codex-default-gpt",
+            "content": "Build with Codex",
+            "agentFramework": "codex",
+        }
+        created = await client.post(
+            f"/v1/projects/{project_id}/messages",
+            headers={**headers, "Idempotency-Key": body["clientMessageId"]},
+            json=body,
+        )
+        assert created.status_code == 202
+        assert created.json()["run"]["agentFramework"] == "codex"
+        assert created.json()["run"]["runtime"]["profileId"] == "gpt-5.6"
+
+        incompatible_profile = await client.post(
+            f"/v1/projects/{project_id}/messages",
+            headers={**headers, "Idempotency-Key": "codex-deepseek"},
+            json={
+                "clientMessageId": "codex-deepseek",
+                "content": "Do not queue an incompatible model",
+                "agentFramework": "codex",
+                "profileId": "deepseek-flash",
+            },
+        )
+        assert incompatible_profile.status_code == 422
+
+        incompatible_thinking = await client.post(
+            f"/v1/projects/{project_id}/messages",
+            headers={**headers, "Idempotency-Key": "codex-off"},
+            json={
+                "clientMessageId": "codex-off",
+                "content": "Do not queue unsupported thinking",
+                "agentFramework": "codex",
+                "profileId": "gpt-5.6",
+                "thinking": "off",
+            },
+        )
+        assert incompatible_thinking.status_code == 422
+
+    disabled = replace(
+        configured,
+        agent_enabled_frameworks=("pi",),
+        agent_default_framework="pi",
+        litellm_api_key=None,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app(disabled, repository)),
+        base_url="http://test",
+    ) as client:
+        replay = await client.post(
+            f"/v1/projects/{project_id}/messages",
+            headers={**headers, "Idempotency-Key": body["clientMessageId"]},
+            json=body,
+        )
+        assert replay.status_code == 200
+        assert replay.json()["run"]["agentFramework"] == "codex"
+
+        mismatch = await client.post(
+            f"/v1/projects/{project_id}/messages",
+            headers={**headers, "Idempotency-Key": body["clientMessageId"]},
+            json={**body, "agentFramework": "pi"},
+        )
+        assert mismatch.status_code == 409
 
 
 @pytest.mark.asyncio

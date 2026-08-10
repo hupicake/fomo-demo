@@ -74,7 +74,7 @@ const publicFailureContracts = {
   },
   coding_agent_runtime_failed: {
     title: "Coding Agent 运行环境问题",
-    message: "Coding Agent 运行环境暂时不可用，请重试；若问题持续发生，请检查 OpenCode 服务状态。",
+    message: "Coding Agent 运行环境暂时不可用，请重试；若问题持续发生，请检查所选 Agent 框架状态。",
   },
   planning_contract_failed: {
     title: "模型运行问题：规划输出无效",

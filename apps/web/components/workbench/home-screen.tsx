@@ -125,26 +125,12 @@ export function HomeScreen() {
   );
   const availableProfiles = runtimeOptions?.profiles.filter((profile) => profile.available) ?? [];
   const availableFrameworks = runtimeOptions?.agentFrameworks.filter((framework) => framework.available) ?? [];
-  const hasAvailableModel = availableProfiles.length > 0;
   const hasAvailableFramework = availableFrameworks.length > 0;
   const runtimeLoading = !runtimeOptions && !runtimeError;
 
   const [selectedAgentFramework, setSelectedAgentFramework] = useState<AgentFrameworkId>();
   const [selectedProfileId, setSelectedProfileId] = useState<string>();
   const [selectedThinking, setSelectedThinking] = useState<string>();
-  // Resolve the effective selection: the user's pick, else the first available
-  // profile (and its default thinking) so a submit is always well-formed.
-  const selectedAvailableProfile = runtimeOptions?.profiles.find(
-    (profile) => profile.profileId === selectedProfileId && profile.available,
-  );
-  const defaultAvailableProfile = runtimeOptions?.profiles.find(
-    (profile) => profile.profileId === runtimeOptions.defaultProfileId && profile.available,
-  );
-  const activeProfileId = selectedAvailableProfile?.profileId
-    ?? defaultAvailableProfile?.profileId
-    ?? availableProfiles[0]?.profileId;
-  const activeThinking = selectedThinking
-    ?? runtimeOptions?.profiles.find((profile) => profile.profileId === activeProfileId)?.defaultThinking;
   const selectedAvailableFramework = runtimeOptions?.agentFrameworks.find(
     (framework) => framework.id === selectedAgentFramework && framework.available,
   );
@@ -154,6 +140,34 @@ export function HomeScreen() {
   const activeAgentFramework = selectedAvailableFramework?.id
     ?? defaultAvailableFramework?.id
     ?? availableFrameworks[0]?.id;
+  const activeFramework = runtimeOptions?.agentFrameworks.find(
+    (framework) => framework.id === activeAgentFramework,
+  );
+  const compatibleAvailableProfiles = availableProfiles.filter(
+    (profile) => !activeFramework
+      || activeFramework.compatibleProfileIds.length === 0
+      || activeFramework.compatibleProfileIds.includes(profile.profileId),
+  );
+  const hasAvailableModel = compatibleAvailableProfiles.length > 0;
+  const selectedAvailableProfile = compatibleAvailableProfiles.find(
+    (profile) => profile.profileId === selectedProfileId,
+  );
+  const defaultAvailableProfile = compatibleAvailableProfiles.find(
+    (profile) => profile.profileId === runtimeOptions?.defaultProfileId,
+  );
+  const activeProfile = selectedAvailableProfile
+    ?? defaultAvailableProfile
+    ?? compatibleAvailableProfiles[0];
+  const activeProfileId = activeProfile?.profileId;
+  const compatibleThinkingLevels = activeProfile?.thinkingLevels.filter(
+    (level) => activeFramework?.compatibleThinkingLevels == null
+      || activeFramework.compatibleThinkingLevels.includes(level),
+  ) ?? [];
+  const activeThinking = compatibleThinkingLevels.includes(selectedThinking ?? "")
+    ? selectedThinking
+    : compatibleThinkingLevels.includes(activeProfile?.defaultThinking ?? "")
+      ? activeProfile?.defaultThinking
+      : compatibleThinkingLevels[0];
 
   useEffect(() => {
     if (!runtimeOptions || selectedAgentFramework) return;
@@ -165,13 +179,14 @@ export function HomeScreen() {
 
   useEffect(() => {
     if (!runtimeOptions || selectedProfileId) return;
-    const profile = runtimeOptions.profiles.find((candidate) => candidate.profileId === runtimeOptions.defaultProfileId && candidate.available)
-      ?? runtimeOptions.profiles.find((candidate) => candidate.available);
+    const profile = compatibleAvailableProfiles.find(
+      (candidate) => candidate.profileId === runtimeOptions.defaultProfileId,
+    ) ?? compatibleAvailableProfiles[0];
     if (profile) {
       setSelectedProfileId(profile.profileId);
       setSelectedThinking(profile.defaultThinking);
     }
-  }, [runtimeOptions, selectedProfileId]);
+  }, [compatibleAvailableProfiles, runtimeOptions, selectedProfileId]);
 
   useEffect(() => {
     if (error instanceof ApiProblem && error.status === 401) {

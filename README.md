@@ -1,6 +1,6 @@
 # FOMO
 
-FOMO is a web coding agent workbench that runs **Pi or OpenCode as a
+FOMO is a web coding agent workbench that runs **Pi, OpenCode, or Codex CLI as a
 per-run selectable Coding Agent runtime** inside an OpenSandbox generation
 sandbox, with FOMO as the single persistent control plane for verification,
 versions, and provenance. The current implementation contains the **P0 Pi baseline**
@@ -50,10 +50,11 @@ If a local environment file does not already exist, copy `.env.example` to
 `.env.local` and fill in only the model credentials you use. Do not overwrite an
 existing `.env.local`.
 
-`FOMO_AGENT_ENABLED_FRAMEWORKS=pi,opencode` controls the public framework
+`FOMO_AGENT_ENABLED_FRAMEWORKS=pi,opencode,codex` controls the public framework
 allowlist and `FOMO_AGENT_DEFAULT_FRAMEWORK=pi` selects the initial UI value.
 The selected framework, model and thinking level are frozen together when a
-run is created; workers never silently fall back to another framework.
+run is created; workers never silently fall back to another framework. Codex
+CLI is intentionally limited to the GPT-5.5 and GPT-5.6 profiles.
 
 Start the complete stack:
 
@@ -92,11 +93,14 @@ deleting persistent volumes.
 
 ## Coding Agent runtimes
 
-Pi and OpenCode share the same GoalGraph, workspace safety audit, clean
+Pi, OpenCode, and Codex CLI share the same GoalGraph, workspace safety audit, clean
 Playwright verification, Preview and version publication pipeline. Pi uses the
 root-owned RPC bridge. OpenCode runs as a loopback-only server inside the same
 generation sandbox through a pinned SDK bridge; it receives only the run-scoped
-LiteLLM virtual key and never a provider or LiteLLM master credential.
+LiteLLM virtual key and never a provider or LiteLLM master credential. Codex
+uses pinned `codex exec --json`/`resume` through a root-owned adapter and the
+same run-scoped key; the surrounding OpenSandbox remains the hard isolation
+boundary.
 
 ### Direct Pi
 

@@ -11,6 +11,7 @@ import pytest
 from fomo.fomo_pi_ds import (
     FOMO_PI_MODEL,
     FOMO_PI_THINKING,
+    OpenSandboxCodexTransport,
     OpenSandboxOpenCodeTransport,
     OpenSandboxPiTransport,
     PiBridgeFailed,
@@ -58,7 +59,9 @@ def _line(seq: int, event_type: str, payload: dict[str, object]) -> str:
     )
 
 
-def _successful_lines() -> list[str]:
+def _successful_lines(
+    *, model: str = FOMO_PI_MODEL, thinking: str = FOMO_PI_THINKING
+) -> list[str]:
     session_id = "session-1"
     return [
         _line(
@@ -66,8 +69,8 @@ def _successful_lines() -> list[str]:
             "started",
             {
                 "sessionId": session_id,
-                "model": FOMO_PI_MODEL,
-                "thinkingLevel": FOMO_PI_THINKING,
+                "model": model,
+                "thinkingLevel": thinking,
                 "resumed": False,
                 "initialStats": _stats(session_id),
             },
@@ -342,6 +345,93 @@ async def test_opencode_transport_projects_protocol_failure_as_runtime_failure(
         "phase": "transport",
     }
     assert "private-value" not in str(failure.value)
+
+
+@pytest.mark.asyncio
+async def test_codex_transport_selects_isolated_runtime_and_strict_resume(
+    tmp_path: Path,
+) -> None:
+    profile = runtime_profile("gpt-5.6")
+    invocation = PiInvocation(
+        PiRequest(
+            request_id="request-1",
+            correlation_id="run-1",
+            session_id="session-1",
+            provider_base_url="http://litellm:4000/v1",
+            prompt="private prompt",
+            virtual_key="sk-run-secret",
+            model=profile.model_ref,
+            thinking="xhigh",
+            context_window=profile.context_window,
+            user_input_enabled=False,
+            require_resume=True,
+        )
+    )
+    commands = _FakeCommands(
+        stdout=_successful_lines(model=profile.model_ref, thinking="xhigh")
+    )
+    provider = _FakeProvider(commands)
+    transport = OpenSandboxCodexTransport(  # type: ignore[arg-type]
+        provider,
+        default_timeout_seconds=300,
+    )
+
+    result = await transport.run(
+        SandboxRef(id="sandbox-1", project_id="project-1"), invocation
+    )
+
+    assert result.bridge.completed["sessionId"] == "session-1"
+    assert commands.command == "/opt/fomo/bin/fomo-codex-rpc-bridge.mjs"
+    assert commands.opts.envs["FOMO_PI_STATE_DIR"] == "/var/lib/fomo-codex"
+    assert commands.opts.envs["FOMO_PI_BIN"] == "/opt/fomo/pi/bin/codex"
+    assert commands.opts.envs["FOMO_PI_REQUIRE_RESUME"] == "1"
+    assert "FOMO_PI_USER_INPUT_ENABLED" not in commands.opts.envs
+    assert invocation.command_line() == ("/opt/fomo/bin/fomo-pi-rpc-bridge.mjs",)
+
+
+@pytest.mark.asyncio
+async def test_codex_transport_fails_closed_without_framework_fallback(
+    tmp_path: Path,
+) -> None:
+    commands = _FakeCommands(stdout=["{private-provider-body}"])
+    provider = _FakeProvider(commands)
+    transport = OpenSandboxCodexTransport(  # type: ignore[arg-type]
+        provider,
+        default_timeout_seconds=300,
+    )
+
+    with pytest.raises(PiBridgeFailed) as unsupported:
+        await transport.run(
+            SandboxRef(id="sandbox-1", project_id="project-1"),
+            _invocation(tmp_path),
+        )
+    assert unsupported.value.payload["code"] == "codex_profile_unsupported"
+    assert provider.refs == []
+
+    profile = runtime_profile("gpt-5.5")
+    supported = PiInvocation(
+        PiRequest(
+            request_id="request-1",
+            correlation_id="run-1",
+            session_id="session-1",
+            provider_base_url="http://litellm:4000/v1",
+            prompt="private prompt",
+            virtual_key="sk-run-secret",
+            model=profile.model_ref,
+            thinking="high",
+            context_window=profile.context_window,
+        )
+    )
+    with pytest.raises(PiBridgeFailed) as malformed:
+        await transport.run(
+            SandboxRef(id="sandbox-1", project_id="project-1"), supported
+        )
+    assert malformed.value.payload == {
+        "code": "codex_runtime_failed",
+        "message": "Codex runtime could not complete the request.",
+        "phase": "transport",
+    }
+    assert "private-provider-body" not in str(malformed.value)
 
 
 @pytest.mark.asyncio

@@ -106,6 +106,26 @@ def test_opencode_failures_use_closed_model_runtime_and_generic_contracts() -> N
     )
 
 
+def test_codex_failures_use_closed_model_runtime_and_planning_contracts() -> None:
+    secret = "provider_body=password=never-persist"
+
+    assert classify_direct_pi_failure(
+        PiBridgeFailed({"code": "codex_model_failed", "message": secret})
+    ) == MODEL_RESPONSE_FAILED
+    assert public_bridge_failure("codex_protocol_failed") == MODEL_RUNTIME_PROTOCOL_FAILED
+    assert public_bridge_failure("codex_structured_output_invalid") == PLANNING_CONTRACT_FAILED
+    assert public_bridge_failure("codex_runtime_failed") == CODING_AGENT_RUNTIME_FAILED
+    assert secret not in json.dumps(
+        [
+            MODEL_RESPONSE_FAILED.event_payload(),
+            MODEL_RUNTIME_PROTOCOL_FAILED.event_payload(),
+            PLANNING_CONTRACT_FAILED.event_payload(),
+            CODING_AGENT_RUNTIME_FAILED.event_payload(),
+        ],
+        ensure_ascii=False,
+    )
+
+
 def test_model_and_planning_contract_failures_are_specific_without_forwarding_text() -> None:
     secret = "api_key=private-model-body"
 

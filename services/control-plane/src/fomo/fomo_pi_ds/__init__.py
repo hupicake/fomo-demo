@@ -1,5 +1,13 @@
 """Direct Pi runtime primitives for FOMO's generation sandbox."""
 
+from .codex_transport import (
+    CODEX_BIN,
+    CODEX_BRIDGE_BIN,
+    CODEX_MODEL_REFS,
+    CODEX_STATE_DIR,
+    CODEX_THINKING_LEVELS,
+    OpenSandboxCodexTransport,
+)
 from .gateway import (
     FOMO_PI_ALLOWED_LITELLM_ALIASES,
     FOMO_PI_BUILD_LITELLM_ALIAS,
@@ -55,6 +63,12 @@ __all__ = [
     "FOMO_PI_REQUIRE_RESUME",
     "InferenceGatewayError",
     "LiteLLMRunKeyClient",
+    "CODEX_BIN",
+    "CODEX_BRIDGE_BIN",
+    "CODEX_MODEL_REFS",
+    "CODEX_STATE_DIR",
+    "CODEX_THINKING_LEVELS",
+    "OpenSandboxCodexTransport",
     "OpenSandboxOpenCodeTransport",
     "OpenSandboxPiTransport",
     "PiBridgeEnvelope",
