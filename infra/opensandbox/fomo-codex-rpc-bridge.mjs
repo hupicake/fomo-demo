@@ -27,6 +27,8 @@ const SCHEMA_VERSION = 1;
 const CODEX_VERSION = "codex-cli 0.147.0";
 const CODEX_MODEL_CATALOG = "/opt/fomo/bin/fomo-codex-models.json";
 const STRUCTURED_OUTPUT_TOOL = "submit_structured_output";
+const COMMAND_FAILURE_RECOVERY_PROMPT =
+  "Continue the current task from the persisted thread. Inspect the failed command result, correct the issue, and finish the requested work without repeating completed work.";
 const MODEL_REFS = new Set([
   "fomo-litellm/fomo-pi-gpt-5.5",
   "fomo-litellm/fomo-pi-gpt-5.6",
@@ -119,7 +121,10 @@ let assistantText = "";
 let childUsage = null;
 let toolCalls = 0;
 let toolResults = 0;
+let failedToolResults = 0;
 let startedAt = 0;
+let recoveryAttempts = 0;
+let awaitingRecoveryThread = false;
 const activeTools = new Map();
 const toolCounts = {};
 
@@ -416,7 +421,7 @@ function storeThreadMapping(value, cumulativeUsage) {
   }
 }
 
-function codexArguments() {
+function codexArguments(forceResume = false) {
   // OpenSandbox is the host isolation boundary. Codex is deliberately
   // unrestricted only inside that disposable generation sandbox; the bypass
   // flag is not used, and approvals are explicitly disabled for headless IO.
@@ -455,11 +460,13 @@ function codexArguments() {
     "--ignore-rules",
   ];
   if (structuredMode) exec.push("--output-schema", schemaPath);
-  if (resumed) return [...global, "exec", "resume", ...exec, expectedThreadId, "-"];
+  if (forceResume || resumed) {
+    return [...global, "exec", "resume", ...exec, forceResume ? threadId : expectedThreadId, "-"];
+  }
   return [...global, "exec", ...exec, "-"];
 }
 
-function spawnCodex() {
+function spawnCodex(input = prompt, forceResume = false) {
   const environment = { ...process.env };
   for (const name of Object.keys(environment)) {
     if (name.startsWith("FOMO_PI_")) delete environment[name];
@@ -467,7 +474,7 @@ function spawnCodex() {
   environment.CODEX_HOME = codexHome;
   environment.CODEX_API_KEY = virtualKey;
   environment.NO_COLOR = "1";
-  child = spawn(codexBin, codexArguments(), {
+  child = spawn(codexBin, codexArguments(forceResume), {
     cwd: workspace,
     env: environment,
     detached: true,
@@ -482,7 +489,7 @@ function spawnCodex() {
     // bridge deliberately does not publish or persist them.
   });
   child.on("close", onClose);
-  child.stdin.end(prompt);
+  child.stdin.end(input);
 }
 
 function safeToolId(value) {
@@ -559,6 +566,7 @@ function endTool(item) {
   const failed = item.status === "failed" ||
     (Number.isInteger(item.exit_code) && item.exit_code !== 0) ||
     (item.type === "mcp_tool_call" && item.error != null);
+  if (failed) failedToolResults += 1;
   emitPi("tool_end", {
     toolCallId: active.publicId,
     toolName: active.name,
@@ -660,6 +668,11 @@ function handleRecord(record) {
     throw new Error("Codex emitted an invalid JSONL record");
   }
   if (record.type === "thread.started") {
+    if (awaitingRecoveryThread) {
+      if (record.thread_id !== threadId) throw new Error("Codex recovery resumed a different thread");
+      awaitingRecoveryThread = false;
+      return;
+    }
     if (sawThread || typeof record.thread_id !== "string" || !UUID.test(record.thread_id)) {
       throw new Error("Codex thread contract is invalid");
     }
@@ -694,7 +707,7 @@ function handleRecord(record) {
   if (record.type === "turn.completed") {
     if (
       !sawTurnStart || sawTurnComplete || sawTurnFailure ||
-      activeTools.size || !assistantText.trim()
+      activeTools.size
     ) {
       throw new Error("Codex turn completion is invalid");
     }
@@ -837,6 +850,33 @@ function finalizeSuccess() {
   process.exit(0);
 }
 
+function recoverIncompleteCommandFailure() {
+  if (
+    recoveryAttempts !== 0 || structuredMode || !sawThread ||
+    failedToolResults === 0 || activeTools.size || sawTurnFailure || sawModelError ||
+    assistantText.trim()
+  ) return false;
+
+  // Codex 0.147 treats a non-zero command exit as a normal tool result and is
+  // expected to continue the same turn. Its exec frontend can nevertheless
+  // exit cleanly if the in-process event channel closes before the terminal
+  // turn notification. Resume the captured UUID once so the model can observe
+  // the persisted command result and repair it; never use --last or fallback
+  // to a new thread.
+  if (sawTurnComplete && childUsage) storeThreadMapping(threadId, childUsage);
+  recoveryAttempts += 1;
+  awaitingRecoveryThread = true;
+  childExited = false;
+  sawTurnStart = false;
+  sawTurnComplete = false;
+  sawTurnFailure = false;
+  sawModelError = false;
+  childUsage = null;
+  emitPi("inference_heartbeat", { elapsedMs: elapsedMs() });
+  spawnCodex(COMMAND_FAILURE_RECOVERY_PROMPT, true);
+  return true;
+}
+
 function onClose(code, signal) {
   childExited = true;
   if (terminal) return;
@@ -852,11 +892,19 @@ function onClose(code, signal) {
     );
     return;
   }
+  if (
+    code === 0 && signal === null &&
+    (!sawTurnComplete || !assistantText.trim()) &&
+    recoverIncompleteCommandFailure()
+  ) return;
   if (code === 0 && signal === null && (!sawThread || !sawTurnComplete || !childUsage)) {
     fail("codex_protocol_failed", "Codex ended without a valid terminal turn.", sawThread ? "running" : "booting");
     return;
   }
-  if (code !== 0 || signal !== null || !sawThread || !sawTurnComplete || !childUsage) {
+  if (
+    code !== 0 || signal !== null || !sawThread || !sawTurnComplete ||
+    !childUsage || !assistantText.trim()
+  ) {
     fail("codex_runtime_failed", "Codex runtime could not complete the request.", sawThread ? "running" : "booting");
     return;
   }
