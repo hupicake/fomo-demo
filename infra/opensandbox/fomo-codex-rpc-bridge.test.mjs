@@ -35,7 +35,10 @@ process.stdin.on("end", () => {
   }) + "\n");
   const send = (value) => process.stdout.write(JSON.stringify(value) + "\n");
   const mode = process.env.FAKE_CODEX_MODE || "success";
-  send({ type: "thread.started", thread_id: "${THREAD_ID}" });
+  const recoveryMode = mode.startsWith("command-eof-recovery");
+  if (!(mode === "command-eof-recovery-missing-thread" && args.includes("resume"))) {
+    send({ type: "thread.started", thread_id: "${THREAD_ID}" });
+  }
   if (mode === "success") {
     send({ type: "item.completed", item: { id: "warning-1", type: "error", message: "recoverable private warning" } });
   }
@@ -46,7 +49,7 @@ process.stdin.on("end", () => {
     process.exitCode = 1;
     return;
   }
-  if (mode === "command-eof-recovery" && !args.includes("resume")) {
+  if (recoveryMode && !args.includes("resume")) {
     send({ type: "item.started", item: { id: "cmd-reused", type: "command_execution", command: "false" } });
     send({ type: "item.completed", item: { id: "cmd-reused", type: "command_execution", status: "failed", exit_code: 1, aggregated_output: "expected failure" } });
     return;
@@ -60,7 +63,7 @@ process.stdin.on("end", () => {
     send({ type: "item.completed", item: { id: "cmd-1", type: "command_execution", status: "failed", exit_code: 1, aggregated_output: "private command output" } });
     send({ type: "error", message: "transient private provider error" });
   }
-  if (mode === "command-eof-recovery") {
+  if (recoveryMode) {
     send({ type: "item.started", item: { id: "cmd-reused", type: "command_execution", command: "true" } });
     send({ type: "item.completed", item: { id: "cmd-reused", type: "command_execution", status: "completed", exit_code: 0, aggregated_output: "fixed" } });
   }
@@ -338,6 +341,7 @@ test("Codex bridge classifies structured, model, and protocol terminal failures"
   for (const [mode, expected] of [
     ["model-failed", "codex_model_failed"],
     ["protocol-eof", "codex_protocol_failed"],
+    ["command-eof-recovery-missing-thread", "codex_protocol_failed"],
     ["structured-invalid", "codex_structured_output_invalid"],
   ]) {
     const paths = await fixture();
