@@ -46,6 +46,11 @@ process.stdin.on("end", () => {
     process.exitCode = 1;
     return;
   }
+  if (mode === "command-eof-recovery" && !args.includes("resume")) {
+    send({ type: "item.started", item: { id: "cmd-failed", type: "command_execution", command: "false" } });
+    send({ type: "item.completed", item: { id: "cmd-failed", type: "command_execution", status: "failed", exit_code: 1, aggregated_output: "expected failure" } });
+    return;
+  }
   const text = mode === "structured" ? '{"answer":{"label":"ok","priority":"must"}}'
     : mode === "structured-invalid" ? "{" : "done";
   if (mode === "success") {
@@ -54,6 +59,10 @@ process.stdin.on("end", () => {
     send({ type: "item.updated", item: { id: "cmd-1", type: "command_execution", aggregated_output: "private command output" } });
     send({ type: "item.completed", item: { id: "cmd-1", type: "command_execution", status: "failed", exit_code: 1, aggregated_output: "private command output" } });
     send({ type: "error", message: "transient private provider error" });
+  }
+  if (mode === "command-eof-recovery") {
+    send({ type: "item.started", item: { id: "cmd-fixed", type: "command_execution", command: "true" } });
+    send({ type: "item.completed", item: { id: "cmd-fixed", type: "command_execution", status: "completed", exit_code: 0, aggregated_output: "fixed" } });
   }
   send({ type: "item.completed", item: { id: "message-1", type: "agent_message", text } });
   if (mode !== "protocol-eof") {
@@ -213,6 +222,30 @@ test("Codex bridge resumes only the captured UUID and fail-closes a missing sess
   const failed = await runBridge(environment(missing, { FOMO_PI_REQUIRE_RESUME: "1" }));
   assert.equal(failed.code, 1);
   assert.equal(records(failed.stdout).at(-1).payload.code, "session_resume_unavailable");
+});
+
+test("Codex bridge gives an incomplete failed command one bounded same-thread recovery", async () => {
+  const paths = await fixture();
+  const result = await runBridge(environment(paths, {
+    FAKE_CODEX_MODE: "command-eof-recovery",
+  }));
+  assert.equal(result.code, 0, result.stderr);
+
+  const events = records(result.stdout);
+  assert.equal(events.filter((event) => event.type === "started").length, 1);
+  assert.equal(events.filter((event) => event.type === "completed").length, 1);
+  assert.deepEqual(
+    events.filter((event) => event.payload.kind === "tool_end")
+      .map((event) => event.payload.isError),
+    [true, false],
+  );
+
+  const calls = await invocations(paths.log);
+  assert.equal(calls.length, 2);
+  assert.ok(calls[1].args.includes("resume"));
+  assert.ok(calls[1].args.includes(THREAD_ID));
+  assert.ok(!calls[1].args.includes("--last"));
+  assert.match(calls[1].prompt, /Inspect the failed command result/);
 });
 
 test("Codex bridge classifies structured, model, and protocol terminal failures", async () => {
