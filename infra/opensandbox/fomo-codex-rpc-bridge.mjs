@@ -164,6 +164,44 @@ function parseFlag(name) {
   return true;
 }
 
+function normalizeStrictOutputSchema(schema) {
+  const visit = (node) => {
+    if (!node || typeof node !== "object" || Array.isArray(node)) return;
+
+    for (const key of ["$defs", "definitions", "properties", "patternProperties", "dependentSchemas"]) {
+      const schemas = node[key];
+      if (schemas && typeof schemas === "object" && !Array.isArray(schemas)) {
+        for (const child of Object.values(schemas)) visit(child);
+      }
+    }
+    for (const key of ["allOf", "anyOf", "oneOf", "prefixItems"]) {
+      const schemas = node[key];
+      if (Array.isArray(schemas)) for (const child of schemas) visit(child);
+    }
+    for (const key of [
+      "additionalProperties", "unevaluatedProperties", "items", "contains",
+      "propertyNames", "not", "if", "then", "else", "contentSchema",
+    ]) {
+      const child = node[key];
+      if (Array.isArray(child)) for (const item of child) visit(item);
+      else visit(child);
+    }
+
+    const types = Array.isArray(node.type) ? node.type : [node.type];
+    if (!types.includes("object")) return;
+    const properties = node.properties ?? {};
+    if (!properties || typeof properties !== "object" || Array.isArray(properties)) {
+      throw new Error("output schema object properties are invalid");
+    }
+    node.properties = properties;
+    node.required = Object.keys(properties);
+    node.additionalProperties = false;
+  };
+
+  visit(schema);
+  return schema;
+}
+
 function bounded(value, maximum = MAX.publicTextCharacters) {
   const text = String(value ?? "");
   return text.length <= maximum ? text : `${text.slice(0, maximum)}…[truncated]`;
@@ -281,6 +319,10 @@ function parseEnvironment() {
     try { schema = JSON.parse(schemaText); } catch { throw new Error("output schema is invalid"); }
     if (!schema || typeof schema !== "object" || Array.isArray(schema) || schema.type !== "object") {
       throw new Error("output schema must describe an object");
+    }
+    schemaText = JSON.stringify(normalizeStrictOutputSchema(schema));
+    if (Buffer.byteLength(schemaText, "utf8") > MAX.schemaBytes) {
+      throw new Error("normalized output schema exceeds its limit");
     }
     structuredMode = true;
   }

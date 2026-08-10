@@ -1035,12 +1035,26 @@ async function main() {
     sdkClient = runtimeValue(() => sdk.createOpencodeClient({ baseUrl: sdkServer.url, directory: workspace }));
     const resolved = await runtimeStep(() => resolveSession(sdkClient));
     sdkSessionId = resolved.id;
-    const initialMessages = unwrap(
-      await runtimeStep(() => sdkClient.session.messages({ sessionID: sdkSessionId, directory: workspace })),
-      "OpenCode initial message query",
-    );
-    if (!Array.isArray(initialMessages)) throw new OpenCodeRuntimeFailure({ reason: "invalid_initial_messages" });
-    if (requireResume && initialMessages.length === 0) {
+    let initialMessages;
+    let initialHistoryAvailable = true;
+    try {
+      initialMessages = unwrap(
+        await runtimeStep(() => sdkClient.session.messages({ sessionID: sdkSessionId, directory: workspace })),
+        "OpenCode initial message query",
+      );
+      if (!Array.isArray(initialMessages)) throw new OpenCodeRuntimeFailure({ reason: "invalid_initial_messages" });
+    } catch (error) {
+      if (!resolved.resumed) throw error;
+      // session.get() already established that the mapped durable session
+      // exists. Some OpenCode versions cannot project a structured-output
+      // turn through the history endpoint, although the session remains
+      // resumable by session.prompt(). Treat that read as telemetry only and
+      // let the authoritative resumed prompt validate the stored history.
+      initialHistoryAvailable = false;
+      initialMessages = [];
+      diagnostic("OpenCode resume history telemetry unavailable; deferring validation to resumed prompt");
+    }
+    if (requireResume && initialHistoryAvailable && initialMessages.length === 0) {
       throw new OpenCodeRuntimeFailure({ reason: "empty_resume_session" });
     }
     const initialStats = summarizeMessages(initialMessages);
@@ -1052,7 +1066,7 @@ async function main() {
       model: modelRef,
       thinkingLevel,
       contextWindow,
-      resumed: resolved.resumed && initialMessages.length > 0,
+      resumed: resolved.resumed && (!initialHistoryAvailable || initialMessages.length > 0),
       initialStats,
     });
     emitPi("agent_start");
