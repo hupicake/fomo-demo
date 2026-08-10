@@ -102,6 +102,9 @@ export function createOpencodeClient() {
       async get() { return { data: { id: "oc-session-1" } }; },
       async messages() {
         messageQueryCount += 1;
+        if (process.env.FOMO_TEST_INITIAL_MESSAGES_FAILURE === "1" && messageQueryCount === 1) {
+          return { error: { message: "resume leaked api_key=resume-private-value" } };
+        }
         if (messageQueryCount === 1) return { data: [] };
         if (process.env.FOMO_TEST_FINAL_MESSAGES_FAILURE === "1") {
           return { error: { message: "history leaked api_key=history-private-value" } };
@@ -269,6 +272,25 @@ test("OpenCode bridge keeps a successful structured result when final telemetry 
   assert.equal(records.at(-1).payload.stats.assistantMessages, 1);
 });
 
+test("OpenCode bridge resumes a mapped session when history telemetry cannot project it", async () => {
+  const paths = await fixture();
+  const first = await runBridge(baseEnvironment(paths));
+  assert.equal(first.code, 0, first.stderr);
+
+  const resumed = await runBridge({
+    ...baseEnvironment(paths),
+    FOMO_PI_REQUIRE_RESUME: "1",
+    FOMO_TEST_INITIAL_MESSAGES_FAILURE: "1",
+  });
+
+  assert.equal(resumed.code, 0, resumed.stderr);
+  assert.doesNotMatch(resumed.stdout, /resume-private-value|api_key/);
+  assert.doesNotMatch(resumed.stderr, /resume-private-value|api_key/);
+  const records = envelopes(resumed.stdout);
+  assert.equal(records[0].type, "started");
+  assert.equal(records[0].payload.resumed, true);
+  assert.equal(records.at(-1).type, "completed");
+});
 test("OpenCode bridge classifies provider responses without exposing their body", async () => {
   const paths = await fixture();
   const result = await runBridge({ ...baseEnvironment(paths), FOMO_TEST_MODEL_FAILURE: "1" });

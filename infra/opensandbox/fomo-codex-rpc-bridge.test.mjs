@@ -46,7 +46,7 @@ process.stdin.on("end", () => {
     process.exitCode = 1;
     return;
   }
-  const text = mode === "structured" ? '{"answer":"ok"}'
+  const text = mode === "structured" ? '{"answer":{"label":"ok","priority":"must"}}'
     : mode === "structured-invalid" ? "{" : "done";
   if (mode === "success") {
     send({ type: "item.completed", item: { id: "reason-1", type: "reasoning", text: "private reasoning" } });
@@ -216,7 +216,20 @@ test("Codex bridge resumes only the captured UUID and fail-closes a missing sess
 });
 
 test("Codex bridge classifies structured, model, and protocol terminal failures", async () => {
-  const schema = { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] };
+  const schema = {
+    type: "object",
+    properties: {
+      answer: {
+        type: "object",
+        properties: {
+          label: { type: "string" },
+          priority: { type: "string", default: "must" },
+        },
+        required: ["label"],
+      },
+    },
+    required: ["answer"],
+  };
   const structuredPaths = await fixture();
   const structured = await runBridge(environment(structuredPaths, {
     FAKE_CODEX_MODE: "structured",
@@ -225,8 +238,18 @@ test("Codex bridge classifies structured, model, and protocol terminal failures"
   assert.equal(structured.code, 0, structured.stderr);
   const structuredEvents = records(structured.stdout);
   const submit = structuredEvents.find((event) => event.payload.toolName === "submit_structured_output");
-  assert.deepEqual(submit.payload.args, { answer: "ok" });
-  assert.deepEqual(JSON.parse((await invocations(structuredPaths.log))[0].schema), schema);
+  assert.deepEqual(submit.payload.args, { answer: { label: "ok", priority: "must" } });
+  assert.deepEqual(JSON.parse((await invocations(structuredPaths.log))[0].schema), {
+    ...schema,
+    additionalProperties: false,
+    properties: {
+      answer: {
+        ...schema.properties.answer,
+        required: ["label", "priority"],
+        additionalProperties: false,
+      },
+    },
+  });
 
   for (const [mode, expected] of [
     ["model-failed", "codex_model_failed"],
