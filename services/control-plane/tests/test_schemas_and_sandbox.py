@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import platform as host_platform
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -426,7 +427,8 @@ async def test_opensandbox_provider_uses_pinned_sdk_contract_and_application_por
     assert ref.id == "server-sandbox-1"
     image, create_kwargs = SDK.create_calls[0]
     assert image == "example/fomo-base:test"
-    assert create_kwargs["platform"].arch == "arm64"
+    expected_arch = "arm64" if host_platform.machine().lower() in {"arm64", "aarch64"} else "amd64"
+    assert create_kwargs["platform"].arch == expected_arch
     assert create_kwargs["metadata"]["fomo.source_version_id"] == "version-1"
     assert create_kwargs["timeout"] == timedelta(seconds=21_600)
     assert create_kwargs["ready_timeout"] == timedelta(seconds=120)

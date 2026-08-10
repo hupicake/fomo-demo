@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import mimetypes
+import platform as host_platform
 from collections.abc import Mapping
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
@@ -44,6 +45,15 @@ from .base import (
     SourceRef,
     validate_workspace_path,
 )
+
+
+def _native_sandbox_arch() -> str:
+    machine = host_platform.machine().lower()
+    if machine in {"arm64", "aarch64"}:
+        return "arm64"
+    if machine in {"amd64", "x86_64"}:
+        return "amd64"
+    raise RuntimeError(f"unsupported OpenSandbox host architecture: {machine}")
 
 _APPLICATION_PORT = 8080
 _WORKSPACE = "/workspace"
@@ -239,7 +249,7 @@ class OpenSandboxProvider:
             "timeout": timedelta(seconds=effective_lifetime),
             "ready_timeout": timedelta(seconds=self._ready_timeout_seconds),
             "metadata": metadata,
-            "platform": PlatformSpec(os="linux", arch="arm64"),
+            "platform": PlatformSpec(os="linux", arch=_native_sandbox_arch()),
             "connection_config": self._connection_config(),
         }
         if self._proxy_environment:
