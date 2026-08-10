@@ -8,7 +8,7 @@
  * stderr never enter that protocol.
  *
  * Scope (P0): transport, event/usage observation, cancellation, total
- * resource/inactivity/wall-clock budgets, redaction, fail-closed protocol, and
+ * resource liveness, redaction, fail-closed protocol, and
  * session reuse. Build and repair turns keep Pi's official builtin tools with
  * full /workspace permission. Planning turns may instead expose one trusted,
  * schema-backed terminating tool; the bridge never proxies filesystem tool
@@ -25,37 +25,102 @@ import { TextDecoder } from "node:util";
 const SCHEMA_VERSION = 1;
 const PROVIDER_ID = "fomo-litellm";
 const DEFAULT_MODEL_REF = `${PROVIDER_ID}/fomo-pi-flash`;
+
+function runtimeModel(
+  id,
+  thinkingLevels,
+  thinkingLevelMap,
+  {
+    format = "openai",
+    replayReasoning = false,
+    supportsReasoningEffort = true,
+    fixedThinkingLevel = null,
+    maxContextWindow = 250_000,
+    maxOutputTokens = 128_000,
+  } = {},
+) {
+  return Object.freeze({
+    id,
+    thinkingLevels: Object.freeze([...thinkingLevels]),
+    thinkingLevelMap: Object.freeze({ ...thinkingLevelMap }),
+    fixedThinkingLevel,
+    maxContextWindow,
+    maxOutputTokens,
+    compat: Object.freeze({
+      supportsDeveloperRole: false,
+      supportsReasoningEffort,
+      requiresReasoningContentOnAssistantMessages: replayReasoning,
+      thinkingFormat: format,
+      maxTokensField: "max_tokens",
+    }),
+  });
+}
+
 const MODEL_CONFIGS = Object.freeze({
-  [`${PROVIDER_ID}/fomo-pi-flash`]: Object.freeze({
-    id: "fomo-pi-flash",
-    thinkingLevelMap: {
-      minimal: null, low: null, medium: null, high: "high", xhigh: null, max: "max",
+  // Historical aliases remain available only for pre-0005 run resumption.
+  [`${PROVIDER_ID}/fomo-pi-flash`]: runtimeModel(
+    "fomo-pi-flash", ["off", "high", "max"],
+    { minimal: null, low: null, medium: null, high: "high", xhigh: null, max: "max" },
+    {
+      format: "deepseek",
+      replayReasoning: true,
+      maxContextWindow: 1_000_000,
+      maxOutputTokens: 384_000,
     },
-    compat: {
-      supportsDeveloperRole: false,
-      supportsReasoningEffort: true,
-      requiresReasoningContentOnAssistantMessages: true,
-      thinkingFormat: "deepseek",
-      maxTokensField: "max_tokens",
+  ),
+  [`${PROVIDER_ID}/fomo-pi-build`]: runtimeModel(
+    "fomo-pi-build", ["off", "medium", "high"],
+    { minimal: null, low: null, medium: "medium", high: "high", xhigh: null, max: null },
+  ),
+  [`${PROVIDER_ID}/fomo-pi-gpt-5.6`]: runtimeModel(
+    "fomo-pi-gpt-5.6", ["off", "low", "medium", "high", "xhigh", "max"],
+    { minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" },
+  ),
+  [`${PROVIDER_ID}/fomo-pi-gpt-5.5`]: runtimeModel(
+    "fomo-pi-gpt-5.5", ["off", "low", "medium", "high", "xhigh"],
+    { minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: null },
+  ),
+  [`${PROVIDER_ID}/fomo-pi-deepseek-flash`]: runtimeModel(
+    "fomo-pi-deepseek-flash", ["off", "high"],
+    { minimal: null, low: null, medium: null, high: "high", xhigh: null, max: null },
+    {
+      format: "deepseek",
+      replayReasoning: true,
+      maxContextWindow: 1_000_000,
+      maxOutputTokens: 384_000,
     },
-  }),
-  [`${PROVIDER_ID}/fomo-pi-build`]: Object.freeze({
-    id: "fomo-pi-build",
-    thinkingLevelMap: {
-      minimal: null, low: null, medium: "medium", high: "high", xhigh: null, max: null,
+  ),
+  [`${PROVIDER_ID}/fomo-pi-grok-4.5`]: runtimeModel(
+    "fomo-pi-grok-4.5", ["low", "medium", "high"],
+    { minimal: null, low: "low", medium: "medium", high: "high", xhigh: null, max: null },
+    { maxContextWindow: 500_000, maxOutputTokens: 500_000 },
+  ),
+  [`${PROVIDER_ID}/fomo-pi-kimi-k2.7-code`]: runtimeModel(
+    "fomo-pi-kimi-k2.7-code", ["default"],
+    { minimal: null, low: null, medium: null, high: null, xhigh: null, max: null },
+    {
+      format: "deepseek",
+      replayReasoning: true,
+      supportsReasoningEffort: false,
+      fixedThinkingLevel: "off",
+      maxContextWindow: 262_144,
+      maxOutputTokens: 262_144,
     },
-    compat: {
-      supportsDeveloperRole: false,
-      supportsReasoningEffort: true,
-      requiresReasoningContentOnAssistantMessages: false,
-      thinkingFormat: "openai",
-      maxTokensField: "max_tokens",
-    },
-  }),
+  ),
+  [`${PROVIDER_ID}/fomo-pi-gemini-3.6-flash`]: runtimeModel(
+    "fomo-pi-gemini-3.6-flash", ["minimal", "low", "medium", "high"],
+    { minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: null, max: null },
+    { maxOutputTokens: 65_536 },
+  ),
+  [`${PROVIDER_ID}/fomo-pi-gemini-3.1-pro`]: runtimeModel(
+    "fomo-pi-gemini-3.1-pro", ["low", "medium", "high"],
+    { minimal: null, low: "low", medium: "medium", high: "high", xhigh: null, max: null },
+    { maxOutputTokens: 65_536 },
+  ),
 });
 const DEFAULT_THINKING_LEVEL = "max";
-const ALLOWED_THINKING_LEVELS = new Set(["off", "medium", "high", "max"]);
 const DEFAULT_CONTEXT_WINDOW = 200_000;
+const MAX_CONTEXT_WINDOW = 1_000_000;
 const COMPACTION_SETTINGS = Object.freeze({
   enabled: true,
   reserveTokens: 32_768,
@@ -65,7 +130,6 @@ const COMPACTION_SETTINGS = Object.freeze({
 // fail-closed transport contract; it never intercepts or rewrites tool calls.
 const ALLOWED_TOOLS = "read,write,edit,bash,grep,find,ls";
 const STRUCTURED_OUTPUT_TOOL = "submit_structured_output";
-const MAX_STRUCTURED_OUTPUT_ATTEMPTS = 3;
 const STRUCTURED_OUTPUT_EXTENSION = fileURLToPath(new URL("./fomo-structured-output.ts", import.meta.url));
 const USER_INPUT_TOOL = "request_user_input";
 const MAX_USER_INPUT_ATTEMPTS = 3;
@@ -110,7 +174,6 @@ const LIMITS = Object.freeze({
   publicDeltaCharacters: 4096,
   publicArgumentCharacters: 2048,
   structuredOutputSchemaBytes: 64 * 1024,
-  structuredOutputArgumentBytes: 1024 * 1024,
   userInputQuestionCharacters: 2000,
   userInputChoiceCharacters: 200,
   userInputChoices: 8,
@@ -158,6 +221,7 @@ let workspace = DEFAULTS.workspace;
 let stateDir = DEFAULTS.stateDir;
 let piBin = DEFAULTS.piBin;
 let thinkingLevel = DEFAULT_THINKING_LEVEL;
+let effectiveThinkingLevel = DEFAULT_THINKING_LEVEL;
 let modelRef = DEFAULT_MODEL_REF;
 let modelConfig = MODEL_CONFIGS[DEFAULT_MODEL_REF];
 // Explicit FOMO logical context window. The active provider supports a larger
@@ -400,18 +464,20 @@ function parseEnvironment() {
     throw new Error(`${ENV.modelRef} must select a supported FOMO Pi model`);
   }
   thinkingLevel = process.env[ENV.thinkingLevel] || DEFAULT_THINKING_LEVEL;
-  if (!ALLOWED_THINKING_LEVELS.has(thinkingLevel)) {
-    throw new Error(`${ENV.thinkingLevel} must be off, medium, high, or max`);
-  }
-  if (modelConfig.thinkingLevelMap[thinkingLevel] === null) {
+  if (!modelConfig.thinkingLevels.includes(thinkingLevel)) {
     throw new Error(`${ENV.thinkingLevel} is unsupported by ${modelRef}`);
   }
+  effectiveThinkingLevel = modelConfig.fixedThinkingLevel || thinkingLevel;
   if (!existsSync(workspace) || !statSync(workspace).isDirectory()) throw new Error(`${ENV.workspace} is not a directory`);
   if (!existsSync(piBin) || !statSync(piBin).isFile()) throw new Error(`${ENV.piBin} is not a file`);
 
   if (process.env[ENV.contextWindow]) {
     // Sane explicit bound: a provider alias must not declare an absurd window.
-    contextWindow = parsePositiveInteger(ENV.contextWindow, process.env[ENV.contextWindow], 8_000_000);
+    contextWindow = parsePositiveInteger(
+      ENV.contextWindow,
+      process.env[ENV.contextWindow],
+      modelConfig.maxContextWindow,
+    );
   }
   if (process.env[ENV.activitySilenceSeconds]) {
     activitySilenceSeconds = parsePositiveInteger(
@@ -441,13 +507,19 @@ function writePrivateConfiguration() {
         api: "openai-completions",
         apiKey: `$${ENV.virtualKey}`,
         authHeader: true,
-        models: Object.values(MODEL_CONFIGS).map((config) => ({
+        models: [modelConfig].map((config) => ({
           id: config.id,
           name: config.id,
           reasoning: true,
           input: ["text"],
           contextWindow,
-          maxTokens: 32_768,
+          // Provider-specific response maximum with space reserved for the
+          // current prompt and Pi's compaction handoff. This is derived from
+          // the selected model window, never a unified FOMO quota.
+          maxTokens: Math.min(
+            modelConfig.maxOutputTokens,
+            contextWindow - COMPACTION_SETTINGS.reserveTokens,
+          ),
           thinkingLevelMap: config.thinkingLevelMap,
           compat: config.compat,
         })),
@@ -481,7 +553,7 @@ function spawnPi(sessionsDir) {
     "--session-id", sessionId,
     "--session-dir", sessionsDir,
     "--model", modelRef,
-    "--thinking", thinkingLevel,
+    "--thinking", effectiveThinkingLevel,
     "--tools", activeTools,
     "--no-context-files",
     "--no-extensions",
@@ -630,7 +702,7 @@ function summarizeState(data) {
   if (
     data.model.provider !== PROVIDER_ID ||
     data.model.id !== modelConfig.id ||
-    data.thinkingLevel !== thinkingLevel
+    data.thinkingLevel !== effectiveThinkingLevel
   ) {
     fail("model_mismatch", "Pi selected provider, model, or thinking level does not match the run contract", 1);
     return null;
@@ -834,15 +906,7 @@ function structuredOutputArguments(value) {
     fail("invalid_structured_output", `${STRUCTURED_OUTPUT_TOOL} arguments must be JSON`, 1, true);
     return null;
   }
-  if (!serialized || Buffer.byteLength(serialized) > LIMITS.structuredOutputArgumentBytes) {
-    fail(
-      "structured_output_too_large",
-      `${STRUCTURED_OUTPUT_TOOL} arguments exceed the transport limit`,
-      1,
-      true,
-    );
-    return null;
-  }
+  if (!serialized) return null;
   try {
     // Unlike ordinary diagnostic tool arguments, this is the machine result;
     // preserve its complete structure while retaining the bridge's redaction.
@@ -978,16 +1042,10 @@ function beginToolCall(message) {
       fail("invalid_structured_output", `${STRUCTURED_OUTPUT_TOOL} is unavailable`, 1, true);
       return false;
     }
-    if (activeToolCalls.size !== 0 || structuredOutputCalls >= MAX_STRUCTURED_OUTPUT_ATTEMPTS) {
-      fail(
-        "invalid_structured_output",
-        `Pi may attempt ${STRUCTURED_OUTPUT_TOOL} at most ${MAX_STRUCTURED_OUTPUT_ATTEMPTS} times`,
-        1,
-        true,
-      );
+    if (activeToolCalls.size !== 0) {
+      fail("invalid_structured_output", `${STRUCTURED_OUTPUT_TOOL} must run serially`, 1, true);
       return false;
     }
-    structuredOutputCalls += 1;
   }
   if (toolName === USER_INPUT_TOOL) {
     if (!userInputEnabled) {
@@ -1067,25 +1125,17 @@ function endToolCall(message, ending) {
 }
 
 function startActivityTimer() {
-  if (activitySilenceSeconds === null) return;
-  const silenceLimitMs = activitySilenceSeconds * 1000;
-  const heartbeatIntervalMs = Math.min(15_000, Math.max(250, silenceLimitMs / 2));
+  // Protocol silence is normal while a provider is thinking. Emit liveness
+  // heartbeats indefinitely; only process exit/EOF, transport failure,
+  // cancellation, lease loss, sandbox expiry, or spend policy may terminate.
+  const cadenceMs = (activitySilenceSeconds ?? 30) * 1000;
+  const heartbeatIntervalMs = Math.min(15_000, Math.max(250, cadenceMs / 2));
   const pollIntervalMs = Math.min(1_000, Math.max(100, heartbeatIntervalMs / 2));
   lastAgentActivityAt = Date.now();
   lastInferenceHeartbeatAt = lastAgentActivityAt;
   activityTimerHandle = setInterval(() => {
     if (lifecycle !== "running") return;
     const now = Date.now();
-    const silentForMs = now - lastAgentActivityAt;
-    if (silentForMs >= silenceLimitMs) {
-      fail(
-        "agent_inactivity_timeout",
-        `Pi produced no protocol activity for ${activitySilenceSeconds} seconds`,
-        124,
-        true,
-      );
-      return;
-    }
     if (now - lastInferenceHeartbeatAt >= heartbeatIntervalMs) {
       // A heartbeat only proves that the bridge remains alive and is still
       // awaiting Pi. It never exposes private reasoning or resets the watchdog.
@@ -1272,7 +1322,7 @@ function main() {
     lifecycle = "booting";
     spawnPi(sessionsDir);
     send("select-model", "set_model", { provider: PROVIDER_ID, modelId: modelConfig.id });
-    send("select-thinking", "set_thinking_level", { level: thinkingLevel });
+    send("select-thinking", "set_thinking_level", { level: effectiveThinkingLevel });
     send("initial-state", "get_state");
     send("initial-stats", "get_session_stats");
     if (timeoutSeconds !== null) {

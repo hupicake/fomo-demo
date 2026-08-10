@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import shlex
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
@@ -15,6 +16,7 @@ from opensandbox.models.execd import ExecutionHandlers, RunCommandOpts
 from fomo.sandbox.base import SandboxRef
 from fomo.sandbox.opensandbox import OpenSandboxProvider
 
+from .gateway import RunVirtualKey
 from .invocation import PiInvocation
 from .rpc import PiBridgeEnvelope, PiBridgeResult, PiBridgeStreamReducer
 
@@ -41,6 +43,10 @@ class PiTransportResult:
 # Extra headroom beyond bridge grace so the bridge can clean up and emit its
 # terminal envelope before the sandbox command deadline fires.
 _OUTER_TIMEOUT_MARGIN_SECONDS = 5
+_RUNTIME_PREFLIGHT_BIN = "/opt/fomo/bin/fomo-runtime-preflight.mjs"
+_RUNTIME_PREFLIGHT_PROVIDER_BASE_URL = "FOMO_PREFLIGHT_PROVIDER_BASE_URL"
+_RUNTIME_PREFLIGHT_VIRTUAL_KEY = "FOMO_PREFLIGHT_VIRTUAL_KEY"
+_RUNTIME_PREFLIGHT_ALIASES_JSON = "FOMO_PREFLIGHT_ALIASES_JSON"
 
 
 class OpenSandboxPiTransport:
@@ -60,6 +66,78 @@ class OpenSandboxPiTransport:
         self._provider = provider
         self._default_timeout_seconds = default_timeout_seconds
         self._stderr_limit_bytes = stderr_limit_bytes
+
+    async def preflight_gateway(
+        self,
+        ref: SandboxRef,
+        virtual_key: RunVirtualKey,
+        *,
+        provider_base_url: str,
+        timeout_seconds: int,
+    ) -> None:
+        """Run the fixed, silent LiteLLM canary from inside OpenSandbox.
+
+        The virtual key crosses the same execd environment boundary as a real
+        Pi turn. It is never placed in argv, a workspace file, output, or an
+        exception message.
+        """
+
+        if timeout_seconds <= 0:
+            raise ValueError("runtime preflight timeout must be greater than 0")
+        sandbox = await self._provider.connect(ref)
+        execution_id: str | None = None
+
+        async def discard_output(_message: Any) -> None:
+            # The root-owned probe intentionally emits nothing. Never inspect
+            # unexpected output because it could contain a provider response.
+            return None
+
+        async def on_init(message: Any) -> None:
+            nonlocal execution_id
+            value = getattr(message, "id", None)
+            if isinstance(value, str) and value:
+                execution_id = value
+
+        try:
+            execution = await sandbox.commands.run(
+                _RUNTIME_PREFLIGHT_BIN,
+                opts=RunCommandOpts(
+                    background=False,
+                    working_directory="/workspace",
+                    timeout=timedelta(seconds=timeout_seconds),
+                    envs={
+                        _RUNTIME_PREFLIGHT_PROVIDER_BASE_URL: provider_base_url,
+                        _RUNTIME_PREFLIGHT_VIRTUAL_KEY: virtual_key.secret,
+                        _RUNTIME_PREFLIGHT_ALIASES_JSON: json.dumps(
+                            virtual_key.model_aliases,
+                            separators=(",", ":"),
+                        ),
+                    },
+                ),
+                handlers=ExecutionHandlers(
+                    on_stdout=discard_output,
+                    on_stderr=discard_output,
+                    on_init=on_init,
+                    skip_accumulation=True,
+                ),
+            )
+        except asyncio.CancelledError:
+            if execution_id is not None:
+                with suppress(Exception):
+                    await asyncio.shield(sandbox.commands.interrupt(execution_id))
+            raise
+        except Exception:
+            if execution_id is not None:
+                with suppress(Exception):
+                    await sandbox.commands.interrupt(execution_id)
+            raise PiTransportError("OpenSandbox runtime preflight command failed") from None
+
+        exit_code = getattr(execution, "exit_code", None)
+        error = getattr(execution, "error", None)
+        # An absent exit code means execd never proved command completion (for
+        # example, its SSE stream ended early). Only an explicit zero is ready.
+        if exit_code != 0 or error is not None:
+            raise PiTransportError("OpenSandbox runtime preflight command failed") from None
 
     async def run(
         self,

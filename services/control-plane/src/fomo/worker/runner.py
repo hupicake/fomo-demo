@@ -6,6 +6,8 @@ import asyncio
 import ipaddress
 import logging
 import socket
+import time
+from collections.abc import Awaitable, Callable
 from typing import Protocol
 from urllib.parse import urlparse
 
@@ -14,9 +16,14 @@ from fomo.config import Settings
 from fomo.direct_pi import DirectPiOrchestrator
 from fomo.fomo_pi_ds import LiteLLMRunKeyClient, OpenSandboxPiTransport
 from fomo.persistence import Database, Repository, SandboxCleanupTarget
+from fomo.runtime_contract import runtime_profile
+from fomo.runtime_preflight import DirectPiRuntimePreflight
 from fomo.sandbox import OpenSandboxProvider, SandboxProvider, SandboxRef, create_sandbox_provider
 
 logger = logging.getLogger(__name__)
+_PREFLIGHT_SUCCESS_TTL_SECONDS = 60.0
+_PREFLIGHT_RETRY_BASE_SECONDS = 1.0
+_PREFLIGHT_RETRY_MAX_SECONDS = 30.0
 
 
 class RunOrchestrator(Protocol):
@@ -69,6 +76,8 @@ class WorkerRunner:
         model: ModelClient | None = None,
         sandbox: SandboxProvider | None = None,
         direct_orchestrator: RunOrchestrator | None = None,
+        runtime_preflight: Callable[[], Awaitable[None]] | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
         worker_id: str | None = None,
     ) -> None:
         if settings.worker_lease_seconds <= 0:
@@ -83,6 +92,11 @@ class WorkerRunner:
         self.sandbox = sandbox or create_sandbox_provider(settings)
         self.direct_orchestrator: RunOrchestrator | None = None
         self.model: ModelClient | None = None
+        self._runtime_preflight = runtime_preflight
+        self._monotonic = monotonic
+        self._preflight_ready_until = 0.0
+        self._preflight_next_attempt_at = 0.0
+        self._preflight_retry_seconds = _PREFLIGHT_RETRY_BASE_SECONDS
         if settings.agent_framework == "direct_pi":
             if model is not None:
                 raise ValueError("direct_pi does not accept a legacy model")
@@ -102,9 +116,27 @@ class WorkerRunner:
                 )
                 transport = OpenSandboxPiTransport(
                     self.sandbox,
-                    default_timeout_seconds=settings.run_max_wall_seconds,
+                    # This is the provider resource lifetime, not a FOMO run
+                    # budget. Individual Pi turns have no bridge wall timer.
+                    default_timeout_seconds=settings.opensandbox_lifetime_seconds,
                     stderr_limit_bytes=settings.command_output_limit_bytes,
                 )
+                if self._runtime_preflight is None:
+                    self._runtime_preflight = DirectPiRuntimePreflight(
+                        gateway=gateway,
+                        sandbox=self.sandbox,
+                        transport=transport,
+                        provider_base_url=settings.pi_provider_base_url,
+                        sandbox_ready_timeout_seconds=settings.opensandbox_ready_timeout_seconds,
+                        sandbox_lifetime_seconds=settings.opensandbox_lifetime_seconds,
+                        management_timeout_seconds=(
+                            settings.inference_management_timeout_seconds
+                        ),
+                        model_aliases=tuple(
+                            runtime_profile(profile_id).litellm_alias
+                            for profile_id in settings.runtime_enabled_profiles
+                        ),
+                    )
                 self.direct_orchestrator = DirectPiOrchestrator(
                     repository, self.sandbox, settings, gateway, transport
                 )
@@ -126,6 +158,11 @@ class WorkerRunner:
 
     async def run_once(self) -> bool:
         await self._recover_expired_runs()
+        if self._runtime_preflight is not None:
+            if not await self.repository.has_claimable_run():
+                return False
+            if not await self._ensure_runtime_ready():
+                return False
         run = await self.repository.claim_next_run(self.worker_id, self.settings.worker_lease_seconds)
         if run is None:
             return False
@@ -170,6 +207,33 @@ class WorkerRunner:
         finally:
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)
+        return True
+
+    async def _ensure_runtime_ready(self) -> bool:
+        """Probe before claim, caching success and backing off without touching runs."""
+
+        assert self._runtime_preflight is not None
+        now = self._monotonic()
+        if now < self._preflight_ready_until:
+            return True
+        if now < self._preflight_next_attempt_at:
+            return False
+        try:
+            await self._runtime_preflight()
+        except Exception:
+            self._preflight_ready_until = 0.0
+            self._preflight_next_attempt_at = self._monotonic() + self._preflight_retry_seconds
+            self._preflight_retry_seconds = min(
+                _PREFLIGHT_RETRY_MAX_SECONDS,
+                self._preflight_retry_seconds * 2,
+            )
+            # Never attach the exception: HTTP clients may retain credentials or
+            # provider response bodies even when their string form looks safe.
+            logger.warning("FOMO runtime preflight failed; worker will retry before claiming work")
+            return False
+        self._preflight_ready_until = self._monotonic() + _PREFLIGHT_SUCCESS_TTL_SECONDS
+        self._preflight_next_attempt_at = 0.0
+        self._preflight_retry_seconds = _PREFLIGHT_RETRY_BASE_SECONDS
         return True
 
     async def _renew_lease_forever(

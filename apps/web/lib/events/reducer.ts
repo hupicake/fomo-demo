@@ -23,6 +23,7 @@ import {
   type RoleActivity,
   type RoleStatus,
   type RunPresentation,
+  type RunRuntimeResponse,
   type RunSnapshot,
   type StageActivity,
   type UserInputAnswerResponse,
@@ -37,6 +38,111 @@ const maxInputRequests = maxActivityItems;
 const maxPublicProgressCharacters = 1_200;
 const maxPublicDetailCharacters = 280;
 const maxPublicCommandOutputCharacters = 8_000;
+
+const publicFailureContracts = {
+  inference_gateway_unavailable: {
+    title: "模型运行问题：服务不可用",
+    message: "模型服务暂时不可用，请稍后重试。",
+  },
+  run_token_budget_exceeded: {
+    title: "模型运行问题：Token 上限",
+    message: "本次任务已达到 Token 使用上限，请缩小任务范围后重试。",
+  },
+  run_tool_budget_exceeded: {
+    title: "Agent 运行问题：工具调用上限",
+    message: "本次任务已达到工具调用上限，请缩小任务范围后重试。",
+  },
+  run_wall_time_budget_exceeded: {
+    title: "模型运行问题：运行超时",
+    message: "本次任务已达到最长运行时间，请缩小任务范围后重试。",
+  },
+  run_spend_budget_exceeded: {
+    title: "模型运行问题：费用上限",
+    message: "本次任务已达到费用上限，请缩小任务范围后重试。",
+  },
+  run_output_budget_exceeded: {
+    title: "模型运行问题：输出上限",
+    message: "模型单次输出已达到上限，请重试或缩小任务范围。",
+  },
+  model_runtime_protocol_failed: {
+    title: "模型运行问题：响应协议失败",
+    message: "模型运行协议未能完整结束，未获得可用结果。请重试或切换模型。",
+  },
+  model_response_failed: {
+    title: "模型运行问题：无可用结果",
+    message: "模型未返回可用的公开结果。请重试、切换模型或缩小任务范围。",
+  },
+  planning_contract_failed: {
+    title: "模型运行问题：规划输出无效",
+    message: "模型未能按要求返回有效的产品规划合约。请重试或切换模型。",
+  },
+  workspace_contract_failed: {
+    title: "工作区契约失败",
+    message: "生成结果未通过工作区安全契约检查，未被发布。请移除密钥或环境文件、受保护文件改动、符号链接或超出限制的文件后重试。",
+  },
+  direct_pi_verification_failed: {
+    title: "确定性验收失败",
+    message: "确定性验收仍有阻塞项，任务未发布。请查看失败的类型检查、构建或浏览器验收结果后重试。",
+  },
+  goal_verification_failed: {
+    title: "目标验收失败",
+    message: "当前开发目标未通过确定性验收，且自动修复次数已用完。请查看失败门禁并缩小需求后重试。",
+  },
+  goal_typecheck_failed: {
+    title: "类型检查失败",
+    message: "当前开发目标未通过 TypeScript 类型检查，且自动修复未成功。请查看类型检查结果后重试。",
+  },
+  goal_graph_final_reverification_failed: {
+    title: "发布复验失败",
+    message: "最终候选在完整复验中失败，未被发布。请查看发布门禁结果后重试。",
+  },
+  direct_pi_infrastructure_failed: {
+    title: "验收基础设施异常",
+    message: "验收基础设施暂时不可用，无法可信判断生成结果。请稍后重试；这不代表应用代码一定有问题。",
+  },
+  goal_verification_infrastructure_failed: {
+    title: "目标验收基础设施异常",
+    message: "当前目标的验收基础设施未能完成检查。请稍后重试；这不代表当前代码一定有问题。",
+  },
+  worker_lease_expired: {
+    title: "执行 Worker 中断",
+    message: "执行 Worker 在任务完成前失去租约，任务已中止。请重试；若持续发生，请检查 Worker 状态。",
+  },
+  continuation_answer_missing: {
+    title: "澄清回答未保存",
+    message: "澄清问题的回答未能持久保存，任务无法继续。请重新提交该需求。",
+  },
+  continuation_cursor_invalid: {
+    title: "澄清阶段已失效",
+    message: "澄清回答对应的运行阶段已失效，任务无法安全继续。请重新提交该需求。",
+  },
+  pi_session_resume_unavailable: {
+    title: "Agent 会话无法续接",
+    message: "原 Coding Agent 会话或沙箱已不可用，无法安全续接。请重新提交该需求。",
+  },
+  p0_continuation_unsupported: {
+    title: "当前模式无法续接",
+    message: "当前兼容运行模式不支持安全续接澄清回答。请重新提交该需求。",
+  },
+  repair_no_progress: {
+    title: "自动修复没有进展",
+    message: "自动修复后再次出现同一阻塞问题，任务已停止。请查看失败门禁并调整需求后重试。",
+  },
+  repair_limit_reached: {
+    title: "自动修复次数已用完",
+    message: "自动修复次数已用完，仍有阻塞性验收失败。请查看失败门禁后重试。",
+  },
+  sop_execution_error: {
+    title: "执行 Worker 异常停止",
+    message: "执行 Worker 在验收完成前异常停止。请重试；若持续发生，请检查 Worker 状态。",
+  },
+  coding_agent_failed: {
+    title: "Coding Agent 运行失败",
+    message: "Coding Agent 运行失败，请重试；若问题持续发生，请检查服务状态。",
+  },
+} as const satisfies Record<string, { message: string; title: string }>;
+
+const genericFailureContract = publicFailureContracts.coding_agent_failed;
 
 const roleLabels: Record<AgentRole, string> = {
   product_manager: "Product manager",
@@ -141,6 +247,58 @@ function boundedPublicText(value: string, limit: number): string {
   return redacted.length <= limit ? redacted : `${redacted.slice(0, Math.max(0, limit - 1))}…`;
 }
 
+function publicFailureContract(payload: Record<string, unknown>): { message: string; title: string } {
+  const codeValue = payload.code ?? payload.errorCode ?? payload.error_code;
+  const code = typeof codeValue === "string" && codeValue.length <= 80
+    ? codeValue
+    : "";
+  return publicFailureContracts[code as keyof typeof publicFailureContracts]
+    || genericFailureContract;
+}
+
+function publicFailureDetail(payload: Record<string, unknown>): string {
+  // The server-provided message/summary is intentionally ignored. Only its
+  // stable code can select browser text, so provider bodies and exception
+  // strings remain private even if an upstream boundary regresses.
+  return publicFailureContract(payload).message;
+}
+
+const legacyFailureCodesByExactReason = {
+  InferenceGatewayError: "inference_gateway_unavailable",
+  PiBridgeProtocolError: "model_runtime_protocol_failed",
+  PlanningContractError: "planning_contract_failed",
+  WorkspaceContractError: "workspace_contract_failed",
+  "direct typecheck failed after same-goal repair": "goal_typecheck_failed",
+  "goal repair rounds exhausted": "goal_verification_failed",
+  "run-total repair rounds exhausted during typecheck": "goal_typecheck_failed",
+  "verification infrastructure failed": "goal_verification_infrastructure_failed",
+} as const satisfies Record<string, keyof typeof publicFailureContracts>;
+
+function legacyFailureCode(payload: Record<string, unknown>): keyof typeof publicFailureContracts | undefined {
+  const reason = payload.reason ?? payload.errorType ?? payload.error_type;
+  if (typeof reason !== "string") return undefined;
+  return legacyFailureCodesByExactReason[reason as keyof typeof legacyFailureCodesByExactReason];
+}
+
+function inferredLegacyFailureCode(events: DomainEvent[]): keyof typeof publicFailureContracts | undefined {
+  for (const event of [...events].reverse()) {
+    const directCode = event.payload.code ?? event.payload.errorCode ?? event.payload.error_code;
+    if (
+      ["pi.failed", "run.failed"].includes(event.kind)
+      && typeof directCode === "string"
+      && directCode !== "coding_agent_failed"
+      && directCode in publicFailureContracts
+    ) {
+      return directCode as keyof typeof publicFailureContracts;
+    }
+    const code = ["goal.failed", "goal_graph.failed", "pi.failed"].includes(event.kind)
+      ? legacyFailureCode(event.payload)
+      : undefined;
+    if (code) return code;
+  }
+  return undefined;
+}
+
 function safePathFromToolArgs(value: unknown): string | undefined {
   const args = asRecord(value);
   const path = asText(
@@ -176,15 +334,6 @@ function upsertWorklog(items: AgentWorklogItem[], incoming: AgentWorklogItem): A
   const previous = items.find((item) => item.id === incoming.id);
   const withoutPrevious = items.filter((item) => item.id !== incoming.id);
   return [...withoutPrevious, { ...previous, ...incoming }].slice(-maxActivityItems);
-}
-
-function defaultRoles(): Record<AgentRole, RoleActivity> {
-  return Object.fromEntries(
-    agentRoles.map((role) => [
-      role,
-      { role, status: "idle", title: roleLabels[role] },
-    ]),
-  ) as Record<AgentRole, RoleActivity>;
 }
 
 function defaultStages(): Record<AgentStage, StageActivity> {
@@ -235,7 +384,7 @@ function advanceStages(
 export function createRunPresentation(input: {
   projectId: string;
   run?: RunSnapshot;
-  trace?: AcceptanceTrace[];
+  runtime?: RunRuntimeResponse;
   versions?: VersionSummary[];
   preview?: PreviewRef;
   goalGraph?: GoalGraphProjection | null;
@@ -248,21 +397,17 @@ export function createRunPresentation(input: {
     projectId: input.projectId,
     status: input.run?.status || "queued",
     lastSeq: input.run?.lastSeq || 0,
-    roles: defaultRoles(),
     stages,
-    artifacts: [],
-    trace: input.trace || [],
-    fileChanges: [],
     commands: [],
     verifications: [],
     problems: [],
     versions: input.versions || [],
     preview: input.preview,
-    summaries: [],
     worklog: [],
     inputRequests: pendingInputRequest ? [pendingInputRequest] : [],
     goalGraph: input.goalGraph ?? null,
     contextUsage: undefined,
+    runtime: input.runtime ?? input.run?.runtime,
   };
 }
 
@@ -286,9 +431,7 @@ export function hydrateRunPresentationFromSnapshot(input: {
   preview?: PreviewRef;
   projectId: string;
   run?: RunSnapshot;
-  trace?: AcceptanceTrace[];
   versions?: VersionSummary[];
-  artifactRefs?: ArtifactRef[];
   goalGraph?: GoalGraphProjection | null;
   pendingInputRequest?: UserInputRequest;
 }): RunPresentation {
@@ -296,7 +439,6 @@ export function hydrateRunPresentationFromSnapshot(input: {
   let presentation = createRunPresentation({
     projectId: input.projectId,
     run: replayRun,
-    trace: input.trace,
     versions: input.versions,
     preview: input.preview,
     goalGraph: input.goalGraph,
@@ -305,11 +447,57 @@ export function hydrateRunPresentationFromSnapshot(input: {
   for (const event of [...input.events].sort((left, right) => left.seq - right.seq)) {
     presentation = reduceDomainEvent(presentation, event);
   }
+  const inferredFailureCode = inferredLegacyFailureCode(input.events);
+  const snapshotFailureCode = input.run?.errorCode;
+  const specificSnapshotCode = snapshotFailureCode
+    && snapshotFailureCode !== "coding_agent_failed"
+    && snapshotFailureCode in publicFailureContracts
+    ? snapshotFailureCode as keyof typeof publicFailureContracts
+    : undefined;
+  const terminalFailureCode = specificSnapshotCode || inferredFailureCode || snapshotFailureCode;
+  const terminalFailure = input.run
+    && ["failed", "needs_attention"].includes(input.run.status)
+    && terminalFailureCode
+    ? publicFailureContract({ code: terminalFailureCode })
+    : undefined;
+  let worklog = presentation.worklog;
+  let problems = presentation.problems;
+  if (terminalFailure && input.run) {
+    worklog = upsertWorklog(worklog, {
+      id: "system:run:failure",
+      kind: "system",
+      status: "failed",
+      title: terminalFailure.title,
+      detail: terminalFailure.message,
+      occurredAt: input.run.updatedAt || input.run.createdAt || "",
+      seq: Math.max(presentation.lastSeq, input.lastSeq, input.run.lastSeq),
+    });
+    const piFailure = worklog.find((item) => item.id === "system:pi:failure");
+    if (piFailure) {
+      worklog = upsertWorklog(worklog, {
+        ...piFailure,
+        title: terminalFailure.title,
+        detail: terminalFailure.message,
+      });
+    }
+    const terminalProblemIndexes = problems
+      .map((problem, index) => problem.id.startsWith("failure:") ? index : -1)
+      .filter((index) => index >= 0);
+    if (terminalProblemIndexes.length > 0) {
+      const lastTerminalIndex = terminalProblemIndexes.at(-1)!;
+      problems = problems.map((problem, index) => index === lastTerminalIndex
+        ? { ...problem, title: terminalFailure.message }
+        : problem);
+    } else {
+      problems = [...problems, {
+        id: "failure:snapshot",
+        title: terminalFailure.message,
+        severity: "error" as const,
+      }].slice(-maxActivityItems);
+    }
+  }
   return {
     ...presentation,
-    // The snapshot's refs are authoritative for the display run; event-derived
-    // loading refs only remain when the snapshot carried none.
-    artifacts: input.artifactRefs && input.artifactRefs.length > 0 ? input.artifactRefs : presentation.artifacts,
     // A non-null snapshot projection is the server's final read model. Replay
     // remains useful for the rest of the presentation, but an older
     // goal_graph.created event must not replace the authoritative graph.
@@ -318,6 +506,8 @@ export function hydrateRunPresentationFromSnapshot(input: {
       presentation,
       input.pendingInputRequest || input.run?.pendingInputRequest,
     ).inputRequests,
+    worklog,
+    problems,
     lastSeq: Math.max(presentation.lastSeq, input.lastSeq, input.run?.lastSeq || 0),
   };
 }
@@ -723,14 +913,16 @@ function goalWorklogItem(
   };
   const display = lifecycle[event.kind];
   if (!display) return undefined;
-  const graphDetail = event.kind === "goal_graph.created"
+  const legacyCode = display.status === "failed" ? legacyFailureCode(payload) : undefined;
+  const legacyFailure = legacyCode ? publicFailureContract({ code: legacyCode }) : undefined;
+  const graphDetail = legacyFailure?.message || (event.kind === "goal_graph.created"
     ? boundedPublicText(graph?.productOutcome || "", maxPublicDetailCharacters) || undefined
-    : detail;
+    : detail);
   return worklogItem(event, {
     id: `goal:${goalId || graph?.graphId || "graph"}`,
     kind: "goal",
     status: display.status,
-    title: display.title,
+    title: legacyFailure?.title || display.title,
     detail: graphDetail,
   });
 }
@@ -845,13 +1037,28 @@ function projectWorklogEvent(
     return { worklog, activePublicMessageId };
   }
 
+  if (event.kind === "run.failed") {
+    const failure = publicFailureContract(event.payload);
+    add(worklogItem(event, {
+      id: "system:run:failure",
+      kind: "system",
+      status: "failed",
+      title: failure.title,
+      detail: failure.message,
+    }));
+    return { worklog, activePublicMessageId: undefined };
+  }
+
   const piLifecycle: Partial<Record<string, { title: string; status: AgentWorklogItem["status"]; detail?: string }>> = {
     "pi.started": { title: "Coding Agent connected", status: "running" },
     "pi.completed": { title: "Coding Agent turn completed", status: "completed" },
-    "pi.failed": { title: "Coding Agent turn failed", status: "failed" },
+    "pi.failed": { title: "Coding Agent 运行失败", status: "failed" },
   };
   const piDisplay = piLifecycle[event.kind];
   if (piDisplay) {
+    const failure = event.kind === "pi.failed"
+      ? publicFailureContract(event.payload)
+      : undefined;
     const stage = asStage(event.payload.stage);
     const thinkingLevel = event.kind === "pi.started" ? asThinkingLevel(event.payload.thinkingLevel) : undefined;
     const contextWindow = event.kind === "pi.started" ? asNumber(event.payload.contextWindow) : undefined;
@@ -859,12 +1066,15 @@ function projectWorklogEvent(
       thinkingLevel ? `thinkingLevel=${thinkingLevel}` : "",
       contextWindow === undefined ? "" : `contextWindow=${Math.round(contextWindow)} tokens`,
     ].filter(Boolean).join(" · ") || undefined;
+    const lifecycleDetail = event.kind === "pi.failed"
+      ? publicFailureDetail(event.payload)
+      : runtimeDetail;
     add(worklogItem(event, {
-      id: `system:pi:${stage || "turn"}`,
+      id: event.kind === "pi.failed" ? "system:pi:failure" : `system:pi:${stage || "turn"}`,
       kind: "system",
       status: piDisplay.status,
-      title: piDisplay.title,
-      ...(runtimeDetail ? { detail: runtimeDetail } : {}),
+      title: failure?.title || piDisplay.title,
+      ...(lifecycleDetail ? { detail: lifecycleDetail } : {}),
       stage,
     }));
     if (event.kind === "pi.failed") activePublicMessageId = undefined;
@@ -925,13 +1135,6 @@ export function reduceDomainEvent(state: RunPresentation, event: DomainEvent): R
     };
   }
 
-  if (event.kind.startsWith("agent.")) {
-    const activity = activityFromEvent(event);
-    if (activity) {
-      next.roles = { ...state.roles, [activity.role]: activity };
-    }
-  }
-
   switch (event.kind) {
     case "run.created":
     case "run.status_changed":
@@ -950,7 +1153,11 @@ export function reduceDomainEvent(state: RunPresentation, event: DomainEvent): R
           ? { ...state.stages[stage], status: "failed", updatedAt: event.occurredAt }
           : state.stages[stage],
       ])) as Record<AgentStage, StageActivity>;
-      next.problems = [...state.problems, ...problemsFromEvent(event)].slice(-maxActivityItems);
+      next.problems = [...state.problems, {
+        id: `failure:${event.eventId}`,
+        title: publicFailureDetail(event.payload),
+        severity: "error" as const,
+      }].slice(-maxActivityItems);
       break;
     case "run.cancelled":
       next.status = "cancelled";
@@ -988,21 +1195,6 @@ export function reduceDomainEvent(state: RunPresentation, event: DomainEvent): R
         : request);
       break;
     }
-    case "artifact.upserted": {
-      const ref = artifactRefFromEvent(event);
-      if (ref) {
-        next.artifacts = replaceById(state.artifacts, ref);
-      }
-      break;
-    }
-    case "trace.updated": {
-      const updated = traceFromPayload(event.payload);
-      next.trace = updated.length > 0 ? updated : state.trace;
-      break;
-    }
-    case "file.changed":
-      next.fileChanges = replaceById(state.fileChanges, fileChangeFromEvent(event));
-      break;
     case "command.started":
     case "command.output":
     case "command.completed": {
@@ -1041,11 +1233,6 @@ export function reduceDomainEvent(state: RunPresentation, event: DomainEvent): R
     case "version.restored":
       next.versions = replaceById(state.versions, versionFromEvent(event));
       break;
-    case "assistant.summary": {
-      const summary = asText(event.payload.markdown || event.payload.content || event.payload.summary);
-      next.summaries = summary ? [...state.summaries, summary].slice(-12) : state.summaries;
-      break;
-    }
     case "goal_graph.created":
     case "goal.activated":
     case "goal.claimed":

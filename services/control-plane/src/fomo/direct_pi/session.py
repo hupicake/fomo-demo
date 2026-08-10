@@ -1,18 +1,15 @@
-"""One budgeted Direct Pi session reused across planning, build, and repair turns."""
+"""One policy-bounded Direct Pi session reused across planning, build, and repair turns."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import math
-import time
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 
 from fomo.config import Settings
 from fomo.fomo_pi_ds import (
-    FOMO_PI_PLANNING_MODEL,
-    FOMO_PI_THINKING,
     PiBridgeEnvelope,
     PiBridgeFailed,
     PiInvocation,
@@ -23,22 +20,13 @@ from fomo.fomo_pi_ds import (
 )
 from fomo.ids import uuid7
 from fomo.persistence import Repository, RunLeaseLost
+from fomo.runtime_contract import RuntimeContract, legacy_runtime_contract
 from fomo.sandbox.base import SandboxRef
 from fomo.schemas import UserInputRequestDraft
 
 from .execution import DirectPiRunCancelled, PiEventWriter, redact
 
-# The configured GPT-compatible upstream currently rejects Pi's full tool
-# request at its WAF, so every stage stays on the reachable DeepSeek/Pi route.
-# Planning, implementation, and bounded repair all keep full reasoning; the
-# deterministic QA boundary remains independent evidence, not a substitute for
-# model capability during the initial implementation.
-_PLANNING_THINKING_LEVEL = "high"
-_BUILD_THINKING_LEVEL = "high"
-_REPAIR_THINKING_LEVEL = "high"
-
 _STRUCTURED_OUTPUT_TOOL_NAME = "submit_structured_output"
-_MAX_STRUCTURED_OUTPUT_ATTEMPTS = 3
 _USER_INPUT_TOOL_NAME = "request_user_input"
 
 
@@ -78,6 +66,7 @@ class DirectPiSession:
         settings: Settings,
         virtual_key: RunVirtualKey,
         *,
+        runtime_contract: RuntimeContract | None = None,
         run_id: str,
         lease_token: str,
         started_at: float,
@@ -87,6 +76,9 @@ class DirectPiSession:
         self.transport = transport
         self.settings = settings
         self.virtual_key = virtual_key
+        self.runtime_contract = runtime_contract or legacy_runtime_contract()
+        if self.runtime_contract.litellm_alias not in virtual_key.model_aliases:
+            raise ValueError("virtual key does not authorize the run runtime profile")
         self.run_id = run_id
         self.lease_token = lease_token
         self.started_at = started_at
@@ -110,28 +102,9 @@ class DirectPiSession:
         if structured_output_schema is not None and stage != "planning":
             raise DirectPiSessionError(
                 "structured output is only available during planning"
-            )
+        )
         await self._check_active()
         await self._check_durable_budget(for_new_turn=True)
-        remaining = self.settings.run_max_wall_seconds - (time.monotonic() - self.started_at)
-        if remaining <= 0:
-            raise DirectPiSessionError("Direct Pi run exceeded its wall-clock budget")
-        stage_thinking = {
-            "planning": _PLANNING_THINKING_LEVEL,
-            "building": _BUILD_THINKING_LEVEL,
-            "repairing": _REPAIR_THINKING_LEVEL,
-        }.get(stage, FOMO_PI_THINKING)
-        thinking_level = stage_thinking
-        model = FOMO_PI_PLANNING_MODEL
-        # A high-thinking turn may legitimately go longer than two minutes
-        # before its first tool. Detect a genuinely silent Pi/provider stream
-        # using the configured model-request budget instead; validated private
-        # reasoning deltas reset this watchdog without crossing the public event
-        # boundary. The remaining run wall budget is still the hard upper bound.
-        activity_silence_seconds = min(
-            self.settings.model_request_timeout_seconds,
-            max(1, math.floor(remaining)),
-        )
         request = PiRequest(
             request_id=uuid7(),
             correlation_id=self.run_id,
@@ -139,13 +112,17 @@ class DirectPiSession:
             provider_base_url=self.settings.pi_provider_base_url,
             prompt=prompt,
             virtual_key=self.virtual_key.secret,
-            # DeepSeek keeps high reasoning across planning, implementation,
-            # and bounded repair.
-            thinking=thinking_level,
-            model=model,
-            context_window=self.settings.pi_context_window,
-            activity_silence_seconds=activity_silence_seconds,
-            timeout_seconds=max(1, math.floor(remaining)),
+            # One immutable run contract spans planning, implementation,
+            # bounded repair, and clarification resume.
+            thinking=self.runtime_contract.thinking,
+            model=self.runtime_contract.model_ref,
+            context_window=self.runtime_contract.context_window,
+            # This value controls liveness heartbeat cadence only. The bridge
+            # never turns protocol silence into a run failure.
+            activity_silence_seconds=self.settings.model_request_timeout_seconds,
+            # The sandbox resource lifetime, lease, cancellation, provider
+            # connection, and spend boundary own termination—not a FOMO wall.
+            timeout_seconds=None,
             structured_output_schema=structured_output_schema,
             user_input_enabled=True,
             require_resume=resume_request_id is not None,
@@ -384,32 +361,12 @@ class DirectPiSession:
                     return float(candidate)
             return 0.0
 
-        budgeted_tokens = (
-            value("input_tokens", "inputTokens")
-            + value("output_tokens", "outputTokens")
-            + value("cache_write_tokens", "cacheWriteTokens")
-        )
-        tool_calls = value("tool_calls", "toolCalls")
         cost_micros = value("cost_micros", "costMicros")
-        token_exhausted = (
-            budgeted_tokens >= self.settings.run_max_tokens
-            if for_new_turn
-            else budgeted_tokens > self.settings.run_max_tokens
-        )
-        tool_exhausted = (
-            tool_calls >= self.settings.run_max_tool_calls
-            if for_new_turn
-            else tool_calls > self.settings.run_max_tool_calls
-        )
         spend_exhausted = (
-            cost_micros >= self.settings.run_max_spend * 1_000_000
+            cost_micros >= self.runtime_contract.max_spend_micros
             if for_new_turn
-            else cost_micros > self.settings.run_max_spend * 1_000_000
+            else cost_micros > self.runtime_contract.max_spend_micros
         )
-        if token_exhausted:
-            raise DirectPiSessionError("Direct Pi exceeded the run token budget")
-        if tool_exhausted:
-            raise DirectPiSessionError("Direct Pi exceeded the run tool-call budget")
         if spend_exhausted:
             raise DirectPiSessionError("Direct Pi exceeded the run spend budget")
         return True
@@ -513,23 +470,21 @@ class DirectPiSession:
             raise DirectPiSessionError("Direct Pi tool usage is invalid")
         if not isinstance(cost, (int, float)) or not math.isfinite(cost) or cost < 0:
             raise DirectPiSessionError("Direct Pi cost usage is invalid")
-        budgeted_tokens = self._budgeted_token_total(tokens)
-        if budgeted_tokens > self.settings.run_max_tokens:
-            raise DirectPiSessionError("Direct Pi exceeded the run token budget")
-        if tool_calls > self.settings.run_max_tool_calls:
-            raise DirectPiSessionError("Direct Pi exceeded the run tool-call budget")
-        if cost > self.settings.run_max_spend:
+        # Keep token accounting structurally valid for telemetry and context
+        # management, but runtime v2 intentionally has no cumulative per-run
+        # token ceiling. Provider/context/output limits remain enforced at the
+        # invocation boundary.
+        self._budgeted_token_total(tokens)
+        if cost * 1_000_000 > self.runtime_contract.max_spend_micros:
             raise DirectPiSessionError("Direct Pi exceeded the run spend budget")
 
     @staticmethod
     def _budgeted_token_total(tokens: object) -> float:
-        """Count newly processed tokens without penalizing cache reuse.
+        """Validate and derive newly processed tokens for usage telemetry.
 
         Pi's cumulative ``total`` includes ``cacheRead`` again for every tool
-        turn. That value is useful telemetry but makes a cache-heavy coding
-        session appear orders of magnitude larger than the newly processed
-        input and output. Cache writes still consume the run budget; cache
-        reads are tracked separately and deliberately excluded.
+        turn. Cache reads are tracked separately and excluded from this derived
+        value. The value is not compared with a cumulative run ceiling.
         """
         if not isinstance(tokens, dict):
             raise DirectPiSessionError("Direct Pi token usage is invalid")
@@ -613,10 +568,6 @@ class DirectPiSession:
                 if active:
                     raise DirectPiSessionError(
                         "Direct Pi emitted concurrent structured tool attempts"
-                    )
-                if len(seen_ids) >= _MAX_STRUCTURED_OUTPUT_ATTEMPTS:
-                    raise DirectPiSessionError(
-                        "Direct Pi exceeded the structured output attempt limit"
                     )
                 arguments = event.payload.get("args")
                 if not isinstance(arguments, dict):

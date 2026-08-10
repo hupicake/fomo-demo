@@ -68,8 +68,8 @@ describe("TaskSummary", () => {
   it("keeps a compact waiting state for runs without a goal projection", () => {
     render(createElement(TaskSummary, { graph: null }));
 
-    expect(screen.getByRole("region", { name: "Current task" })).toBeTruthy();
-    expect(screen.getByText("The delivery plan will appear when it is ready.")).toBeTruthy();
+    expect(screen.getByRole("region", { name: "当前任务" })).toBeTruthy();
+    expect(screen.getByText("交付计划就绪后会显示在这里。")).toBeTruthy();
     expect(screen.queryByText(/GoalGraph projection/i)).toBeNull();
   });
 
@@ -85,7 +85,7 @@ describe("TaskSummary", () => {
     expect(document.activeElement).toBe(details);
     await user.keyboard("{Enter}");
     expect(details.getAttribute("aria-expanded")).toBe("true");
-    expect(await screen.findByText("Full delivery plan")).toBeTruthy();
+    expect(await screen.findByText("完整交付计划")).toBeTruthy();
     expect(screen.getByText("Readers can find and borrow available books.")).toBeTruthy();
     expect(screen.getByText("1/5 acceptance criteria complete")).toBeTruthy();
     expect(screen.getByText("1 blocked")).toBeTruthy();

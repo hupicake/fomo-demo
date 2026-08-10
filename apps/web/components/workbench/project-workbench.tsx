@@ -25,20 +25,23 @@ import { Message, MessageContent, MessageResponse } from "@/components/ai-elemen
 import { PromptInput, PromptInputFooter, PromptInputSubmit, PromptInputTextarea, PromptInputTools } from "@/components/ai-elements/prompt-input";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
+import { ThemeToggle } from "@/components/theme/theme-toggle";
 import { AgentActivityPanel } from "@/components/workbench/agent-activity-panel";
 import { AccountEntry } from "@/components/workbench/account-entry";
 import { TaskSummary } from "@/components/workbench/goal-graph-panel";
 import { RunMetrics } from "@/components/workbench/run-metrics";
 import { RunTimeline } from "@/components/workbench/role-timeline";
+import { RuntimeBadge, RuntimeSelector, findRuntimeProfile } from "@/components/workbench/runtime-selector";
 import { Workspace } from "@/components/workbench/workspace";
 import { derivePreviewState, deriveRunState, type PreviewStateView, type RunStateView } from "@/lib/run-state";
 import { ApiProblem, controlPlane, controlPlaneUrl } from "@/lib/api/client";
-import { artifactKinds, type AgentUIMessage, type ArtifactDetail, type ArtifactLoadState, type ArtifactRef, type DomainEvent, type FileContent, type FileManifestEntry, type ProjectMessage, type ProjectSnapshot, type ProjectSummary, type RunPresentation, type UserInputAnswerInput, type UserInputAnswerResponse, type VersionSummary } from "@/lib/contracts";
-import { createDemoRunPresentation, demoFiles, demoProjectId, demoProjectSnapshot } from "@/lib/demo/library-project";
+import { type AgentUIMessage, type DomainEvent, type FileContent, type FileManifestEntry, type ProjectMessage, type ProjectSnapshot, type ProjectSummary, type RunPresentation, type RuntimeOptionsResponse, type UserInputAnswerInput, type UserInputAnswerResponse, type VersionSummary } from "@/lib/contracts";
 import { submitChatMessage } from "@/lib/chat/submit-message";
 import { createRunPresentation, hydrateRunPresentationFromSnapshot, reconcileInputAnswer, reconcileInputRequestSnapshot, reduceDomainEvent } from "@/lib/events/reducer";
 import { projectStatusLabel } from "@/lib/project-status";
 import { validatePreviewUrl } from "@/lib/preview";
+import { useAuthStore } from "@/lib/store/auth-store";
 import { AgentEventTransport } from "@/lib/transport/agent-event-transport";
 import { useWorkbenchStore } from "@/lib/store/workbench-store";
 import { cn } from "@/lib/utils";
@@ -52,58 +55,6 @@ function isTerminal(status: RunPresentation["status"]): boolean {
 function isTerminalEvent(event: DomainEvent): boolean {
   return ["run.completed", "run.failed", "run.cancelled"].includes(event.kind)
     || ["succeeded", "completed", "failed", "cancelled", "needs_attention"].includes(String(event.payload.status));
-}
-
-export function artifactDetailKey(runId: string, artifactId: string): string {
-  return `${runId}/${artifactId}`;
-}
-
-/**
- * Module-level immutable promise cache keyed by runId + artifactId so each
- * visible artifact detail is fetched exactly once across rerenders, React
- * StrictMode remounts and snapshot refreshes. Rejected promises stay cached:
- * failures are surfaced once and never auto-retried in this change.
- */
-const artifactDetailPromises = new Map<string, Promise<ArtifactDetail>>();
-
-export function clearArtifactDetailCache(): void {
-  artifactDetailPromises.clear();
-}
-
-export function useArtifactDetailLoader(
-  artifacts: ArtifactRef[],
-  currentRunId?: string,
-): Record<string, ArtifactLoadState> {
-  const [loads, setLoads] = useState<Record<string, ArtifactLoadState>>({});
-  const currentRunRef = useRef(currentRunId);
-  currentRunRef.current = currentRunId;
-
-  useEffect(() => {
-    for (const ref of artifacts) {
-      if (!artifactKinds.includes(ref.kind as (typeof artifactKinds)[number])) continue;
-      if (!ref.runId) continue;
-      const runId = ref.runId;
-      const key = artifactDetailKey(runId, ref.id);
-      const promise = artifactDetailPromises.get(key) ?? controlPlane.getArtifact(runId, ref.id);
-      artifactDetailPromises.set(key, promise);
-      setLoads((previous) => (previous[ref.id] ? previous : { ...previous, [ref.id]: { status: "loading" } }));
-      promise.then(
-        (detail) => {
-          if (currentRunRef.current !== runId) return;
-          setLoads((previous) => ({ ...previous, [ref.id]: { status: "ready", detail } }));
-        },
-        (failure) => {
-          if (currentRunRef.current !== runId) return;
-          setLoads((previous) => ({
-            ...previous,
-            [ref.id]: { status: "error", message: failure instanceof Error ? failure.message : "Could not load this spec." },
-          }));
-        },
-      );
-    }
-  }, [artifacts]);
-
-  return loads;
 }
 
 function projectMessages(messages: ProjectMessage[], projectId: string): AgentUIMessage[] {
@@ -130,49 +81,282 @@ function ReadableMessage({ message }: { message: AgentUIMessage }) {
   );
 }
 
+const runStatusLabels: Record<string, string> = {
+  idle: "空闲",
+  queued: "排队中",
+  running: "运行中",
+  planning: "规划中",
+  building: "构建中",
+  verifying: "验证中",
+  publishing: "发布中",
+  completed: "已完成",
+  failed: "失败",
+  cancelled: "已取消",
+  needs_attention: "需关注",
+  waiting_for_user: "等待回答",
+};
+
 function RunStatusBadge({ status }: { status: RunPresentation["status"] | "idle" }) {
-  const color = status === "completed" ? "bg-emerald-500/10 text-emerald-700" : status === "failed" || status === "needs_attention" ? "bg-destructive/10 text-destructive" : status === "waiting_for_user" ? "bg-amber-500/10 text-amber-800" : status === "running" ? "bg-primary/10 text-primary" : "bg-muted text-muted-foreground";
-  return <Badge className={cn("gap-1 rounded-full border-0 px-2 py-0.5 text-[11px]", color)} variant="secondary"><CircleDotIcon className={cn("size-3", status === "running" && "animate-pulse")} />{status.replaceAll("_", " ")}</Badge>;
+  const color = status === "completed"
+    ? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+    : status === "failed" || status === "needs_attention"
+      ? "bg-destructive/10 text-destructive"
+      : status === "waiting_for_user"
+        ? "bg-amber-500/10 text-amber-800 dark:text-amber-200"
+        : status === "running"
+          ? "bg-primary/10 text-primary"
+          : "bg-muted text-muted-foreground";
+  return (
+    <Badge className={cn("gap-1 rounded-full border-0 px-2 py-0.5 text-[11px]", color)} variant="secondary">
+      <CircleDotIcon aria-hidden="true" className={cn("size-3", status === "running" && "animate-pulse")} />
+      {runStatusLabels[status] || status.replaceAll("_", " ")}
+    </Badge>
+  );
 }
 
-function ProjectSidebar({ connection, currentProjectId, currentProjectName, isDemo, projects, run }: { connection: "online" | "degraded" | "demo"; currentProjectId: string; currentProjectName: string; isDemo: boolean; projects: ProjectSummary[]; run: RunPresentation }) {
+function WorkbenchBoot({ label }: { label: string }) {
   return (
-    <aside className="hidden min-h-0 flex-col border-r bg-card/75 xl:flex">
-      <div className="flex h-14 items-center justify-between gap-2 border-b px-4"><Link className="flex items-center gap-2 font-semibold tracking-tight" href="/"><span className="grid size-7 place-items-center rounded-md bg-slate-950 font-mono text-xs text-white">F</span>FOMO</Link><div className="flex items-center gap-2"><AccountEntry connection={connection} /><Button asChild size="icon-sm" title="Back to projects" variant="ghost"><Link href="/"><PanelLeftCloseIcon className="size-4" /></Link></Button></div></div>
-      <div className="border-b p-3"><Button asChild className="w-full justify-start" size="sm" variant="secondary"><Link href="/"><LayoutPanelTopIcon className="mr-2 size-3.5" />New project</Link></Button></div>
-      <div className="min-h-0 flex-1 overflow-auto p-3"><p className="mb-2 px-1 font-mono text-[10px] uppercase tracking-wider text-muted-foreground">Projects</p><div className="space-y-1">{isDemo ? <Link className="block rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-sm" href={`/projects/${demoProjectId}`}><span className="block truncate font-medium">图书管理系统</span><span className="mt-1 block text-[11px] text-amber-800">explicit demo fixture</span></Link> : projects.map((project) => <Link className={cn("block rounded-lg px-3 py-2 text-sm transition-colors hover:bg-muted", project.id === currentProjectId && "bg-muted")} href={`/projects/${project.id}`} key={project.id}><span className="block truncate font-medium">{project.name}</span><span className="mt-1 block text-[11px] text-muted-foreground">{projectStatusLabel(project, project.id === currentProjectId && run.runId ? run.status : undefined)}</span></Link>)}</div></div>
-      <div className="border-t p-3"><div className="rounded-xl border bg-background p-3"><div className="flex items-center gap-2"><span className="grid size-7 place-items-center rounded-md bg-muted"><GitBranchIcon className="size-3.5" /></span><div className="min-w-0"><p className="truncate text-xs font-medium">{currentProjectName}</p><p className="mt-0.5 text-[11px] text-muted-foreground">{run.runId ? `run ${run.runId.slice(0, 8)}` : "No run started"}</p></div></div></div></div>
+    <main aria-busy="true" aria-label={label} className="flex h-dvh flex-col overflow-hidden bg-muted/30">
+      <div className="flex h-12 items-center justify-between border-b bg-card px-4">
+        <div className="flex items-center gap-2">
+          <Skeleton className="size-7 rounded-md" />
+          <Skeleton className="h-4 w-16" />
+        </div>
+        <Skeleton className="h-8 w-24 rounded-full" />
+      </div>
+      <div className="grid min-h-0 flex-1 overflow-hidden lg:grid-cols-[25rem_minmax(0,1fr)]">
+        <section className="hidden h-full min-h-0 flex-col border-r bg-background lg:flex">
+          <div className="flex h-12 items-center gap-2 border-b px-3">
+            <Skeleton className="h-4 w-32" />
+            <Skeleton className="h-5 w-16 rounded-full" />
+          </div>
+          <div className="space-y-3 p-3">
+            <Skeleton className="h-16 w-full rounded-xl" />
+            <Skeleton className="h-12 w-5/6 rounded-xl" />
+            <Skeleton className="h-20 w-full rounded-xl" />
+          </div>
+        </section>
+        <div className="flex h-full min-h-0 items-center justify-center p-6">
+          <div className="flex items-center gap-2 text-sm text-muted-foreground">
+            <LoaderCircleIcon aria-hidden="true" className="size-4 animate-spin" />
+            {label}
+          </div>
+        </div>
+      </div>
+    </main>
+  );
+}
+
+function formatProjectActivity(iso?: string): string {
+  if (!iso) return "暂无活动";
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "暂无活动";
+  const diffMs = Date.now() - date.getTime();
+  if (diffMs < 0) {
+    return date.toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" });
+  }
+  const minutes = Math.floor(diffMs / 60_000);
+  if (minutes < 1) return "刚刚";
+  if (minutes < 60) return `${minutes} 分钟前`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} 小时前`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days} 天前`;
+  return date.toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" });
+}
+
+function projectStatusText(status: string): string {
+  return runStatusLabels[status] || status.replaceAll("_", " ");
+}
+
+function errorNotice(prefix: string, failure: unknown): string {
+  return failure instanceof Error && failure.message
+    ? `${prefix}：${failure.message}`
+    : prefix;
+}
+
+function ProjectRail({ currentProjectId, currentProjectName, projects, run }: { currentProjectId: string; currentProjectName: string; projects: ProjectSummary[]; run: RunPresentation }) {
+  const visibleProjects = projects.map((project) => {
+    const status = projectStatusLabel(project, project.id === currentProjectId && run.runId ? run.status : undefined);
+    return {
+      id: project.id,
+      name: project.name,
+      status,
+      statusText: projectStatusText(status),
+      activity: formatProjectActivity(project.updatedAt || project.createdAt),
+      activityIso: project.updatedAt || project.createdAt,
+    };
+  });
+  const runHint = run.runId ? `run ${run.runId.slice(0, 8)}` : "尚未开始运行";
+  return (
+    <aside aria-label="项目导航" className="hidden min-h-0 w-56 flex-col border-r bg-card/90 lg:flex">
+      <div className="flex h-12 shrink-0 items-center gap-2 border-b px-3">
+        <Link
+          aria-label="FOMO 首页"
+          className="grid size-8 shrink-0 place-items-center rounded-lg bg-foreground font-mono text-xs font-semibold text-background shadow-sm"
+          href="/"
+        >
+          F
+        </Link>
+        <span className="truncate text-sm font-semibold tracking-tight">FOMO</span>
+      </div>
+      <div className="flex h-11 shrink-0 items-center justify-between gap-2 border-b px-3">
+        <span className="text-xs font-medium text-muted-foreground">项目</span>
+        <Button asChild size="icon-sm" title="新建项目" variant="secondary">
+          <Link href="/">
+            <LayoutPanelTopIcon aria-hidden="true" className="size-4" />
+            <span className="sr-only">新建项目</span>
+          </Link>
+        </Button>
+      </div>
+      <nav aria-label="项目列表" className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto overscroll-contain p-2 [scrollbar-gutter:stable]">
+        {visibleProjects.length === 0 ? (
+          <p className="px-2 py-3 text-xs leading-5 text-muted-foreground">还没有其他项目。</p>
+        ) : null}
+        {visibleProjects.map((project) => (
+          <Link
+            aria-current={project.id === currentProjectId ? "page" : undefined}
+            aria-label={`${project.name} · ${project.statusText} · ${project.activity}`}
+            className={cn(
+              "flex min-w-0 flex-col gap-0.5 rounded-lg border border-transparent px-2.5 py-2 outline-none transition-colors",
+              "text-muted-foreground hover:bg-muted/70 hover:text-foreground",
+              "focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50",
+              project.id === currentProjectId && "border-border bg-muted text-foreground shadow-sm",
+            )}
+            href={`/projects/${project.id}`}
+            key={project.id}
+            title={`${project.name} · ${project.statusText} · ${project.activity}`}
+          >
+            <span className="truncate text-sm font-medium text-foreground">{project.name}</span>
+            <span className="flex min-w-0 items-center gap-1.5 text-[11px] leading-4 text-muted-foreground">
+              <span className="truncate">{project.statusText}</span>
+              <span aria-hidden="true" className="shrink-0 text-border">·</span>
+              {project.activityIso ? (
+                <time className="shrink-0 tabular-nums" dateTime={project.activityIso}>{project.activity}</time>
+              ) : (
+                <span className="shrink-0">{project.activity}</span>
+              )}
+            </span>
+          </Link>
+        ))}
+      </nav>
+      <div className="flex shrink-0 flex-col gap-2 border-t p-2">
+        <div
+          aria-label={`${currentProjectName} · ${runHint}`}
+          className="flex min-w-0 items-start gap-2 rounded-lg bg-muted/70 px-2.5 py-2 text-muted-foreground"
+          title={runHint}
+        >
+          <GitBranchIcon aria-hidden="true" className="mt-0.5 size-3.5 shrink-0" />
+          <span className="min-w-0">
+            <span className="block truncate text-xs font-medium text-foreground">{currentProjectName}</span>
+            <span className="mt-0.5 block truncate font-mono text-[10px]">{runHint}</span>
+          </span>
+        </div>
+        <Button asChild className="w-full justify-start" size="sm" title="返回项目列表" variant="ghost">
+          <Link href="/">
+            <PanelLeftCloseIcon aria-hidden="true" className="size-4" />
+            项目列表
+          </Link>
+        </Button>
+      </div>
     </aside>
   );
 }
 
-function EmptyWorkspace({ onDemo }: { onDemo: () => void }) {
-  return <main className="grid min-h-screen place-items-center p-6"><section className="max-w-md rounded-2xl border bg-card p-6 shadow-sm"><CircleAlertIcon className="size-5 text-amber-600" /><h1 className="mt-3 text-lg font-semibold">Project is temporarily unavailable</h1><p className="mt-2 text-sm leading-6 text-muted-foreground">We could not load this project. Try again, or open the demo workspace.</p><div className="mt-5 flex gap-2"><Button asChild variant="outline"><Link href="/"><ArrowLeftIcon className="mr-1.5 size-3.5" />Home</Link></Button><Button onClick={onDemo} variant="secondary">Open explicit demo</Button></div></section></main>;
+function EmptyWorkspace({ onRetry }: { onRetry: () => void }) {
+  return <main className="grid min-h-screen place-items-center p-6"><section className="max-w-md rounded-2xl border bg-card p-6 shadow-sm"><CircleAlertIcon className="size-5 text-amber-600" /><h1 className="mt-3 text-lg font-semibold">项目暂时不可用</h1><p className="mt-2 text-sm leading-6 text-muted-foreground">该项目不存在、你无权访问，或控制面暂时不可达。</p><div className="mt-5 flex gap-2"><Button asChild variant="outline"><Link href="/"><ArrowLeftIcon className="mr-1.5 size-3.5" />首页</Link></Button><Button onClick={onRetry} variant="secondary">重试</Button></div></section></main>;
 }
 
 export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: string; projectId: string }) {
   const router = useRouter();
-  const isDemo = projectId === demoProjectId;
-  const { data: fetchedSnapshot, error: fetchError, isLoading, mutate: mutateProject } = useSWR(isDemo ? null : ["project", projectId], () => controlPlane.getProject(projectId), { revalidateOnFocus: false });
-  const { data: projects = [] } = useSWR(isDemo ? null : "projects", controlPlane.getProjects, { revalidateOnFocus: false });
-  const snapshot = isDemo ? demoProjectSnapshot : fetchedSnapshot;
+  const authStatus = useAuthStore((state) => state.status);
+  const authLoading = useAuthStore((state) => state.loading);
+  const user = useAuthStore((state) => state.user);
+  const cacheEpoch = useAuthStore((state) => state.cacheEpoch);
+  const invalidateSession = useAuthStore((state) => state.invalidate);
+  const userId = authStatus === "authenticated" ? user?.id : undefined;
+  const redirectPath = `/projects/${encodeURIComponent(projectId)}${initialRunId ? `?run=${encodeURIComponent(initialRunId)}` : ""}`;
+
+  useEffect(() => {
+    if (authStatus === "unauthenticated" && !authLoading) {
+      router.replace(`/login?redirect=${encodeURIComponent(redirectPath)}`);
+    }
+  }, [authLoading, authStatus, redirectPath, router]);
+
+  const { data: snapshot, error: fetchError, isLoading, mutate: mutateProject } = useSWR(
+    userId ? ["project", userId, cacheEpoch, projectId] : null,
+    () => controlPlane.getProject(projectId),
+    { revalidateOnFocus: false },
+  );
+  const { data: projects = [], error: projectsError, mutate: mutateProjects } = useSWR(
+    userId ? ["projects", userId, cacheEpoch] : null,
+    controlPlane.getProjects,
+    { revalidateOnFocus: false },
+  );
+  const { data: runtimeOptions, error: runtimeOptionsError, mutate: mutateRuntimeOptions } = useSWR<RuntimeOptionsResponse>(
+    userId ? ["runtime-options", userId, cacheEpoch] : null,
+    controlPlane.getRuntimeOptions,
+    { revalidateOnFocus: false },
+  );
+  const availableProfiles = runtimeOptions?.profiles.filter((profile) => profile.available) ?? [];
+  const hasAvailableModel = availableProfiles.length > 0;
+  const runtimeOptionsLoading = !runtimeOptions && !runtimeOptionsError;
+
+  // The user's choice for the next run. Defaults to the server's suggested
+  // profile (and that profile's default thinking) once options load.
+  const [selectedProfileId, setSelectedProfileId] = useState<string>();
+  const [selectedThinking, setSelectedThinking] = useState<string>();
+  const activeProfileId = selectedProfileId
+    ?? runtimeOptions?.defaultProfileId
+    ?? availableProfiles[0]?.profileId;
+  const activeThinking = selectedThinking
+    ?? runtimeOptions?.profiles.find((profile) => profile.profileId === activeProfileId)?.defaultThinking;
+  useEffect(() => {
+    if (!runtimeOptions || selectedProfileId) return;
+    const profile = runtimeOptions.profiles.find((candidate) => candidate.profileId === runtimeOptions.defaultProfileId && candidate.available)
+      ?? runtimeOptions.profiles.find((candidate) => candidate.available);
+    if (profile) {
+      setSelectedProfileId(profile.profileId);
+      setSelectedThinking(profile.defaultThinking);
+    }
+  }, [runtimeOptions, selectedProfileId]);
+
+  // Retries reuse the first selection for a given clientMessageId. useChat may
+  // resend the same message id on reconnect; capture it once so the backend's
+  // idempotency check never sees a conflicting runtime pair.
+  const runtimeSelectionByMessageId = useRef(new Map<string, { profileId: string; thinking: string }>());
+  const resolveRuntimeSelection = useCallback(
+    (clientMessageId: string) => {
+      const cached = runtimeSelectionByMessageId.current.get(clientMessageId);
+      if (cached) return cached;
+      const selection = { profileId: activeProfileId ?? "", thinking: activeThinking ?? "" };
+      if (selection.profileId) runtimeSelectionByMessageId.current.set(clientMessageId, selection);
+      return selection;
+    },
+    [activeProfileId, activeThinking],
+  );
+  const resolveRuntimeSelectionRef = useRef(resolveRuntimeSelection);
+  resolveRuntimeSelectionRef.current = resolveRuntimeSelection;
+
+  useEffect(() => {
+    if (fetchError instanceof ApiProblem && fetchError.status === 401) {
+      invalidateSession();
+      router.replace(`/login?redirect=${encodeURIComponent(redirectPath)}`);
+    }
+  }, [fetchError, invalidateSession, redirectPath, router]);
+
   const activeRunId = snapshot?.activeRun?.id || initialRunId;
   const { data: fetchedVersions, mutate: mutateVersions } = useSWR(
-    !isDemo && snapshot ? ["versions", projectId] : null,
+    userId && snapshot ? ["versions", userId, cacheEpoch, projectId] : null,
     () => controlPlane.getVersions(projectId),
     { revalidateOnFocus: false },
   );
-  const { data: fetchedTrace, mutate: mutateTrace } = useSWR(
-    !isDemo && snapshot && activeRunId ? ["trace", projectId, activeRunId] : null,
-    () => controlPlane.getTrace(projectId, activeRunId),
-    { revalidateOnFocus: false },
-  );
   const { data: fetchedPreview, mutate: mutatePreview } = useSWR(
-    !isDemo && snapshot ? ["preview", projectId] : null,
+    userId && snapshot ? ["preview", userId, cacheEpoch, projectId] : null,
     () => controlPlane.getPreview(projectId),
     { revalidateOnFocus: false },
   );
-  const [presentation, setPresentation] = useState<RunPresentation>(() => isDemo ? createDemoRunPresentation() : createRunPresentation({ projectId }));
+  const [presentation, setPresentation] = useState<RunPresentation>(() => createRunPresentation({ projectId }));
   const presentationRef = useRef(presentation);
   const hydratedSnapshotRef = useRef<string | undefined>(undefined);
   const resumedRunsRef = useRef(new Set<string>());
@@ -196,16 +380,19 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
 
   const transport = useMemo(() => new AgentEventTransport({
     getLastSeq: () => presentationRef.current.lastSeq,
+    getRuntimeSelection: (clientMessageId) => resolveRuntimeSelectionRef.current(clientMessageId),
     onConnectionChange: (connected, message) => setConnectionMessage(connected ? undefined : message),
     onEvent: (event) => {
       setPresentation((current) => reduceDomainEvent(current, event));
       if (isTerminalEvent(event)) {
-        void Promise.all([mutateProject(), mutatePreview(), mutateTrace(), mutateVersions()]);
+        void Promise.all([mutateProject(), mutatePreview(), mutateVersions()]).catch((refreshFailure) => {
+          setConnectionMessage(errorNotice("运行已结束，但刷新项目结果失败", refreshFailure));
+        });
       }
     },
-    onRunStarted: (runId) => setPresentation((current) => ({ ...createRunPresentation({ projectId, run: { id: runId, projectId, status: "running", lastSeq: 0 } }), versions: current.versions, trace: current.trace, preview: current.preview })),
+    onRunStarted: (runId, runtime) => setPresentation((current) => ({ ...createRunPresentation({ projectId, run: { id: runId, projectId, status: "running", lastSeq: 0 }, runtime }), versions: current.versions, preview: current.preview })),
     projectId,
-  }), [mutatePreview, mutateProject, mutateTrace, mutateVersions, projectId]);
+  }), [mutatePreview, mutateProject, mutateVersions, projectId]);
 
   const { clearError, error: chatError, messages, resumeStream, sendMessage, setMessages, status: chatStatus, stop } = useChat<AgentUIMessage>({
     id: `project-${projectId}`,
@@ -216,7 +403,6 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
   useEffect(() => {
     if (!snapshot) return;
     const run = snapshot.activeRun;
-    const artifactSignature = (snapshot.artifactRefs || []).map((ref) => `${ref.kind}:${ref.id}`).join(",");
     // GoalGraph is deliberately bounded (six goals / twelve criteria), so a
     // full projection signature is cheap and ensures evidence or acceptance
     // updates hydrate even when graph revision/status do not change.
@@ -224,12 +410,11 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
     const inputRequestSignature = snapshot.pendingInputRequest
       ? JSON.stringify(snapshot.pendingInputRequest)
       : "none";
-    const signature = `${run?.id || initialRunId || "none"}:${snapshot.lastSeq}:${snapshot.messages.length}:${artifactSignature}:${goalGraphSignature}:${inputRequestSignature}`;
+    const signature = `${run?.id || initialRunId || "none"}:${snapshot.lastSeq}:${snapshot.messages.length}:${goalGraphSignature}:${inputRequestSignature}`;
     if (hydratedSnapshotRef.current !== signature) {
       hydratedSnapshotRef.current = signature;
       setMessages(projectMessages(snapshot.messages, projectId));
       setPresentation((current) => {
-        if (isDemo) return createDemoRunPresentation();
         const sameRun = Boolean(run?.id && current.runId === run.id);
         let next = sameRun
           ? current
@@ -239,9 +424,7 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
             preview: snapshot.preview,
             projectId,
             run,
-            trace: snapshot.trace,
             versions: snapshot.versions,
-            artifactRefs: snapshot.artifactRefs,
             goalGraph: snapshot.goalGraph,
             pendingInputRequest: snapshot.pendingInputRequest,
           });
@@ -252,28 +435,24 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
         return {
           ...next,
           lastSeq: Math.max(next.lastSeq, snapshot.lastSeq, run?.lastSeq || 0),
-          trace: snapshot.trace && snapshot.trace.length > 0 ? snapshot.trace : next.trace,
           versions: snapshot.versions && snapshot.versions.length > 0 ? snapshot.versions : next.versions,
           preview: snapshot.preview || next.preview,
-          artifacts: snapshot.artifactRefs && snapshot.artifactRefs.length > 0 ? snapshot.artifactRefs : next.artifacts,
           goalGraph: snapshot.goalGraph || next.goalGraph,
         };
       });
     }
-  }, [initialRunId, isDemo, projectId, setMessages, snapshot]);
+  }, [initialRunId, projectId, setMessages, snapshot]);
 
   useEffect(() => {
-    if (isDemo || !snapshot || !(fetchedVersions || fetchedTrace || fetchedPreview)) return;
+    if (!snapshot || !(fetchedVersions || fetchedPreview)) return;
     setPresentation((current) => ({
       ...current,
-      trace: fetchedTrace || current.trace,
       versions: fetchedVersions || current.versions,
       preview: fetchedPreview || current.preview,
     }));
-  }, [fetchedPreview, fetchedTrace, fetchedVersions, isDemo, snapshot]);
+  }, [fetchedPreview, fetchedVersions, snapshot]);
 
   useEffect(() => {
-    if (isDemo) return;
     const run = snapshot?.activeRun;
     const runId = run?.id || initialRunId;
     if (!runId) return;
@@ -282,22 +461,22 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
     if (resumedRunsRef.current.has(runId)) return;
     resumedRunsRef.current.add(runId);
     void resumeStream();
-  }, [initialRunId, isDemo, resumeStream, snapshot?.activeRun, transport]);
+  }, [initialRunId, resumeStream, snapshot?.activeRun, transport]);
 
-  const manifestKey = !isDemo && snapshot ? ["files", projectId, selectedVersionId || "current"] : null;
+  const manifestKey = userId && snapshot ? ["files", userId, cacheEpoch, projectId, selectedVersionId || "current"] : null;
   const { data: fetchedFiles } = useSWR(manifestKey, () => controlPlane.getFiles(projectId, selectedVersionId), { revalidateOnFocus: false });
-  const files: FileManifestEntry[] = isDemo ? demoProjectSnapshot.files || [] : fetchedFiles || snapshot?.files || [];
+  const files: FileManifestEntry[] = fetchedFiles || snapshot?.files || [];
 
   useEffect(() => {
-    if (!selectedFile && files[0]) setSelectedFile(files[0].path);
+    if ((!selectedFile || !files.some((candidate) => candidate.path === selectedFile)) && files[0]) {
+      setSelectedFile(files[0].path);
+    }
   }, [files, selectedFile, setSelectedFile]);
 
   const selectedManifest = files.find((file) => file.path === selectedFile);
-  const fileKey = !isDemo && selectedTab === "code" && selectedFile ? ["file", projectId, selectedFile, selectedVersionId || "current"] : null;
+  const fileKey = userId && selectedTab === "code" && selectedFile ? ["file", userId, cacheEpoch, projectId, selectedFile, selectedVersionId || "current"] : null;
   const { data: fetchedFile, mutate: mutateFile } = useSWR(fileKey, () => controlPlane.getFileContent(projectId, selectedFile || "", selectedVersionId), { revalidateOnFocus: false });
-  const file: FileContent | undefined = isDemo && selectedFile && demoFiles[selectedFile]
-    ? { path: selectedFile, ...demoFiles[selectedFile] }
-    : fetchedFile || (selectedManifest && selectedTab === "code" ? { ...selectedManifest, content: "" } : undefined);
+  const file: FileContent | undefined = fetchedFile?.path === selectedManifest?.path ? fetchedFile : undefined;
 
   const visibleMessages = messages.length > 0 ? messages : snapshot ? projectMessages(snapshot.messages, projectId) : [];
 
@@ -311,28 +490,31 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
   }, [files, setSelectedFile, setSelectedTab]);
 
   const submitPrompt = useCallback(async (text: string) => {
-    if (isDemo) {
-      setConnectionMessage("The demo fixture is read-only. Create a real project to run the agent.");
-      return;
-    }
     if (presentationRef.current.inputRequests.some((request) => request.status === "pending")) {
-      return;
+      throw new Error("请先回答工作日志中等待处理的问题。");
     }
     if (!text.trim()) return;
+    if (!hasAvailableModel || !activeProfileId || !activeThinking) {
+      const failure = new Error("当前没有可用的运行时模型，无法开始运行。");
+      setConnectionMessage(failure.message);
+      throw failure;
+    }
     setConnectionMessage(undefined);
     try {
       await submitChatMessage({ clearError, sendMessage, text });
     } catch (sendFailure) {
-      setConnectionMessage(sendFailure instanceof Error ? sendFailure.message : "Could not start the run.");
+      const failure = sendFailure instanceof Error ? sendFailure : new Error("无法启动运行。");
+      setConnectionMessage(failure.message);
+      throw failure;
     }
-  }, [clearError, isDemo, sendMessage]);
+  }, [activeProfileId, activeThinking, clearError, hasAvailableModel, sendMessage]);
 
   const answerClarification = useCallback(async (requestId: string, input: UserInputAnswerInput) => {
     const current = presentationRef.current;
     const request = current.inputRequests.find((candidate) => candidate.id === requestId);
-    if (isDemo || !current.runId || request?.status !== "pending") {
+    if (!current.runId || request?.status !== "pending") {
       await mutateProject();
-      throw new Error("This question is no longer pending. The project was refreshed.");
+      throw new Error("该问题已不再等待回答。项目已刷新。");
     }
 
     let response: UserInputAnswerResponse;
@@ -345,7 +527,7 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
         } catch {
           // Preserve the authoritative API error; reconnect remains available.
         }
-        throw new Error("This question changed or was already answered. The project was refreshed.");
+        throw new Error("问题已变更或已回答。项目已刷新。");
       }
       throw failure;
     }
@@ -356,14 +538,14 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
       await mutateProject();
     } catch (refreshFailure) {
       setConnectionMessage(refreshFailure instanceof Error
-        ? `Answer accepted, but refresh failed: ${refreshFailure.message}`
-        : "Answer accepted, but the project snapshot could not be refreshed.");
+        ? `回答已接受，但刷新失败：${refreshFailure.message}`
+        : "回答已接受，但项目快照无法刷新。");
     }
-  }, [isDemo, mutateProject]);
+  }, [mutateProject]);
 
   const stopRun = useCallback(async () => {
     const runId = presentationRef.current.runId;
-    if (!runId || isDemo) return;
+    if (!runId) return;
     try {
       await controlPlane.cancelRun(runId);
       stop();
@@ -375,23 +557,27 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
           : request),
       }));
     } catch (cancelFailure) {
-      setConnectionMessage(cancelFailure instanceof Error ? cancelFailure.message : "Could not cancel the run.");
+      setConnectionMessage(cancelFailure instanceof Error ? cancelFailure.message : "无法取消运行。");
     }
-  }, [isDemo, stop]);
+  }, [stop]);
 
   const reconnect = useCallback(async () => {
-    if (isDemo) return;
     setConnectionMessage(undefined);
     try {
-      await Promise.all([mutateProject(), mutateVersions(), mutateTrace(), mutatePreview()]);
+      await Promise.all([
+        mutateProject(),
+        mutateProjects(),
+        mutateVersions(),
+        mutatePreview(),
+        mutateRuntimeOptions(),
+      ]);
       await resumeStream();
     } catch (reconnectFailure) {
-      setConnectionMessage(reconnectFailure instanceof Error ? reconnectFailure.message : "Reconnect failed.");
+      setConnectionMessage(reconnectFailure instanceof Error ? reconnectFailure.message : "重连失败。");
     }
-  }, [isDemo, mutatePreview, mutateProject, mutateTrace, mutateVersions, resumeStream]);
+  }, [mutatePreview, mutateProject, mutateProjects, mutateRuntimeOptions, mutateVersions, resumeStream]);
 
   const saveFile = useCallback(async (path: string, content: string, hash?: string) => {
-    if (isDemo) return;
     setSaving(true);
     setSaveError(undefined);
     try {
@@ -405,30 +591,35 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
       await Promise.all([mutateProject(), mutateVersions()]);
     } catch (saveFailure) {
       const message = saveFailure instanceof ApiProblem && saveFailure.status === 409
-        ? "This file changed in a newer Agent version. Reload or select that version before saving; FOMO did not overwrite it."
-        : saveFailure instanceof Error ? saveFailure.message : "Could not save the file.";
+        ? "此文件在较新的 Agent 版本中已变更。保存前请重新加载或选择该版本；FOMO 未覆盖它。"
+        : saveFailure instanceof Error ? saveFailure.message : "无法保存文件。";
       setSaveError(message);
     } finally {
       setSaving(false);
     }
-  }, [isDemo, mutateFile, mutateProject, mutateVersions, projectId, selectedVersionId, snapshot?.project.headVersionId]);
+  }, [mutateFile, mutateProject, mutateVersions, projectId, selectedVersionId, snapshot?.project.headVersionId]);
 
   const restoreVersion = useCallback(async (version: VersionSummary) => {
-    if (isDemo) return;
     try {
       const restored = await controlPlane.restoreVersion(projectId, version.id);
       if (restored) setSelectedVersionId(restored.id);
-      await Promise.all([mutateProject(), mutateVersions(), mutateTrace(), mutatePreview()]);
+      await Promise.all([mutateProject(), mutateVersions(), mutatePreview()]);
     } catch (restoreFailure) {
-      setConnectionMessage(restoreFailure instanceof Error ? restoreFailure.message : "Could not restore the version.");
+      setConnectionMessage(restoreFailure instanceof Error ? restoreFailure.message : "无法恢复版本。");
     }
-  }, [isDemo, mutatePreview, mutateProject, mutateTrace, mutateVersions, projectId]);
+  }, [mutatePreview, mutateProject, mutateVersions, projectId]);
 
-  if (!isDemo && fetchError && !snapshot) return <EmptyWorkspace onDemo={() => router.push(`/projects/${demoProjectId}`)} />;
-  if (!snapshot && isLoading) return <main className="grid min-h-screen place-items-center"><div className="flex items-center gap-2 text-sm text-muted-foreground"><LoaderCircleIcon className="size-4 animate-spin" />Loading project…</div></main>;
+  if (authStatus !== "authenticated" || authLoading || !userId) {
+    return <WorkbenchBoot label="正在检查登录状态……" />;
+  }
+  if (fetchError && !snapshot) return <EmptyWorkspace onRetry={() => void mutateProject()} />;
+  if (!snapshot && isLoading) return <WorkbenchBoot label="正在加载项目……" />;
   if (!snapshot) return null;
 
   const currentProjectName = snapshot.project.name;
+  const runtimeProfileLabel = presentation.runtime
+    ? (findRuntimeProfile(runtimeOptions, presentation.runtime.profileId)?.label ?? presentation.runtime.profileId)
+    : undefined;
   const currentStatus = presentation.runId ? presentation.status : projectStatusLabel(snapshot.project);
   // The actionable request, rather than an unpaired status string, owns the
   // composer lock. Malformed or partial history must never dead-end the UI.
@@ -449,42 +640,154 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
     preview: presentation.preview,
     run: runStateView,
   });
-  const connection: "online" | "degraded" | "demo" = isDemo ? "demo" : connectionMessage ? "degraded" : "online";
-  const canStopRun = !isDemo && (
-    isWaitingForUser || chatStatus === "streaming" || chatStatus === "submitted"
-  );
-  const connectionNotice = connectionMessage || chatError?.message;
-  const downloadHref = isDemo
-    ? undefined
-    : controlPlaneUrl(`/projects/${encodeURIComponent(projectId)}/download${selectedVersionId ? `?versionId=${encodeURIComponent(selectedVersionId)}` : ""}`);
+  const runActive = runStateView.live
+    || isWaitingForUser
+    || chatStatus === "streaming"
+    || chatStatus === "submitted";
+  const canStopRun = runActive;
+  const connectionNotice = connectionMessage
+    || chatError?.message
+    || (runtimeOptionsError ? errorNotice("无法加载运行时模型", runtimeOptionsError) : undefined)
+    || (projectsError ? errorNotice("无法刷新项目列表", projectsError) : undefined)
+    || (fetchError && snapshot ? errorNotice("无法刷新当前项目", fetchError) : undefined);
+  const downloadHref = controlPlaneUrl(`/projects/${encodeURIComponent(projectId)}/download${selectedVersionId ? `?versionId=${encodeURIComponent(selectedVersionId)}` : ""}`);
   return (
-    <main className="flex h-dvh flex-col overflow-hidden bg-background bg-grid" data-run-state={runStateView.state}>
-      <div className="flex h-14 items-center justify-between border-b bg-card px-4 xl:hidden"><Link className="flex items-center gap-2 font-semibold" href="/"><span className="grid size-7 place-items-center rounded-md bg-slate-950 font-mono text-xs text-white">F</span>FOMO</Link><div className="flex items-center gap-2"><AccountEntry connection={connection} /><div className="lg:hidden"><RunStatusBadge status={currentStatus} /></div></div></div>
-      {isDemo ? <div className="border-b border-amber-500/25 bg-amber-500/5 px-4 py-2 text-center text-xs text-amber-900">Explicit demo fixture · all results are local sample data, not a real model, sandbox, or QA result.</div> : null}
-      {connectionNotice ? <div className="flex items-center justify-between gap-3 border-b border-amber-500/25 bg-amber-500/5 px-4 py-2 text-xs text-amber-900"><span className="flex min-w-0 items-center gap-2"><CircleAlertIcon className="size-3.5 shrink-0" />{connectionNotice}</span><Button className="shrink-0" onClick={reconnect} size="sm" variant="outline"><RotateCcwIcon className="mr-1 size-3" />Reconnect</Button></div> : null}
-      <div className="border-b bg-card px-3 py-2 lg:hidden"><div className="grid grid-cols-2 rounded-lg bg-muted p-1"><button className={cn("rounded-md px-3 py-1.5 text-xs font-medium", mobileSurface === "chat" && "bg-background shadow-sm")} onClick={() => setMobileSurface("chat")} type="button"><MessageSquareTextIcon className="mr-1 inline size-3.5" />Chat</button><button className={cn("rounded-md px-3 py-1.5 text-xs font-medium", mobileSurface === "workspace" && "bg-background shadow-sm")} onClick={() => setMobileSurface("workspace")} type="button"><FolderKanbanIcon className="mr-1 inline size-3.5" />Workspace</button></div></div>
-      <div className="grid min-h-0 flex-1 overflow-hidden lg:grid-cols-[minmax(20rem,24rem)_minmax(0,1fr)] xl:grid-cols-[15rem_minmax(20rem,24rem)_minmax(0,1fr)]">
-        <ProjectSidebar connection={connection} currentProjectId={projectId} currentProjectName={currentProjectName} isDemo={isDemo} projects={projects} run={presentation} />
-        <section className={cn("h-full min-h-0 overflow-hidden border-r bg-background lg:flex lg:flex-col", mobileSurface === "chat" ? "flex flex-col" : "hidden")} aria-label="Agent work log" data-run-state={runStateView.state}>
-          <header className="flex shrink-0 items-center justify-between border-b bg-card px-4 py-3"><div className="min-w-0"><p className="truncate text-sm font-semibold">{currentProjectName}</p><p className="mt-0.5 text-xs text-muted-foreground">Plan → Build → Verify → Repair</p></div><div className="hidden items-center gap-2 lg:flex"><RunStatusBadge status={presentation.status} /></div></header>
-          <div className="shrink-0 space-y-3 border-b bg-card/60 p-3"><RunTimeline stages={presentation.stages} /><RunMetrics contextUsage={presentation.contextUsage} goalGraph={presentation.goalGraph} /></div>
-          <div className="relative min-h-0 flex-1 overflow-hidden" aria-label="Work log">
-            <Conversation className="h-full min-h-0"><ConversationContent className="min-h-full gap-5 p-4 pb-6">{visibleMessages.length > 0 ? visibleMessages.map((message) => <ReadableMessage key={message.id} message={message} />) : <div className="rounded-xl border border-dashed p-5 text-sm text-muted-foreground">Submit a request to start the first run.</div>}<AgentActivityPanel inputRequests={presentation.inputRequests} items={presentation.worklog} onAnswer={answerClarification} /></ConversationContent><ConversationScrollButton /></Conversation>
+    <main className="flex h-dvh flex-col overflow-hidden bg-muted/30" data-run-state={runStateView.state}>
+      <div className="flex h-12 items-center justify-between border-b bg-card px-4 lg:hidden">
+        <Link className="flex items-center gap-2 font-semibold" href="/">
+          <span className="grid size-7 place-items-center rounded-md bg-foreground font-mono text-xs text-background">F</span>
+          FOMO
+        </Link>
+        <div className="flex items-center gap-2">
+          <ThemeToggle />
+          <AccountEntry />
+          <RunStatusBadge status={currentStatus} />
+        </div>
+      </div>
+      {connectionNotice ? (
+        <div className="flex items-center justify-between gap-3 border-b border-amber-500/25 bg-amber-500/5 px-4 py-2 text-xs text-amber-900 dark:text-amber-200" role="alert">
+          <span className="flex min-w-0 items-center gap-2">
+            <CircleAlertIcon aria-hidden="true" className="size-3.5 shrink-0" />
+            {connectionNotice}
+          </span>
+          <Button className="shrink-0" onClick={reconnect} size="sm" variant="outline">
+            <RotateCcwIcon aria-hidden="true" className="mr-1 size-3" />
+            重新连接
+          </Button>
+        </div>
+      ) : null}
+      <div className="border-b bg-card px-3 py-2 lg:hidden">
+        <div aria-label="视图切换" className="grid grid-cols-2 rounded-lg bg-muted p-1" role="group">
+          <button
+            aria-pressed={mobileSurface === "chat"}
+            className={cn("rounded-md px-3 py-1.5 text-xs font-medium transition-colors", mobileSurface === "chat" && "bg-background shadow-sm")}
+            onClick={() => setMobileSurface("chat")}
+            type="button"
+          >
+            <MessageSquareTextIcon aria-hidden="true" className="mr-1 inline size-3.5" />
+            工作日志
+          </button>
+          <button
+            aria-pressed={mobileSurface === "workspace"}
+            className={cn("rounded-md px-3 py-1.5 text-xs font-medium transition-colors", mobileSurface === "workspace" && "bg-background shadow-sm")}
+            onClick={() => setMobileSurface("workspace")}
+            type="button"
+          >
+            <FolderKanbanIcon aria-hidden="true" className="mr-1 inline size-3.5" />
+            工作区
+          </button>
+        </div>
+      </div>
+      <div className="grid min-h-0 flex-1 overflow-hidden lg:grid-cols-[14rem_minmax(0,24rem)_minmax(0,1fr)]">
+        <ProjectRail currentProjectId={projectId} currentProjectName={currentProjectName} projects={projects} run={presentation} />
+        <section
+          aria-label="Agent 工作日志"
+          className={cn("h-full min-h-0 overflow-hidden border-r bg-background lg:flex lg:flex-col", mobileSurface === "chat" ? "flex flex-col" : "hidden")}
+          data-run-state={runStateView.state}
+        >
+          <header className="flex h-12 shrink-0 items-center gap-2 overflow-hidden border-b bg-card px-3">
+            <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
+              {/* Project name lives in the rail at lg+; keep it only for mobile/tablet chat. */}
+              <p className="truncate text-sm font-semibold lg:hidden">{currentProjectName}</p>
+              <RunStatusBadge status={presentation.status} />
+              {presentation.runtime ? <RuntimeBadge profileLabel={runtimeProfileLabel ?? presentation.runtime.profileId} runtime={presentation.runtime} /> : null}
+            </div>
+            <div className="hidden shrink-0 items-center gap-1 lg:flex">
+              <ThemeToggle />
+              <AccountEntry />
+            </div>
+          </header>
+          <div aria-label="运行状态条" className="grid h-11 shrink-0 grid-cols-[minmax(0,1fr)_11.5rem] items-center gap-2 border-b bg-card/70 px-3"><RunTimeline stages={presentation.stages} /><RunMetrics contextUsage={presentation.contextUsage} goalGraph={presentation.goalGraph} /></div>
+          <div className="relative min-h-0 flex-1 overflow-hidden" aria-label="工作日志">
+            <Conversation aria-label="工作日志流" className="h-full min-h-0 overscroll-contain [scrollbar-gutter:stable]"><ConversationContent className="min-h-full gap-3 p-3 pb-5">{visibleMessages.length > 0 ? visibleMessages.map((message) => <ReadableMessage key={message.id} message={message} />) : <div className="rounded-xl border border-dashed p-4 text-sm text-muted-foreground">提交一个需求以开始首次运行。</div>}<AgentActivityPanel inputRequests={presentation.inputRequests} items={presentation.worklog} onAnswer={answerClarification} /></ConversationContent><ConversationScrollButton aria-label="跳转到最新活动" /></Conversation>
           </div>
           <div className="shrink-0 border-t bg-card">
             <TaskSummary graph={presentation.goalGraph} />
             <div className="border-t p-3">
               <PromptInput onSubmit={(message) => submitPrompt(message.text)}>
-                <PromptInputTextarea disabled={isDemo || isWaitingForUser} placeholder={isDemo ? "Demo fixture is read-only" : isWaitingForUser ? "Answer the question in the work log to continue" : "Describe a change, bug fix, or next capability…"} />
-                <PromptInputFooter>
-                  <PromptInputTools><span className="text-[11px] text-muted-foreground">{isWaitingForUser ? "Answer the question in the work log to continue this run." : "Describe the next change"}</span></PromptInputTools>
-                  <PromptInputSubmit disabled={isDemo || (isWaitingForUser && !canStopRun)} onStop={canStopRun ? stopRun : undefined} status={isDemo ? "ready" : isWaitingForUser ? "streaming" : chatStatus} />
+                <PromptInputTextarea
+                  disabled={runActive}
+                  placeholder={isWaitingForUser
+                    ? "请在工作日志中回答问题以继续"
+                    : runActive ? "Agent 正在处理当前任务……" : "描述一个改动、修复或下一步能力……"}
+                />
+                <PromptInputFooter className="flex-wrap items-center gap-x-2 gap-y-1.5 !justify-start">
+                  <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1.5">
+                    <RuntimeSelector
+                      disabled={runActive || !hasAvailableModel || runtimeOptionsLoading}
+                      onSelectProfile={(profileId) => {
+                        setSelectedProfileId(profileId);
+                        const profile = runtimeOptions?.profiles.find((candidate) => candidate.profileId === profileId);
+                        if (profile) setSelectedThinking(profile.defaultThinking);
+                      }}
+                      onSelectThinking={setSelectedThinking}
+                      options={runtimeOptions}
+                      selectedProfileId={selectedProfileId}
+                      selectedThinking={selectedThinking}
+                    />
+                    {isWaitingForUser ? (
+                      <PromptInputTools className="basis-full sm:basis-auto">
+                        <span className="text-[11px] leading-4 text-muted-foreground">
+                          请回答工作日志中的问题以继续本次运行。
+                        </span>
+                      </PromptInputTools>
+                    ) : null}
+                  </div>
+                  <PromptInputSubmit
+                    className="ml-auto shrink-0"
+                    disabled={!canStopRun && !hasAvailableModel}
+                    onStop={canStopRun ? stopRun : undefined}
+                    status={runActive ? "streaming" : chatStatus}
+                  />
                 </PromptInputFooter>
               </PromptInput>
             </div>
           </div>
         </section>
-        <div className={cn("h-full min-h-0 p-2 lg:flex", mobileSurface === "workspace" ? "flex" : "hidden")}><div className="h-full min-h-0 min-w-0 flex-1"><Workspace device={device} downloadHref={downloadHref} file={file} files={files} isDemo={isDemo} onDeviceChange={setDevice} onRestore={restoreVersion} onSave={saveFile} onSelectFile={selectFile} onVersionChange={setSelectedVersionId} previewState={previewStateView} presentation={presentation} runState={runStateView} saveError={saveError} saving={saving} selectedFile={selectedFile} selectedTab={selectedTab} selectedVersionId={selectedVersionId} setSelectedTab={setSelectedTab} /></div></div>
+        <div className={cn("h-full min-h-0 p-1.5 lg:flex", mobileSurface === "workspace" ? "flex" : "hidden")}>
+          <div className="h-full min-h-0 min-w-0 flex-1">
+            <Workspace
+              device={device}
+              downloadHref={downloadHref}
+              file={file}
+              files={files}
+              onDeviceChange={setDevice}
+              onRestore={restoreVersion}
+              onSave={saveFile}
+              onSelectFile={selectFile}
+              onVersionChange={setSelectedVersionId}
+              previewState={previewStateView}
+              presentation={presentation}
+              runState={runStateView}
+              saveError={saveError}
+              saving={saving}
+              selectedFile={selectedFile}
+              selectedTab={selectedTab}
+              selectedVersionId={selectedVersionId}
+              setSelectedTab={setSelectedTab}
+            />
+          </div>
+        </div>
       </div>
     </main>
   );

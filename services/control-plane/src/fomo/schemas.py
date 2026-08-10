@@ -13,6 +13,17 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
+from fomo.runtime_contract import (
+    DEFAULT_PROFILE_ID,
+    DEFAULT_THINKING,
+    LEGACY_CONTEXT_WINDOW,
+    LEGACY_INFERENCE_TPM_LIMIT,
+    LEGACY_RUN_MAX_TOKENS,
+    LEGACY_RUNTIME_POLICY_VERSION,
+    RuntimeContractError,
+    resolve_runtime_contract,
+)
+
 
 def _camel(value: str) -> str:
     head, *tail = value.split("_")
@@ -341,6 +352,15 @@ class GateStatus(StrEnum):
     skipped = "skipped"
 
 
+class GateDiagnostic(SchemaModel):
+    """Bounded assertion evidence safe to persist and forward for repair."""
+
+    message: str = Field(min_length=1, max_length=1_200)
+    locator: str | None = Field(default=None, max_length=500)
+    test_name: str = Field(min_length=1, max_length=300)
+    line: int | None = Field(default=None, ge=1, le=10_000_000)
+
+
 class GateResult(SchemaModel):
     gate: str
     status: GateStatus
@@ -365,6 +385,10 @@ class GateResult(SchemaModel):
     # dependency install is classified as infrastructure while an ordinary
     # non-zero install stays repairable.
     timed_out: bool = False
+    # Failed acceptance assertions may carry only this closed, bounded
+    # diagnostic projection. Raw reporter output, stack, trace and attachments
+    # are never valid gate fields.
+    diagnostic: GateDiagnostic | None = None
 
     @model_validator(mode="after")
     def _enforce_gate_scope_contract(self) -> GateResult:
@@ -373,11 +397,12 @@ class GateResult(SchemaModel):
             self.test_path,
             self.test_name,
             self.outcome,
+            self.diagnostic,
         )
         if self.scope == "project":
             if any(value is not None for value in acceptance_fields):
                 raise ValueError(
-                    "project-scope gates must not carry acceptanceId, testPath, testName, or outcome"
+                    "project-scope gates must not carry acceptance fields or diagnostics"
                 )
             return self
         if not self.acceptance_id or not self.outcome:
@@ -393,6 +418,8 @@ class GateResult(SchemaModel):
                 raise ValueError(
                     "passed or failed acceptance gates require testPath, testName, and exitCode"
                 )
+        if self.diagnostic is not None and self.outcome != "failed":
+            raise ValueError("only failed acceptance assertions may carry diagnostics")
         for label, value, limit in (
             ("testPath", self.test_path, 512),
             ("testName", self.test_name, 300),
@@ -461,11 +488,6 @@ class EventEnvelope(SchemaModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
-class GuestSessionResponse(SchemaModel):
-    id: str
-    expires_at: datetime
-
-
 class AccountCredentials(SchemaModel):
     email: str = Field(min_length=3, max_length=320)
     password: str = Field(min_length=8, max_length=128)
@@ -513,7 +535,6 @@ class UserResponse(SchemaModel):
 
 
 class AuthSessionResponse(SchemaModel):
-    session_id: str
     expires_at: datetime
     user: UserResponse
 
@@ -526,11 +547,34 @@ class ProjectPatch(SchemaModel):
     title: str = Field(min_length=1, max_length=200)
 
 
+class RuntimeSelection(SchemaModel):
+    profile_id: str = Field(default=DEFAULT_PROFILE_ID, min_length=1, max_length=64)
+    thinking: str | None = Field(default=None, min_length=1, max_length=32)
+
+    @model_validator(mode="after")
+    def _supported_selection(self) -> RuntimeSelection:
+        try:
+            resolve_runtime_contract(self.profile_id, self.thinking)
+        except RuntimeContractError as exc:
+            raise ValueError(str(exc)) from exc
+        return self
+
+
 class MessageCreate(SchemaModel):
     client_message_id: str = Field(min_length=1, max_length=128)
     content: str = Field(min_length=1, max_length=50_000)
     base_version_id: str | None = None
-    attachments: list[dict[str, Any]] = Field(default_factory=list)
+    # Binary/file attachments are not part of the current persisted run input
+    # contract. Accept the existing client's empty array but reject silent data loss.
+    attachments: list[dict[str, Any]] = Field(default_factory=list, max_length=0)
+    profile_id: str | None = Field(default=None, min_length=1, max_length=64)
+    thinking: str | None = Field(default=None, min_length=1, max_length=32)
+
+    @model_validator(mode="after")
+    def _supported_runtime(self) -> MessageCreate:
+        if self.profile_id is not None:
+            RuntimeSelection(profile_id=self.profile_id, thinking=self.thinking)
+        return self
 
 
 class UserInputRequestDraft(SchemaModel):
@@ -613,6 +657,60 @@ class MessageResponse(SchemaModel):
     created_at: datetime
 
 
+class RunRuntimeResponse(SchemaModel):
+    profile_id: str
+    thinking: str
+    context_window: int
+    policy_version: str
+    # ``None`` plus the explicit flag is the public unlimited contract. An
+    # integer is retained only when replaying a historical runtime-v0/v1 run.
+    run_token_budget: int | None
+    run_token_budget_unlimited: bool
+    inference_tpm_limit: int
+
+    @model_validator(mode="after")
+    def _consistent_token_budget(self) -> RunRuntimeResponse:
+        if self.run_token_budget_unlimited != (self.run_token_budget is None):
+            raise ValueError("run token budget unlimited flag is inconsistent")
+        return self
+
+
+def _legacy_run_runtime_response() -> RunRuntimeResponse:
+    return RunRuntimeResponse(
+        profile_id=DEFAULT_PROFILE_ID,
+        thinking=DEFAULT_THINKING,
+        context_window=LEGACY_CONTEXT_WINDOW,
+        policy_version=LEGACY_RUNTIME_POLICY_VERSION,
+        run_token_budget=LEGACY_RUN_MAX_TOKENS,
+        run_token_budget_unlimited=False,
+        inference_tpm_limit=LEGACY_INFERENCE_TPM_LIMIT,
+    )
+
+
+class RuntimeProfileOption(SchemaModel):
+    profile_id: str
+    label: str
+    thinking_levels: list[str]
+    default_thinking: str
+    context_window: int
+    run_token_budget: int | None
+    run_token_budget_unlimited: bool
+    inference_tpm_limit: int
+    available: bool
+    disabled_reason: str | None = None
+
+    @model_validator(mode="after")
+    def _consistent_token_budget(self) -> RuntimeProfileOption:
+        if self.run_token_budget_unlimited != (self.run_token_budget is None):
+            raise ValueError("run token budget unlimited flag is inconsistent")
+        return self
+
+
+class RuntimeOptionsResponse(SchemaModel):
+    default_profile_id: str | None
+    profiles: list[RuntimeProfileOption]
+
+
 class RunResponse(SchemaModel):
     id: str
     project_id: str
@@ -626,6 +724,7 @@ class RunResponse(SchemaModel):
     preview_url: str | None = None
     pending_input_request: UserInputRequestResponse | None = None
     execution_started_at: datetime | None = None
+    runtime: RunRuntimeResponse = Field(default_factory=_legacy_run_runtime_response)
     created_at: datetime
     updated_at: datetime
 

@@ -10,6 +10,7 @@ import pytest
 
 from fomo.direct_pi.execution import PiEventWriter
 from fomo.fomo_pi_ds import PiBridgeEnvelope
+from tests.helpers import create_user_session
 
 
 def _repository() -> SimpleNamespace:
@@ -32,6 +33,7 @@ async def test_pi_lifecycle_projects_only_safe_flat_context_usage() -> None:
             type="started",
             payload={
                 "sessionId": "pi-session",
+                "model": "fomo-litellm/private-provider-alias",
                 "contextWindow": 200_000,
                 "initialStats": {
                     "contextUsage": {"tokens": 12_345, "contextWindow": 180_000},
@@ -96,6 +98,35 @@ async def test_pi_lifecycle_projects_only_safe_flat_context_usage() -> None:
         "pi.started",
         {"bridgeSeq": 3, "contextWindow": 200_000},
     )
+
+
+@pytest.mark.asyncio
+async def test_pi_failed_projects_only_a_closed_public_failure_contract() -> None:
+    repository = _repository()
+    writer = PiEventWriter(repository, run_id="run-1", lease_token="lease-1")
+
+    await writer(
+        PiBridgeEnvelope(
+            seq=4,
+            type="failed",
+            payload={
+                "code": "bridge_error",
+                "phase": "running",
+                "message": "provider leaked password=private-value",
+            },
+        ),
+        stage="building",
+    )
+
+    kind, payload = _persisted(repository)
+    assert kind == "pi.failed"
+    assert payload == {
+        "stage": "building",
+        "bridgeSeq": 4,
+        "code": "coding_agent_failed",
+        "message": "Coding Agent 运行失败，请重试；若问题持续发生，请检查服务状态。",
+    }
+    assert "private-value" not in json.dumps(payload, ensure_ascii=False)
 
 
 @pytest.mark.asyncio
@@ -381,7 +412,7 @@ async def test_pi_event_writer_suppresses_non_text_message_deltas() -> None:
 
 @pytest.mark.asyncio
 async def test_repository_sse_source_contains_only_the_public_projection(repository) -> None:
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Public event projection")
     _message, run, _created = await repository.create_message_and_run(
         project.id,

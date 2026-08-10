@@ -1,14 +1,10 @@
 import {
-  artifactKinds,
   toProjectStatus,
   toRunStatus,
   userInputRequestStages,
   userInputRequestStatuses,
 } from "@/lib/contracts";
 import type {
-  AcceptanceTrace,
-  ArtifactDetail,
-  ArtifactKind,
   DomainEvent,
   FileContent,
   FileManifestEntry,
@@ -16,20 +12,18 @@ import type {
   ProjectMessage,
   ProjectSnapshot,
   ProjectSummary,
+  RunRuntimeResponse,
   RunSnapshot,
+  RuntimeOptionsResponse,
+  RuntimeProfileOption,
   UserInputAnswerInput,
   UserInputAnswerResponse,
   UserInputRequest,
   VersionSummary,
-  VisibleArtifactRef,
 } from "@/lib/contracts";
 import { normalizeGoalGraph } from "@/lib/goal-graph";
 
 const defaultApiOrigin = "http://localhost:8000";
-const guestSessionPath = "/sessions/guest";
-
-let guestSessionBootstrap: Promise<JsonRecord> | undefined;
-
 type JsonRecord = Record<string, unknown>;
 
 export class ApiProblem extends Error {
@@ -81,6 +75,10 @@ function text(value: unknown, fallback = ""): string {
 
 function numberValue(value: unknown, fallback = 0): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function nullableNumberValue(value: unknown): number | null {
+  return value === null ? null : numberValue(value);
 }
 
 function toArray(value: unknown): unknown[] {
@@ -150,6 +148,60 @@ export function normalizeUserInputRequest(value: unknown): UserInputRequest | un
   };
 }
 
+export function normalizeRunRuntime(value: unknown): RunRuntimeResponse | undefined {
+  const source = record(value);
+  const profileId = text(source.profileId || source.profile_id);
+  const thinking = text(source.thinking);
+  if (!profileId || !thinking) {
+    return undefined;
+  }
+  return {
+    profileId,
+    thinking,
+    contextWindow: numberValue(source.contextWindow ?? source.context_window),
+    policyVersion: text(source.policyVersion || source.policy_version, "unknown"),
+    runTokenBudget: nullableNumberValue(
+      source.runTokenBudget !== undefined ? source.runTokenBudget : source.run_token_budget,
+    ),
+    runTokenBudgetUnlimited: Boolean(
+      source.runTokenBudgetUnlimited ?? source.run_token_budget_unlimited,
+    ),
+    inferenceTpmLimit: numberValue(source.inferenceTpmLimit ?? source.inference_tpm_limit),
+  };
+}
+
+/** Mirrors the public RuntimeProfileOption contract; drops nothing server-sent. */
+export function normalizeRuntimeProfile(value: unknown): RuntimeProfileOption | undefined {
+  const source = record(value);
+  const profileId = text(source.profileId || source.profile_id);
+  const label = text(source.label);
+  const rawLevels = source.thinkingLevels ?? source.thinking_levels;
+  const thinkingLevels = Array.isArray(rawLevels)
+    ? rawLevels.map((item) => text(item)).filter(Boolean)
+    : [];
+  if (!profileId || !label || thinkingLevels.length === 0) {
+    return undefined;
+  }
+  const available = Boolean(source.available ?? source.available);
+  const disabledReason = text(source.disabledReason || source.disabled_reason) || undefined;
+  return {
+    profileId,
+    label,
+    thinkingLevels,
+    defaultThinking: text(source.defaultThinking ?? source.default_thinking, thinkingLevels[0] || "high"),
+    contextWindow: numberValue(source.contextWindow ?? source.context_window),
+    runTokenBudget: nullableNumberValue(
+      source.runTokenBudget !== undefined ? source.runTokenBudget : source.run_token_budget,
+    ),
+    runTokenBudgetUnlimited: Boolean(
+      source.runTokenBudgetUnlimited ?? source.run_token_budget_unlimited,
+    ),
+    inferenceTpmLimit: numberValue(source.inferenceTpmLimit ?? source.inference_tpm_limit),
+    available,
+    ...(disabledReason ? { disabledReason } : {}),
+  };
+}
+
 export function normalizeRun(value: unknown): RunSnapshot | undefined {
   const source = record(value);
   const id = text(source.id || source.runId);
@@ -157,15 +209,18 @@ export function normalizeRun(value: unknown): RunSnapshot | undefined {
     return undefined;
   }
   const pendingInputRequest = normalizeUserInputRequest(source.pendingInputRequest || source.pending_input_request);
+  const runtime = normalizeRunRuntime(source.runtime);
   return {
     id,
     projectId: text(source.projectId || source.project_id),
     status: toRunStatus(source.status),
     phase: text(source.phase) || undefined,
+    errorCode: text(source.errorCode || source.error_code).slice(0, 80) || undefined,
     lastSeq: numberValue(source.lastSeq ?? source.last_seq),
     createdAt: text(source.createdAt || source.created_at) || undefined,
     updatedAt: text(source.updatedAt || source.updated_at) || undefined,
     ...(pendingInputRequest ? { pendingInputRequest } : {}),
+    ...(runtime ? { runtime } : {}),
   };
 }
 
@@ -205,201 +260,6 @@ function normalizeMessage(value: unknown): ProjectMessage | undefined {
     content,
     createdAt: text(source.createdAt || source.created_at) || undefined,
   };
-}
-
-function traceEvidenceType(value: unknown): AcceptanceTrace["evidence"][number]["type"] {
-  const type = text(value);
-  return ["design", "file", "test", "screenshot", "version", "command"].includes(type)
-    ? (type as AcceptanceTrace["evidence"][number]["type"])
-    : "test";
-}
-
-function traceEvidenceStatus(value: unknown): AcceptanceTrace["evidence"][number]["status"] {
-  const status = text(value);
-  return ["passed", "pending", "failed"].includes(status)
-    ? (status as AcceptanceTrace["evidence"][number]["status"])
-    : "pending";
-}
-
-function traceStatus(value: unknown): AcceptanceTrace["status"] {
-  const status = text(value);
-  if (status === "passed" || status === "failed" || status === "blocked") return status;
-  if (status === "unverified") return "unverified";
-  return status === "skipped" ? "blocked" : "pending";
-}
-
-function implementationStatus(value: unknown): AcceptanceTrace["implementationStatus"] {
-  return value === "implemented" ? "implemented" : value === "not_implemented" ? "not_implemented" : undefined;
-}
-
-/** Only a well-formed business-file implemented_in link proves implementation:
- * source acceptance_criterion -> target file, with a nonempty targetRef that
- * is not a tests/generated smoke path. Explicit backend implementationStatus
- * stays authoritative and is checked before any link-derived fallback.
- * Missing links remain unknown; open-world trace data cannot prove that an
- * implementation does not exist. */
-function isImplementedInLink(link: JsonRecord): boolean {
-  if (text(link.relation) !== "implemented_in") return false;
-  const sourceKind = text(link.sourceKind || link.source_kind);
-  const targetKind = text(link.targetKind || link.target_kind);
-  const targetRef = text(link.targetRef || link.target_ref);
-  return (
-    sourceKind === "acceptance_criterion" &&
-    targetKind === "file" &&
-    targetRef.length > 0 &&
-    !targetRef.startsWith("tests/generated/")
-  );
-}
-
-/** The evidence summary is a bounded structured JSON object, never a log. */
-function evidenceLabel(source: JsonRecord, fallback: string): string {
-  const explicit = text(source.label || source.title);
-  if (explicit) return explicit;
-  const summary = text(source.summary);
-  if (!summary || summary[0] !== "{") return fallback;
-  try {
-    const parsed = JSON.parse(summary) as JsonRecord;
-    const testName = text(parsed.testName);
-    const result = text(parsed.result);
-    if (testName && result) return `${testName} · ${result}`;
-  } catch {
-    return fallback;
-  }
-  return fallback;
-}
-
-function tracePriority(value: unknown): AcceptanceTrace["priority"] {
-  const priority = text(value);
-  return priority === "should" || priority === "could" ? priority : "must";
-}
-
-function traceTitle(source: JsonRecord): string {
-  const explicit = text(source.title || source.description);
-  if (explicit) return explicit;
-  const criterion = record(source.criterion);
-  const then = text(criterion.then);
-  if (then) return then;
-  return text(criterion.title || criterion.description, "Acceptance criterion");
-}
-
-function normalizeTraceEvidence(value: unknown, fallbackId: string): AcceptanceTrace["evidence"][number] | undefined {
-  const source = record(value);
-  const id = text(source.id || source.linkId || source.link_id || source.artifactId || source.artifact_id, fallbackId);
-  return {
-    id,
-    type: traceEvidenceType(source.type || source.kind || source.targetKind || source.target_kind),
-    label: evidenceLabel(source, text(source.targetRef || source.target_ref, "Evidence")),
-    href: text(source.href || source.url) || undefined,
-    status: traceEvidenceStatus(source.status),
-  };
-}
-
-function normalizeTrace(value: unknown): AcceptanceTrace | undefined {
-  const source = record(value);
-  const id = text(source.id || source.acId || source.ac_id || source.acceptanceId || source.acceptance_id);
-  if (!id) {
-    return undefined;
-  }
-  const evidence = [...toArray(source.links), ...toArray(source.evidence)].flatMap((item, index) => {
-    const normalized = normalizeTraceEvidence(item, `${id}-${index}`);
-    return normalized ? [normalized] : [];
-  });
-  const criterion = record(source.criterion);
-  const normalizedImplementationStatus = implementationStatus(source.implementationStatus || source.implementation_status)
-    || (source.links && Array.isArray(source.links) && toArray(source.links).some((link) => isImplementedInLink(record(link)))
-      ? "implemented"
-      : undefined);
-  return {
-    id,
-    title: traceTitle(source),
-    priority: tracePriority(source.priority || criterion.priority),
-    status: traceStatus(source.status),
-    ...(normalizedImplementationStatus ? { implementationStatus: normalizedImplementationStatus } : {}),
-    evidence,
-  };
-}
-
-/** Supports both the V1 graph response and the richer trace items planned by the API. */
-function normalizeTraceResponse(value: unknown): AcceptanceTrace[] {
-  if (Array.isArray(value)) {
-    return value.flatMap((item) => {
-      const normalized = normalizeTrace(item);
-      return normalized ? [normalized] : [];
-    });
-  }
-  const source = record(value);
-  const direct = toArray(source.items || source.trace || source.data || source.acceptanceTrace || source.acceptance_trace)
-    .flatMap((item) => {
-      const normalized = normalizeTrace(item);
-      return normalized ? [normalized] : [];
-    });
-  if (direct.length > 0) {
-    return direct;
-  }
-
-  const byAcceptanceId = new Map<string, AcceptanceTrace>();
-  const ensureAcceptance = (id: string): AcceptanceTrace => {
-    const existing = byAcceptanceId.get(id);
-    if (existing) return existing;
-    const created: AcceptanceTrace = {
-      id,
-      title: `Acceptance criterion ${id}`,
-      priority: "must",
-      status: "pending",
-      evidence: [],
-    };
-    byAcceptanceId.set(id, created);
-    return created;
-  };
-
-  for (const link of toArray(source.links)) {
-    const item = record(link);
-    if (text(item.sourceKind || item.source_kind) !== "acceptance_criterion") continue;
-    const id = text(item.sourceRef || item.source_ref);
-    if (!id) continue;
-    const targetRef = text(item.targetRef || item.target_ref);
-    const targetKind = text(item.targetKind || item.target_kind);
-    if (targetRef) {
-      const trace = ensureAcceptance(id);
-      trace.evidence.push({
-        id: text(item.id, `${id}-${targetRef}`),
-        type: traceEvidenceType(targetKind === "file" ? "file" : targetKind),
-        label: targetRef,
-        // verified_in is a durable publication relation created only after
-        // this AC passes; structural implementation/test links are not gates.
-        status: text(item.relation) === "verified_in" ? "passed" : "pending",
-      });
-      if (isImplementedInLink(item)) {
-        trace.implementationStatus = "implemented";
-      }
-    }
-  }
-
-  for (const evidence of toArray(source.evidence)) {
-    const item = record(evidence);
-    const acceptanceId = text(item.acceptanceId || item.acceptance_id);
-    if (!acceptanceId) continue;
-    const trace = ensureAcceptance(acceptanceId);
-    trace.evidence.push({
-      id: text(item.id, `${acceptanceId}-${trace.evidence.length}`),
-      type: traceEvidenceType(item.kind),
-      label: text(item.summary, "Verification evidence"),
-      status: traceEvidenceStatus(item.status),
-    });
-  }
-
-  return [...byAcceptanceId.values()].map((trace) => ({
-    ...trace,
-    // Only deterministic acceptance evidence decides the AC result. File,
-    // test-definition and version links remain visible evidence but cannot
-    // downgrade an otherwise passed Playwright result to pending.
-    status: trace.evidence.filter((item) => item.type === "test").some((item) => item.status === "failed")
-      ? "failed"
-      : trace.evidence.filter((item) => item.type === "test").length > 0
-        && trace.evidence.filter((item) => item.type === "test").every((item) => item.status === "passed")
-        ? "passed"
-        : "pending",
-  }));
 }
 
 function normalizeFile(value: unknown): FileManifestEntry | undefined {
@@ -469,51 +329,6 @@ function normalizePreview(value: unknown): PreviewRef | undefined {
   };
 }
 
-function normalizeArtifactRef(value: unknown): VisibleArtifactRef | undefined {
-  const source = record(value);
-  const id = text(source.id || source.artifactId || source.artifact_id);
-  const runId = text(source.runId || source.run_id);
-  const kind = text(source.kind);
-  const role = text(source.role);
-  const stage = text(source.stage);
-  const schemaVersion = numberValue(source.schemaVersion ?? source.schema_version, -1);
-  const title = text(source.title);
-  const summary = text(source.summary);
-  const createdAt = text(source.createdAt || source.created_at);
-  if (!id || !runId || !kind || !role || !stage || schemaVersion < 0 || !title || !summary || !createdAt) {
-    return undefined;
-  }
-  if (!artifactKinds.includes(kind as ArtifactKind)) {
-    return undefined;
-  }
-  const expected = {
-    run_input: ["user", "input"],
-    build_plan: ["pi", "planning"],
-    acceptance_contract: ["fomo", "acceptance"],
-    diagnostic_report: ["fomo", "verification"],
-    product_spec: ["product_manager", "product"],
-    technical_spec: ["architect", "architecture"],
-  } as const;
-  const [expectedRole, expectedStage] = expected[kind as ArtifactKind];
-  if (role !== expectedRole || stage !== expectedStage) {
-    return undefined;
-  }
-  return { id, runId, kind: kind as ArtifactKind, role: expectedRole, stage: expectedStage, schemaVersion, title, summary, createdAt };
-}
-
-function normalizeArtifactDetail(value: unknown): ArtifactDetail | undefined {
-  const source = record(value);
-  const ref = normalizeArtifactRef(source);
-  if (!ref) {
-    return undefined;
-  }
-  const content = source.content;
-  if (!content || typeof content !== "object" || Array.isArray(content)) {
-    return undefined;
-  }
-  return { ...ref, content: content as Record<string, unknown> };
-}
-
 async function responseProblem(response: Response): Promise<ApiProblem> {
   let body: JsonRecord = {};
   try {
@@ -529,10 +344,6 @@ async function responseProblem(response: Response): Promise<ApiProblem> {
   });
 }
 
-function isGuestSessionRequest(path: string): boolean {
-  return path.replace(/\/+$/, "") === guestSessionPath;
-}
-
 async function executeRequest(path: string, init?: RequestInit): Promise<Response> {
   const headers = new Headers(init?.headers);
   headers.set("Accept", "application/json");
@@ -546,38 +357,8 @@ async function executeRequest(path: string, init?: RequestInit): Promise<Respons
   });
 }
 
-async function createGuestSessionRequest(): Promise<JsonRecord> {
-  const response = await executeRequest(guestSessionPath, {
-    method: "POST",
-    headers: { "Idempotency-Key": idempotencyKey() },
-  });
-  if (!response.ok) {
-    throw await responseProblem(response);
-  }
-  return response.status === 204 ? {} : record(await response.json());
-}
-
-/**
- * Shares one cookie-creating request among concurrent 401 recoveries. This
- * intentionally uses the raw executor so a failed guest-session request never
- * tries to bootstrap itself recursively.
- */
-function bootstrapGuestSession(): Promise<JsonRecord> {
-  if (!guestSessionBootstrap) {
-    guestSessionBootstrap = createGuestSessionRequest().finally(() => {
-      guestSessionBootstrap = undefined;
-    });
-  }
-  return guestSessionBootstrap;
-}
-
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  let response = await executeRequest(path, init);
-  if (response.status === 401 && !isGuestSessionRequest(path)) {
-    await bootstrapGuestSession();
-    // Retry the original operation exactly once with the newly set cookie.
-    response = await executeRequest(path, init);
-  }
+  const response = await executeRequest(path, init);
   if (!response.ok) {
     throw await responseProblem(response);
   }
@@ -592,10 +373,6 @@ function idempotencyKey(): string {
 }
 
 export const controlPlane = {
-  async createGuestSession() {
-    return bootstrapGuestSession();
-  },
-
   async getProjects(): Promise<ProjectSummary[]> {
     const response = await request<unknown>("/projects");
     const source = record(response);
@@ -650,37 +427,45 @@ export const controlPlane = {
         const normalized = normalizeVersion(item);
         return normalized ? [normalized] : [];
       }),
-      trace: normalizeTraceResponse(source.trace || source.acceptanceTrace || source.acceptance_trace),
       preview: normalizePreview(source.preview),
-      artifactRefs: toArray(source.artifactRefs || source.artifact_refs).flatMap((item) => {
-        const normalized = normalizeArtifactRef(item);
-        return normalized ? [normalized] : [];
-      }),
       ...(pendingInputRequest ? { pendingInputRequest } : {}),
       goalGraph: normalizeGoalGraph(source.goalGraph || source.goal_graph),
     };
   },
 
-  async getRun(runId: string): Promise<RunSnapshot | undefined> {
-    const response = await request<unknown>(`/runs/${encodeURIComponent(runId)}`);
-    return normalizeRun(record(response).run || response);
-  },
-
   async startRun(
     projectId: string,
-    input: { clientMessageId: string; content: string; baseVersionId?: string },
-  ): Promise<{ runId: string }> {
+    input: { clientMessageId: string; content: string; baseVersionId?: string; profileId?: string; thinking?: string },
+  ): Promise<{ runId: string; runtime?: RunRuntimeResponse }> {
+    // A message always carries attachments: []. The runtime selection is sent
+    // only when the caller chose one; when omitted the server applies its own
+    // default and the UI still renders the resolved contract from the response.
+    const body: JsonRecord = { ...input, attachments: [] };
+    if (!input.profileId) delete body.profileId;
+    if (input.thinking === undefined) delete body.thinking;
     const response = await request<unknown>(`/projects/${encodeURIComponent(projectId)}/messages`, {
       method: "POST",
       headers: { "Idempotency-Key": input.clientMessageId },
-      body: JSON.stringify({ ...input, attachments: [] }),
+      body: JSON.stringify(body),
     });
     const source = record(response);
     const runId = text(source.runId || source.run_id || record(source.run).id);
     if (!runId) {
       throw new ApiProblem({ status: 502, title: "Control plane did not return a run ID" });
     }
-    return { runId };
+    const runtime = normalizeRunRuntime(record(source.run).runtime);
+    return { runId, ...(runtime ? { runtime } : {}) };
+  },
+
+  async getRuntimeOptions(): Promise<RuntimeOptionsResponse> {
+    const response = await request<unknown>("/runtime/options");
+    const source = record(response);
+    const defaultProfileId = text(source.defaultProfileId || source.default_profile_id) || null;
+    const profiles = toArray(source.profiles || source.options).flatMap((item) => {
+      const profile = normalizeRuntimeProfile(item);
+      return profile ? [profile] : [];
+    });
+    return { defaultProfileId: defaultProfileId || null, profiles };
   },
 
   async answerRunInputRequest(
@@ -777,26 +562,9 @@ export const controlPlane = {
     });
   },
 
-  async getTrace(projectId: string, runId?: string): Promise<AcceptanceTrace[]> {
-    const query = runId ? `?runId=${encodeURIComponent(runId)}` : "";
-    const response = await request<unknown>(`/projects/${encodeURIComponent(projectId)}/trace${query}`);
-    return normalizeTraceResponse(response);
-  },
-
   async getPreview(projectId: string): Promise<PreviewRef | undefined> {
     const response = await request<unknown>(`/projects/${encodeURIComponent(projectId)}/preview`);
     return normalizePreview(record(response).preview || response);
-  },
-
-  async getArtifact(runId: string, artifactId: string): Promise<ArtifactDetail> {
-    const response = await request<unknown>(
-      `/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(artifactId)}`,
-    );
-    const detail = normalizeArtifactDetail(record(response).artifact || response);
-    if (!detail || detail.runId !== runId || detail.id !== artifactId) {
-      throw new ApiProblem({ status: 502, title: "Artifact detail did not match the requested run or artifact" });
-    }
-    return detail;
   },
 
   async restoreVersion(projectId: string, versionId: string): Promise<VersionSummary | undefined> {
@@ -816,7 +584,6 @@ export type AuthUser = {
 };
 
 export type AuthSession = {
-  sessionId: string;
   expiresAt: string;
   user: AuthUser;
 };
@@ -842,23 +609,20 @@ function toAuthUser(value: unknown): AuthUser {
   };
 }
 
-/** Register/login return a nested `user` object; the session fields
- * (sessionId, expiresAt) sit at the top level of the envelope. */
+/** Register/login return a nested `user` object and a public expiry hint. */
 function toAuthSession(value: unknown): AuthSession {
   const source = record(value);
   return {
-    sessionId: text(source.sessionId),
     expiresAt: text(source.expiresAt),
     user: toAuthUser(source.user),
   };
 }
 
 /**
- * Auth endpoints deliberately bypass the generic `request` wrapper so a 401
- * never bootstraps a guest session or auto-retries. `auth/me` returns a guest
- * (null) on 401; `/auth/login` returns 401 for bad credentials; register may
- * 409 on a duplicate email. The browser relies on the HttpOnly `fomo_session`
- * cookie the server sets and clears — nothing here reads or persists it.
+ * Auth endpoints deliberately bypass the generic `request` wrapper.
+ * `auth/me` returns null on 401; `/auth/login` returns 401 for bad credentials;
+ * register may return 409 for a duplicate email. The browser relies solely on
+ * the HttpOnly `fomo_session` cookie the server sets and clears.
  */
 export const auth = {
   async register(input: RegisterInput): Promise<AuthSession> {
@@ -881,8 +645,7 @@ export const auth = {
     return toAuthSession(record(await response.json()));
   },
 
-  /** The signed-in user, or null for a guest / expired / logged-out session.
-   * Never bootstraps a guest: a 401 is the expected guest signal. */
+  /** The signed-in user, or null for an expired or logged-out session. */
   async me(): Promise<AuthUser | null> {
     const response = await executeRequest("/auth/me", { method: "GET" });
     if (response.status === 401) return null;

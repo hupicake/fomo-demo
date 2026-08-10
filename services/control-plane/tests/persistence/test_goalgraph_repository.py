@@ -22,6 +22,7 @@ from fomo.persistence.models import (
     VersionRecord,
 )
 from fomo.schemas import RunStatus
+from tests.helpers import create_user_session
 
 
 def _acceptance(identifier: str) -> dict[str, Any]:
@@ -81,7 +82,7 @@ def _draft():
 
 
 async def _running_context(repository, suffix: str = "one"):
-    owner = await repository.create_guest_session()
+    owner = await create_user_session(repository)
     project = await repository.create_project(owner.id, f"Project {suffix}")
     _message, run, _created = await repository.create_message_and_run(
         project.id, owner.id, f"message-{suffix}", "Build it"

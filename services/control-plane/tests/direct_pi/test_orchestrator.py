@@ -17,10 +17,15 @@ from fomo.direct_pi.goalgraph import parse_goal_graph_draft
 from fomo.direct_pi.orchestrator import DirectPiOrchestrationError
 from fomo.direct_pi.prompts import (
     GOAL_GRAPH_PLANNING_POLICY,
+    PRODUCT_DESIGN_POLICY,
+    PRODUCT_REQUIREMENTS_POLICY,
+    build_prompt,
+    build_repair_prompt,
     goal_graph_planning_correction_prompt,
     goal_graph_planning_prompt,
     planning_correction_prompt,
     planning_prompt,
+    repair_prompt,
 )
 from fomo.direct_pi.session import (
     DirectPiAwaitingUser,
@@ -37,6 +42,7 @@ from fomo.direct_pi.workspace import (
 )
 from fomo.fomo_pi_ds import (
     FOMO_PI_PLANNING_MODEL,
+    InferenceGatewayError,
     PiBridgeEnvelope,
     PiBridgeFailed,
     PiBridgeResult,
@@ -44,9 +50,11 @@ from fomo.fomo_pi_ds import (
     RunVirtualKey,
 )
 from fomo.persistence.models import TraceLinkRecord
+from fomo.runtime_contract import resolve_runtime_contract
 from fomo.sandbox.base import ExecResult, FileChange, SandboxRef
 from fomo.schemas import RunStatus
 from fomo.starter import resolve_starter_manifest
+from tests.helpers import create_user_session
 
 from ._git_sandbox import CANDIDATE_SHA, GitAwareSandbox, persisted_sandbox_id
 
@@ -197,6 +205,7 @@ class _Gateway:
             key_alias=f"fomo-run-{values['run_id']}",
             duration_seconds=int(values["duration_seconds"]),
             secret="sk-test-run-key",
+            model_aliases=tuple(values.get("model_aliases") or ("fomo-pi-flash",)),
         )
 
     async def block(self, _key: RunVirtualKey) -> None:
@@ -398,25 +407,29 @@ def _goal_graph_plan() -> dict[str, object]:
     }
 
 
-def test_goal_graph_planning_prompts_enforce_coarse_vertical_policy() -> None:
+def test_goal_graph_planning_prompts_use_complexity_driven_product_scope() -> None:
     prompt = goal_graph_planning_prompt(
         requirement="Build one responsive landing page.",
         starter={"routes": ["/"]},
     )
     correction = goal_graph_planning_correction_prompt(validation_error="invalid graph")
 
-    assert GOAL_GRAPH_PLANNING_POLICY == "coarse-v2"
-    assert "define 1-3 coarse-grained" in prompt
-    assert "single-route, frontend-only page" in prompt
-    assert "prefer exactly one goal" in prompt
-    assert "hero, features, pricing, FAQ, and footer" in prompt
-    assert "1-8 concise observable acceptance criteria" in prompt
-    assert "at most 12 criteria total" in prompt
+    assert GOAL_GRAPH_PLANNING_POLICY == "adaptive-v4"
+    assert "derive the number and granularity" in prompt
+    assert "actual requirement complexity" in prompt
+    assert "Use enough goals to express the complete product" in prompt
+    assert "artificial consolidation or fragmentation" in prompt
+    assert "verification floor" in prompt
+    assert "define 1-3 coarse-grained" not in prompt
+    assert "single-route, frontend-only page" not in prompt
+    assert "prefer exactly one goal" not in prompt
+    assert "at most 12 criteria total" not in prompt
     assert GOAL_GRAPH_PLANNING_POLICY in correction
-    assert "collapse a single-route frontend page into one complete goal" in correction
+    assert "requirement complexity and coherent user outcomes" in correction
+    assert "without shrinking the source request" in correction
 
 
-def test_structured_planning_prompts_allow_only_bounded_schema_refills() -> None:
+def test_structured_planning_prompts_allow_schema_refills_until_success() -> None:
     prompts = (
         goal_graph_planning_prompt(requirement="Build a page.", starter={}),
         goal_graph_planning_correction_prompt(validation_error="invalid graph"),
@@ -426,9 +439,48 @@ def test_structured_planning_prompts_allow_only_bounded_schema_refills() -> None
 
     for prompt in prompts:
         assert "succeeds exactly once" in prompt
-        assert "at most 3 total attempts" in prompt
+        assert "resubmit until it succeeds" in prompt
+        assert "at most 3 total attempts" not in prompt
         assert "Stop immediately after the successful submission" in prompt
         assert "emit prose or JSON as assistant text" in prompt
+
+
+def test_legacy_planning_prompt_does_not_use_a_file_count_quota() -> None:
+    prompt = planning_prompt(requirement="Build a page.", starter={})
+
+    assert "8-15 files" not in prompt
+    assert "as many or as few files as the complete product warrants" in prompt
+    assert "Define 4-5" not in prompt
+    assert "acceptance criteria are a non-negotiable verification floor" in prompt
+    assert PRODUCT_REQUIREMENTS_POLICY in prompt
+    assert "Act as a product manager" in prompt
+    assert "primary end-to-end journey" in prompt
+    assert "verbatim JSON string" in prompt
+
+
+def test_legacy_build_and_repair_prompts_allow_complete_sandbox_work() -> None:
+    bundle = _plan()
+    build = build_prompt(
+        requirement="Build a complete library product.",
+        starter={"routes": ["/"]},
+        planning_bundle=bundle,
+    )
+    type_repair = build_repair_prompt(diagnostic="Type error")
+    verification_repair = repair_prompt(
+        planning_bundle=bundle,
+        diagnostic={"gate": "typecheck", "summary": "Type error"},
+        round_number=1,
+    )
+
+    assert "verification floor" in build
+    assert "freely adjust architecture" in build
+    assert "run any useful local self-checks" in build
+    assert "Do not run the production build" not in build
+    assert "under 1500 characters" not in build
+    assert "every implementation, architecture, or integration change" in type_repair
+    assert "tool silence and budget limits" not in type_repair
+    assert "inspect any relevant project source" in verification_repair
+    assert "Run any useful sandbox-supported self-checks" in verification_repair
 
 
 class _GoalGraphTransport:
@@ -866,8 +918,12 @@ def test_direct_pi_structured_output_accepts_failed_attempt_then_valid_refill() 
     events = (
         _structured_start(1, "structured-1", {"answer": 42}),
         _structured_end(2, "structured-1", True),
-        _structured_start(3, "structured-2", {"answer": "valid"}),
-        _structured_end(4, "structured-2", False),
+        _structured_start(3, "structured-2", {"answer": 43}),
+        _structured_end(4, "structured-2", True),
+        _structured_start(5, "structured-3", {"answer": 44}),
+        _structured_end(6, "structured-3", True),
+        _structured_start(7, "structured-4", {"answer": "valid"}),
+        _structured_end(8, "structured-4", False),
     )
 
     result = DirectPiSession._structured_output_text(_structured_pi_result(events))
@@ -943,7 +999,7 @@ def test_direct_pi_structured_output_accepts_failed_attempt_then_valid_refill() 
                 _structured_end(6, "structured-3", True),
                 _structured_start(7, "structured-4", {"answer": "late"}),
             ),
-            "attempt limit",
+            "did not complete",
         ),
     ],
 )
@@ -1177,13 +1233,47 @@ async def test_direct_pi_stage_contract_maps_model_thinking_and_inactivity_budge
     assert planning.model == FOMO_PI_PLANNING_MODEL
     assert planning.thinking == "high"
     assert planning.activity_silence_seconds == settings.model_request_timeout_seconds
+    assert planning.timeout_seconds is None
     assert building.model == FOMO_PI_PLANNING_MODEL
     assert building.thinking == "high"
     assert building.activity_silence_seconds == settings.model_request_timeout_seconds
+    assert building.timeout_seconds is None
     assert repairing.model == FOMO_PI_PLANNING_MODEL
     assert repairing.thinking == "high"
     assert repairing.activity_silence_seconds == settings.model_request_timeout_seconds
+    assert repairing.timeout_seconds is None
     assert all(request.context_window == settings.pi_context_window for request in transport.requests)
+
+
+@pytest.mark.asyncio
+async def test_selected_runtime_is_frozen_across_every_direct_pi_stage(settings) -> None:
+    transport = _RecordingTransport()
+    runtime = resolve_runtime_contract("gpt-5.6", "xhigh")
+    session = DirectPiSession(
+        _session_repository(),
+        transport,
+        settings,
+        RunVirtualKey(
+            run_id="run-selected",
+            key_alias="fomo-run-selected",
+            duration_seconds=300,
+            secret="sk-test-selected-key",
+            model_aliases=(runtime.litellm_alias,),
+        ),
+        runtime_contract=runtime,
+        run_id="run-selected",
+        lease_token="lease-selected",
+        started_at=time.monotonic(),
+    )
+    ref = SandboxRef(id="sandbox-selected", project_id="project-selected")
+
+    for stage in ("planning", "building", "repairing"):
+        assert await session.invoke(ref, stage, stage=stage) == "ok"
+
+    assert len(transport.requests) == 3
+    assert all(request.model == runtime.model_ref for request in transport.requests)
+    assert all(request.thinking == "xhigh" for request in transport.requests)
+    assert all(request.context_window == 250_000 for request in transport.requests)
 
 
 @pytest.mark.asyncio
@@ -1360,7 +1450,7 @@ def test_planning_parser_rejects_arbitrary_trailing_content() -> None:
 
 
 async def _new_project_run(repository, requirement: str, message_id: str):
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, message_id, requirement
@@ -1487,7 +1577,7 @@ async def test_goal_graph_runs_two_goals_with_scoped_full_regression_and_checkpo
 
 
 async def _run_until_goal_graph_question(repository, settings, suffix: str):
-    owner = await repository.create_guest_session()
+    owner = await create_user_session(repository)
     project = await repository.create_project(owner.id, f"Clarification {suffix}")
     _message, run, _created = await repository.create_message_and_run(
         project.id,
@@ -1628,7 +1718,7 @@ async def test_goal_graph_reuses_failed_build_planning_artifact_and_starts_with_
     repository, settings
 ) -> None:
     requirement = "Build a library with search and durable create."
-    owner = await repository.create_guest_session()
+    owner = await create_user_session(repository)
     project = await repository.create_project(owner.id, "Library")
     _message, prior, _created = await repository.create_message_and_run(
         project.id,
@@ -1648,6 +1738,8 @@ async def test_goal_graph_reuses_failed_build_planning_artifact_and_starts_with_
             "starterCapabilities": list(starter.capability_ids),
             "goalGraph": True,
             "planningPolicy": GOAL_GRAPH_PLANNING_POLICY,
+            "productDesignPolicy": PRODUCT_DESIGN_POLICY,
+            **resolve_runtime_contract().cache_fingerprint(),
         },
         lease_token=prior_claim.lease_owner,
     )
@@ -1691,6 +1783,8 @@ async def test_goal_graph_reuses_failed_build_planning_artifact_and_starts_with_
             "starterVersion": starter.version,
             "starterCapabilities": list(starter.capability_ids),
             "goalGraph": True,
+            "productDesignPolicy": PRODUCT_DESIGN_POLICY,
+            **resolve_runtime_contract().cache_fingerprint(),
         },
         lease_token=legacy_claim.lease_owner,
     )
@@ -1793,6 +1887,7 @@ async def test_goal_graph_recovers_from_verified_checkpoint_with_durable_session
         for item in starter.files
         if not item.path.startswith("tests/harness/")
         and not item.path.startswith("tests/fomo-acceptance/")
+        and item.path != "next-env.d.ts"
         and item.path != ".gitignore"
     ]
     await repository.record_verified_checkpoint(
@@ -1865,7 +1960,10 @@ async def test_goal_graph_recovers_from_verified_checkpoint_with_durable_session
     assert latest is not None and latest.ordinal == 2
     assert len(transport.session_ids) == 1
     assert transport.session_ids[0] == f"fomo-{run.id}"
-    assert gateway.issued[0]["max_budget"] == pytest.approx(1.5)
+    runtime = resolve_runtime_contract()
+    assert gateway.issued[0]["max_budget"] == pytest.approx(
+        (runtime.max_spend_micros - 500_000) / 1_000_000
+    )
     events = await repository.list_events(run.id)
     assert any(event.kind == "goal.resumed" for event in events)
 
@@ -1891,6 +1989,7 @@ async def test_verified_graph_publish_recovery_rebuilds_and_reverifies_without_p
         for item in starter.files
         if not item.path.startswith("tests/harness/")
         and not item.path.startswith("tests/fomo-acceptance/")
+        and item.path != "next-env.d.ts"
         and item.path != ".gitignore"
     ]
     await repository.activate_goal(run.id, "G-1", lease_token=lease)
@@ -2093,7 +2192,7 @@ async def test_direct_pi_dependency_timeout_is_infrastructure_and_not_repaired(
 @pytest.mark.asyncio
 async def test_direct_pi_reuses_exact_validated_planning_artifacts(repository, settings) -> None:
     requirement = "Build a polished library manager with search and durable create."
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, prior, _created = await repository.create_message_and_run(
         project.id, session.id, "prior-planning", requirement
@@ -2108,6 +2207,8 @@ async def test_direct_pi_reuses_exact_validated_planning_artifacts(repository, s
             "starterId": starter.id,
             "starterVersion": starter.version,
             "starterCapabilities": list(starter.capability_ids),
+            "productDesignPolicy": PRODUCT_DESIGN_POLICY,
+            **resolve_runtime_contract().cache_fingerprint(),
         },
         lease_token=prior_claim.lease_owner,
     )
@@ -2146,6 +2247,8 @@ async def test_direct_pi_reuses_exact_validated_planning_artifacts(repository, s
             "starterId": starter.id,
             "starterVersion": starter.version,
             "starterCapabilities": list(starter.capability_ids),
+            "productDesignPolicy": PRODUCT_DESIGN_POLICY,
+            **resolve_runtime_contract().cache_fingerprint(),
         },
         lease_token=invalid_claim.lease_owner,
     )
@@ -2247,19 +2350,115 @@ async def test_direct_pi_planning_failure_destroys_generation_and_blocks_key(
     )
     sandbox = GitAwareSandbox()
     gateway = _Gateway()
-    transport = _Transport(sandbox, fail_planning=RuntimeError("provider exploded"))
+    transport = _Transport(
+        sandbox,
+        fail_planning=RuntimeError("provider exploded with password=private-value"),
+    )
     orchestrator = _direct_orchestrator(repository, settings, sandbox, gateway, transport)
 
     with pytest.raises(RuntimeError, match="provider exploded"):
         await orchestrator.run(run.id, lease_token=lease)
 
     final = await repository.get_run(run.id)
+    events = await repository.list_events(run.id)
+    failure = next(event for event in reversed(events) if event.kind == "pi.failed")
+    run_failed = next(event for event in reversed(events) if event.kind == "run.failed")
     assert final.status == RunStatus.failed
-    assert final.error_code == "direct_pi_execution_error"
+    assert final.error_code == "coding_agent_failed"
+    assert run_failed.payload["summary"] == "Coding Agent 运行失败，请重试；若问题持续发生，请检查服务状态。"
+    assert failure.payload == {
+        "code": "coding_agent_failed",
+        "message": "Coding Agent 运行失败，请重试；若问题持续发生，请检查服务状态。",
+    }
+    assert "private-value" not in json.dumps(failure.payload, ensure_ascii=False)
     assert gateway.blocked
     # The generation sandbox was destroyed and its durable reference cleared
     # by the orchestrator's cleanup.
     assert await persisted_sandbox_id(repository, run.id) is None
+
+
+@pytest.mark.asyncio
+async def test_direct_pi_budget_failure_persists_specific_safe_contract(
+    repository, settings
+) -> None:
+    _project, run, lease = await _new_project_run(
+        repository,
+        "Build a polished library manager.",
+        "token-budget-failure",
+    )
+    sandbox = GitAwareSandbox()
+    gateway = _Gateway()
+    transport = _Transport(
+        sandbox,
+        fail_planning=DirectPiSessionError(
+            "Direct Pi exceeded the run token budget"
+        ),
+    )
+    orchestrator = _direct_orchestrator(
+        repository, settings, sandbox, gateway, transport
+    )
+
+    with pytest.raises(DirectPiSessionError, match="token budget"):
+        await orchestrator.run(run.id, lease_token=lease)
+
+    final = await repository.get_run(run.id)
+    events = await repository.list_events(run.id)
+    failure = next(event for event in reversed(events) if event.kind == "pi.failed")
+    run_failed = next(event for event in reversed(events) if event.kind == "run.failed")
+    assert final.error_code == "run_token_budget_exceeded"
+    assert run_failed.payload["summary"] == "本次任务已达到 Token 使用上限，请缩小任务范围后重试。"
+    assert failure.payload == {
+        "code": "run_token_budget_exceeded",
+        "message": "本次任务已达到 Token 使用上限，请缩小任务范围后重试。",
+    }
+
+
+@pytest.mark.asyncio
+async def test_goal_graph_gateway_failure_is_specific_and_does_not_leak(
+    repository, settings
+) -> None:
+    _project, run, lease = await _new_project_run(
+        repository,
+        "Build a polished library manager.",
+        "goal-gateway-failure",
+    )
+    sandbox = GitAwareSandbox()
+
+    class FailingGateway(_Gateway):
+        async def issue(self, **values: Any) -> RunVirtualKey:
+            self.issued.append(dict(values))
+            raise InferenceGatewayError(
+                "gateway returned Authorization: Bearer private-token"
+            )
+
+    gateway = FailingGateway()
+    orchestrator = DirectPiOrchestrator(
+        repository,
+        sandbox,
+        replace(
+            settings,
+            agent_framework="direct_pi",
+            direct_pi_goal_graph_enabled=True,
+        ),
+        gateway,
+        _GoalGraphTransport(sandbox),
+    )
+
+    with pytest.raises(InferenceGatewayError):
+        await orchestrator.run(run.id, lease_token=lease)
+
+    final = await repository.get_run(run.id)
+    events = await repository.list_events(run.id)
+    failure = next(event for event in reversed(events) if event.kind == "pi.failed")
+    run_failed = next(event for event in reversed(events) if event.kind == "run.failed")
+    serialized = json.dumps(failure.payload, ensure_ascii=False)
+    assert final.error_code == "inference_gateway_unavailable"
+    assert run_failed.payload["summary"] == "模型服务暂时不可用，请稍后重试。"
+    assert failure.payload == {
+        "code": "inference_gateway_unavailable",
+        "message": "模型服务暂时不可用，请稍后重试。",
+    }
+    assert "private-token" not in serialized
 
 
 class _RetainingGitAwareSandbox(GitAwareSandbox):

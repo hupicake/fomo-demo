@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from fomo.persistence import Database, MigrationStateError, Repository
+from fomo.persistence import Database, MigrationStateError
 from fomo.persistence.database import HEAD_REVISION, P0_REVISION
 
 
@@ -40,6 +40,73 @@ async def test_fresh_database_upgrades_to_head(tmp_path: Path) -> None:
     with sqlite3.connect(path) as connection:
         session_columns = {row[1] for row in connection.execute("PRAGMA table_info('sessions')")}
         assert "revoked_at" in session_columns
+        run_columns = {row[1] for row in connection.execute("PRAGMA table_info('runs')")}
+        assert {
+            "runtime_profile_id",
+            "runtime_model_ref",
+            "runtime_thinking",
+            "runtime_context_window",
+            "runtime_policy_version",
+            "runtime_run_max_tokens",
+            "runtime_inference_tpm_limit",
+            "runtime_max_spend_micros",
+        } <= run_columns
+        token_budget_column = next(
+            row
+            for row in connection.execute("PRAGMA table_info('runs')")
+            if row[1] == "runtime_run_max_tokens"
+        )
+        assert token_budget_column[3] == 0  # nullable: NULL means unlimited
+        assert token_budget_column[4] is None
+
+
+@pytest.mark.asyncio
+async def test_pre_model_selection_run_upgrades_with_legacy_execution_contract(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy-run.db"
+    database = Database(f"sqlite+aiosqlite:///{path}")
+    try:
+        await asyncio.to_thread(database._alembic_command, "upgrade", "0004_accounts")
+        with sqlite3.connect(path) as connection:
+            connection.execute(
+                "INSERT INTO sessions (id, kind, user_id, expires_at, created_at) "
+                "VALUES ('session-1', 'guest', NULL, '2099-01-01', '2026-01-01')"
+            )
+            connection.execute(
+                "INSERT INTO projects "
+                "(id, owner_session_id, title, status, created_at, updated_at) "
+                "VALUES ('project-1', 'session-1', 'Legacy', 'queued', "
+                "'2026-01-01', '2026-01-01')"
+            )
+            connection.execute(
+                "INSERT INTO runs "
+                "(id, project_id, status, phase, repair_round, created_at, updated_at) "
+                "VALUES ('run-1', 'project-1', 'queued', 'queued', 0, "
+                "'2026-01-01', '2026-01-01')"
+            )
+            connection.commit()
+        await database.upgrade()
+    finally:
+        await database.dispose()
+
+    with sqlite3.connect(path) as connection:
+        row = connection.execute(
+            "SELECT runtime_profile_id, runtime_model_ref, runtime_thinking, "
+            "runtime_context_window, runtime_policy_version, runtime_run_max_tokens, "
+            "runtime_inference_tpm_limit, runtime_max_spend_micros "
+            "FROM runs WHERE id = 'run-1'"
+        ).fetchone()
+    assert row == (
+        "deepseek-flash",
+        "fomo-litellm/fomo-pi-flash",
+        "high",
+        200_000,
+        "direct-pi-legacy-v0",
+        400_000,
+        1_000_000,
+        2_000_000,
+    )
 
 
 @pytest.mark.asyncio
@@ -59,7 +126,6 @@ async def test_unversioned_p0_database_is_fingerprinted_stamped_and_preserved(
             connection.commit()
         await database.upgrade()
         assert await database.current_revision() == HEAD_REVISION
-        assert (await Repository(database).get_session("legacy")).kind == "guest"
     finally:
         await database.dispose()
     with sqlite3.connect(path) as connection:

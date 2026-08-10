@@ -2,7 +2,7 @@
 
 Passwords are stored as versioned, salted scrypt hashes. Session identifiers
 are opaque random values persisted by the control plane, so logout can revoke
-them server-side without changing the guest-session transport contract.
+them server-side.
 """
 
 from __future__ import annotations

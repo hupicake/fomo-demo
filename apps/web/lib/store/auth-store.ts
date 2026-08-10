@@ -3,49 +3,52 @@
 import { mutate as revalidateAll } from "swr";
 import { create } from "zustand";
 
-import { ApiProblem, auth, controlPlane, type AuthUser } from "@/lib/api/client";
+import { ApiProblem, auth, type AuthUser } from "@/lib/api/client";
 
 export type AuthMode = "signin" | "register";
-export type AuthStatus = "unknown" | "guest" | "authenticated";
+export type AuthStatus = "unknown" | "unauthenticated" | "authenticated";
 
 type AuthState = {
   status: AuthStatus;
   user?: AuthUser;
+  /** Changes whenever the authenticated browser session changes. */
+  cacheEpoch: number;
   /** True while the initial `me()` check is in flight. */
   loading: boolean;
   /** True while a register / login / logout request is in flight. */
   busy: boolean;
-  /** Last actionable error from an auth action, shown in the dialog. */
+  /** Last actionable error from an auth action, shown on the login page. */
   error?: string;
-  /** The open dialog mode, or null when closed. */
-  dialogMode: AuthMode | null;
   load: () => Promise<void>;
   register: (input: { email: string; password: string; displayName?: string }) => Promise<boolean>;
   login: (input: { email: string; password: string }) => Promise<boolean>;
   logout: () => Promise<void>;
-  openDialog: (mode: AuthMode) => void;
-  closeDialog: () => void;
+  invalidate: () => void;
   clearError: () => void;
 };
 
 function describeError(failure: unknown): string {
   if (failure instanceof ApiProblem) {
-    if (failure.status === 409) return "An account with this email already exists. Try signing in instead.";
-    if (failure.status === 401) return failure.detail || "Incorrect email or password.";
-    if (failure.status === 422) return failure.detail || "Check your email and password, then try again.";
-    return failure.detail || failure.title || "Something went wrong. Please try again.";
+    if (failure.status === 409) return "该邮箱已注册，请直接登录。";
+    if (failure.status === 401) return failure.detail || "邮箱或密码不正确。";
+    if (failure.status === 422) return failure.detail || "请检查邮箱与密码后重试。";
+    return failure.detail || failure.title || "出错了，请重试。";
   }
-  return failure instanceof Error ? failure.message : "Something went wrong. Please try again.";
+  return failure instanceof Error ? failure.message : "出错了，请重试。";
 }
 
 // Guard the initial `me()` so concurrent mounts (and StrictMode) fetch once.
 let loadStarted = false;
 
-export const useAuthStore = create<AuthState>((set, get) => ({
+async function clearIdentityCache(): Promise<void> {
+  await revalidateAll(() => true, undefined, { revalidate: false });
+}
+
+export const useAuthStore = create<AuthState>((set) => ({
   status: "unknown",
+  cacheEpoch: 0,
   loading: false,
   busy: false,
-  dialogMode: null,
 
   load: async () => {
     if (loadStarted) return;
@@ -54,14 +57,17 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     try {
       const user = await auth.me();
       if (user) {
-        set({ status: "authenticated", user, loading: false });
+        set((state) => ({
+          status: "authenticated",
+          user,
+          loading: false,
+          cacheEpoch: state.cacheEpoch + 1,
+        }));
         return;
       }
-      set({ status: "guest", loading: false });
+      set({ status: "unauthenticated", user: undefined, loading: false });
     } catch {
-      // A failed identity check must never dead-end the UI: fall back to guest
-      // and let the next guarded request bootstrap a session if needed.
-      set({ status: "guest", loading: false });
+      set({ status: "unauthenticated", user: undefined, loading: false });
     }
   },
 
@@ -69,10 +75,14 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     set({ busy: true, error: undefined });
     try {
       const session = await auth.register(input);
-      set({ status: "authenticated", user: session.user, busy: false, error: undefined, dialogMode: null });
-      // Projects owned by the prior guest token are transferred to this
-      // account; refresh the caches so they appear immediately.
-      void revalidateAll(() => true);
+      await clearIdentityCache();
+      set((state) => ({
+        status: "authenticated",
+        user: session.user,
+        busy: false,
+        error: undefined,
+        cacheEpoch: state.cacheEpoch + 1,
+      }));
       return true;
     } catch (failure) {
       set({ busy: false, error: describeError(failure) });
@@ -84,8 +94,14 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     set({ busy: true, error: undefined });
     try {
       const session = await auth.login(input);
-      set({ status: "authenticated", user: session.user, busy: false, error: undefined, dialogMode: null });
-      void revalidateAll(() => true);
+      await clearIdentityCache();
+      set((state) => ({
+        status: "authenticated",
+        user: session.user,
+        busy: false,
+        error: undefined,
+        cacheEpoch: state.cacheEpoch + 1,
+      }));
       return true;
     } catch (failure) {
       set({ busy: false, error: describeError(failure) });
@@ -103,20 +119,26 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       set({ busy: false, error: describeError(failure) });
       return;
     }
-    // Only after a confirmed server logout do we re-establish a guest session
-    // and refresh the project caches under the new guest token.
-    try {
-      await controlPlane.createGuestSession();
-    } catch {
-      // If the guest bootstrap fails now, the next guarded request retries it.
-    }
-    set({ status: "guest", user: undefined, busy: false, error: undefined, dialogMode: null });
-    void revalidateAll(() => true);
+    set((state) => ({
+      status: "unauthenticated",
+      user: undefined,
+      busy: false,
+      error: undefined,
+      cacheEpoch: state.cacheEpoch + 1,
+    }));
+    await clearIdentityCache();
   },
 
-  openDialog: (mode) => set({ dialogMode: mode, error: undefined }),
-  closeDialog: () => set({ dialogMode: null, error: undefined }),
+  invalidate: () => {
+    set((state) => ({
+      status: "unauthenticated",
+      user: undefined,
+      busy: false,
+      error: undefined,
+      cacheEpoch: state.cacheEpoch + 1,
+    }));
+    void clearIdentityCache();
+  },
+
   clearError: () => set({ error: undefined }),
 }));
-
-export const isAuthenticated = (state: AuthState): boolean => state.status === "authenticated";

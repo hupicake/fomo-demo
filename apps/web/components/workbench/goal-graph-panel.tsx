@@ -14,8 +14,6 @@ export type TaskSummaryProps = {
   graph: GoalGraphProjection | null;
 };
 
-export type GoalGraphPanelProps = TaskSummaryProps;
-
 type GoalDisplayStatus = GoalProjection["status"] | "ready" | "waiting";
 
 function GoalStatusIcon({ status }: { status: GoalDisplayStatus }) {
@@ -34,10 +32,10 @@ function statusLabel(status: GoalDisplayStatus): string {
 }
 
 function statusTone(status: GoalDisplayStatus): string {
-  if (status === "verified") return "text-emerald-600";
+  if (status === "verified") return "text-emerald-600 dark:text-emerald-400";
   if (status === "failed") return "text-destructive";
   if (status === "active" || status === "claimed") return "text-primary";
-  if (status === "ready") return "text-sky-600";
+  if (status === "ready") return "text-sky-600 dark:text-sky-400";
   return "text-muted-foreground";
 }
 
@@ -60,9 +58,9 @@ export function TaskSummary({ graph }: TaskSummaryProps) {
 
   if (!graph) {
     return (
-      <section aria-label="Current task" className="px-3 py-2.5" data-goal-state="unavailable">
-        <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Current task</p>
-        <p className="line-clamp-1 text-xs leading-5 text-muted-foreground">The delivery plan will appear when it is ready.</p>
+      <section aria-label="当前任务" className="flex h-10 items-center gap-2 px-3" data-goal-state="unavailable">
+        <CircleDashedIcon aria-hidden="true" className="size-4 text-muted-foreground" />
+        <p className="line-clamp-1 text-xs text-muted-foreground"><span className="font-medium text-foreground">当前任务</span><span> · </span><span>交付计划就绪后会显示在这里。</span></p>
       </section>
     );
   }
@@ -95,12 +93,12 @@ export function TaskSummary({ graph }: TaskSummaryProps) {
 
   return (
     <section
-      aria-label="Current task"
-      className="space-y-2 px-3 py-2.5"
+      aria-label="当前任务"
+      className="px-3 py-1.5"
       data-goal-state={activeStatus}
       data-goal-progress={percent ?? "unknown"}
     >
-      <div className="flex min-w-0 items-center gap-2.5">
+      <div className="flex min-w-0 items-center gap-2">
         <span className={cn("shrink-0 [&>svg]:size-4", statusTone(activeStatus))}>
           <GoalStatusIcon status={activeStatus} />
         </span>
@@ -112,7 +110,26 @@ export function TaskSummary({ graph }: TaskSummaryProps) {
           </div>
           <p className="line-clamp-1 text-xs font-medium leading-5" title={activeGoal?.title}>{activeGoal?.title || "No active goal"}</p>
         </div>
-        {activeGoal ? <Badge className="h-5 shrink-0 text-[10px] capitalize" variant={activeGoal.status === "failed" ? "destructive" : "outline"}>{statusLabel(activeStatus)}</Badge> : null}
+        {activeGoal ? <Badge className="hidden h-5 shrink-0 text-[10px] capitalize sm:inline-flex" variant={activeGoal.status === "failed" ? "destructive" : "outline"}>{statusLabel(activeStatus)}</Badge> : null}
+        <div className="flex shrink-0 items-center gap-1.5">
+          <div
+            aria-label="Overall goal progress"
+            aria-valuemax={100}
+            aria-valuemin={0}
+            aria-valuetext={percent === undefined ? "Unknown" : `${percent}%`}
+            {...(percent === undefined ? {} : { "aria-valuenow": percent })}
+            className="h-1 w-12 overflow-hidden rounded-full bg-border/70"
+            role="progressbar"
+          >
+            <div
+              className={cn("h-full rounded-full transition-[width] duration-500", progress.blocked > 0 ? "bg-amber-500" : "bg-emerald-500")}
+              style={{ width: `${percent === undefined ? 0 : Math.min(100, Math.max(0, percent))}%` }}
+            />
+          </div>
+          <span className="w-7 text-right font-mono text-[9px] tabular-nums text-muted-foreground">
+            {percent === undefined ? "—" : `${percent}%`}
+          </span>
+        </div>
         <HoverCard onOpenChange={setDetailsOpen} open={detailsOpen} openDelay={250}>
           <HoverCardTrigger asChild>
             <Button
@@ -128,7 +145,7 @@ export function TaskSummary({ graph }: TaskSummaryProps) {
           </HoverCardTrigger>
           <HoverCardContent align="end" className="max-h-[min(24rem,70vh)] w-[min(24rem,calc(100vw-2rem))] overflow-y-auto p-3">
             <div className="mb-2 space-y-1">
-              <p className="text-xs font-medium">Full delivery plan</p>
+              <p className="text-xs font-medium">完整交付计划</p>
               <p className="text-xs leading-5 text-muted-foreground">{graph.productOutcome}</p>
               <p className="text-[11px] leading-4 text-muted-foreground">{executionDetail}</p>
             </div>
@@ -158,38 +175,7 @@ export function TaskSummary({ graph }: TaskSummaryProps) {
           </HoverCardContent>
         </HoverCard>
       </div>
-
-      {activeGoal ? (
-        <div className="flex min-w-0 items-center gap-3 pl-[1.625rem]">
-          <p className="min-w-0 flex-1 truncate text-[11px] leading-4 text-muted-foreground">
-            {currentStep
-              ? <><span className="font-medium text-foreground/70">Step</span> · {currentStep.title}</>
-              : "No acceptance criteria linked to this goal yet."}
-          </p>
-          <div className="flex shrink-0 items-center gap-1.5">
-            <div
-              aria-label="Overall goal progress"
-              aria-valuemax={100}
-              aria-valuemin={0}
-              aria-valuetext={percent === undefined ? "Unknown" : `${percent}%`}
-              {...(percent === undefined ? {} : { "aria-valuenow": percent })}
-              className="h-1 w-16 overflow-hidden rounded-full bg-border/70"
-              role="progressbar"
-            >
-              <div
-                className={cn("h-full rounded-full transition-[width] duration-500", progress.blocked > 0 ? "bg-amber-500" : "bg-emerald-500")}
-                style={{ width: `${percent === undefined ? 0 : Math.min(100, Math.max(0, percent))}%` }}
-              />
-            </div>
-            <span className="w-8 text-right font-mono text-[10px] tabular-nums text-muted-foreground">
-              {percent === undefined ? "—" : `${percent}%`}
-            </span>
-          </div>
-        </div>
-      ) : null}
+      <p className="sr-only">{currentStep ? `步骤 · ${currentStep.title}` : "此目标尚未关联验收条件。"}</p>
     </section>
   );
 }
-
-// Compatibility export for callers that still use the former component name.
-export const GoalGraphPanel = TaskSummary;

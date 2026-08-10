@@ -1,103 +1,69 @@
-# FOMO Demo — submission notes
+# FOMO Demo — 交付总结
 
-FOMO is an AI coding-agent workbench. A user describes an application, the agent plans and edits a real project inside OpenSandbox, deterministic verification checks the result, and the workbench exposes the live work log, generated code, terminal output, versions, and a runnable preview.
+FOMO 是一个本地运行的 AI Coding Agent 工作台：用户登录后输入产品需求并选择模型，控制面驱动 Pi 在 OpenSandbox 中规划、开发和修复，再由独立干净沙箱执行确定性验收，最终保存版本并提供可交互 Preview。
 
-## Delivery links
+## 交付入口
 
-- Online demo: pending public deployment
-- Source repository: [github.com/hupicake/fomo-demo](https://github.com/hupicake/fomo-demo)
-- Local runbook: [README.md](README.md)
-- Technical design and trade-offs: [DESIGN.md](DESIGN.md)
+- 源码：[github.com/hupicake/fomo-demo](https://github.com/hupicake/fomo-demo)
+- 本地运行与架构说明：[README.md](README.md)
+- 控制面运行手册：[services/control-plane/README.md](services/control-plane/README.md)
+- 公网 Demo：尚未完成 Cloudflare 外网验收，因此不提供未经验证的临时链接
 
-The public source repository is available. The online demo remains a release
-blocker; local success is not presented as evidence that the public deployment
-is ready.
+## 1. 实现思路与关键取舍
 
-### Public-link completion gate
+- 优先完成“需求 → 规划 → 沙箱开发 → 自动修复 → 独立验收 → 版本/Preview”的完整纵向链路，而不是继续堆叠外围页面。
+- Pi 在生成沙箱 G 内拥有完整项目开发权限，不用业务文件白名单限制代码架构；`.env*`、路径、符号链接、FOMO 自有验收文件等安全边界仍由控制面保护。
+- 当前 Goal 的受保护 Playwright 测试会提前放入 G，供 Agent 在交付前运行类型检查和浏览器自验；该结果只用于快速反馈。正式证据始终来自干净验证沙箱 V 中独立重新编译的验收套件。
+- 模型选择采用服务端冻结的 Runtime Contract。浏览器只提交模型与思考强度，服务端固定实际别名、上下文和预算策略；未知、未启用或不兼容组合明确失败，不静默切换模型。
+- 规划使用结构化虚拟表单；字段校验失败会把错误反馈给模型继续修正，而不是第一次格式错误就结束。产品提示词按产品经理方式描述用户、目标、完整流程、状态、边界和成功标准，验收条件是下限而不是功能上限。
+- 页面展示公开进度、工具活动和闭集失败原因，不展示私有思维链。Context 占用明确标注为 turn 边界快照，不伪装成实时计数。
 
-The intended evaluator topology is a named Cloudflare Tunnel with one
-same-origin workbench host (`app.example.com`, where `/v1/*` routes to API and
-all other paths route to Web) plus a cross-site generated-code host
-(`*.fomo-previews.example.net`, routed to the verified Preview gateway). The
-two hosts deliberately use different eTLD+1 sites. The exact template is
-[`deploy/cloudflared/config.example.yml`](deploy/cloudflared/config.example.yml);
-real Tunnel credentials remain outside Git.
+## 2. 当前完成程度
 
-Before replacing “pending public deployment” above:
+已完成：
 
-1. Build Web with `NEXT_PUBLIC_API_URL=https://app.example.com`; run with
-   `APP_ENV=production`, `WEB_ORIGIN=https://app.example.com`, and
-   `PUBLIC_PREVIEW_BASE_DOMAIN=fomo-previews.example.net`.
-2. Provision DNS and TLS for `*.fomo-previews.example.net`, preserve the
-   incoming Preview Host, and bypass Cloudflare cache for the wildcard.
-3. Expose only Cloudflare HTTPS. OpenSandbox `8080`, LiteLLM `4000`, Docker
-   Preview ports including `40000-60000`, PostgreSQL, Redis, and MinIO must not
-   be Internet-reachable.
-4. Keep the named Tunnel and retained sandbox alive through the evaluation.
-   Publication renews once for at most seven days; renew or rerun before expiry
-   if the review window is longer.
-5. From an external network, verify account login, one real generation and SSE
-   work log, the final HTTPS Preview and `/_next/*`, interaction, and state
-   after reload. Local Gateway/Playwright success does not satisfy this gate.
+- 注册、登录、退出、开发账号预填、HttpOnly Session 和跨账户项目隔离。
+- GPT-5.6、GPT-5.5、DeepSeek Flash、Grok 4.5、Kimi K2.7 Code、Gemini 3.6 Flash、Gemini 3.1 Pro 的运行目录，以及按模型约束的思考强度选择。
+- 分模型上下文：GPT 250K、DeepSeek 1M、Grok 500K、Kimi 262K、Gemini 250K；新运行不设累计 token 上限，但 Provider 上下文/输出、TPM、费用、沙箱生命周期、租约和取消仍是实际边界。
+- GoalGraph 多目标规划、结构化输出纠错、同一 Pi Session 开发/修复、Verified Checkpoint 与 Worker 恢复。
+- 工作日志、Goal 状态、Preview、Code、Terminal、Problems、Versions，以及模型/规划/协议/工作区/验收问题的可解释错误展示。
+- 受保护的 G 内 Playwright 自验、V 内独立权威验收、版本快照和 Preview Gateway。
+- 删除生产 Demo fixture、Guest 自动会话/项目认领、旧 starter v1 和无消费者的前端组件/状态链；登录成为默认入口。
 
-The Preview gateway supports ordinary HTTP Next.js pages for this demo, not
-generated-app WebSocket, SSE, or arbitrary streaming transports.
+尚未完成或尚未形成可信证据：
 
-## Implemented
+- 尚无稳定公网 URL，也没有从外部网络完成登录 → 生成/SSE → Preview → 交互 → 刷新保持的 Cloudflare 验收。
+- 多模型同题能力矩阵未完成；Grok 已达到额度，DeepSeek 曾遇到流中断/超时，不能把“模型可配置”写成“所有模型已稳定交付”。
+- 失败任务删除和终态任务原地续跑未实现；当前恢复覆盖 Worker/沙箱故障、Verified Checkpoint 和用户澄清续接。失败后应创建新运行。
+- 项目列表仍以名称、状态和时间为主，没有独立的需求摘要字段；生成中的完整文件内容也不会实时从沙箱暴露到浏览器。
+- Context Inspector、阶段记忆投影、Verified Reuse、同条件 A/B benchmark 尚未实现。
+- 本地 Docker OpenSandbox 适合受控 Demo，不是面向匿名公网代码的强隔离环境；公网开放前仍需 egress、限流和成本保护。
 
-- A real interactive flow from product request to generated code, deterministic verification, version creation, and live Preview.
-- OpenSandbox-backed execution with Pi as the coding harness and full useful permissions inside `/workspace`; the sandbox, not a business-file allowlist, is the security boundary.
-- GoalGraph planning through a schema-constrained virtual tool, a 200,000-token context window, reusable session context, and SSE work-log/status events.
-- A fixed, independently scrollable work log plus Preview, Code, Terminal, and Versions workspaces. Frontend visual composition was delegated to WorkBuddy Hy3; backend and security contracts remain independent of the layout.
-- PostgreSQL persistence for users, server sessions, projects, runs, events, artifacts, versions, and preview state. Redis and MinIO support runtime coordination and artifact storage.
-- Minimal account flow: register, sign in, sign out, HttpOnly server session cookies, token rotation on authentication, guest-project transfer, cross-account project isolation, session revocation, and SSE authorization rechecks.
-- Verified Preview retention and routing: a successful OpenSandbox Preview is renewed to seven days, then published through an isolated wildcard host gateway that resolves the current verified sandbox server-side. FOMO account cookies, authorization headers, and OpenSandbox credentials are not forwarded into generated applications.
-- MetaGPT and frozen business-file plans are not part of the active runtime. The current path remains OpenSandbox; E2B is not required.
+## 3. 如果继续投入时间
 
-## Verified evidence
+P0 — 先保证可交付：
 
-| Evidence level | Result | What it proves |
-| --- | --- | --- |
-| Backend code tests | 385 passed | Repository, API, auth/session, GoalGraph, worker, verifier, persistence, Preview retention, and publish contracts at code/integration level |
-| Preview Gateway code tests | Passed within the 385-test backend suite | UUID Host validation, verified-resource lookup, header/cookie isolation, expiry handling, and bounded bodies; this does not exercise DNS, TLS, Tunnel, or a public network |
-| Web Vitest | 134 passed | UI reducers, stores, API parsing, and components; this does not prove a browser flow |
-| Pi bridge tests | 18 passed | Native/structured tool contracts, continuation, timeout/activity, user-input, and fail-closed protocol behavior without a live model |
-| Automated Web Playwright suite | 2/2 local tests passed | Workbench smoke plus guest-project registration/rotation/migration, logout isolation, login recovery, and a second account denied by API (`403`) and UI |
-| Real local PostgreSQL/API smoke | Passed | Guest-to-user token rotation, guest project transfer, logout revocation, and persisted account access against the running database |
-| Real local OpenSandbox canary | `succeeded / ready`, verifier `verified` | Pi produced a runnable habit tracker through planning, building, verification, versioning, and Preview in the local OpenSandbox stack |
-| Local Chrome/Playwright direct-Preview acceptance | Passed | Habit creation, completion toggle, summary updates, and localStorage state after reload through the direct local endpoint |
-| Local Chrome/Playwright Gateway acceptance | Passed | The verified Preview, absolute `/_next` assets, interaction, and reload persistence work through the local host-based Gateway |
-| Public HTTPS deployment acceptance | Not yet available | No claim is made until an external-network URL completes DNS/TLS/Tunnel, login, generation/SSE, Preview interaction, and reload |
+1. 固定一个已验证的默认模型路线（当前优先 GPT-5.5），完成一次真实端到端生成。
+2. 配置 named Cloudflare Tunnel，并从外网验收登录、SSE、Preview 静态资源、交互和刷新保持。
+3. 给失败任务提供“从最后 verified version 创建新运行”，而不是尝试恢复已经失效的模型进程。
 
-The browser/runtime rows above used local endpoints or local Host routing; none
-is a public HTTPS result. The successful OpenSandbox run took about 7 minutes
-28 seconds: planning 63 seconds, building 5 minutes 29 seconds, and verification
-50 seconds. Peak recorded context was 47,854 of 200,000 tokens. The generated
-Preview remained healthy after verification and its retained sandbox was
-extended to 2026-08-17 02:32 China Standard Time. Its only observed browser
-noise on the earlier direct-origin check was a non-blocking missing
-`favicon.ico` request.
+P1 — 改善 Demo 体验：
 
-## Key decisions
+1. 项目列表补充需求摘要、最近模型、运行阶段和失败原因。
+2. 在 Goal 边界展示文件树/架构快照，并把心跳转成“当前动作 + 最后活动时间”，不伪造百分比。
+3. 增加模型健康状态和显式的重试/切换模型动作。
 
-1. **Prioritize the complete vertical slice.** Account isolation, persistence, real generation, deterministic verification, and Preview take precedence over secondary dashboards and decorative proof views.
-2. **Keep Pi native inside the sandbox.** FOMO adds goal/context/reuse strategy around the harness rather than reimplementing its coding loop or freezing a file plan.
-3. **Use concentrated verification.** Low-cost targeted checks run during implementation; a small end-to-end matrix runs after a coherent module is complete.
-4. **Be explicit about evidence.** Unit tests, a local OpenSandbox run, a browser check, and a public deployment are separate proof levels.
-5. **Keep auth intentionally small.** Password reset, email verification, social login, organizations, billing, and admin screens are outside this demo.
+P2 — 长期能力：
 
-## Known limits
+1. Context Manifest/Capsule、阶段记忆投影和增量索引。
+2. Verified Reuse 与相同模型/沙箱条件的 A/B benchmark。
+3. 面向公网匿名使用的强沙箱隔离、认证 egress、限流和费用治理。
 
-- A stable public demo URL is still missing; the source repository is public.
-- The current local OpenSandbox Docker configuration is suitable for a controlled demo, not unrestricted anonymous Internet traffic. A public release needs authenticated ingress, abuse/rate controls, and a hardened sandbox egress policy.
-- Published Preview hostnames are high-entropy capability URLs. The gateway additionally requires a current, uncleaned verified resource in FOMO persistence, but it does not require the viewer's FOMO account after disclosure.
-- `sessions.user_id` is validated by application logic but does not yet have a database foreign key. No public endpoint can create arbitrary identity links, so this is a follow-up migration rather than a demo blocker.
-- The product advantage over an unmodified coding harness has not yet been established by a comparative benchmark. The current evidence proves a working delivery path, not model/context superiority.
+## 截止版验证记录
 
-## Next priorities
+- Web：Vitest 14 个文件、97 项通过；TypeScript 检查和 Next.js production build 通过。
+- Bridge/启动探针：Node 23 项通过。
+- 后端：一次全量回归为 443/447，通过后确认剩余 4 项均是旧测试夹具与新 Runtime Contract/checkpoint 规则不一致；同步夹具后这 4 项定向通过。最终全量复跑按交付要求在 96% 主动停止，停止前未出现新失败，因此不把它写成“447 项完整通过”。
+- 全量 Ruff、Compose 配置解析和 `git diff --check` 通过。
 
-1. Configure a stable authenticated app/API ingress plus wildcard Preview DNS/TLS routed to the implemented gateway; keep the OpenSandbox lifecycle API and random Docker host ports private.
-2. Replace the pending online-demo link, then rerun registration → generation → Preview → refresh from an external browser.
-3. Add invite/rate limits and hardened egress controls before allowing untrusted public prompts.
-4. Measure FOMO against the same model and sandbox with native Pi: completion rate, time to first write, time to verified Preview, repair count, and context-token use.
-5. Improve component/recipe reuse only where benchmark data shows a repeatable delivery gain.
+以上记录只证明当前代码与本地受控环境，不等同于公网部署验收。

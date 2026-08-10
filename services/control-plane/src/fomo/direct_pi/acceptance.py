@@ -14,6 +14,7 @@ from .contracts import (
     AcceptanceAssertion,
     AcceptanceContract,
     Locator,
+    SelectAction,
 )
 from .goalgraph import (
     ScopedAcceptanceContract,
@@ -24,6 +25,7 @@ from .goalgraph import (
 
 ACCEPTANCE_ROOT = "tests/fomo-acceptance"
 ACCEPTANCE_CONFIG_PATH = f"{ACCEPTANCE_ROOT}/fomo.config.ts"
+ADVISORY_ACCEPTANCE_CONFIG_PATH = f"{ACCEPTANCE_ROOT}/fomo.advisory.config.ts"
 FOMO_HARNESS_PATH = "tests/harness/starter.smoke.spec.ts"
 # The authoritative verifier invokes the root-owned Playwright CLI from this
 # same immutable runtime cache. Every FOMO-injected config/spec imports the
@@ -65,6 +67,47 @@ def _locator(value: Locator) -> str:
     return f"page.getByText({_quoted(value.value)}, {{ exact: true }})"
 
 
+def _select_action(value: SelectAction) -> str:
+    """Select through native and accessible custom controls without guessing.
+
+    The frozen DSL names a control and an option, but generated applications
+    may implement that contract with either a native ``select`` or an ARIA
+    combobox/listbox (for example, Radix Select). Inspecting the resolved
+    control keeps the branch deterministic while preserving strict/exact
+    locators for both the control and option.
+    """
+
+    target = _locator(value.target)
+    option = _quoted(value.value)
+    return "\n".join(
+        (
+            "{",
+            f"  const fomoSelectTarget = {target};",
+            "  const fomoSelectControl = await fomoSelectTarget.evaluate((element) => ({",
+            '    tagName: element.tagName.toLowerCase(),',
+            '    role: (element.getAttribute("role") || "").toLowerCase(),',
+            '    popup: (element.getAttribute("aria-haspopup") || "").toLowerCase(),',
+            "  }));",
+            '  if (fomoSelectControl.tagName === "select") {',
+            f"    await fomoSelectTarget.selectOption({option});",
+            '  } else if (fomoSelectControl.role === "listbox") {',
+            "    await fomoSelectTarget",
+            f'      .getByRole("option", {{ name: {option}, exact: true }})',
+            "      .click();",
+            "  } else if (",
+            '    fomoSelectControl.role === "combobox" ||',
+            '    fomoSelectControl.popup === "listbox"',
+            "  ) {",
+            "    await fomoSelectTarget.click();",
+            f'    await page.getByRole("option", {{ name: {option}, exact: true }}).click();',
+            "  } else {",
+            '    throw new Error("FOMO select target is not a native select or ARIA listbox");',
+            "  }",
+            "}",
+        )
+    )
+
+
 def _action(value: AcceptanceAction) -> str:
     if value.kind == "goto":
         return f"await page.goto({_quoted(value.path)});"
@@ -73,7 +116,7 @@ def _action(value: AcceptanceAction) -> str:
     if value.kind == "fill":
         return f"await {_locator(value.target)}.fill({_quoted(value.value)});"
     if value.kind == "select":
-        return f"await {_locator(value.target)}.selectOption({_quoted(value.value)});"
+        return _select_action(value)
     return "await page.reload();"
 
 
@@ -95,12 +138,18 @@ def _assertion(value: AcceptanceAssertion) -> str:
 
 
 def _test_source(
-    title: str, actions: list[AcceptanceAction], assertions: list[AcceptanceAssertion]
+    title: str,
+    actions: list[AcceptanceAction],
+    assertions: list[AcceptanceAssertion],
+    *,
+    playwright_test_module: str = FOMO_PLAYWRIGHT_TEST_MODULE,
 ) -> str:
     body = [*(_action(item) for item in actions), *(_assertion(item) for item in assertions)]
-    indented = "\n".join(f"  {line}" for line in body)
+    indented = "\n".join(
+        f"  {line}" for statement in body for line in statement.splitlines()
+    )
     return (
-        f'import {{ expect, test }} from "{FOMO_PLAYWRIGHT_TEST_MODULE}";\n\n'
+        f'import {{ expect, test }} from "{playwright_test_module}";\n\n'
         f"test({_quoted(title)}, async ({{ page }}) => {{\n{indented}\n}});\n"
     )
 
@@ -119,6 +168,31 @@ _CONFIG_SOURCE = (
     trace: "retain-on-failure",
     screenshot: "only-on-failure",
     video: "off",
+  },
+  projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
+});
+"""
+)
+
+_ADVISORY_CONFIG_SOURCE = (
+    f'import {{ defineConfig, devices }} from "{FOMO_PLAYWRIGHT_TEST_MODULE}";\n\n'
+    """export default defineConfig({
+  testDir: "../..",
+  testMatch: "**/*.smoke.spec.ts",
+  fullyParallel: false,
+  workers: 1,
+  retries: 0,
+  reporter: "line",
+  timeout: 30_000,
+  use: {
+    baseURL: "http://127.0.0.1:8080",
+    trace: "retain-on-failure",
+  },
+  webServer: {
+    command: "/usr/local/bin/node /opt/fomo/runtime-cache/fomo-next-radix-v2/node_modules/next/dist/bin/next dev --hostname 0.0.0.0 --port 8080",
+    url: "http://127.0.0.1:8080",
+    reuseExistingServer: false,
+    timeout: 30_000,
   },
   projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
 });
@@ -156,10 +230,18 @@ def _fomo_verification_sources() -> dict[str, str]:
 
 def _compile_sources(
     scoped_contracts: Iterable[ScopedAcceptanceContract],
+    *,
+    include_verification_assets: bool = True,
+    playwright_test_module: str = FOMO_PLAYWRIGHT_TEST_MODULE,
+    additional_sources: Mapping[str, str] | None = None,
 ) -> CompiledAcceptance:
     scoped_values = tuple(scoped_contracts)
     single_goal = len(scoped_values) == 1
-    sources = _fomo_verification_sources()
+    sources = _fomo_verification_sources() if include_verification_assets else {}
+    for path, content in (additional_sources or {}).items():
+        if path in sources:
+            raise AcceptanceCompilationError(f"duplicate acceptance source path: {path}")
+        sources[path] = content
     test_paths: dict[str, str] = {}
     test_names: dict[str, str] = {}
     acceptance_keys: dict[str, str] = {}
@@ -185,7 +267,12 @@ def _compile_sources(
                 raise AcceptanceCompilationError(
                     f"invalid scoped acceptance key for {scoped.goal_id}:{item.acceptance_id}"
                 )
-            sources[path] = _test_source(item.title, item.actions, item.assertions)
+            sources[path] = _test_source(
+                item.title,
+                item.actions,
+                item.assertions,
+                playwright_test_module=playwright_test_module,
+            )
             test_paths[key] = path
             test_names[key] = item.title
             acceptance_keys[item.acceptance_id if single_goal else key] = key
@@ -218,6 +305,28 @@ def compile_goal_acceptance(
     """Compile one goal to isolated paths and globally durable criterion keys."""
 
     return _compile_sources((scope_acceptance_contract(goal_id, contract),))
+
+
+def compile_goal_advisory_acceptance(
+    goal_id: str,
+    contract: AcceptanceContract,
+) -> CompiledAcceptance:
+    """Compile one current-goal suite for advisory execution in G.
+
+    Generation sandboxes use the immutable image runner and a protected
+    advisory config, so candidate package scripts, Playwright config, and
+    ``node_modules/.bin`` cannot redefine this feedback loop. The trusted V
+    config and harness remain independent; this slice never constitutes
+    release evidence.
+    """
+
+    return _compile_sources(
+        (scope_acceptance_contract(goal_id, contract),),
+        include_verification_assets=False,
+        additional_sources={
+            ADVISORY_ACCEPTANCE_CONFIG_PATH: _ADVISORY_CONFIG_SOURCE,
+        },
+    )
 
 
 def compile_acceptance_suite(
@@ -289,6 +398,7 @@ def compile_acceptance(
 __all__ = [
     "ACCEPTANCE_CONFIG_PATH",
     "ACCEPTANCE_ROOT",
+    "ADVISORY_ACCEPTANCE_CONFIG_PATH",
     "FOMO_HARNESS_PATH",
     "FOMO_PLAYWRIGHT_TEST_MODULE",
     "AcceptanceCompilationError",
@@ -296,4 +406,5 @@ __all__ = [
     "compile_acceptance",
     "compile_acceptance_suite",
     "compile_goal_acceptance",
+    "compile_goal_advisory_acceptance",
 ]

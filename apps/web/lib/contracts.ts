@@ -102,15 +102,57 @@ export interface UserInputAnswerResponse {
   run: RunSnapshot;
 }
 
+/**
+ * A single model the user may pick for a run. Provider routing, LiteLLM
+ * aliases and context limits stay server-owned; the browser
+ * only sees a public label, the thinking levels that model supports, and why
+ * an otherwise-valid profile might be unavailable right now.
+ */
+export interface RuntimeProfileOption {
+  profileId: string;
+  label: string;
+  thinkingLevels: string[];
+  defaultThinking: string;
+  contextWindow: number;
+  runTokenBudget: number | null;
+  runTokenBudgetUnlimited: boolean;
+  inferenceTpmLimit: number;
+  available: boolean;
+  disabledReason?: string | null;
+}
+
+export interface RuntimeOptionsResponse {
+  defaultProfileId: string | null;
+  profiles: RuntimeProfileOption[];
+}
+
+/**
+ * The immutable per-run inference contract resolved by the server. After a run
+ * is created the UI shows *only* these fields; it never lets the user edit
+ * provider routing or context limits.
+ */
+export interface RunRuntimeResponse {
+  profileId: string;
+  thinking: string;
+  contextWindow: number;
+  policyVersion: string;
+  runTokenBudget: number | null;
+  runTokenBudgetUnlimited: boolean;
+  inferenceTpmLimit: number;
+}
+
 export interface RunSnapshot {
   id: string;
   projectId: string;
   status: RunStatus;
   phase?: string;
+  /** Server-owned terminal category; never an exception or provider body. */
+  errorCode?: string;
   lastSeq: number;
   createdAt?: string;
   updatedAt?: string;
   pendingInputRequest?: UserInputRequest;
+  runtime?: RunRuntimeResponse;
 }
 
 export interface FileManifestEntry {
@@ -135,7 +177,7 @@ export interface VersionSummary {
 }
 
 export interface PreviewRef {
-  status: "ready" | "reconnecting" | "failed" | "pending" | "demo" | "expired" | "unavailable";
+  status: "ready" | "reconnecting" | "failed" | "pending" | "expired" | "unavailable";
   url?: string;
   runId?: string;
   error?: string;
@@ -185,29 +227,7 @@ export interface ArtifactRef {
   title?: string;
   summary?: string;
   createdAt?: string;
-  /** Demo fixture only; real refs never carry pre-rendered markdown. */
-  markdown?: string;
 }
-
-export interface VisibleArtifactRef extends ArtifactRef {
-  runId: string;
-  kind: ArtifactKind;
-  role: "user" | "pi" | "fomo" | "product_manager" | "architect";
-  stage: "input" | "planning" | "acceptance" | "verification" | "product" | "architecture";
-  schemaVersion: number;
-  title: string;
-  summary: string;
-  createdAt: string;
-}
-
-export interface ArtifactDetail extends VisibleArtifactRef {
-  content: Record<string, unknown>;
-}
-
-export type ArtifactLoadState =
-  | { status: "loading" }
-  | { status: "error"; message: string }
-  | { status: "ready"; detail: ArtifactDetail };
 
 export interface RoleActivity {
   role: AgentRole;
@@ -343,9 +363,7 @@ export interface ProjectSnapshot {
   events: DomainEvent[];
   files?: FileManifestEntry[];
   versions?: VersionSummary[];
-  trace?: AcceptanceTrace[];
   preview?: PreviewRef;
-  artifactRefs?: VisibleArtifactRef[];
   pendingInputRequest?: UserInputRequest;
   /** Null for legacy P0 runs and responses that predate GoalGraph. */
   goalGraph: GoalGraphProjection | null;
@@ -356,23 +374,20 @@ export interface RunPresentation {
   projectId: string;
   status: RunStatus;
   lastSeq: number;
-  roles: Record<AgentRole, RoleActivity>;
   stages: Record<AgentStage, StageActivity>;
-  artifacts: ArtifactRef[];
-  trace: AcceptanceTrace[];
-  fileChanges: FileChange[];
   commands: CommandLog[];
   verifications: VerificationResult[];
   problems: Problem[];
   versions: VersionSummary[];
   preview?: PreviewRef;
-  summaries: string[];
   worklog: AgentWorklogItem[];
   inputRequests: UserInputRequest[];
   /** Reducer cursor used only to coalesce one streamed public message. */
   activePublicMessageId?: string;
   goalGraph: GoalGraphProjection | null;
   contextUsage?: ContextUsageSnapshot;
+  /** Immutable actual configuration, shown read-only after the run is created. */
+  runtime?: RunRuntimeResponse;
   disconnected?: boolean;
 }
 

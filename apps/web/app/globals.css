@@ -100,6 +100,12 @@ body {
     var(--background);
 }
 
+.dark body {
+  background:
+    radial-gradient(circle at 100% 0%, oklch(0.28 0.055 264 / 0.35), transparent 32rem),
+    var(--background);
+}
+
 ::selection {
   background: oklch(0.72 0.12 264 / 0.35);
 }

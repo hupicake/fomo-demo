@@ -57,15 +57,13 @@ function Metric({ detail, label, percent, sublabel, tone }: { detail: string; la
   return (
     <HoverCard openDelay={200}>
       <HoverCardTrigger asChild>
-        <Button className="h-auto w-full flex-col items-stretch gap-1 rounded-md px-2 py-1.5 text-left hover:bg-muted/60" variant="ghost">
-          <span className="flex items-baseline justify-between gap-2">
-            <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">{label}</span>
-            <span className={cn("font-mono text-xs tabular-nums", percent === undefined ? "text-muted-foreground" : "font-semibold text-foreground")}>
-              {percent === undefined ? "—" : `${percent}%`}
-            </span>
-          </span>
+        <Button className="grid h-7 w-full grid-cols-[auto_minmax(1.5rem,1fr)_auto] items-center gap-1.5 rounded-md px-1.5 text-left hover:bg-muted/60" variant="ghost">
+          <span className="text-[9px] font-medium uppercase tracking-wide text-muted-foreground">{label === "Development" ? "Dev" : "Ctx"}</span>
           <Meter label={`${label} progress`} percent={percent} tone={tone} />
-          <span className="truncate text-[10px] font-normal leading-4 text-muted-foreground">{sublabel}</span>
+          <span className={cn("font-mono text-[10px] tabular-nums", percent === undefined ? "text-muted-foreground" : "font-semibold text-foreground")}>
+            {percent === undefined ? "—" : `${percent}%`}
+          </span>
+          <span className="sr-only">{sublabel}</span>
         </Button>
       </HoverCardTrigger>
       <HoverCardContent align="start" className="w-72">
@@ -97,8 +95,8 @@ export function RunMetrics({ contextUsage, goalGraph }: { contextUsage?: Context
 
   return (
     <section
-      aria-label="Run metrics"
-      className="grid grid-cols-2 gap-1"
+      aria-label="运行指标"
+      className="grid grid-cols-2 gap-0.5"
       data-context-percent={contextPercent ?? "unknown"}
       data-development-percent={development.percent ?? "unknown"}
     >

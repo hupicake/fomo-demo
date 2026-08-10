@@ -207,7 +207,7 @@ class OpenSandboxProvider:
         # server snapshots instead of its authoritative Git/file manifest.
         # Egress policy stays disabled: the local config.toml has no
         # authenticated dns+nft sidecar, so no fail-closed network policy can
-        # be claimed (see DESIGN: public untrusted deployment is blocked).
+        # be claimed (see the root README: public untrusted deployment is blocked).
         return SandboxCapabilities(
             snapshot=False,
             pause_resume=True,
@@ -215,7 +215,20 @@ class OpenSandboxProvider:
             network_policy=False,
         )
 
-    async def create(self, project_id: str, source: SourceRef | None = None) -> SandboxRef:
+    async def create(
+        self,
+        project_id: str,
+        source: SourceRef | None = None,
+        *,
+        lifetime_seconds: int | None = None,
+    ) -> SandboxRef:
+        effective_lifetime = self._lifetime_seconds
+        if lifetime_seconds is not None:
+            if lifetime_seconds <= 0 or lifetime_seconds > self._lifetime_seconds:
+                raise ValueError(
+                    "temporary OpenSandbox lifetime must be positive and no greater than the configured lifetime"
+                )
+            effective_lifetime = lifetime_seconds
         metadata = {"fomo.project_id": project_id}
         if source and source.version_id:
             metadata["fomo.source_version_id"] = source.version_id
@@ -223,7 +236,7 @@ class OpenSandboxProvider:
             metadata["fomo.source_bundle_key"] = source.bundle_key
 
         create_kwargs: dict[str, Any] = {
-            "timeout": timedelta(seconds=self._lifetime_seconds),
+            "timeout": timedelta(seconds=effective_lifetime),
             "ready_timeout": timedelta(seconds=self._ready_timeout_seconds),
             "metadata": metadata,
             "platform": PlatformSpec(os="linux", arch="arm64"),

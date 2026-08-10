@@ -9,16 +9,23 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from fomo.direct_pi.acceptance import compile_acceptance
+from fomo.direct_pi.acceptance import (
+    ACCEPTANCE_ROOT,
+    ADVISORY_ACCEPTANCE_CONFIG_PATH,
+    compile_acceptance,
+    compile_goal_advisory_acceptance,
+)
 from fomo.direct_pi.contracts import AcceptanceContract
 from fomo.direct_pi.execution import CommandExecutor
 from fomo.direct_pi.workspace import (
+    FOMO_RUNNER_BIN,
     AuditedWorkspace,
     WorkspaceContractError,
     WorkspaceManager,
 )
 from fomo.sandbox.base import ExecResult, FileChange
 from fomo.starter import resolve_starter_manifest
+from tests.helpers import create_user_session
 
 from ._git_sandbox import CANDIDATE_SHA, GitAwareSandbox, persisted_sandbox_id
 
@@ -69,7 +76,7 @@ class _RecordingKillSandbox(GitAwareSandbox):
 
 
 async def _run_context(repository, message_id: str = "workspace-test"):
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, message_id, "Build a library manager."
@@ -132,6 +139,47 @@ async def test_audit_transfers_only_real_changed_new_and_deleted_files(
     # Unchanged files never enter the candidate diff.
     assert "app/layout.tsx" not in by_path
     assert len(audited.model_changes) == 3
+
+
+@pytest.mark.asyncio
+async def test_next_env_runtime_rewrite_is_not_candidate_or_checkpoint_truth(
+    repository, settings
+) -> None:
+    _project, run, lease = await _run_context(repository, "next-env-generated")
+    sandbox = GitAwareSandbox()
+    workspaces = _manager(repository, sandbox, settings, run.id, _project.id, lease)
+    generation = await workspaces.create_generation(run.base_version_id)
+    baseline = await workspaces.snapshot_hashes(generation)
+    dev_next_env = (
+        '/// <reference types="next" />\n'
+        '/// <reference types="next/image-types/global" />\n'
+        'import "./.next/dev/types/routes.d.ts";\n'
+        'import "./.next/dev/types/root-params.d.ts";\n'
+    )
+
+    # Next 16 rewrites this file when a candidate starts `next dev` in G.
+    await sandbox.apply_changes(
+        generation,
+        [FileChange(path="next-env.d.ts", content=dev_next_env)],
+    )
+
+    audited = await workspaces.audit(generation, baseline=baseline)
+    assert "next-env.d.ts" not in audited.changed_paths
+    assert "next-env.d.ts" not in {change.path for change in audited.model_changes}
+
+    checkpoint = await workspaces.capture_candidate_checkpoint(generation)
+    assert "next-env.d.ts" not in {str(item["path"]) for item in checkpoint.files}
+
+    snapshot = await workspaces.create_verification(
+        audited,
+        compile_acceptance(_contract()),
+        base_version_id=run.base_version_id,
+    )
+    starter_next_env = next(
+        item for item in workspaces.starter.files if item.path == "next-env.d.ts"
+    )
+    assert await sandbox.read_file(snapshot.ref, "next-env.d.ts") == starter_next_env._content
+    assert snapshot.initial_hashes["next-env.d.ts"] == starter_next_env.sha256
 
 
 @pytest.mark.asyncio
@@ -203,7 +251,99 @@ async def test_audit_rejects_fomo_owned_changes_and_keeps_unchanged_out_of_diff(
 
 
 @pytest.mark.asyncio
-async def test_audit_allows_large_lockfile_but_limits_ordinary_source(
+async def test_generation_advisory_is_protected_and_excluded_from_candidate_truth(
+    repository, settings
+) -> None:
+    project, run, lease = await _run_context(repository, "goal-advisory")
+    sandbox = GitAwareSandbox()
+    workspaces = _manager(repository, sandbox, settings, run.id, project.id, lease)
+    generation = await workspaces.create_generation(run.base_version_id)
+    baseline = await workspaces.snapshot_hashes(generation)
+    compiled = compile_goal_advisory_acceptance("G-1", _contract())
+
+    refreshed, command = await workspaces.reconcile_generation_advisory(
+        generation,
+        compiled,
+        baseline=baseline,
+    )
+
+    expected_paths = set(compiled.sha256_by_path)
+    assert expected_paths == {
+        ADVISORY_ACCEPTANCE_CONFIG_PATH,
+        "tests/fomo-acceptance/G-1/search-books.smoke.spec.ts",
+    }
+    assert {
+        path for path in refreshed if path.startswith(f"{ACCEPTANCE_ROOT}/")
+    } == expected_paths
+    assert f"{FOMO_RUNNER_BIN}/tsc --noEmit" in command
+    assert f"{FOMO_RUNNER_BIN}/playwright test" in command
+    assert "tests/fomo-acceptance/G-1/search-books.smoke.spec.ts" in command
+    assert f"--config={ADVISORY_ACCEPTANCE_CONFIG_PATH}" in command
+    assert "--project=chromium --workers=1 --retries=0 --reporter=line" in command
+    for path, digest in compiled.sha256_by_path.items():
+        assert hashlib.sha256(await sandbox.read_file(generation, path)).hexdigest() == digest
+
+    audited = await workspaces.audit(generation, baseline=refreshed)
+    assert not any(path.startswith(f"{ACCEPTANCE_ROOT}/") for path in audited.changed_paths)
+    assert not any(
+        change.path.startswith(f"{ACCEPTANCE_ROOT}/")
+        for change in audited.model_changes
+    )
+    checkpoint = await workspaces.capture_candidate_checkpoint(generation)
+    assert not any(
+        str(item["path"]).startswith(f"{ACCEPTANCE_ROOT}/")
+        for item in checkpoint.files
+    )
+
+
+@pytest.mark.asyncio
+async def test_generation_advisory_replaces_prior_goal_and_fails_closed_on_tamper(
+    repository, settings
+) -> None:
+    project, run, lease = await _run_context(repository, "goal-advisory-transition")
+    sandbox = GitAwareSandbox()
+    workspaces = _manager(repository, sandbox, settings, run.id, project.id, lease)
+    generation = await workspaces.create_generation(run.base_version_id)
+    baseline = await workspaces.snapshot_hashes(generation)
+    first = compile_goal_advisory_acceptance("G-1", _contract())
+    baseline, _command = await workspaces.reconcile_generation_advisory(
+        generation,
+        first,
+        baseline=baseline,
+    )
+    second = compile_goal_advisory_acceptance("G-2", _contract())
+    baseline, _command = await workspaces.reconcile_generation_advisory(
+        generation,
+        second,
+        baseline=baseline,
+    )
+
+    first_path = next(
+        path for path in first.sha256_by_path if path != ADVISORY_ACCEPTANCE_CONFIG_PATH
+    )
+    second_path = next(
+        path for path in second.sha256_by_path if path != ADVISORY_ACCEPTANCE_CONFIG_PATH
+    )
+    with pytest.raises(FileNotFoundError):
+        await sandbox.read_file(generation, first_path)
+    assert await sandbox.read_file(generation, second_path)
+    assert first_path not in baseline
+    assert baseline[second_path] == second.sha256_by_path[second_path]
+
+    await sandbox.apply_changes(
+        generation,
+        [FileChange(path=second_path, content="// tampered\n", operation="modify")],
+    )
+    with pytest.raises(WorkspaceContractError, match="changed outside FOMO"):
+        await workspaces.reconcile_generation_advisory(
+            generation,
+            second,
+            baseline=baseline,
+        )
+
+
+@pytest.mark.asyncio
+async def test_audit_does_not_impose_file_size_or_changed_source_quotas(
     repository, settings
 ) -> None:
     _project, run, lease = await _run_context(repository, "audit-limits")
@@ -225,8 +365,8 @@ async def test_audit_allows_large_lockfile_but_limits_ordinary_source(
         generation,
         [FileChange(path="pnpm-lock.yaml", content=oversized_lockfile, operation="modify")],
     )
-    with pytest.raises(WorkspaceContractError, match="pnpm-lock.yaml"):
-        await workspaces.audit(generation, baseline=baseline)
+    audited = await workspaces.audit(generation, baseline=baseline)
+    assert "pnpm-lock.yaml" in audited.changed_paths
 
     # Character count alone would accept this value, but its UTF-8 encoding
     # exceeds the 512 KiB persistence boundary.
@@ -243,11 +383,10 @@ async def test_audit_allows_large_lockfile_but_limits_ordinary_source(
             )
         ],
     )
-    with pytest.raises(WorkspaceContractError, match="pnpm-lock.yaml"):
-        await workspaces.audit(generation, baseline=baseline)
+    audited = await workspaces.audit(generation, baseline=baseline)
+    assert "pnpm-lock.yaml" in audited.changed_paths
 
-    # Restore the valid lockfile so the ordinary-source assertion identifies
-    # the source limit rather than the earlier lockfile violation.
+    # Restore the smaller lockfile before checking an ordinary source file.
     await sandbox.apply_changes(
         generation,
         [FileChange(path="pnpm-lock.yaml", content=large_lockfile, operation="modify")],
@@ -257,8 +396,8 @@ async def test_audit_allows_large_lockfile_but_limits_ordinary_source(
         generation,
         [FileChange(path="app/layout.tsx", content="x" * 25_000, operation="modify")],
     )
-    with pytest.raises(WorkspaceContractError, match="exceeds the file limit"):
-        await workspaces.audit(generation, baseline=baseline)
+    audited = await workspaces.audit(generation, baseline=baseline)
+    assert {"app/layout.tsx", "pnpm-lock.yaml"}.issubset(audited.changed_paths)
 
 
 @pytest.mark.asyncio

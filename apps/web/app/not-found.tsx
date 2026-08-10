@@ -5,10 +5,10 @@ export default function NotFound() {
     <main className="grid min-h-screen place-items-center p-6">
       <section className="max-w-md text-center">
         <p className="font-mono text-sm text-muted-foreground">404</p>
-        <h1 className="mt-2 text-2xl font-semibold">Project not found</h1>
-        <p className="mt-2 text-sm text-muted-foreground">The project may have expired, or this guest session does not have access.</p>
+        <h1 className="mt-2 text-2xl font-semibold">找不到项目</h1>
+        <p className="mt-2 text-sm text-muted-foreground">项目可能已过期，或当前账号无权访问。</p>
         <Link className="mt-5 inline-flex rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground" href="/">
-          Return home
+          返回首页
         </Link>
       </section>
     </main>

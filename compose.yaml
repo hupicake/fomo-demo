@@ -15,17 +15,14 @@ x-control-plane-environment: &control-plane-environment
   # Pi runs in an OpenSandbox-created container outside the Compose network;
   # it reaches the published LiteLLM port through the Docker host.
   SANDBOX_LITELLM_BASE_URL: ${SANDBOX_LITELLM_BASE_URL:-http://host.docker.internal:4000}
-  LITELLM_API_KEY: ${LITELLM_MASTER_KEY:-sk-local-fomo-development-only}
+  LITELLM_API_KEY: ${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY must be set}
   FOMO_INFERENCE_TOKEN_TTL: ${FOMO_INFERENCE_TOKEN_TTL:-4200}
   INFERENCE_MANAGEMENT_TIMEOUT_SECONDS: ${INFERENCE_MANAGEMENT_TIMEOUT_SECONDS:-15}
-  RUN_MAX_WALL_SECONDS: ${RUN_MAX_WALL_SECONDS:-3600}
-  RUN_MAX_SPEND: ${RUN_MAX_SPEND:-2.0}
+  RUN_MAX_SPEND: ${RUN_MAX_SPEND:-5.0}
   RUN_INFERENCE_RPM_LIMIT: ${RUN_INFERENCE_RPM_LIMIT:-60}
-  RUN_INFERENCE_TPM_LIMIT: ${RUN_INFERENCE_TPM_LIMIT:-1000000}
-  RUN_MAX_TOOL_CALLS: ${RUN_MAX_TOOL_CALLS:-300}
-  RUN_MAX_TOKENS: ${RUN_MAX_TOKENS:-400000}
-  PI_MAX_FILE_CHARACTERS: ${PI_MAX_FILE_CHARACTERS:-20000}
-  PI_MAX_CHANGED_FILES: ${PI_MAX_CHANGED_FILES:-24}
+  RUN_INFERENCE_TPM_LIMIT: ${RUN_INFERENCE_TPM_LIMIT:-1250000}
+  FOMO_RUNTIME_ENABLED_PROFILES: ${FOMO_RUNTIME_ENABLED_PROFILES:-deepseek-flash}
+  FOMO_RUNTIME_DEFAULT_PROFILE: ${FOMO_RUNTIME_DEFAULT_PROFILE:-deepseek-flash}
   MODEL_PM: ${MODEL_PM:-pm}
   MODEL_ARCHITECT: ${MODEL_ARCHITECT:-architect}
   MODEL_ENGINEER: ${MODEL_ENGINEER:-engineer}
@@ -153,25 +150,29 @@ services:
     command: ["--config", "/app/config.yaml", "--port", "4000"]
     environment:
       DATABASE_URL: ${LITELLM_DATABASE_URL_DOCKER:-postgresql://fomo:fomo-local-only@postgres:5432/fomo_litellm}
-      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-local-fomo-development-only}
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY must be set}
       LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:-local-litellm-salt-change-before-production-0123456789}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
       OPENAI_API_BASE: ${OPENAI_API_BASE:-https://api.openai.com/v1}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      # Provider credentials stop here. Control-plane services and
+      # generation sandboxes receive only LiteLLM's run-scoped virtual key.
+      GROK_API_KEY: ${GROK_API_KEY:-}
+      OPENCODE_API_KEY: ${OPENCODE_API_KEY:-}
       # Optional only. A macOS host proxy such as 127.0.0.1:7890 is reached
       # from Docker containers through host.docker.internal:7890.
       HTTP_PROXY: ${DOCKER_HTTP_PROXY:-}
       HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-}
-      NO_PROXY: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,::1,postgres,redis,minio,minio-init,litellm,opensandbox,api,worker,web}
+      NO_PROXY: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,::1,postgres,redis,minio,minio-init,litellm,opensandbox,api,worker,web,api.deepseek.com}
       http_proxy: ${DOCKER_HTTP_PROXY:-}
       https_proxy: ${DOCKER_HTTPS_PROXY:-}
-      no_proxy: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,::1,postgres,redis,minio,minio-init,litellm,opensandbox,api,worker,web}
+      no_proxy: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,::1,postgres,redis,minio,minio-init,litellm,opensandbox,api,worker,web,api.deepseek.com}
     depends_on:
       litellm-db-init:
         condition: service_completed_successfully
     ports:
-      - "${LITELLM_HOST_PORT:-4000}:4000"
+      - "127.0.0.1:${LITELLM_HOST_PORT:-4000}:4000"
     volumes:
       - ./infra/litellm/config.yaml:/app/config.yaml:ro
     healthcheck:
@@ -217,7 +218,7 @@ services:
       args:
         HTTP_PROXY: ${DOCKER_HTTP_PROXY:-}
         HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-}
-        NO_PROXY: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,::1,postgres,redis,minio,minio-init,litellm,opensandbox,api,worker,web}
+        NO_PROXY: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,::1,postgres,redis,minio,minio-init,litellm,opensandbox,api,worker,web,api.deepseek.com}
     image: fomo-sandbox-node:2026-08-08
     entrypoint: ["/bin/true"]
     restart: "no"
@@ -245,7 +246,7 @@ services:
       args:
         HTTP_PROXY: ${DOCKER_HTTP_PROXY:-}
         HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-}
-        NO_PROXY: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,::1,postgres,redis,minio,minio-init,litellm,opensandbox,api,worker,web}
+        NO_PROXY: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,::1,postgres,redis,minio,minio-init,litellm,opensandbox,api,worker,web,api.deepseek.com}
     image: fomo-control-plane:local
     command: ["fomo-api"]
     environment: *control-plane-environment
@@ -312,9 +313,11 @@ services:
       dockerfile: Dockerfile
       args:
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+        NEXT_PUBLIC_DEV_ACCOUNT_EMAIL: ${NEXT_PUBLIC_DEV_ACCOUNT_EMAIL:-dev@fomo.local}
+        NEXT_PUBLIC_DEV_ACCOUNT_PASSWORD: ${NEXT_PUBLIC_DEV_ACCOUNT_PASSWORD:-fomo-dev-password}
         HTTP_PROXY: ${DOCKER_HTTP_PROXY:-}
         HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-}
-        NO_PROXY: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,::1,postgres,redis,minio,minio-init,litellm,opensandbox,api,worker,web}
+        NO_PROXY: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,::1,postgres,redis,minio,minio-init,litellm,opensandbox,api,worker,web,api.deepseek.com}
     image: fomo-web:local
     environment:
       NODE_ENV: production

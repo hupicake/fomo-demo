@@ -8,12 +8,48 @@ from opensandbox.exceptions import SandboxApiException
 from pydantic import ValidationError
 
 from fomo.config import DEFAULT_OPENSANDBOX_IMAGE, Settings
+from fomo.runtime_contract import (
+    RuntimeContractError,
+    parse_enabled_profile_ids,
+    resolve_runtime_contract,
+    validated_default_profile_id,
+)
 from fomo.sandbox import create_sandbox_provider
 from fomo.sandbox.base import Command, FileChange, SandboxPathError, SourceRef
 from fomo.sandbox.fake import FakeSandboxProvider
 from fomo.sandbox.opensandbox import OpenSandboxProvider, _OutputCollector
 from fomo.sandbox.process import ProcessSandboxProvider
-from fomo.schemas import PreviewResponse, ProductSpec
+from fomo.schemas import MessageCreate, PreviewResponse, ProductSpec
+
+
+def test_runtime_selection_uses_the_selected_profile_default_thinking() -> None:
+    payload = MessageCreate.model_validate(
+        {
+            "clientMessageId": "kimi-default",
+            "content": "Build a polished product",
+            "profileId": "kimi-k2.7-code",
+        }
+    )
+
+    assert payload.profile_id == "kimi-k2.7-code"
+    assert payload.thinking is None
+
+
+def test_runtime_allowlist_has_unlimited_cumulative_tokens_and_bounded_throughput() -> None:
+    enabled = parse_enabled_profile_ids("gpt-5.6")
+    assert enabled == frozenset({"gpt-5.6"})
+    with pytest.raises(RuntimeContractError, match="must be enabled"):
+        validated_default_profile_id("deepseek-flash", enabled)
+
+    runtime = resolve_runtime_contract(
+        "gpt-5.6",
+        "xhigh",
+        inference_tpm_limit=300_001,
+        max_spend_micros=500_000,
+    )
+    assert runtime.run_max_tokens is None
+    assert runtime.inference_tpm_limit == 300_001
+    assert runtime.max_spend_micros == 500_000
 
 
 def test_opensandbox_exit_code_minus_one_is_a_timeout_without_sdk_error() -> None:
@@ -469,6 +505,15 @@ async def test_opensandbox_provider_uses_pinned_sdk_contract_and_application_por
         await provider.expose(ref, 44772)
     with pytest.raises(NotImplementedError):
         await provider.snapshot(ref)
+
+    temporary_ref = await provider.create(
+        "runtime-preflight",
+        lifetime_seconds=300,
+    )
+    assert SDK.create_calls[-1][1]["timeout"] == timedelta(seconds=300)
+    with pytest.raises(ValueError, match="temporary OpenSandbox lifetime"):
+        await provider.create("runtime-preflight-invalid", lifetime_seconds=21_601)
+    await provider.kill(temporary_ref)
 
     reconnected = OpenSandboxProvider("http://sandbox.test", sandbox_class=SDK)
     assert await reconnected.connect(ref) is SDK.handle

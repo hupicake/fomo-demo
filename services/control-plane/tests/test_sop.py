@@ -33,6 +33,7 @@ from fomo.schemas import (
     TechnicalSpec,
 )
 from fomo.starter import default_starter_manifest
+from tests.helpers import create_user_session
 
 # The fixed project-scope smoke gate executes the protected starter harness by
 # exact path with the structured JSON reporter; tests mirror that command.
@@ -959,7 +960,7 @@ def test_default_starter_manifest_is_digest_pinned_and_exposes_approved_primitiv
 
 @pytest.mark.asyncio
 async def test_sandbox_bootstrap_copies_verified_starter_before_initial_commit(repository, settings) -> None:
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Starter bootstrap")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, "starter-bootstrap", "Create a book management system"
@@ -1185,7 +1186,7 @@ class _PermissionAwareGitignoreSandbox(FakeSandboxProvider):
 
 @pytest.mark.asyncio
 async def test_four_role_sop_creates_version_and_trace(repository, settings) -> None:
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, "message-1", "Create a book management system"
@@ -1344,7 +1345,7 @@ async def test_four_role_sop_creates_version_and_trace(repository, settings) -> 
 
 @pytest.mark.asyncio
 async def test_architect_prompt_uses_configured_file_character_thresholds(repository, settings) -> None:
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, "message-file-character-limit", "Create a book management system"
@@ -1373,7 +1374,7 @@ async def test_architect_prompt_uses_configured_file_character_thresholds(reposi
 async def test_system_gitignore_is_idempotent_and_recovers_a_permission_protected_tamper(
     repository, settings
 ) -> None:
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, "message-gitignore", "Create a book management system"
@@ -1580,7 +1581,7 @@ async def test_reviewer_scope_fails_closed_when_deterministic_union_exceeds_capa
 async def test_verify_reviewer_scope_contract_retries_without_detail_leak(
     repository, settings, monkeypatch
 ) -> None:
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, "reviewer-scope-verify", "Create a book management system"
@@ -1711,7 +1712,7 @@ async def test_reviewer_scope_contract_variants_retry_closed_without_detail_leak
     )
 
     for case, invalid_update, expected_code in invalid_cases:
-        session = await repository.create_guest_session()
+        session = await create_user_session(repository)
         project = await repository.create_project(session.id, f"Library {case}")
         _message, run, _created = await repository.create_message_and_run(
             project.id,
@@ -1775,7 +1776,7 @@ async def test_reviewer_scope_contract_variants_retry_closed_without_detail_leak
 async def test_reviewer_scope_rejects_planned_guess_without_affected_file_evidence(
     repository, settings
 ) -> None:
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, "reviewer-evidence-missing", "Create a book management system"
@@ -1849,7 +1850,7 @@ async def test_reviewer_scope_rejects_planned_guess_without_affected_file_eviden
 async def test_gate_command_extracts_concatenated_paths_and_bounds_reviewer_scope(
     repository, settings
 ) -> None:
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, "gate-path-extraction", "Create a book management system"
@@ -2259,7 +2260,7 @@ def _starter_workspace_changes() -> list[FileChange]:
 
 
 async def _acceptance_context(repository, sandbox: FakeSandboxProvider, message_id: str):
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, message_id, "Create a book management system"
@@ -2314,7 +2315,7 @@ async def test_verify_writes_playwright_smoke_evidence_after_diagnostic_artifact
     """Project gates pass and the single required AC test passes: the report
     stores first, then playwright_smoke evidence points at the real artifact.
     """
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, "message-project-ac-pass", "Create a book management system"
@@ -2408,7 +2409,7 @@ async def test_verify_assertion_failure_writes_failed_evidence_and_blocks_requir
 ) -> None:
     """A failed assertion writes failed evidence, and the required-AC blocker
     is enforced after the Reviewer draft even when the model omits it."""
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, "message-project-ac-fail", "Create a book management system"
@@ -2763,7 +2764,7 @@ async def test_starter_invariants_reject_new_protected_glob_files(repository, se
 
 @pytest.mark.asyncio
 async def test_verify_skips_acceptance_tests_when_a_project_gate_fails(repository, settings) -> None:
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, "message-gate-blocks-ac", "Create a book management system"
@@ -2865,7 +2866,7 @@ def _smoke_evidence_summary(run_id: str, acceptance_id: str, result: str, artifa
 async def test_acceptance_status_follows_latest_closed_scope_acceptance_event(
     repository, settings
 ) -> None:
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, "message-evidence-status", "Create a book management system"
@@ -3754,7 +3755,7 @@ async def test_architect_two_concern_feature_surface_slices_bind_explicit_concer
 async def test_architect_file_plan_over_capacity_retries_before_sandbox_creation(
     repository, settings
 ) -> None:
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, "message-capacity", "Create a book management system"
@@ -3805,7 +3806,7 @@ async def test_architect_file_plan_over_capacity_retries_before_sandbox_creation
 async def test_repeated_architect_file_plan_over_capacity_fails_without_sandbox(
     repository, settings
 ) -> None:
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, "message-capacity-failure", "Create a book management system"
@@ -3923,7 +3924,7 @@ async def test_engineer_file_batch_rejects_immutable_starter_and_non_model_roots
 
 @pytest.mark.asyncio
 async def test_system_managed_file_plan_retries_before_sandbox_creation(repository, settings) -> None:
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, "message-system-path-retry", "Create a book management system"
@@ -3994,7 +3995,7 @@ async def test_system_managed_file_plan_retries_before_sandbox_creation(reposito
 async def test_architect_persistence_adapter_retry_uses_closed_code_without_event_leak(
     repository, settings
 ) -> None:
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, "message-domain-slice-retry", "Create a book management system"
@@ -4065,7 +4066,7 @@ async def test_architect_persistence_adapter_retry_uses_closed_code_without_even
 async def test_architect_feature_surface_retry_uses_closed_component_mapping_code_without_event_leak(
     repository, settings
 ) -> None:
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Catalog")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, "message-feature-surface-retry", "Create a catalog management system"
@@ -4139,7 +4140,7 @@ async def test_architect_feature_surface_retry_uses_closed_component_mapping_cod
 async def test_architect_feature_surface_controller_budget_retries_to_split_surfaces_without_event_leak(
     repository, settings
 ) -> None:
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Catalog")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, "message-feature-surface-budget-retry", "Create a catalog management system"
@@ -4215,7 +4216,7 @@ async def test_architect_feature_surface_controller_budget_retries_to_split_surf
 
 @pytest.mark.asyncio
 async def test_non_architect_contract_violation_uses_generic_schema_correction(repository, settings) -> None:
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, "message-non-architect-contract", "Create a book management system"
@@ -4270,7 +4271,7 @@ async def test_non_architect_contract_violation_uses_generic_schema_correction(r
 
 @pytest.mark.asyncio
 async def test_file_batch_contract_violation_adds_targeted_schema_correction(repository, settings) -> None:
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, "message-file-batch-contract", "Create a book management system"
@@ -4344,7 +4345,7 @@ async def test_file_batch_contract_violation_adds_targeted_schema_correction(rep
 
 @pytest.mark.asyncio
 async def test_file_batch_size_retry_and_failure_include_only_safe_metrics(repository, settings) -> None:
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, "message-file-batch-size-contract", "Create a book management system"
@@ -4455,7 +4456,7 @@ async def test_file_batch_size_retry_and_failure_include_only_safe_metrics(repos
 async def test_file_batch_size_retry_persists_only_the_compact_requested_path(
     repository, settings
 ) -> None:
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, "message-file-batch-size-retry", "Create a book management system"
@@ -4510,7 +4511,7 @@ async def test_file_batch_size_retry_persists_only_the_compact_requested_path(
 
 @pytest.mark.asyncio
 async def test_over_target_file_batch_persists_then_emits_one_safe_warning(repository, settings) -> None:
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, "message-file-batch-over-target", "Create a book management system"
@@ -4551,7 +4552,7 @@ async def test_over_target_file_batch_persists_then_emits_one_safe_warning(repos
 async def test_engineer_non_file_batch_contract_violation_uses_generic_schema_correction(
     repository, settings
 ) -> None:
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, "message-engineer-generic-contract", "Create a book management system"
@@ -4613,7 +4614,7 @@ async def test_engineer_non_file_batch_contract_violation_uses_generic_schema_co
 
 @pytest.mark.asyncio
 async def test_repeated_system_managed_file_plan_fails_without_sandbox(repository, settings) -> None:
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, "message-system-path-failure", "Create a book management system"
@@ -4657,7 +4658,7 @@ async def test_repeated_system_managed_file_plan_fails_without_sandbox(repositor
 
 @pytest.mark.asyncio
 async def test_gateway_failure_does_not_spend_structured_output_retry(repository, settings) -> None:
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, "message-gateway-failure", "Create a book management system"
@@ -4691,7 +4692,7 @@ async def test_gateway_failure_does_not_spend_structured_output_retry(repository
 
 @pytest.mark.asyncio
 async def test_sop_persists_safe_model_transport_retry_telemetry(repository, settings) -> None:
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, "message-retry-telemetry", "Create a book management system"
@@ -4722,7 +4723,7 @@ async def test_sop_persists_safe_model_transport_retry_telemetry(repository, set
 
 @pytest.mark.asyncio
 async def test_engineer_batch_failure_keeps_prior_batch_durable_in_the_current_run(repository, settings) -> None:
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, "message-batch-failure", "Create a book management system"
@@ -4773,7 +4774,7 @@ async def test_blocking_typecheck_routes_one_repair_to_engineer(repository, sett
             self._sandbox(ref).files["pnpm-lock.yaml"] = b"lockfileVersion: '9.0'\n"
             return ref
 
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, "message-repair", "Create a book management system"

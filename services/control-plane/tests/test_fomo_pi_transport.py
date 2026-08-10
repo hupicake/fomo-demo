@@ -17,7 +17,9 @@ from fomo.fomo_pi_ds import (
     PiRequest,
     PiTransportCancelled,
     PiTransportError,
+    RunVirtualKey,
 )
+from fomo.runtime_contract import runtime_profile
 from fomo.sandbox.base import SandboxRef
 
 
@@ -95,7 +97,7 @@ class _FakeCommands:
         stdout: list[str] | None = None,
         stderr: list[str] | None = None,
         wait_for_interrupt: bool = False,
-        exit_code: int = 0,
+        exit_code: int | None = 0,
     ) -> None:
         self.stdout = stdout or []
         self.stderr = stderr or []
@@ -126,7 +128,7 @@ class _FakeCommands:
         self.interrupted.set()
 
     @staticmethod
-    def _execution(*, exit_code: int) -> Any:
+    def _execution(*, exit_code: int | None) -> Any:
         return SimpleNamespace(
             id="execution-1",
             exit_code=exit_code,
@@ -158,6 +160,84 @@ def _invocation(tmp_path: Path) -> PiInvocation:
             timeout_seconds=120,
         )
     )
+
+
+def _preflight_key() -> RunVirtualKey:
+    return RunVirtualKey(
+        run_id="preflight-1",
+        key_alias="fomo-run-preflight-1",
+        duration_seconds=300,
+        secret="sk-preflight-secret",
+        model_aliases=(runtime_profile("deepseek-flash").litellm_alias,),
+    )
+
+
+@pytest.mark.asyncio
+async def test_transport_runs_silent_runtime_probe_with_secret_only_in_environment() -> None:
+    commands = _FakeCommands(
+        stdout=["private provider response sk-preflight-secret"],
+        stderr=["private provider error sk-preflight-secret"],
+    )
+    provider = _FakeProvider(commands)
+    transport = OpenSandboxPiTransport(provider, default_timeout_seconds=300)  # type: ignore[arg-type]
+
+    await transport.preflight_gateway(
+        SandboxRef(id="sandbox-1", project_id="runtime-preflight-1"),
+        _preflight_key(),
+        provider_base_url="http://host.docker.internal:4000/v1",
+        timeout_seconds=195,
+    )
+
+    assert commands.command == "/opt/fomo/bin/fomo-runtime-preflight.mjs"
+    assert "sk-preflight-secret" not in commands.command
+    assert commands.opts.working_directory == "/workspace"
+    assert commands.opts.timeout.total_seconds() == 195
+    assert commands.opts.envs == {
+        "FOMO_PREFLIGHT_PROVIDER_BASE_URL": "http://host.docker.internal:4000/v1",
+        "FOMO_PREFLIGHT_VIRTUAL_KEY": "sk-preflight-secret",
+        "FOMO_PREFLIGHT_ALIASES_JSON": json.dumps(
+            _preflight_key().model_aliases,
+            separators=(",", ":"),
+        ),
+    }
+
+
+@pytest.mark.asyncio
+async def test_transport_runtime_probe_failure_never_exposes_output_or_key() -> None:
+    commands = _FakeCommands(
+        stderr=["private provider error sk-preflight-secret"],
+        exit_code=7,
+    )
+    provider = _FakeProvider(commands)
+    transport = OpenSandboxPiTransport(provider, default_timeout_seconds=300)  # type: ignore[arg-type]
+
+    with pytest.raises(PiTransportError) as failure:
+        await transport.preflight_gateway(
+            SandboxRef(id="sandbox-1", project_id="runtime-preflight-1"),
+            _preflight_key(),
+            provider_base_url="http://host.docker.internal:4000/v1",
+            timeout_seconds=195,
+        )
+
+    rendered = str(failure.value)
+    assert rendered == "OpenSandbox runtime preflight command failed"
+    assert "sk-preflight-secret" not in rendered
+    assert "private provider" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_transport_runtime_probe_requires_explicit_zero_exit_code() -> None:
+    commands = _FakeCommands(exit_code=None)
+    provider = _FakeProvider(commands)
+    transport = OpenSandboxPiTransport(provider, default_timeout_seconds=300)  # type: ignore[arg-type]
+
+    with pytest.raises(PiTransportError, match="runtime preflight command failed"):
+        await transport.preflight_gateway(
+            SandboxRef(id="sandbox-1", project_id="runtime-preflight-1"),
+            _preflight_key(),
+            provider_base_url="http://host.docker.internal:4000/v1",
+            timeout_seconds=195,
+        )
 
 
 @pytest.mark.asyncio

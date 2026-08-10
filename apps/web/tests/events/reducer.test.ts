@@ -362,30 +362,17 @@ describe("run presentation reducer", () => {
     const verifiedGraph = reduceDomainEvent(failedGoal, event(2, "goal_graph.verified", { revision: 2 }));
     expect(verifiedGraph.goalGraph).toEqual(expect.objectContaining({ status: "verified", activeGoalId: null, revision: 2 }));
   });
-  it("projects ordered events into role, command, trace and version evidence", () => {
+  it("projects ordered events into command and version evidence", () => {
     let state = createRunPresentation({
       projectId: "project-library",
       run: { id: "run-library", projectId: "project-library", status: "running", lastSeq: 0 },
     });
 
-    state = reduceDomainEvent(state, event(1, "agent.started", { title: "Clarifying lending rules" }, "product_manager"));
-    state = reduceDomainEvent(state, event(2, "command.started", { commandId: "build", command: "npm run build" }, "engineer"));
-    state = reduceDomainEvent(state, event(3, "command.output", { commandId: "build", chunk: "compiled successfully\n" }, "engineer"));
-    state = reduceDomainEvent(state, event(4, "trace.updated", {
-      items: [{
-        id: "AC-BOOK-SEARCH",
-        title: "Readers can search the catalogue",
-        priority: "must",
-        status: "passed",
-        evidence: [{ id: "test-search", type: "test", label: "search.spec.ts", status: "passed" }],
-      }],
-    }, "reviewer"));
-    state = reduceDomainEvent(state, event(5, "version.created", { versionId: "v1", commitHash: "abc1234", message: "Library catalogue ready" }, "reviewer"));
+    state = reduceDomainEvent(state, event(1, "command.started", { commandId: "build", command: "npm run build" }, "engineer"));
+    state = reduceDomainEvent(state, event(2, "command.output", { commandId: "build", chunk: "compiled successfully\n" }, "engineer"));
+    state = reduceDomainEvent(state, event(3, "version.created", { versionId: "v1", commitHash: "abc1234", message: "Library catalogue ready" }, "reviewer"));
 
-    expect(state.roles.product_manager.status).toBe("working");
     expect(state.commands).toEqual([expect.objectContaining({ id: "build", output: "compiled successfully\n", status: "running" })]);
-    expect(state.trace).toEqual([expect.objectContaining({ id: "AC-BOOK-SEARCH", status: "passed" })]);
-    expect(state.trace[0]?.evidence[0]).toEqual(expect.objectContaining({ id: "test-search", status: "passed" }));
     expect(state.versions).toEqual([expect.objectContaining({ id: "v1", hash: "abc1234" })]);
   });
 
@@ -533,6 +520,150 @@ describe("run presentation reducer", () => {
     }));
   });
 
+  it("shows a closed-set Coding Agent failure reason in the worklog", () => {
+    const initial = createRunPresentation({
+      projectId: "project-library",
+      run: { id: "run-library", projectId: "project-library", status: "running", lastSeq: 0 },
+    });
+
+    const state = reduceDomainEvent(initial, event(1, "pi.failed", {
+      code: "run_token_budget_exceeded",
+      message: "本次任务已达到 Token 使用上限，请缩小任务范围后重试。",
+      stage: "repairing",
+    }));
+
+    expect(state.worklog.at(-1)).toEqual(expect.objectContaining({
+      id: "system:pi:failure",
+      kind: "system",
+      status: "failed",
+      title: "模型运行问题：Token 上限",
+      detail: "本次任务已达到 Token 使用上限，请缩小任务范围后重试。",
+      stage: "repairing",
+    }));
+  });
+
+  it("never renders unknown, malformed, or mismatched pi.failed text", () => {
+    let state = createRunPresentation({
+      projectId: "project-library",
+      run: { id: "run-library", projectId: "project-library", status: "running", lastSeq: 0 },
+    });
+    const privateText = `password=private-value-${"x".repeat(400)}`;
+
+    state = reduceDomainEvent(state, event(1, "pi.failed", {
+      code: "provider_internal_failure",
+      message: privateText,
+    }));
+    expect(state.worklog.at(-1)?.detail).toBe(
+      "Coding Agent 运行失败，请重试；若问题持续发生，请检查服务状态。",
+    );
+
+    state = reduceDomainEvent(state, event(2, "pi.failed", {
+      code: "run_token_budget_exceeded",
+      message: { secret: privateText },
+    }));
+    expect(state.worklog.at(-1)?.detail).toBe(
+      "本次任务已达到 Token 使用上限，请缩小任务范围后重试。",
+    );
+
+    state = reduceDomainEvent(state, event(3, "pi.failed", {
+      code: "run_token_budget_exceeded",
+      message: privateText,
+    }));
+    expect(state.worklog.at(-1)?.detail).toBe(
+      "本次任务已达到 Token 使用上限，请缩小任务范围后重试。",
+    );
+    expect(JSON.stringify(state.worklog)).not.toContain("private-value");
+  });
+
+  it("shows the closed terminal category and never renders run.failed exception text", () => {
+    const initial = createRunPresentation({
+      projectId: "project-library",
+      run: { id: "run-library", projectId: "project-library", status: "running", lastSeq: 0 },
+    });
+    const privateText = "provider response password=private-value";
+
+    const state = reduceDomainEvent(initial, event(1, "run.failed", {
+      status: "failed",
+      code: "model_runtime_protocol_failed",
+      message: privateText,
+      summary: privateText,
+      stack: privateText,
+    }));
+
+    expect(state.worklog.at(-1)).toEqual(expect.objectContaining({
+      id: "system:run:failure",
+      status: "failed",
+      title: "模型运行问题：响应协议失败",
+      detail: "模型运行协议未能完整结束，未获得可用结果。请重试或切换模型。",
+    }));
+    expect(state.problems).toEqual([
+      expect.objectContaining({
+        title: "模型运行协议未能完整结束，未获得可用结果。请重试或切换模型。",
+      }),
+    ]);
+    expect(JSON.stringify(state)).not.toContain("private-value");
+  });
+
+  it("infers only exact safe failure types for legacy generic terminal events", () => {
+    const snapshot = hydrateRunPresentationFromSnapshot({
+      events: [
+        event(4, "goal_graph.failed", { reason: "WorkspaceContractError" }),
+        event(5, "pi.failed", {
+          code: "coding_agent_failed",
+          message: "Coding Agent 运行失败，请重试；若问题持续发生，请检查服务状态。",
+        }),
+        event(6, "run.failed", { status: "failed", summary: "private legacy text" }),
+      ],
+      lastSeq: 6,
+      projectId: "project-library",
+      run: {
+        id: "run-library",
+        projectId: "project-library",
+        status: "failed",
+        errorCode: "coding_agent_failed",
+        lastSeq: 6,
+        updatedAt: "2026-08-10T12:00:00Z",
+      },
+    });
+
+    expect(snapshot.worklog.find((item) => item.id === "system:run:failure")).toEqual(
+      expect.objectContaining({
+        title: "工作区契约失败",
+        detail: expect.stringContaining("工作区安全契约"),
+      }),
+    );
+    expect(snapshot.worklog.find((item) => item.id === "system:pi:failure")).toEqual(
+      expect.objectContaining({ title: "工作区契约失败" }),
+    );
+    expect(snapshot.problems.at(-1)).toEqual(expect.objectContaining({
+      title: expect.stringContaining("工作区安全契约"),
+    }));
+    expect(JSON.stringify(snapshot.worklog)).not.toContain("private legacy text");
+
+    const gatewaySnapshot = hydrateRunPresentationFromSnapshot({
+      events: [
+        event(4, "pi.failed", { errorType: "InferenceGatewayError" }),
+        event(5, "run.failed", { status: "failed", summary: "private provider body" }),
+      ],
+      lastSeq: 5,
+      projectId: "project-library",
+      run: {
+        id: "run-library",
+        projectId: "project-library",
+        status: "failed",
+        errorCode: "coding_agent_failed",
+        lastSeq: 5,
+      },
+    });
+    expect(gatewaySnapshot.worklog.find((item) => item.id === "system:run:failure")).toEqual(
+      expect.objectContaining({
+        title: "模型运行问题：服务不可用",
+        detail: "模型服务暂时不可用，请稍后重试。",
+      }),
+    );
+    expect(JSON.stringify(gatewaySnapshot.worklog)).not.toContain("private provider body");
+  });
+
   it("puts only closed-set project scope verification events into the Release gate", () => {
     let state = createRunPresentation({
       projectId: "project-library",
@@ -618,10 +749,6 @@ describe("run presentation reducer", () => {
   it("replays terminal snapshot events even when the run carries the final cursor", () => {
     const snapshot = hydrateRunPresentationFromSnapshot({
       events: [
-        event(1, "agent.started", {}, "product_manager"),
-        event(2, "agent.completed", {}, "product_manager"),
-        event(3, "agent.started", {}, "architect"),
-        event(4, "agent.completed", {}, "architect"),
         event(5, "run.failed", { summary: "Model route failed" }),
       ],
       lastSeq: 5,
@@ -631,8 +758,6 @@ describe("run presentation reducer", () => {
 
     expect(snapshot.status).toBe("failed");
     expect(snapshot.lastSeq).toBe(5);
-    expect(snapshot.roles.product_manager.status).toBe("completed");
-    expect(snapshot.roles.architect.status).toBe("completed");
   });
 
   it("maps a canonical artifact.upserted to the hyphenated typed AI data part", () => {
@@ -681,97 +806,6 @@ describe("run presentation reducer", () => {
       artifactId: "plan-1",
       kind: "build_plan",
     }, "pi"))).toEqual([]);
-  });
-
-  it("creates a lightweight loading ref from artifact.upserted without inventing fields", () => {
-    const initial = createRunPresentation({
-      projectId: "project-library",
-      run: { id: "run-library", projectId: "project-library", status: "running", lastSeq: 0 },
-    });
-
-    const next = reduceDomainEvent(initial, event(1, "artifact.upserted", {
-      artifactId: "spec-1",
-      kind: "product_spec",
-    }, "product_manager"));
-
-    expect(next.artifacts).toEqual([{
-      id: "spec-1",
-      kind: "product_spec",
-      runId: "run-library",
-      role: "product_manager",
-    }]);
-    expect(next.artifacts[0]).not.toHaveProperty("title");
-    expect(next.artifacts[0]).not.toHaveProperty("summary");
-    expect(next.artifacts[0]).not.toHaveProperty("schemaVersion");
-    expect(next.artifacts[0]).not.toHaveProperty("createdAt");
-    expect(next.artifacts[0]).not.toHaveProperty("content");
-  });
-
-  it("ignores artifact events from an older run after a run switch", () => {
-    const initial = createRunPresentation({
-      projectId: "project-library",
-      run: { id: "run-new", projectId: "project-library", status: "running", lastSeq: 0 },
-    });
-    const stale: DomainEvent = {
-      schemaVersion: 1,
-      eventId: "event-stale",
-      seq: 9,
-      projectId: "project-library",
-      runId: "run-old",
-      kind: "artifact.upserted",
-      role: "product_manager",
-      occurredAt: "2026-08-07T12:00:00.000Z",
-      payload: { artifactId: "spec-old", kind: "product_spec" },
-    };
-
-    const next = reduceDomainEvent(initial, stale);
-
-    expect(next).toBe(initial);
-    expect(next.artifacts).toEqual([]);
-  });
-
-  it("replaces event-derived loading refs with snapshot refs during hydration", () => {
-    const hydrated = hydrateRunPresentationFromSnapshot({
-      events: [event(1, "artifact.upserted", { artifactId: "spec-1", kind: "product_spec" }, "product_manager")],
-      lastSeq: 1,
-      projectId: "project-library",
-      run: { id: "run-library", projectId: "project-library", status: "completed", lastSeq: 1 },
-      artifactRefs: [{
-        id: "spec-1",
-        runId: "run-library",
-        kind: "product_spec",
-        role: "product_manager",
-        schemaVersion: 1,
-        title: "Library product specification",
-        summary: "Readers can manage books.",
-        createdAt: "2026-08-07T12:00:00.000Z",
-      }],
-    });
-
-    expect(hydrated.artifacts).toEqual([expect.objectContaining({
-      id: "spec-1",
-      schemaVersion: 1,
-      title: "Library product specification",
-      summary: "Readers can manage books.",
-    })]);
-    expect(hydrated.artifacts[0]).not.toHaveProperty("markdown");
-    expect(hydrated.artifacts[0]).not.toHaveProperty("content");
-  });
-
-  it("keeps event-derived loading refs when the snapshot carried no refs", () => {
-    const hydrated = hydrateRunPresentationFromSnapshot({
-      events: [event(1, "artifact.upserted", { artifactId: "spec-1", kind: "technical_spec" }, "architect")],
-      lastSeq: 1,
-      projectId: "project-library",
-      run: { id: "run-library", projectId: "project-library", status: "completed", lastSeq: 1 },
-    });
-
-    expect(hydrated.artifacts).toEqual([{
-      id: "spec-1",
-      kind: "technical_spec",
-      runId: "run-library",
-      role: "architect",
-    }]);
   });
 
   it("derives preview.ready runId from the trusted event envelope and consumes url and status only", () => {

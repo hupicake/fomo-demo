@@ -13,6 +13,7 @@ import pytest
 from fomo.api import create_app
 from fomo.persistence.models import ArtifactRecord, RunRecord, SessionRecord
 from fomo.schemas import ProjectResponse, RunResponse
+from tests.helpers import create_user_session
 
 PRODUCT_CONTENT: dict[str, object] = {
     "title": "Library product specification",
@@ -81,12 +82,16 @@ TECHNICAL_CONTENT: dict[str, object] = {
 async def _project_with_run(
     repository, *, message_id: str
 ) -> tuple[SessionRecord, ProjectResponse, RunResponse]:
-    session = await repository.create_guest_session()
+    session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
     _message, run, _created = await repository.create_message_and_run(
         project.id, session.id, message_id, "Build the library", None
     )
     return session, project, run
+
+
+def _use_session(client: httpx.AsyncClient, settings, session: SessionRecord) -> None:
+    client.cookies.set(settings.session_cookie_key, session.id)
 
 
 async def _seed_artifact(
@@ -128,7 +133,7 @@ async def test_snapshot_refs_use_display_run_newest_per_kind_and_canonical_order
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         session, project, run = await _project_with_run(repository, message_id="msg-refs")
-        headers = {"X-FOMO-Session": session.id}
+        _use_session(client, settings, session)
 
         _product_old = await _seed_artifact(
             repository,
@@ -163,7 +168,7 @@ async def test_snapshot_refs_use_display_run_newest_per_kind_and_canonical_order
             created_at=datetime(2026, 1, 4, tzinfo=UTC),
         )
 
-        snapshot = (await client.get(f"/v1/projects/{project.id}", headers=headers)).json()
+        snapshot = (await client.get(f"/v1/projects/{project.id}")).json()
         refs = snapshot["artifactRefs"]
 
         # Canonical Product then Architect order, newest per kind, never content.
@@ -203,7 +208,7 @@ async def test_snapshot_refs_use_display_run_newest_per_kind_and_canonical_order
 
         # The ref never carries content, even when the detail endpoint does.
         detail = (
-            await client.get(f"/v1/runs/{run.id}/artifacts/{product_new}", headers=headers)
+            await client.get(f"/v1/runs/{run.id}/artifacts/{product_new}")
         ).json()
         assert "content" not in product_ref
         assert detail["content"]["title"] == _long_title()
@@ -215,7 +220,7 @@ async def test_snapshot_newest_per_kind_tie_breaks_by_id_desc(repository, settin
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         session, project, run = await _project_with_run(repository, message_id="msg-tie")
-        headers = {"X-FOMO-Session": session.id}
+        _use_session(client, settings, session)
         instant = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
         for artifact_id in ("artifact-aaa", "artifact-bbb", "artifact-ccc"):
             await _seed_artifact(
@@ -227,7 +232,7 @@ async def test_snapshot_newest_per_kind_tie_breaks_by_id_desc(repository, settin
                 created_at=instant,
             )
 
-        snapshot = (await client.get(f"/v1/projects/{project.id}", headers=headers)).json()
+        snapshot = (await client.get(f"/v1/projects/{project.id}")).json()
         refs = snapshot["artifactRefs"]
 
         # One newest record per kind: the same-instant tie is broken by id DESC.
@@ -240,7 +245,7 @@ async def test_snapshot_refs_track_the_display_run_including_terminal(repository
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         session, project, run_one = await _project_with_run(repository, message_id="msg-one")
-        headers = {"X-FOMO-Session": session.id}
+        _use_session(client, settings, session)
         await _seed_artifact(
             repository,
             run_one.id,
@@ -251,9 +256,9 @@ async def test_snapshot_refs_track_the_display_run_including_terminal(repository
         )
 
         # Release the active slot through the real cancel API before run two.
-        cancelled_one = await client.post(f"/v1/runs/{run_one.id}/cancel", headers=headers)
+        cancelled_one = await client.post(f"/v1/runs/{run_one.id}/cancel")
         assert cancelled_one.status_code == 200
-        released_snapshot = (await client.get(f"/v1/projects/{project.id}", headers=headers)).json()
+        released_snapshot = (await client.get(f"/v1/projects/{project.id}")).json()
         assert released_snapshot["activeRun"] is None
 
         _message, run_two, _created = await repository.create_message_and_run(
@@ -283,15 +288,15 @@ async def test_snapshot_refs_track_the_display_run_including_terminal(repository
         assert run_two.id > run_one.id
 
         # The active run is the display run; run one's product ref must not leak.
-        active_snapshot = (await client.get(f"/v1/projects/{project.id}", headers=headers)).json()
+        active_snapshot = (await client.get(f"/v1/projects/{project.id}")).json()
         assert active_snapshot["activeRun"]["id"] == run_two.id
         assert [ref["id"] for ref in active_snapshot["artifactRefs"]] == [technical]
 
         # A terminal display run (active run cleared) still yields its refs;
         # the id DESC tie-break must select run two over same-instant run one.
-        cancelled_two = await client.post(f"/v1/runs/{run_two.id}/cancel", headers=headers)
+        cancelled_two = await client.post(f"/v1/runs/{run_two.id}/cancel")
         assert cancelled_two.status_code == 200
-        terminal_snapshot = (await client.get(f"/v1/projects/{project.id}", headers=headers)).json()
+        terminal_snapshot = (await client.get(f"/v1/projects/{project.id}")).json()
         assert terminal_snapshot["activeRun"] is None
         assert [ref["id"] for ref in terminal_snapshot["artifactRefs"]] == [technical]
         assert terminal_snapshot["artifactRefs"][0]["runId"] == run_two.id
@@ -303,7 +308,7 @@ async def test_artifact_detail_returns_exact_strict_content(repository, settings
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         session, _project, run = await _project_with_run(repository, message_id="msg-detail")
-        headers = {"X-FOMO-Session": session.id}
+        _use_session(client, settings, session)
         product_id = await repository.store_artifact(
             run.id, "product_spec", dict(PRODUCT_CONTENT), role="product_manager"
         )
@@ -312,7 +317,7 @@ async def test_artifact_detail_returns_exact_strict_content(repository, settings
         )
 
         product = (
-            await client.get(f"/v1/runs/{run.id}/artifacts/{product_id}", headers=headers)
+            await client.get(f"/v1/runs/{run.id}/artifacts/{product_id}")
         ).json()
         assert product["id"] == product_id
         assert product["runId"] == run.id
@@ -325,7 +330,7 @@ async def test_artifact_detail_returns_exact_strict_content(repository, settings
         assert isinstance(product["content"], dict)
 
         technical = (
-            await client.get(f"/v1/runs/{run.id}/artifacts/{technical_id}", headers=headers)
+            await client.get(f"/v1/runs/{run.id}/artifacts/{technical_id}")
         ).json()
         assert technical["kind"] == "technical_spec"
         assert technical["role"] == "architect"
@@ -339,7 +344,6 @@ async def test_artifact_detail_fails_closed_with_non_disclosing_404(repository, 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         session_a, project_a, run_a = await _project_with_run(repository, message_id="msg-a")
-        headers_a = {"X-FOMO-Session": session_a.id}
         artifact_a = await repository.store_artifact(
             run_a.id, "product_spec", dict(PRODUCT_CONTENT), role="product_manager"
         )
@@ -347,22 +351,22 @@ async def test_artifact_detail_fails_closed_with_non_disclosing_404(repository, 
             run_a.id, "implementation_plan", {"batches": []}, role="engineer"
         )
         session_b, project_b, run_b = await _project_with_run(repository, message_id="msg-b")
-        headers_b = {"X-FOMO-Session": session_b.id}
         artifact_b = await repository.store_artifact(
             run_b.id, "technical_spec", dict(TECHNICAL_CONTENT), role="architect"
         )
         assert project_a.id != project_b.id
 
         cases = [
-            (f"/v1/runs/{run_a.id}/artifacts/unknown-artifact", headers_a),
-            (f"/v1/runs/unknown-run/artifacts/{artifact_a}", headers_a),
-            (f"/v1/runs/{run_b.id}/artifacts/{artifact_a}", headers_a),
-            (f"/v1/runs/{run_a.id}/artifacts/{artifact_b}", headers_b),
-            (f"/v1/runs/{run_a.id}/artifacts/{artifact_a}", headers_b),
-            (f"/v1/runs/{run_a.id}/artifacts/{hidden}", headers_a),
+            (f"/v1/runs/{run_a.id}/artifacts/unknown-artifact", session_a),
+            (f"/v1/runs/unknown-run/artifacts/{artifact_a}", session_a),
+            (f"/v1/runs/{run_b.id}/artifacts/{artifact_a}", session_a),
+            (f"/v1/runs/{run_a.id}/artifacts/{artifact_b}", session_b),
+            (f"/v1/runs/{run_a.id}/artifacts/{artifact_a}", session_b),
+            (f"/v1/runs/{run_a.id}/artifacts/{hidden}", session_a),
         ]
-        for path, request_headers in cases:
-            response = await client.get(path, headers=request_headers)
+        for path, request_session in cases:
+            _use_session(client, settings, request_session)
+            response = await client.get(path)
             assert response.status_code == 404, path
             body = response.json()
             assert body["title"] == "Not Found"
