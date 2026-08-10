@@ -21,7 +21,7 @@ import {
 } from "node:fs";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
-import { TextDecoder } from "node:util";
+import { isDeepStrictEqual, TextDecoder } from "node:util";
 
 const SCHEMA_VERSION = 1;
 const CODEX_VERSION = "codex-cli 0.147.0";
@@ -51,6 +51,13 @@ const MAX = Object.freeze({
   publicTextCharacters: 16_000,
   assistantCharacters: 4 * 1024 * 1024,
 });
+const STRICT_UNSUPPORTED_SCHEMA_KEYWORDS = new Set([
+  "default", "minLength", "maxLength", "pattern", "format",
+  "minItems", "maxItems", "minimum", "maximum", "exclusiveMinimum",
+  "exclusiveMaximum", "multipleOf", "minProperties", "maxProperties",
+  "patternProperties", "unevaluatedProperties", "propertyNames", "contains",
+  "minContains", "maxContains", "dependentRequired", "dependentSchemas",
+]);
 const fatalUtf8 = new TextDecoder("utf-8", { fatal: true });
 
 const ENV = Object.freeze({
@@ -168,19 +175,39 @@ function normalizeStrictOutputSchema(schema) {
   const visit = (node) => {
     if (!node || typeof node !== "object" || Array.isArray(node)) return;
 
-    for (const key of ["$defs", "definitions", "properties", "patternProperties", "dependentSchemas"]) {
+    if (Object.hasOwn(node, "oneOf")) {
+      if (!Array.isArray(node.oneOf)) throw new Error("output schema oneOf is invalid");
+      if (node.anyOf !== undefined && !Array.isArray(node.anyOf)) {
+        throw new Error("output schema anyOf is invalid");
+      }
+      node.anyOf = [...(node.anyOf ?? []), ...node.oneOf];
+      delete node.oneOf;
+    }
+    if (Object.hasOwn(node, "const")) {
+      if (
+        node.enum !== undefined &&
+        (!Array.isArray(node.enum) || !node.enum.some((value) => isDeepStrictEqual(value, node.const)))
+      ) {
+        throw new Error("output schema const conflicts with enum");
+      }
+      node.enum = [node.const];
+      delete node.const;
+    }
+    delete node.discriminator;
+    for (const key of STRICT_UNSUPPORTED_SCHEMA_KEYWORDS) delete node[key];
+
+    for (const key of ["$defs", "definitions", "properties"]) {
       const schemas = node[key];
       if (schemas && typeof schemas === "object" && !Array.isArray(schemas)) {
         for (const child of Object.values(schemas)) visit(child);
       }
     }
-    for (const key of ["allOf", "anyOf", "oneOf", "prefixItems"]) {
+    for (const key of ["allOf", "anyOf", "prefixItems"]) {
       const schemas = node[key];
       if (Array.isArray(schemas)) for (const child of schemas) visit(child);
     }
     for (const key of [
-      "additionalProperties", "unevaluatedProperties", "items", "contains",
-      "propertyNames", "not", "if", "then", "else", "contentSchema",
+      "additionalProperties", "items", "not", "if", "then", "else", "contentSchema",
     ]) {
       const child = node[key];
       if (Array.isArray(child)) for (const item of child) visit(item);
@@ -201,6 +228,7 @@ function normalizeStrictOutputSchema(schema) {
   visit(schema);
   return schema;
 }
+
 function bounded(value, maximum = MAX.publicTextCharacters) {
   const text = String(value ?? "");
   return text.length <= maximum ? text : `${text.slice(0, maximum)}…[truncated]`;
