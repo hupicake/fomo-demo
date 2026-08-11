@@ -10,6 +10,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { spawn, spawnSync } from "node:child_process";
 import {
   existsSync,
   lstatSync,
@@ -30,6 +31,9 @@ const STRUCTURED_OUTPUT_TOOL = "submit_structured_output";
 const DEFAULT_SDK_PATH = "/opt/fomo/pi/lib/node_modules/@opencode-ai/sdk/dist/v2/index.js";
 const SESSION_MAPPING_SCHEMA_VERSION = 2;
 const SESSION_POLICY_VERSION = 1;
+const WATCHDOG_MODE = "--fomo-opencode-watchdog";
+const WATCHDOG_SCHEMA_VERSION = 1;
+const WATCHDOG_INPUT_LIMIT = 128 * 1024;
 
 const SESSION_STAGE = Object.freeze({
   planner: "planner",
@@ -231,7 +235,7 @@ let stderrBytes = 0;
 let runStartedAt = 0;
 let timeoutHandle = null;
 let heartbeatHandle = null;
-let sdkServer = null;
+let serverWatchdog = null;
 let sdkClient = null;
 let sdkSessionId = null;
 let sseAbortController = null;
@@ -253,6 +257,7 @@ let sawTurn = false;
 let terminalError = null;
 let privateRuntimeDir = null;
 let workspaceInvocation = null;
+let terminalEmitted = false;
 
 function bounded(value, limit) {
   const text = String(value ?? "");
@@ -290,6 +295,425 @@ function diagnostic(message) {
   const visible = bytes.subarray(0, Math.max(0, LIMITS.stderrBytes - stderrBytes));
   stderrBytes += visible.length;
   if (visible.length) process.stderr.write(visible);
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function childExited(child) {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
+function ownedPid(owner) {
+  return owner?.pid ?? owner?.child?.pid ?? null;
+}
+
+function processGroupAlive(owner) {
+  const pid = ownedPid(owner);
+  if (!pid || (owner.child && childExited(owner.child) && !owner.detached)) return false;
+  try {
+    process.kill(owner.detached ? -pid : pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+function isLoopbackServerUrl(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" && url.hostname === "127.0.0.1" && Boolean(url.port) &&
+      !url.username && !url.password && url.pathname === "/" && !url.search && !url.hash;
+  } catch {
+    return false;
+  }
+}
+
+function signalOwnedProcessTree(owner, signal) {
+  const pid = ownedPid(owner);
+  if (!pid) return false;
+  if (process.platform === "win32") {
+    if (signal === "SIGKILL") {
+      const result = spawnSync("taskkill", ["/pid", String(pid), "/T", "/F"], { windowsHide: true });
+      return !result.error && result.status === 0;
+    }
+    return owner.child?.kill(signal) ?? false;
+  }
+  try {
+    process.kill(owner.detached ? -pid : pid, signal);
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") return false;
+    throw error;
+  }
+}
+
+async function waitForProcessTreeExit(owner, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (processGroupAlive(owner) && Date.now() < deadline) await delay(25);
+  return !processGroupAlive(owner);
+}
+
+async function stopOwnedProcessTree(owner, termGraceMs) {
+  if (!owner) return true;
+  if (owner.closePromise) return owner.closePromise;
+  owner.closePromise = (async () => {
+    if (processGroupAlive(owner)) {
+      signalOwnedProcessTree(owner, "SIGTERM");
+      if (!await waitForProcessTreeExit(owner, termGraceMs)) {
+        signalOwnedProcessTree(owner, "SIGKILL");
+        if (!await waitForProcessTreeExit(owner, 2000)) return false;
+      }
+    }
+    if (owner.child && !childExited(owner.child)) {
+      await Promise.race([
+        new Promise((resolve) => owner.child.once("exit", resolve)),
+        delay(250),
+      ]);
+    }
+    return !processGroupAlive(owner);
+  })();
+  return owner.closePromise;
+}
+
+function createOwnedOpenCodeServer({ bin, cwd, config, environment, startupTimeoutMs }) {
+  const child = spawn(bin, ["serve", "--hostname=127.0.0.1", "--port=0"], {
+    cwd,
+    detached: true,
+    env: { ...environment, OPENCODE_CONFIG_CONTENT: JSON.stringify(config) },
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  const server = { child, pid: child.pid, detached: true, closePromise: null, ready: null };
+  server.ready = new Promise((resolve, reject) => {
+    let settledStartup = false;
+    let buffered = "";
+    const settle = (operation, value) => {
+      if (settledStartup) return;
+      settledStartup = true;
+      clearTimeout(timer);
+      operation(value);
+    };
+    const timer = setTimeout(
+      () => settle(reject, new Error("OpenCode server startup timed out")),
+      startupTimeoutMs,
+    );
+    child.stdout?.on("data", (chunk) => {
+      if (settledStartup) return;
+      buffered = `${buffered}${chunk}`.slice(-LIMITS.stderrBytes);
+      const lines = buffered.split("\n");
+      buffered = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line.startsWith("opencode server listening")) continue;
+        const match = line.match(/on\s+(https?:\/\/[^\s]+)/);
+        if (!match) {
+          settle(reject, new Error("OpenCode server emitted an invalid listening address"));
+          return;
+        }
+        settle(resolve, match[1]);
+        return;
+      }
+    });
+    // Keep both pipes flowing for the full server lifetime. OpenCode output is
+    // private runtime data and is intentionally never copied into bridge logs.
+    child.stderr?.on("data", () => {});
+    child.on("error", (error) => settle(reject, error));
+    child.on("exit", () => settle(reject, new Error("OpenCode server exited during startup")));
+  });
+  return server;
+}
+
+function createLineChannel(stream, maximumBytes) {
+  const queue = [];
+  const waiters = [];
+  let buffered = "";
+  let closed = false;
+  let resolveClosed;
+  const closedPromise = new Promise((resolve) => { resolveClosed = resolve; });
+  const deliver = (value) => {
+    const waiter = waiters.shift();
+    if (waiter) waiter(value);
+    else queue.push(value);
+  };
+  const finish = () => {
+    if (closed) return;
+    closed = true;
+    resolveClosed();
+    while (waiters.length) waiters.shift()(null);
+  };
+  stream.setEncoding("utf8");
+  stream.on("data", (chunk) => {
+    if (closed) return;
+    buffered += chunk;
+    if (Buffer.byteLength(buffered) > maximumBytes) {
+      finish();
+      stream.destroy();
+      return;
+    }
+    const lines = buffered.split("\n");
+    buffered = lines.pop() ?? "";
+    for (const line of lines) deliver(line);
+  });
+  stream.on("end", finish);
+  stream.on("close", finish);
+  stream.on("error", finish);
+  return {
+    closed: closedPromise,
+    next() {
+      if (queue.length) return Promise.resolve(queue.shift());
+      if (closed) return Promise.resolve(null);
+      return new Promise((resolve) => waiters.push(resolve));
+    },
+  };
+}
+
+function watchdogWrite(record) {
+  try { process.stdout.write(`${JSON.stringify(record)}\n`); } catch { /* parent is already gone */ }
+}
+
+function watchdogInit(line) {
+  let value;
+  try { value = JSON.parse(line); } catch { throw new Error("invalid watchdog initialization"); }
+  if (
+    !value || Array.isArray(value) || value.schemaVersion !== WATCHDOG_SCHEMA_VERSION || value.type !== "init" ||
+    typeof value.bin !== "string" || !value.bin.startsWith("/") || value.bin.includes("\0") ||
+    typeof value.cwd !== "string" || !value.cwd.startsWith("/") || value.cwd.includes("\0") ||
+    !value.config || typeof value.config !== "object" || Array.isArray(value.config) ||
+    !value.environment || typeof value.environment !== "object" || Array.isArray(value.environment) ||
+    Object.entries(value.environment).some(([key, item]) =>
+      !key || key === "OPENCODE_CONFIG_CONTENT" || typeof item !== "string" || item.includes("\0")) ||
+    !Number.isInteger(value.termGraceMs) || value.termGraceMs < 250 || value.termGraceMs > 5000 ||
+    value.startupTimeoutMs !== 10_000
+  ) {
+    throw new Error("unsafe watchdog initialization");
+  }
+  return value;
+}
+
+function watchdogCommand(line) {
+  let value;
+  try { value = JSON.parse(line); } catch { return null; }
+  if (!value || value.schemaVersion !== WATCHDOG_SCHEMA_VERSION) return null;
+  return ["stop", "disarm"].includes(value.type) ? value.type : null;
+}
+
+async function watchdogMain() {
+  if (process.platform === "win32") process.exit(2);
+  process.stdout.on("error", () => {});
+  const input = createLineChannel(process.stdin, WATCHDOG_INPUT_LIMIT);
+  let server = null;
+  let stopping = null;
+  let exiting = false;
+  const stopServer = async (termGraceMs) => {
+    if (!stopping) stopping = stopOwnedProcessTree(server, termGraceMs);
+    return stopping;
+  };
+  const exitAfterCleanup = async (code, termGraceMs = 1000) => {
+    if (exiting) return;
+    exiting = true;
+    try { await stopServer(termGraceMs); } catch { /* exact KILL was already attempted */ }
+    process.exit(code);
+  };
+  process.on("SIGTERM", () => void exitAfterCleanup(143));
+  process.on("SIGINT", () => void exitAfterCleanup(130));
+  process.on("uncaughtException", () => void exitAfterCleanup(1));
+  process.on("unhandledRejection", () => void exitAfterCleanup(1));
+
+  try {
+    const line = await input.next();
+    if (line === null) return await exitAfterCleanup(1);
+    const init = watchdogInit(line);
+    server = createOwnedOpenCodeServer({
+      bin: init.bin,
+      cwd: init.cwd,
+      config: init.config,
+      environment: init.environment,
+      startupTimeoutMs: init.startupTimeoutMs,
+    });
+    watchdogWrite({ schemaVersion: WATCHDOG_SCHEMA_VERSION, type: "spawned", pid: server.pid });
+    const ready = await Promise.race([
+      server.ready.then((url) => ({ url })),
+      input.closed.then(() => ({ parentClosed: true })),
+    ]);
+    if (ready.parentClosed) return await exitAfterCleanup(0, init.termGraceMs);
+    watchdogWrite({ schemaVersion: WATCHDOG_SCHEMA_VERSION, type: "ready", url: ready.url });
+
+    while (true) {
+      const commandLine = await input.next();
+      if (commandLine === null) return await exitAfterCleanup(0, init.termGraceMs);
+      if (watchdogCommand(commandLine) !== "stop") return await exitAfterCleanup(1, init.termGraceMs);
+      const stopped = await stopServer(init.termGraceMs);
+      watchdogWrite({ schemaVersion: WATCHDOG_SCHEMA_VERSION, type: "stopped", stopped });
+      if (!stopped) return await exitAfterCleanup(2, init.termGraceMs);
+      while (true) {
+        const finalLine = await input.next();
+        if (finalLine === null || watchdogCommand(finalLine) === "disarm") process.exit(0);
+        return await exitAfterCleanup(1, init.termGraceMs);
+      }
+    }
+  } catch {
+    watchdogWrite({ schemaVersion: WATCHDOG_SCHEMA_VERSION, type: "failed" });
+    await exitAfterCleanup(1);
+  }
+}
+
+function serverEnvironment() {
+  const allowed = [
+    "PATH", "HOME", "SHELL", "USER", "LOGNAME", "LANG", "LC_ALL", "TZ", "TERM", "COLORTERM",
+    "TMPDIR", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME",
+    "OPENCODE_CONFIG_DIR", "OPENCODE_TEST_HOME", "OPENCODE_DISABLE_PROJECT_CONFIG", "OPENCODE_PURE",
+    "OPENCODE_DISABLE_AUTOUPDATE", "OPENCODE_DISABLE_MODELS_FETCH",
+    "OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER", "OPENCODE_EXPERIMENTAL",
+    // Root-owned, image-pinned frontend toolchain. Workspace commands spawned
+    // by OpenCode must retain the offline pnpm store and bundled Chromium;
+    // these values contain no provider credentials or host proxy settings.
+    "PNPM_HOME", "npm_config_store_dir", "NPM_CONFIG_PREFIX",
+    "COREPACK_HOME", "COREPACK_DEFAULT_TO_LATEST", "PLAYWRIGHT_BROWSERS_PATH", "CI",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
+  ];
+  if (process.env.NODE_ENV === "test") {
+    allowed.push("FOMO_TEST_TRACE_FILE", "FOMO_TEST_PROCESS_DIR");
+  }
+  return Object.fromEntries(allowed.flatMap((name) =>
+    typeof process.env[name] === "string" ? [[name, process.env[name]]] : []));
+}
+
+function watchdogEnvironment() {
+  return Object.fromEntries(["PATH", "LANG", "LC_ALL", "TZ"].flatMap((name) =>
+    typeof process.env[name] === "string" ? [[name, process.env[name]]] : []));
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolveValue, rejectValue) => {
+    resolve = resolveValue;
+    reject = rejectValue;
+  });
+  return { promise, resolve, reject, settled: false };
+}
+
+function settleDeferred(target, operation, value) {
+  if (target.settled) return;
+  target.settled = true;
+  operation.call(target, value);
+}
+
+function createOpenCodeWatchdog(config, termGraceMs) {
+  if (process.platform === "win32") {
+    throw new OpenCodeRuntimeFailure({ reason: "watchdog_process_groups_unsupported" });
+  }
+  const child = spawn(process.execPath, [fileURLToPath(import.meta.url), WATCHDOG_MODE], {
+    cwd: workspace,
+    detached: true,
+    env: watchdogEnvironment(),
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  const ready = deferred();
+  const stopped = deferred();
+  const controller = {
+    child,
+    pid: child.pid,
+    detached: true,
+    serverPid: null,
+    ready: ready.promise,
+    stopped: stopped.promise,
+    closePromise: null,
+  };
+  let buffered = "";
+  child.stdin.on("error", () => {});
+  child.stderr.on("data", () => {});
+  child.stdout.on("data", (chunk) => {
+    buffered = `${buffered}${chunk}`;
+    if (Buffer.byteLength(buffered) > WATCHDOG_INPUT_LIMIT) {
+      settleDeferred(ready, ready.reject, new Error("OpenCode watchdog output exceeded its limit"));
+      return;
+    }
+    const lines = buffered.split("\n");
+    buffered = lines.pop() ?? "";
+    for (const line of lines) {
+      let event;
+      try { event = JSON.parse(line); } catch { event = null; }
+      if (!event || event.schemaVersion !== WATCHDOG_SCHEMA_VERSION) continue;
+      if (event.type === "spawned" && Number.isInteger(event.pid) && event.pid > 1) {
+        controller.serverPid = event.pid;
+      } else if (event.type === "ready" && isLoopbackServerUrl(event.url) && controller.serverPid) {
+        settleDeferred(ready, ready.resolve, event.url);
+      } else if (event.type === "stopped" && typeof event.stopped === "boolean") {
+        settleDeferred(stopped, stopped.resolve, event.stopped);
+      } else if (event.type === "failed") {
+        settleDeferred(ready, ready.reject, new Error("OpenCode watchdog failed"));
+        settleDeferred(stopped, stopped.resolve, false);
+      }
+    }
+  });
+  child.on("error", (error) => {
+    settleDeferred(ready, ready.reject, error);
+    settleDeferred(stopped, stopped.resolve, false);
+  });
+  child.on("exit", () => {
+    settleDeferred(ready, ready.reject, new Error("OpenCode watchdog exited before readiness"));
+    settleDeferred(stopped, stopped.resolve, false);
+  });
+  child.stdin.write(`${JSON.stringify({
+    schemaVersion: WATCHDOG_SCHEMA_VERSION,
+    type: "init",
+    bin: openCodeBin,
+    cwd: workspace,
+    config,
+    environment: serverEnvironment(),
+    termGraceMs,
+    startupTimeoutMs: 10_000,
+  })}\n`);
+  return controller;
+}
+
+async function waitForChildExit(child, timeoutMs) {
+  if (childExited(child)) return true;
+  await Promise.race([
+    new Promise((resolve) => child.once("exit", resolve)),
+    delay(timeoutMs),
+  ]);
+  return childExited(child);
+}
+
+async function stopOpenCodeWatchdog(controller, termGraceMs) {
+  if (!controller) return true;
+  if (controller.closePromise) return controller.closePromise;
+  controller.closePromise = (async () => {
+    if (!childExited(controller.child) && controller.child.stdin.writable) {
+      controller.child.stdin.write(`${JSON.stringify({
+        schemaVersion: WATCHDOG_SCHEMA_VERSION,
+        type: "stop",
+      })}\n`);
+    }
+    let serverStopped = await Promise.race([
+      controller.stopped,
+      delay(termGraceMs + 2500).then(() => false),
+    ]);
+    const fallbackOwner = controller.serverPid
+      ? { pid: controller.serverPid, detached: true, closePromise: null }
+      : null;
+    if (serverStopped && fallbackOwner) serverStopped = !processGroupAlive(fallbackOwner);
+    if (!serverStopped && fallbackOwner) {
+      serverStopped = await stopOwnedProcessTree(fallbackOwner, termGraceMs);
+    }
+    if (serverStopped && !childExited(controller.child) && controller.child.stdin.writable) {
+      controller.child.stdin.write(`${JSON.stringify({
+        schemaVersion: WATCHDOG_SCHEMA_VERSION,
+        type: "disarm",
+      })}\n`);
+    }
+    controller.child.stdin.end();
+    let watchdogStopped = await waitForChildExit(controller.child, 1000);
+    if (!watchdogStopped) {
+      watchdogStopped = await stopOwnedProcessTree(controller, 250);
+    }
+    return serverStopped && watchdogStopped;
+  })();
+  return controller.closePromise;
 }
 
 function required(name) {
@@ -1455,18 +1879,29 @@ async function cleanup({ abort = true } = {}) {
   stopTimers();
   if (sseAbortController) sseAbortController.abort();
   if (abort) await abortSession();
-  try { sdkServer?.close(); } catch { diagnostic("cannot stop OpenCode server"); }
-  sdkServer = null;
+  let serverStopped = true;
+  try {
+    serverStopped = await stopOpenCodeWatchdog(
+      serverWatchdog,
+      Math.min(5000, Math.max(250, graceSeconds * 1000)),
+    );
+  } catch {
+    serverStopped = false;
+  }
+  serverWatchdog = null;
+  if (!serverStopped) diagnostic("OpenCode server/watchdog process trees did not stop within their cleanup deadline");
   if (privateRuntimeDir) {
     try { rmSync(privateRuntimeDir, { recursive: true, force: true }); } catch { /* best effort */ }
     privateRuntimeDir = null;
   }
+  return serverStopped;
 }
 
 async function fail(code, exitCode = 1) {
-  if (["failed", "completed"].includes(lifecycle)) return;
+  if (terminalEmitted) return;
   const phase = lifecycle;
   lifecycle = "failed";
+  terminalEmitted = true;
   const stableCode = Object.hasOwn(BRIDGE_FAILURE_MESSAGES, code) ? code : "opencode_failed";
   emit("failed", { code: stableCode, message: BRIDGE_FAILURE_MESSAGES[stableCode], phase });
   await cleanup();
@@ -1485,21 +1920,16 @@ async function main() {
       configurePrivateEnvironment();
     });
     const sdk = await runtimeStep(() => loadSdk());
-    if (typeof sdk.createOpencodeServer !== "function" || typeof sdk.createOpencodeClient !== "function") {
+    if (typeof sdk.createOpencodeClient !== "function") {
       throw new OpenCodeRuntimeFailure({ reason: "sdk_v2_unavailable" });
     }
-    const abortController = new AbortController();
-    sdkServer = await runtimeStep(() => sdk.createOpencodeServer({
-      hostname: "127.0.0.1",
-      port: 0,
-      timeout: 10_000,
-      signal: abortController.signal,
-      config: openCodeConfig(),
-    }));
-    if (!sdkServer?.url || !String(sdkServer.url).startsWith("http://127.0.0.1:")) {
+    const termGraceMs = Math.min(5000, Math.max(250, graceSeconds * 1000));
+    serverWatchdog = runtimeValue(() => createOpenCodeWatchdog(openCodeConfig(), termGraceMs));
+    const serverUrl = await runtimeStep(() => serverWatchdog.ready);
+    if (!isLoopbackServerUrl(serverUrl)) {
       throw new OpenCodeRuntimeFailure({ reason: "non_loopback_server" });
     }
-    sdkClient = runtimeValue(() => sdk.createOpencodeClient({ baseUrl: sdkServer.url, directory: workspace }));
+    sdkClient = runtimeValue(() => sdk.createOpencodeClient({ baseUrl: serverUrl, directory: workspace }));
     const resolved = await runtimeStep(() => resolveSession(sdkClient));
     sdkSessionId = resolved.id;
     const capabilities = await inspectCapabilities(sdkClient, resolved.session, resolved.stage);
@@ -1600,8 +2030,12 @@ async function main() {
     }
     const stats = summarizeMessages(finalMessages);
     const state = stateFromStats(stats);
-    await cleanup({ abort: false });
+    if (!await cleanup({ abort: false })) {
+      throw new OpenCodeRuntimeFailure({ reason: "server_cleanup_timeout" });
+    }
+    if (shuttingDown || lifecycle !== "finalizing" || terminalEmitted) return;
     lifecycle = "completed";
+    terminalEmitted = true;
     emit("completed", {
       sessionId,
       state,
@@ -1634,12 +2068,15 @@ async function onSignal(signal, code) {
   await fail("terminated", code);
 }
 
-process.on("SIGTERM", () => void onSignal("SIGTERM", 143));
-process.on("SIGINT", () => void onSignal("SIGINT", 130));
-process.on("uncaughtException", () => void fail("bridge_error", 1));
-process.on("unhandledRejection", () => void fail("bridge_error", 1));
-
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
-if (isMain) void main();
+if (isMain && process.argv[2] === WATCHDOG_MODE) {
+  void watchdogMain();
+} else if (isMain) {
+  process.on("SIGTERM", () => void onSignal("SIGTERM", 143));
+  process.on("SIGINT", () => void onSignal("SIGINT", 130));
+  process.on("uncaughtException", () => void fail("bridge_error", 1));
+  process.on("unhandledRejection", () => void fail("bridge_error", 1));
+  void main();
+}
 
 export { sanitizePublic, summarizeMessages };

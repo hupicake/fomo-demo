@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { chmod, mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -162,27 +162,10 @@ function trace(kind, value = {}) {
   appendFileSync(process.env.FOMO_TEST_TRACE_FILE, JSON.stringify({ kind, ...value }) + "\n");
 }
 
-export async function createOpencodeServer(options) {
-  if (process.env.FOMO_TEST_RUNTIME_FAILURE === "1") {
-    throw new Error("OpenCode server leaked password=runtime-private-value");
-  }
-  if (options.hostname !== "127.0.0.1" || options.port !== 0) throw new Error("not loopback");
-  if (process.env.OPENCODE_DISABLE_PROJECT_CONFIG !== "1" || process.env.OPENCODE_PURE !== "1") {
-    throw new Error("unsafe OpenCode environment");
-  }
-  if (options.config.plugin.length !== 0 || Object.keys(options.config.mcp).length !== 0) {
-    throw new Error("plugins or MCP were enabled");
-  }
-  if (options.config.provider["fomo-litellm"].options.apiKey !== "sk-run-secret") {
-    throw new Error("missing run-scoped key");
-  }
-  trace("server.config", {
-    variants: options.config.provider["fomo-litellm"].models[expectedModelID].variants,
-  });
-  return { url: "http://127.0.0.1:4096", close() {} };
-}
-
 export function createOpencodeClient() {
+  if (process.env.FOMO_TEST_RUNTIME_FAILURE === "1") {
+    throw new Error("OpenCode client leaked password=runtime-private-value");
+  }
   return {
     tool: {
       async list(parameters) {
@@ -304,6 +287,9 @@ export function createOpencodeClient() {
           type: "message.updated",
           properties: { sessionID: activeSessionID, info: workspaceAssistant() },
         });
+        if (process.env.FOMO_TEST_HANG_PROMPT === "1") {
+          return { data: undefined, response: { status: 204 } };
+        }
         pushEvent({
           type: "message.part.updated",
           properties: {
@@ -380,6 +366,72 @@ export function createOpencodeClient() {
 }
 `;
 
+const FAKE_SERVER = String.raw`#!/usr/bin/env node
+import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { join } from "node:path";
+
+const config = JSON.parse(process.env.OPENCODE_CONFIG_CONTENT);
+const modelID = Object.keys(config.provider["fomo-litellm"].models)[0];
+if (!process.argv.includes("serve") || !process.argv.includes("--hostname=127.0.0.1") || !process.argv.includes("--port=0")) process.exit(2);
+if (process.env.OPENCODE_DISABLE_PROJECT_CONFIG !== "1" || process.env.OPENCODE_PURE !== "1") process.exit(3);
+if (config.plugin.length !== 0 || Object.keys(config.mcp).length !== 0) process.exit(4);
+if (config.provider["fomo-litellm"].options.apiKey !== "sk-run-secret") process.exit(5);
+if (process.env.PNPM_HOME !== "/opt/fomo/pnpm") process.exit(6);
+if (process.env.npm_config_store_dir !== "/opt/fomo/pnpm/store") process.exit(7);
+if (process.env.COREPACK_HOME !== "/opt/fomo/corepack") process.exit(8);
+if (process.env.PLAYWRIGHT_BROWSERS_PATH !== "/ms-playwright") process.exit(9);
+if (process.env.CI !== "true") process.exit(10);
+if (process.env.FOMO_TEST_TRACE_FILE) {
+  appendFileSync(
+    process.env.FOMO_TEST_TRACE_FILE,
+    JSON.stringify({ kind: "server.config", variants: config.provider["fomo-litellm"].models[modelID].variants }) + "\n",
+  );
+}
+
+const processDirectory = process.env.FOMO_TEST_PROCESS_DIR;
+if (processDirectory) {
+  process.on("SIGTERM", () => writeFileSync(join(processDirectory, "server.term"), "received\n"));
+  writeFileSync(join(processDirectory, "server.pid"), String(process.pid));
+  writeFileSync(join(processDirectory, "watchdog.pid"), String(process.ppid));
+  spawn(process.execPath, [join(processDirectory, "stubborn-child.mjs")], {
+    env: process.env,
+    stdio: "ignore",
+  });
+  const deadline = Date.now() + 3000;
+  while (!existsSync(join(processDirectory, "grandchild.pid")) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  if (!existsSync(join(processDirectory, "grandchild.pid"))) process.exit(2);
+}
+
+process.stdout.write("opencode server listening on http://127.0.0.1:4096\n");
+setInterval(() => {}, 1000);
+`;
+
+const STUBBORN_CHILD = String.raw`
+import { writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { join } from "node:path";
+const directory = process.env.FOMO_TEST_PROCESS_DIR;
+process.on("SIGTERM", () => writeFileSync(join(directory, "child.term"), "received\n"));
+writeFileSync(join(directory, "child.pid"), String(process.pid));
+spawn(process.execPath, [join(directory, "stubborn-grandchild.mjs")], {
+  env: process.env,
+  stdio: "ignore",
+});
+setInterval(() => {}, 1000);
+`;
+
+const STUBBORN_GRANDCHILD = String.raw`
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
+const directory = process.env.FOMO_TEST_PROCESS_DIR;
+process.on("SIGTERM", () => writeFileSync(join(directory, "grandchild.term"), "received\n"));
+writeFileSync(join(directory, "grandchild.pid"), String(process.pid));
+setInterval(() => {}, 1000);
+`;
+
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "fomo-opencode-bridge-"));
   const workspace = join(root, "workspace");
@@ -387,7 +439,7 @@ async function fixture() {
   const bin = join(root, "opencode");
   const sdk = join(root, "fake-sdk.mjs");
   await mkdir(workspace);
-  await writeFile(bin, "#!/bin/sh\nexit 0\n");
+  await writeFile(bin, FAKE_SERVER);
   await chmod(bin, 0o755);
   await writeFile(sdk, FAKE_SDK);
   return { root, workspace, state, bin, sdk };
@@ -411,19 +463,42 @@ function baseEnvironment(paths) {
     FOMO_PI_MODEL_REF: "fomo-litellm/fomo-pi-build",
     FOMO_PI_CONTEXT_WINDOW: "200000",
     FOMO_PI_GRACE_SECONDS: "1",
+    PNPM_HOME: "/opt/fomo/pnpm",
+    npm_config_store_dir: "/opt/fomo/pnpm/store",
+    NPM_CONFIG_PREFIX: "/opt/fomo/pi",
+    COREPACK_HOME: "/opt/fomo/corepack",
+    COREPACK_DEFAULT_TO_LATEST: "0",
+    PLAYWRIGHT_BROWSERS_PATH: "/ms-playwright",
+    CI: "true",
   };
 }
 
-async function runBridge(environment) {
+async function runBridge(environment, options = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [BRIDGE.pathname], { env: environment });
     let stdout = "";
     let stderr = "";
+    let lineBuffer = "";
+    let signalSent = false;
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
       reject(new Error(`bridge test timed out\nstdout=${stdout}\nstderr=${stderr}`));
-    }, 10_000);
-    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    }, options.timeoutMs ?? 10_000);
+    child.stdout.on("data", (chunk) => {
+      const text = String(chunk);
+      stdout += text;
+      lineBuffer += text;
+      const lines = lineBuffer.split("\n");
+      lineBuffer = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line || signalSent || !options.signalWhen) continue;
+        let record;
+        try { record = JSON.parse(line); } catch { continue; }
+        if (!options.signalWhen(record)) continue;
+        signalSent = true;
+        setTimeout(() => child.kill(options.signal ?? "SIGTERM"), options.signalDelayMs ?? 0);
+      }
+    });
     child.stderr.on("data", (chunk) => { stderr += chunk; });
     child.on("error", reject);
     child.on("exit", (code, signal) => {
@@ -431,6 +506,64 @@ async function runBridge(environment) {
       resolve({ code, signal, stdout, stderr });
     });
   });
+}
+
+function processExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") return false;
+    throw error;
+  }
+}
+
+async function waitForProcessesToExit(pids, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+  while (pids.some(processExists) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return pids.filter(processExists);
+}
+
+async function stubbornProcessDirectory(paths) {
+  const directory = join(paths.root, "process-tree");
+  await mkdir(directory);
+  await writeFile(join(directory, "stubborn-child.mjs"), STUBBORN_CHILD);
+  await writeFile(join(directory, "stubborn-grandchild.mjs"), STUBBORN_GRANDCHILD);
+  return directory;
+}
+
+async function processTreePids(directory, { watchdog = false } = {}) {
+  const names = ["server", "child", "grandchild", ...(watchdog ? ["watchdog"] : [])];
+  return Promise.all(names.map(async (name) =>
+    Number(await readFile(join(directory, `${name}.pid`), "utf8"))));
+}
+
+function sentinelEnvironment() {
+  const modelID = "fomo-pi-build";
+  return {
+    PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin",
+    PNPM_HOME: "/opt/fomo/pnpm",
+    npm_config_store_dir: "/opt/fomo/pnpm/store",
+    NPM_CONFIG_PREFIX: "/opt/fomo/pi",
+    COREPACK_HOME: "/opt/fomo/corepack",
+    COREPACK_DEFAULT_TO_LATEST: "0",
+    PLAYWRIGHT_BROWSERS_PATH: "/ms-playwright",
+    CI: "true",
+    OPENCODE_DISABLE_PROJECT_CONFIG: "1",
+    OPENCODE_PURE: "1",
+    OPENCODE_CONFIG_CONTENT: JSON.stringify({
+      plugin: [],
+      mcp: {},
+      provider: {
+        "fomo-litellm": {
+          options: { apiKey: "sk-run-secret" },
+          models: { [modelID]: { variants: {} } },
+        },
+      },
+    }),
+  };
 }
 
 function envelopes(stdout) {
@@ -471,6 +604,110 @@ test("OpenCode bridge emits compatible public text lifecycle without leaking sec
     plannerSessionId: null,
     workspaceSessionId: "oc-workspace-1",
   });
+});
+
+test("OpenCode bridge force-reaps only its owned stubborn server process group", async () => {
+  const paths = await fixture();
+  const processDirectory = await stubbornProcessDirectory(paths);
+
+  const startedAt = Date.now();
+  const result = await runBridge({
+    ...baseEnvironment(paths),
+    FOMO_TEST_PROCESS_DIR: processDirectory,
+  });
+  const elapsedMs = Date.now() - startedAt;
+
+  assert.equal(result.code, 0, `${result.stderr}\n${result.stdout}`);
+  assert.ok(elapsedMs >= 900, `expected TERM grace before KILL, completed in ${elapsedMs}ms`);
+  const names = ["server", "child", "grandchild"];
+  const pids = await processTreePids(processDirectory);
+  for (const name of names) {
+    assert.equal(
+      await readFile(join(processDirectory, `${name}.term`), "utf8"),
+      "received\n",
+      `${name} did not receive graceful TERM`,
+    );
+  }
+  assert.deepEqual(
+    await waitForProcessesToExit(pids),
+    [],
+    "the exact owned server process group was not fully reaped",
+  );
+});
+
+test("SIGTERM during finalizing emits one failed terminal and still reaps the process trees", async () => {
+  const paths = await fixture();
+  const processDirectory = await stubbornProcessDirectory(paths);
+  const result = await runBridge(
+    { ...baseEnvironment(paths), FOMO_TEST_PROCESS_DIR: processDirectory },
+    {
+      signal: "SIGTERM",
+      signalWhen: (record) => record.type === "pi.event" && record.payload?.kind === "agent_settled",
+    },
+  );
+
+  assert.equal(result.code, 143, `${result.stderr}\n${result.stdout}`);
+  assert.equal(result.signal, null);
+  const terminals = envelopes(result.stdout)
+    .filter((record) => ["failed", "completed"].includes(record.type));
+  assert.equal(terminals.length, 1, JSON.stringify(terminals));
+  assert.equal(terminals[0].type, "failed");
+  assert.equal(terminals[0].payload.code, "terminated");
+  assert.equal(terminals[0].payload.phase, "finalizing");
+  assert.deepEqual(
+    await waitForProcessesToExit(await processTreePids(processDirectory, { watchdog: true })),
+    [],
+    "finalizing cancellation left an owned process behind",
+  );
+});
+
+test("watchdog reaps the server tree after bridge SIGKILL without touching another server", async () => {
+  const paths = await fixture();
+  const processDirectory = await stubbornProcessDirectory(paths);
+  const sentinel = spawn(
+    paths.bin,
+    ["serve", "--hostname=127.0.0.1", "--port=0"],
+    {
+      cwd: paths.workspace,
+      detached: true,
+      env: sentinelEnvironment(),
+      stdio: "ignore",
+    },
+  );
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(processExists(sentinel.pid), true, "external sentinel did not start");
+    const result = await runBridge(
+      {
+        ...baseEnvironment(paths),
+        FOMO_TEST_PROCESS_DIR: processDirectory,
+        FOMO_TEST_HANG_PROMPT: "1",
+      },
+      {
+        signal: "SIGKILL",
+        signalWhen: (record) => record.type === "started",
+      },
+    );
+
+    assert.equal(result.code, null, `${result.stderr}\n${result.stdout}`);
+    assert.equal(result.signal, "SIGKILL");
+    const pids = await processTreePids(processDirectory, { watchdog: true });
+    const watchdogSnapshot = spawnSync(
+      "ps",
+      ["eww", "-p", String(pids.at(-1)), "-o", "command="],
+      { encoding: "utf8" },
+    ).stdout;
+    assert.doesNotMatch(watchdogSnapshot, /sk-run-secret|private prompt/);
+    assert.deepEqual(
+      await waitForProcessesToExit(pids, 5000),
+      [],
+      "watchdog left an owned process behind after bridge SIGKILL",
+    );
+    assert.equal(processExists(sentinel.pid), true, "cleanup touched the external server sentinel");
+  } finally {
+    try { process.kill(-sentinel.pid, "SIGKILL"); } catch { /* already stopped */ }
+    await waitForProcessesToExit([sentinel.pid]);
+  }
 });
 
 test("OpenCode bridge sends off as a real non-thinking provider variant", async () => {
