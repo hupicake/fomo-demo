@@ -74,6 +74,7 @@ export function RuntimeSelector({
   );
 
   useEffect(() => {
+    if (disabled) return;
     if (!selectedFrameworkOption?.available) return;
     const allowedProfiles = profiles.filter(
       (profile) => profile.available && (
@@ -98,6 +99,7 @@ export function RuntimeSelector({
         : allowedThinking[0];
     if (thinking && thinking !== selectedThinking) onSelectThinking(thinking);
   }, [
+    disabled,
     onSelectProfile,
     onSelectThinking,
     options?.defaultProfileId,

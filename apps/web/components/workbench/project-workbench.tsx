@@ -691,6 +691,15 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
     || isWaitingForUser
     || chatStatus === "streaming"
     || chatStatus === "submitted";
+  const displayedAgentFramework = runActive
+    ? presentation.agentFramework ?? activeAgentFramework
+    : activeAgentFramework;
+  const displayedProfileId = runActive
+    ? presentation.runtime?.profileId ?? activeProfileId
+    : activeProfileId;
+  const displayedThinking = runActive
+    ? presentation.runtime?.thinking ?? activeThinking
+    : activeThinking;
   const canStopRun = runActive;
   const connectionNotice = connectionMessage
     || chatError?.message
@@ -790,9 +799,9 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
                       }}
                       onSelectThinking={setSelectedThinking}
                       options={runtimeOptions}
-                      selectedAgentFramework={activeAgentFramework}
-                      selectedProfileId={activeProfileId}
-                      selectedThinking={activeThinking}
+                      selectedAgentFramework={displayedAgentFramework}
+                      selectedProfileId={displayedProfileId}
+                      selectedThinking={displayedThinking}
                     />
                     {isWaitingForUser ? (
                       <PromptInputTools className="basis-full sm:basis-auto">
