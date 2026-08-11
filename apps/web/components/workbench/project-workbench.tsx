@@ -33,7 +33,7 @@ import { TaskSummary } from "@/components/workbench/goal-graph-panel";
 import { RunMetrics } from "@/components/workbench/run-metrics";
 import { RunTokenUsage } from "@/components/workbench/run-token-usage";
 import { RunTimeline } from "@/components/workbench/role-timeline";
-import { RuntimeBadge, RuntimeSelector, findRuntimeProfile } from "@/components/workbench/runtime-selector";
+import { RuntimeBadge, RuntimeSelector, findRuntimeProfile, frameworkProfileThinkingLevels } from "@/components/workbench/runtime-selector";
 import { Workspace } from "@/components/workbench/workspace";
 import { derivePreviewState, deriveRunState, type PreviewStateView, type RunStateView } from "@/lib/run-state";
 import { ApiProblem, controlPlane, controlPlaneUrl } from "@/lib/api/client";
@@ -345,10 +345,10 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
     (profile) => profile.profileId === runtimeOptions?.defaultProfileId,
   ) ?? compatibleAvailableProfiles[0];
   const activeProfileId = activeProfile?.profileId;
-  const compatibleThinkingLevels = activeProfile?.thinkingLevels.filter(
-    (level) => activeFramework?.compatibleThinkingLevels == null
-      || activeFramework.compatibleThinkingLevels.includes(level),
-  ) ?? [];
+  const compatibleThinkingLevels = frameworkProfileThinkingLevels(
+    activeFramework,
+    activeProfile,
+  );
   const activeThinking = compatibleThinkingLevels.includes(selectedThinking ?? "")
     ? selectedThinking
     : compatibleThinkingLevels.includes(activeProfile?.defaultThinking ?? "")

@@ -350,11 +350,24 @@ function normalizeAgentFramework(value: unknown): AgentFrameworkOption | undefin
         const value = text(item);
         return value ? [value] : [];
       });
+  const compatibleThinkingLevelsByProfile = Object.fromEntries(
+    Object.entries(record(
+      source.compatibleThinkingLevelsByProfile
+        ?? source.compatible_thinking_levels_by_profile,
+    )).flatMap(([profileId, levels]) => {
+      if (!profileId) return [];
+      return [[profileId, toArray(levels).flatMap((item) => {
+        const level = text(item);
+        return level ? [level] : [];
+      })]];
+    }),
+  );
   return {
     id,
     label,
     compatibleProfileIds,
     compatibleThinkingLevels,
+    compatibleThinkingLevelsByProfile,
     available: Boolean(source.available),
     ...(disabledReason ? { disabledReason } : {}),
   };

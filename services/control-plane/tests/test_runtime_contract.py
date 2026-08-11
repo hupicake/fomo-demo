@@ -7,6 +7,7 @@ from fomo.runtime_contract import (
     PREVIOUS_RUNTIME_POLICY_VERSION,
     RuntimeContractError,
     compatible_profile_ids_for_agent_framework,
+    compatible_thinking_levels_for_agent_framework_profile,
     resolve_runtime_contract,
     runtime_contract_from_storage,
     validate_agent_framework_runtime,
@@ -80,3 +81,16 @@ def test_codex_runtime_compatibility_is_a_closed_gpt_only_contract() -> None:
         validate_agent_framework_runtime("codex", "gpt-5.6", "off")
     with pytest.raises(RuntimeContractError, match="pi, opencode, or codex"):
         compatible_profile_ids_for_agent_framework("unknown")
+
+
+def test_opencode_deepseek_only_admits_non_thinking_runtime() -> None:
+    assert compatible_thinking_levels_for_agent_framework_profile(
+        "opencode", "deepseek-flash"
+    ) == ("off",)
+    assert compatible_thinking_levels_for_agent_framework_profile(
+        "pi", "deepseek-flash"
+    ) == ("off", "high")
+
+    validate_agent_framework_runtime("opencode", "deepseek-flash", "off")
+    with pytest.raises(RuntimeContractError, match="opencode.*deepseek-flash"):
+        validate_agent_framework_runtime("opencode", "deepseek-flash", "high")

@@ -145,6 +145,16 @@ CODEX_COMPATIBLE_THINKING_LEVELS = (
     "xhigh",
 )
 
+# OpenCode 1.18.x implements JSON-schema output as a required synthetic tool
+# call. DeepSeek V4 rejects forced tool choice while thinking is enabled, so a
+# run-wide OpenCode + DeepSeek contract can only admit non-thinking mode: every
+# run must pass the structured planner before reaching the workspace stage.
+_FRAMEWORK_PROFILE_THINKING_OVERRIDES: dict[
+    tuple[str, str], tuple[str, ...]
+] = {
+    (AgentFramework.opencode.value, "deepseek-flash"): ("off",),
+}
+
 # Runtime v1 froze a cumulative token ceiling. It remains accepted only when
 # reading historical runs; runtime v2 stores ``NULL`` to mean that cumulative
 # usage is unlimited. Context windows, per-minute throughput, provider output
@@ -216,6 +226,29 @@ def compatible_profile_ids_for_agent_framework(
     return frozenset(_PROFILE_BY_ID)
 
 
+def compatible_thinking_levels_for_agent_framework_profile(
+    agent_framework: object,
+    profile_id: str,
+) -> tuple[str, ...]:
+    """Return thinking levels proven compatible with one framework/model pair."""
+
+    validate_agent_framework_profile(agent_framework, profile_id)
+    framework = normalize_agent_framework(agent_framework)
+    profile = runtime_profile(profile_id)
+    override = _FRAMEWORK_PROFILE_THINKING_OVERRIDES.get(
+        (framework, profile_id)
+    )
+    if override is not None:
+        return override
+    if framework == AgentFramework.codex.value:
+        return tuple(
+            level
+            for level in profile.thinking_levels
+            if level in CODEX_COMPATIBLE_THINKING_LEVELS
+        )
+    return profile.thinking_levels
+
+
 def validate_agent_framework_profile(
     agent_framework: object,
     profile_id: str,
@@ -236,14 +269,15 @@ def validate_agent_framework_runtime(
 ) -> None:
     """Validate the complete framework-owned inference boundary."""
 
-    validate_agent_framework_profile(agent_framework, profile_id)
     framework = normalize_agent_framework(agent_framework)
-    if (
-        framework == AgentFramework.codex.value
-        and thinking not in CODEX_COMPATIBLE_THINKING_LEVELS
-    ):
+    compatible_levels = compatible_thinking_levels_for_agent_framework_profile(
+        framework,
+        profile_id,
+    )
+    if thinking not in compatible_levels:
         raise RuntimeContractError(
-            "codex agent framework does not support this thinking level"
+            f"{framework} agent framework does not support this thinking level "
+            f"for {profile_id}"
         )
 
 
@@ -473,6 +507,7 @@ __all__ = [
     "allowed_litellm_aliases",
     "allowed_model_refs",
     "compatible_profile_ids_for_agent_framework",
+    "compatible_thinking_levels_for_agent_framework_profile",
     "context_limit_for_model_ref",
     "parse_enabled_profile_ids",
     "legacy_runtime_contract",

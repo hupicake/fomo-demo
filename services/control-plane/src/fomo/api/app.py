@@ -39,8 +39,10 @@ from fomo.runtime_contract import (
     RUNTIME_PROFILES,
     RuntimeContractError,
     compatible_profile_ids_for_agent_framework,
+    compatible_thinking_levels_for_agent_framework_profile,
     legacy_runtime_contract,
     resolve_runtime_contract,
+    runtime_profile,
     validate_agent_framework_profile,
     validate_agent_framework_runtime,
 )
@@ -314,6 +316,33 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
                 )
             else:
                 framework_disabled_reason = None
+            thinking_levels_by_profile = {
+                profile.profile_id: list(
+                    compatible_thinking_levels_for_agent_framework_profile(
+                        framework.value,
+                        profile.profile_id,
+                    )
+                )
+                for profile in RUNTIME_PROFILES
+                if profile.profile_id in enabled_profile_ids
+                and profile.profile_id in compatible_profile_ids
+            }
+            legacy_compatible_thinking_levels: list[str] | None = None
+            if framework is AgentFramework.codex:
+                legacy_compatible_thinking_levels = list(
+                    CODEX_COMPATIBLE_THINKING_LEVELS
+                )
+            elif framework is AgentFramework.opencode:
+                pair_levels = list(thinking_levels_by_profile.values())
+                legacy_compatible_thinking_levels = (
+                    [
+                        level
+                        for level in pair_levels[0]
+                        if all(level in levels for levels in pair_levels[1:])
+                    ]
+                    if pair_levels
+                    else []
+                )
             framework_options.append(
                 AgentFrameworkOption(
                     id=framework,
@@ -324,11 +353,8 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
                         if profile.profile_id in enabled_profile_ids
                         and profile.profile_id in compatible_profile_ids
                     ],
-                    compatible_thinking_levels=(
-                        list(CODEX_COMPATIBLE_THINKING_LEVELS)
-                        if framework is AgentFramework.codex
-                        else None
-                    ),
+                    compatible_thinking_levels_by_profile=thinking_levels_by_profile,
+                    compatible_thinking_levels=legacy_compatible_thinking_levels,
                     available=framework_available,
                     disabled_reason=framework_disabled_reason,
                 )
@@ -569,9 +595,23 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
         if selected_profile not in available_profiles:
             raise HTTPException(status_code=422, detail="runtime profile is unavailable")
         try:
+            selected_thinking = payload.thinking
+            if selected_thinking is None:
+                profile = runtime_profile(selected_profile)
+                compatible_thinking_levels = (
+                    compatible_thinking_levels_for_agent_framework_profile(
+                        selected_agent_framework,
+                        selected_profile,
+                    )
+                )
+                selected_thinking = (
+                    profile.default_thinking
+                    if profile.default_thinking in compatible_thinking_levels
+                    else compatible_thinking_levels[0]
+                )
             runtime_contract = resolve_runtime_contract(
                 selected_profile,
-                payload.thinking,
+                selected_thinking,
                 inference_tpm_limit=settings.run_inference_tpm_limit,
                 max_spend_micros=int(settings.run_max_spend * 1_000_000),
             )
@@ -702,10 +742,17 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
             raise HTTPException(status_code=422, detail="agent framework is not enabled")
         selected_profile = payload.profile_id or source.runtime.profile_id
         selected_thinking = payload.thinking
-        if selected_thinking is None and selected_profile == source.runtime.profile_id:
-            selected_thinking = source.runtime.thinking
         try:
             validate_agent_framework_profile(selected_agent_framework, selected_profile)
+            if selected_thinking is None and selected_profile == source.runtime.profile_id:
+                compatible_thinking_levels = (
+                    compatible_thinking_levels_for_agent_framework_profile(
+                        selected_agent_framework,
+                        selected_profile,
+                    )
+                )
+                if source.runtime.thinking in compatible_thinking_levels:
+                    selected_thinking = source.runtime.thinking
         except RuntimeContractError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if selected_profile not in settings.runtime_enabled_profiles:
@@ -719,6 +766,19 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
         if selected_profile not in available_profiles:
             raise HTTPException(status_code=422, detail="runtime profile is unavailable")
         try:
+            if selected_thinking is None:
+                profile = runtime_profile(selected_profile)
+                compatible_thinking_levels = (
+                    compatible_thinking_levels_for_agent_framework_profile(
+                        selected_agent_framework,
+                        selected_profile,
+                    )
+                )
+                selected_thinking = (
+                    profile.default_thinking
+                    if profile.default_thinking in compatible_thinking_levels
+                    else compatible_thinking_levels[0]
+                )
             runtime_contract = resolve_runtime_contract(
                 selected_profile,
                 selected_thinking,

@@ -402,3 +402,57 @@ async def test_recovery_explicitly_restarts_from_base_and_freezes_selected_runti
             select(RunRecord).where(RunRecord.id == source.id)
         )
         assert source_record is not None and source_record.status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_recovery_reselects_pair_compatible_thinking(
+    repository, settings, monkeypatch
+) -> None:
+    async def discovered(_self) -> set[str]:
+        return {"fomo-pi-deepseek-flash"}
+
+    monkeypatch.setattr(
+        "fomo.api.app.LiteLLMRunKeyClient.discover_model_aliases", discovered
+    )
+    owner = await create_user_session(repository)
+    project = await repository.create_project(owner.id, "Compatible recovery")
+    _message, source, _created = await repository.create_message_and_run(
+        project.id,
+        owner.id,
+        "deepseek-high-source",
+        "Build with Pi and DeepSeek thinking enabled",
+    )
+    assert source.runtime.profile_id == "deepseek-flash"
+    assert source.runtime.thinking == "high"
+    await repository.request_cancel(source.id)
+
+    configured = replace(
+        settings,
+        agent_framework="direct_pi",
+        agent_enabled_frameworks=("pi", "opencode"),
+        litellm_api_key="sk-test-management",
+        runtime_enabled_profiles=("deepseek-flash",),
+        runtime_default_profile="deepseek-flash",
+    )
+    app = create_app(configured, repository)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            f"/v1/runs/{source.id}/recover",
+            headers={
+                **_headers(configured, owner.id),
+                "Idempotency-Key": "compatible-runtime-recovery",
+            },
+            json={
+                "clientMessageId": "compatible-runtime-recovery",
+                "content": "Continue with OpenCode using a compatible runtime.",
+                "agentFramework": "opencode",
+            },
+        )
+
+    assert response.status_code == 202
+    recovered = response.json()["run"]
+    assert recovered["agentFramework"] == "opencode"
+    assert recovered["runtime"]["profileId"] == "deepseek-flash"
+    assert recovered["runtime"]["thinking"] == "off"

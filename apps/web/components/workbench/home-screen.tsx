@@ -16,7 +16,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { ThemeToggle } from "@/components/theme/theme-toggle";
 import { AccountEntry } from "@/components/workbench/account-entry";
 import { RunTokenUsage } from "@/components/workbench/run-token-usage";
-import { RuntimeSelector } from "@/components/workbench/runtime-selector";
+import { RuntimeSelector, frameworkProfileThinkingLevels } from "@/components/workbench/runtime-selector";
 import { ApiProblem, controlPlane } from "@/lib/api/client";
 import type { AgentFrameworkId, ProjectSummary, RuntimeOptionsResponse } from "@/lib/contracts";
 import { useAuthStore } from "@/lib/store/auth-store";
@@ -199,10 +199,10 @@ export function HomeScreen() {
     ?? defaultAvailableProfile
     ?? compatibleAvailableProfiles[0];
   const activeProfileId = activeProfile?.profileId;
-  const compatibleThinkingLevels = activeProfile?.thinkingLevels.filter(
-    (level) => activeFramework?.compatibleThinkingLevels == null
-      || activeFramework.compatibleThinkingLevels.includes(level),
-  ) ?? [];
+  const compatibleThinkingLevels = frameworkProfileThinkingLevels(
+    activeFramework,
+    activeProfile,
+  );
   const activeThinking = compatibleThinkingLevels.includes(selectedThinking ?? "")
     ? selectedThinking
     : compatibleThinkingLevels.includes(activeProfile?.defaultThinking ?? "")
@@ -306,10 +306,7 @@ export function HomeScreen() {
     const profile = compatibleProfiles.find((candidate) => candidate.profileId === source?.profileId)
       ?? compatibleProfiles.find((candidate) => candidate.profileId === runtimeOptions?.defaultProfileId)
       ?? compatibleProfiles[0];
-    const thinkingLevels = profile?.thinkingLevels.filter(
-      (level) => framework?.compatibleThinkingLevels == null
-        || framework.compatibleThinkingLevels.includes(level),
-    ) ?? [];
+    const thinkingLevels = frameworkProfileThinkingLevels(framework, profile);
     const thinking = thinkingLevels.includes(source?.thinking ?? "")
       ? source?.thinking
       : thinkingLevels.includes(profile?.defaultThinking ?? "")

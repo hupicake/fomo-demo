@@ -10,7 +10,7 @@ import {
   PromptInputSelectTrigger,
   PromptInputSelectValue,
 } from "@/components/ai-elements/prompt-input";
-import type { AgentFrameworkId, RuntimeOptionsResponse, RuntimeProfileOption, RunRuntimeResponse } from "@/lib/contracts";
+import type { AgentFrameworkId, AgentFrameworkOption, RuntimeOptionsResponse, RuntimeProfileOption, RunRuntimeResponse } from "@/lib/contracts";
 
 const thinkingLevelLabels: Record<string, string> = {
   off: "关闭",
@@ -37,6 +37,24 @@ export function formatTokenBudget(tokens: number): string {
 export function findRuntimeProfile(options: RuntimeOptionsResponse | undefined, profileId: string | undefined): RuntimeProfileOption | undefined {
   if (!options || !profileId) return undefined;
   return options.profiles.find((profile) => profile.profileId === profileId);
+}
+
+export function frameworkProfileThinkingLevels(
+  framework: AgentFrameworkOption | undefined,
+  profile: RuntimeProfileOption | undefined,
+): string[] {
+  if (!profile) return [];
+  const pairLevels = framework
+    && Object.prototype.hasOwnProperty.call(
+      framework.compatibleThinkingLevelsByProfile,
+      profile.profileId,
+    )
+    ? framework.compatibleThinkingLevelsByProfile[profile.profileId]
+    : undefined;
+  const allowedLevels = pairLevels ?? framework?.compatibleThinkingLevels;
+  return profile.thinkingLevels.filter(
+    (level) => allowedLevels == null || allowedLevels.includes(level),
+  );
 }
 
 export function RuntimeSelector({
@@ -68,9 +86,9 @@ export function RuntimeSelector({
     ? profiles.filter((profile) => compatibleProfileIds.includes(profile.profileId))
     : profiles;
   const selectedProfile = findRuntimeProfile(options, selectedProfileId);
-  const frameworkThinkingLevels = selectedFrameworkOption?.compatibleThinkingLevels;
-  const thinkingLevels = (selectedProfile?.thinkingLevels ?? []).filter(
-    (level) => frameworkThinkingLevels == null || frameworkThinkingLevels.includes(level),
+  const thinkingLevels = frameworkProfileThinkingLevels(
+    selectedFrameworkOption,
+    selectedProfile,
   );
 
   useEffect(() => {
@@ -88,9 +106,9 @@ export function RuntimeSelector({
     if (!profile) return;
     if (profile.profileId !== selectedProfileId) onSelectProfile(profile.profileId);
 
-    const allowedThinking = profile.thinkingLevels.filter(
-      (level) => selectedFrameworkOption.compatibleThinkingLevels == null
-        || selectedFrameworkOption.compatibleThinkingLevels.includes(level),
+    const allowedThinking = frameworkProfileThinkingLevels(
+      selectedFrameworkOption,
+      profile,
     );
     const thinking = allowedThinking.includes(selectedThinking ?? "")
       ? selectedThinking
@@ -126,10 +144,7 @@ export function RuntimeSelector({
     if (!profile) return;
     if (profile.profileId !== selectedProfileId) onSelectProfile(profile.profileId);
 
-    const allowedThinking = profile.thinkingLevels.filter(
-      (level) => framework.compatibleThinkingLevels == null
-        || framework.compatibleThinkingLevels.includes(level),
-    );
+    const allowedThinking = frameworkProfileThinkingLevels(framework, profile);
     const thinking = allowedThinking.includes(selectedThinking ?? "")
       ? selectedThinking
       : allowedThinking.includes(profile.defaultThinking)

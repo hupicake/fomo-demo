@@ -776,6 +776,8 @@ class AgentFrameworkOption(SchemaModel):
     id: AgentFramework
     label: str
     compatible_profile_ids: list[str]
+    compatible_thinking_levels_by_profile: dict[str, list[str]]
+    # Retained for older clients that only understand a framework-wide filter.
     compatible_thinking_levels: list[str] | None = None
     available: bool
     disabled_reason: str | None = None

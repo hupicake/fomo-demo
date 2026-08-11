@@ -145,6 +145,7 @@ export interface AgentFrameworkOption {
   label: string;
   compatibleProfileIds: string[];
   compatibleThinkingLevels: string[] | null;
+  compatibleThinkingLevelsByProfile: Record<string, string[]>;
   available: boolean;
   disabledReason?: string | null;
 }

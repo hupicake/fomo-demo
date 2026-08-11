@@ -240,6 +240,10 @@ async def test_agent_framework_is_available_frozen_and_idempotent(
                 "id": "pi",
                 "label": "Pi",
                 "compatibleProfileIds": ["gpt-5.6", "deepseek-flash"],
+                "compatibleThinkingLevelsByProfile": {
+                    "gpt-5.6": ["off", "low", "medium", "high", "xhigh", "max"],
+                    "deepseek-flash": ["off", "high"],
+                },
                 "compatibleThinkingLevels": None,
                 "available": True,
                 "disabledReason": None,
@@ -248,7 +252,11 @@ async def test_agent_framework_is_available_frozen_and_idempotent(
                 "id": "opencode",
                 "label": "OpenCode",
                 "compatibleProfileIds": ["gpt-5.6", "deepseek-flash"],
-                "compatibleThinkingLevels": None,
+                "compatibleThinkingLevelsByProfile": {
+                    "gpt-5.6": ["off", "low", "medium", "high", "xhigh", "max"],
+                    "deepseek-flash": ["off"],
+                },
+                "compatibleThinkingLevels": ["off"],
                 "available": True,
                 "disabledReason": None,
             },
@@ -256,6 +264,9 @@ async def test_agent_framework_is_available_frozen_and_idempotent(
                 "id": "codex",
                 "label": "Codex",
                 "compatibleProfileIds": ["gpt-5.6"],
+                "compatibleThinkingLevelsByProfile": {
+                    "gpt-5.6": ["low", "medium", "high", "xhigh"],
+                },
                 "compatibleThinkingLevels": [
                     "low",
                     "medium",
@@ -279,7 +290,24 @@ async def test_agent_framework_is_available_frozen_and_idempotent(
         assert created.status_code == 202
         run_id = created.json()["run"]["id"]
         assert created.json()["run"]["agentFramework"] == "opencode"
+        assert created.json()["run"]["runtime"]["thinking"] == "off"
         assert await repository.get_run_agent_framework(run_id) == "opencode"
+
+        incompatible_thinking = await client.post(
+            f"/v1/projects/{project_id}/messages",
+            headers={**headers, "Idempotency-Key": "opencode-deepseek-high"},
+            json={
+                "clientMessageId": "opencode-deepseek-high",
+                "content": "Reject the incompatible planner protocol",
+                "agentFramework": "opencode",
+                "profileId": "deepseek-flash",
+                "thinking": "high",
+            },
+        )
+        assert incompatible_thinking.status_code == 422
+        assert "does not support this thinking level" in incompatible_thinking.json()[
+            "detail"
+        ]
 
         replay = await client.post(
             f"/v1/projects/{project_id}/messages",
@@ -380,6 +408,9 @@ async def test_codex_framework_requires_gpt_and_replays_after_rollout_is_disable
             "id": "codex",
             "label": "Codex",
             "compatibleProfileIds": ["gpt-5.6"],
+            "compatibleThinkingLevelsByProfile": {
+                "gpt-5.6": ["low", "medium", "high", "xhigh"],
+            },
             "compatibleThinkingLevels": [
                 "low",
                 "medium",

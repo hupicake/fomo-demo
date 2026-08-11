@@ -18,6 +18,7 @@ let workspaceComplete = false;
 let workspaceError = null;
 const eventQueue = [];
 const eventWaiters = [];
+const expectedModelID = process.env.FOMO_PI_MODEL_REF.split("/").at(-1);
 
 const permissions = {
   planner: [
@@ -68,7 +69,7 @@ function assistant({
     time: { created: 2, ...(completed ? { completed: 3 } : {}) },
     ...(error ? { error } : {}),
     parentID,
-    modelID: "fomo-pi-build",
+    modelID: expectedModelID,
     providerID: "fomo-litellm",
     mode: "build",
     agent: "build",
@@ -86,7 +87,7 @@ function user(id = "user-1") {
     role: "user",
     time: { created: 1 },
     agent: "build",
-    model: { providerID: "fomo-litellm", modelID: "fomo-pi-build" },
+    model: { providerID: "fomo-litellm", modelID: expectedModelID },
   };
 }
 
@@ -175,6 +176,9 @@ export async function createOpencodeServer(options) {
   if (options.config.provider["fomo-litellm"].options.apiKey !== "sk-run-secret") {
     throw new Error("missing run-scoped key");
   }
+  trace("server.config", {
+    variants: options.config.provider["fomo-litellm"].models[expectedModelID].variants,
+  });
   return { url: "http://127.0.0.1:4096", close() {} };
 }
 
@@ -183,7 +187,7 @@ export function createOpencodeClient() {
     tool: {
       async list(parameters) {
         trace("tool.list", parameters);
-        if (parameters.provider !== "fomo-litellm" || parameters.model !== "fomo-pi-build") {
+        if (parameters.provider !== "fomo-litellm" || parameters.model !== expectedModelID) {
           throw new Error("wrong tool registry model");
         }
         const ids = ["read", "glob", "grep", "list", "bash", "todowrite"];
@@ -215,7 +219,12 @@ export function createOpencodeClient() {
           throw new Error("wrong stage permission profile");
         }
         activeSessionID = "oc-" + stage + "-1";
-        trace("session.create", { sessionID: activeSessionID, stage, permission: parameters.permission });
+        trace("session.create", {
+          sessionID: activeSessionID,
+          stage,
+          permission: parameters.permission,
+          variant: parameters.model.variant,
+        });
         return { data: sessionRecord(activeSessionID) };
       },
       async get(parameters) {
@@ -256,6 +265,7 @@ export function createOpencodeClient() {
           sessionID: parameters.sessionID,
           structured: parameters.format?.type === "json_schema",
           hasTools: Object.hasOwn(parameters, "tools"),
+          variant: parameters.variant,
         });
         // Real SDK prompt completion follows its streamed tool terminal events.
         await new Promise((resolve) => setTimeout(resolve, 5));
@@ -280,6 +290,7 @@ export function createOpencodeClient() {
           sessionID: parameters.sessionID,
           messageID: parameters.messageID,
           hasTools: Object.hasOwn(parameters, "tools"),
+          variant: parameters.variant,
         });
         pushEvent({
           type: "message.updated",
@@ -460,6 +471,42 @@ test("OpenCode bridge emits compatible public text lifecycle without leaking sec
     plannerSessionId: null,
     workspaceSessionId: "oc-workspace-1",
   });
+});
+
+test("OpenCode bridge sends off as a real non-thinking provider variant", async () => {
+  const paths = await fixture();
+  const traceFile = join(paths.root, "sdk-trace.jsonl");
+  await writeFile(traceFile, "");
+  const schema = { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] };
+  const environment = {
+    ...baseEnvironment(paths),
+    FOMO_TEST_TRACE_FILE: traceFile,
+    FOMO_PI_THINKING_LEVEL: "off",
+    FOMO_PI_MODEL_REF: "fomo-litellm/fomo-pi-deepseek-flash",
+    FOMO_PI_CONTEXT_WINDOW: "1000000",
+  };
+  const planning = await runBridge({
+    ...environment,
+    FOMO_PI_STRUCTURED_OUTPUT_SCHEMA_B64: Buffer.from(JSON.stringify(schema)).toString("base64"),
+  });
+  const workspace = await runBridge(environment);
+
+  assert.equal(planning.code, 0, planning.stderr);
+  assert.equal(workspace.code, 0, workspace.stderr);
+  const trace = (await readFile(traceFile, "utf8"))
+    .trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  assert.deepEqual(
+    trace.filter((entry) => entry.kind === "server.config")
+      .map((entry) => entry.variants.off),
+    [{ reasoningEffort: "none" }, { reasoningEffort: "none" }],
+  );
+  assert.deepEqual(
+    trace.filter((entry) => entry.kind === "session.create")
+      .map((entry) => [entry.stage, entry.variant]),
+    [["planner", "off"], ["workspace", "off"]],
+  );
+  assert.equal(trace.find((entry) => entry.kind === "session.prompt").variant, "off");
+  assert.equal(trace.find((entry) => entry.kind === "session.promptAsync").variant, "off");
 });
 
 test("OpenCode bridge exposes SDK JSON Schema result as the existing terminating tool", async () => {

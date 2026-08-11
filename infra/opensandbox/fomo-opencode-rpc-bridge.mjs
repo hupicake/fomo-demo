@@ -605,7 +605,13 @@ function configurePrivateEnvironment() {
 function reasoningVariants() {
   const variants = {};
   for (const level of model.thinkingLevels) {
-    if (["off", "default"].includes(level)) continue;
+    if (level === "default") continue;
+    if (level === "off") {
+      if (model.id === "fomo-pi-deepseek-flash") {
+        variants.off = { reasoningEffort: "none" };
+      }
+      continue;
+    }
     variants[level] = { reasoningEffort: level };
   }
   return variants;
@@ -880,7 +886,9 @@ async function resolveSession(client) {
 }
 
 function thinkingVariant() {
-  return ["off", "default"].includes(thinkingLevel) ? null : thinkingLevel;
+  if (thinkingLevel === "default") return null;
+  if (thinkingLevel === "off" && model.id !== "fomo-pi-deepseek-flash") return null;
+  return thinkingLevel;
 }
 
 function eventSessionId(event) {
