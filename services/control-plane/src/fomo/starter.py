@@ -18,7 +18,7 @@ from pathlib import PurePosixPath
 from fomo.sandbox.base import FileChange
 
 STARTER_ID = "fomo-next-radix-v2"
-STARTER_VERSION = "2.0.1"
+STARTER_VERSION = "2.0.2"
 _BASE_ASSET_DIRECTORY = "base"
 _CAPABILITY_ASSET_DIRECTORY = "capabilities"
 
@@ -26,7 +26,7 @@ _CAPABILITY_ASSET_DIRECTORY = "capabilities"
 # a trust decision. They are filled from the checked-in files below; changing
 # any base/capability asset therefore requires an explicit versioned update.
 _EXPECTED_BASE_TREE_SHA256 = (
-    "bf45c15f6affbe6af4fe693d91f443c72ba5ec092a31bcfd6e80360179934d55"
+    "2c01a9b8eed5747696f34068b474f690423bf3ce45480a28dcaac31fac40c972"
 )
 _EXPECTED_CAPABILITY_TREE_SHA256 = {
     "crud": "1d1bb2d5e289051e8b1d812215da5bb8965b9454f48205787f7eebb72ea2cbad",
@@ -76,6 +76,24 @@ _BASE_AVAILABLE_IMPORTS = (
 _FORBIDDEN_MODEL_OWNED_PATHS = ("app/(generated)/page.tsx",)
 _REQUIRED_SCRIPTS = ("dev", "build", "typecheck", "test:smoke")
 _VALIDATION_COMMANDS = ("pnpm typecheck", "pnpm build", "pnpm test:smoke")
+
+# This is the product-writer boundary enforced by ``WorkspaceManager.audit``.
+# It is intentionally much smaller than the legacy StarterManifest
+# ``protected_paths``/``model_owned_roots`` planning contract.  BUILD prompts
+# must describe the real runtime boundary rather than steering every product
+# into the legacy extension roots.
+_BUILD_RUNTIME_PROTECTION = {
+    "immutable": (
+        ".gitignore",
+        "tests/harness/**",
+        "tests/fomo-acceptance/**",
+    ),
+    "rejected": (
+        "any path segment beginning with .env",
+        "symlinks and non-regular source entries",
+        "changed source that is not regular UTF-8 text",
+    ),
+}
 
 
 class StarterIntegrityError(RuntimeError):
@@ -137,6 +155,18 @@ class StarterCapability:
             "id": self.id,
             "version": self.version,
             "treeSha256": self.tree_sha256,
+        }
+
+    def as_build_context(self) -> dict[str, object]:
+        """Expose reusable capability facts without legacy write boundaries."""
+
+        return {
+            "id": self.id,
+            "version": self.version,
+            "treeSha256": self.tree_sha256,
+            "availableImports": list(self.available_imports),
+            "description": self.description,
+            "provides": list(self.provides),
         }
 
 
@@ -263,6 +293,31 @@ class StarterManifest:
             "forbiddenModelOwnedPaths": list(self.forbidden_model_owned_paths),
             "extensionContracts": [self.root_extension_contract.as_architect_context()],
             "baseScripts": dict(self.base_scripts),
+        }
+
+    def as_build_context(self) -> dict[str, object]:
+        """Return the actual editable baseline and BUILD runtime boundary.
+
+        ``as_architect_context`` remains stable for the legacy planning and
+        provenance readers that still understand model-owned roots and the
+        root extension contract.  A coding turn must not receive those fields:
+        the current workspace audit permits product code to evolve anywhere
+        outside FOMO-owned verification inputs and the safety boundary below.
+        """
+
+        return {
+            "baseline": {
+                "id": self.id,
+                "version": self.version,
+                "treeSha256": self.tree_sha256,
+            },
+            "selectedCapabilities": [
+                capability.as_build_context() for capability in self.selected_capabilities
+            ],
+            "availableImports": list(self.available_imports),
+            "runtimeProtection": {
+                key: list(values) for key, values in _BUILD_RUNTIME_PROTECTION.items()
+            },
         }
 
     def as_provenance(self, initial_commit_sha: str) -> dict[str, object]:

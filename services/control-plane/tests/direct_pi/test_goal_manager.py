@@ -33,14 +33,19 @@ from fomo.direct_pi.goalgraph import (
     GoalStatus,
     materialize_goal_graph,
     parse_goal_graph_draft,
+    parse_legacy_goal_graph_draft,
 )
 from fomo.direct_pi.prompts import (
     PRODUCT_DESIGN_POLICY,
     PRODUCT_REQUIREMENTS_POLICY,
     _bounded_goal_diagnostic,
+    explicit_route_paths,
     goal_build_prompt,
     goal_graph_planning_prompt,
     goal_repair_prompt,
+    required_route_count,
+    requires_multi_route,
+    validate_goal_graph_routing,
 )
 
 _ADVISORY_SELF_CHECK_COMMAND = (
@@ -75,9 +80,162 @@ def _acceptance(index: int) -> dict[str, object]:
     }
 
 
+def _routing_draft(
+    *,
+    viewport_widths: tuple[int, ...] = (390,),
+    missions_deep_linkable: bool = True,
+):
+    root = _acceptance(1)
+    root_test = root["tests"][0]  # type: ignore[index]
+    root_test["actions"] = [  # type: ignore[index]
+        {"kind": "goto", "path": "/"},
+        {"kind": "reload", "target": None},
+    ]
+    root_test["assertions"] = [  # type: ignore[index]
+        {"kind": "url", "path": "/"},
+        {
+            "kind": "visible",
+            "target": {"by": "role", "value": "heading", "name": "Home"},
+        },
+    ]
+    missions = _acceptance(2)
+    direct_test = missions["tests"][0]  # type: ignore[index]
+    direct_actions: list[dict[str, object]] = [
+        {"kind": "goto", "path": "/missions"}
+    ]
+    if missions_deep_linkable:
+        direct_actions.append({"kind": "reload", "target": None})
+    direct_test["actions"] = direct_actions  # type: ignore[index]
+    direct_test["assertions"] = [  # type: ignore[index]
+        {"kind": "url", "path": "/missions"},
+        {
+            "kind": "visible",
+            "target": {"by": "role", "value": "heading", "name": "Missions"},
+        },
+    ]
+    missions["criteria"].extend(  # type: ignore[union-attr]
+        [
+            {
+                "id": "AC-2-link",
+                "title": "Navigate to missions",
+                "priority": "must",
+                "given": "home is open",
+                "when": "the Missions link is followed",
+                "then": "missions is visible",
+            },
+            {
+                "id": "AC-2-history",
+                "title": "Use browser history",
+                "priority": "must",
+                "given": "home and missions were visited",
+                "when": "browser history is traversed",
+                "then": "both exact routes are observed",
+            },
+        ]
+    )
+    missions["tests"].extend(  # type: ignore[union-attr]
+        [
+            {
+                "id": "test-2-link",
+                "acceptanceId": "AC-2-link",
+                "title": "navigates to missions on mobile",
+                "actions": [
+                    *[
+                        {"kind": "set_viewport", "width": width, "height": 844}
+                        for width in viewport_widths
+                    ],
+                    {"kind": "goto", "path": "/"},
+                    {
+                        "kind": "click",
+                        "target": {
+                            "by": "role",
+                            "value": "link",
+                            "name": "Missions",
+                        },
+                    },
+                ],
+                "assertions": [
+                    {"kind": "url", "path": "/missions"},
+                    {
+                        "kind": "visible",
+                        "target": {
+                            "by": "role",
+                            "value": "heading",
+                            "name": "Missions",
+                        },
+                    },
+                ],
+            },
+            {
+                "id": "test-2-history",
+                "acceptanceId": "AC-2-history",
+                "title": "observes back and forward URLs",
+                "actions": [
+                    {"kind": "goto", "path": "/"},
+                    {"kind": "goto", "path": "/missions"},
+                    {
+                        "kind": "history_roundtrip",
+                        "backPath": "/",
+                        "forwardPath": "/missions",
+                    },
+                ],
+                "assertions": [
+                    {"kind": "url", "path": "/missions"},
+                    {
+                        "kind": "visible",
+                        "target": {
+                            "by": "role",
+                            "value": "heading",
+                            "name": "Missions",
+                        },
+                    },
+                ],
+            },
+        ]
+    )
+    return parse_goal_graph_draft(
+        {
+            "schemaVersion": 2,
+            "productOutcome": "Users navigate a mission workspace.",
+            "routes": [
+                {
+                    "path": "/",
+                    "title": "Home",
+                    "owningGoalId": "G-1",
+                    "deepLinkable": True,
+                },
+                {
+                    "path": "/missions",
+                    "title": "Missions",
+                    "owningGoalId": "G-2",
+                    "deepLinkable": missions_deep_linkable,
+                },
+            ],
+            "goals": [
+                {
+                    "goalId": "G-1",
+                    "title": "Home",
+                    "productOutcome": "Users open home.",
+                    "userVisible": True,
+                    "dependsOn": [],
+                    "acceptance": root,
+                },
+                {
+                    "goalId": "G-2",
+                    "title": "Missions",
+                    "productOutcome": "Users navigate missions.",
+                    "userVisible": True,
+                    "dependsOn": ["G-1"],
+                    "acceptance": missions,
+                },
+            ],
+        }
+    )
+
+
 def _graph() -> GoalGraph:
     return materialize_goal_graph(
-        parse_goal_graph_draft(
+        parse_legacy_goal_graph_draft(
             {
                 "schemaVersion": 1,
                 "productOutcome": "Users can complete both workflows.",
@@ -106,7 +264,7 @@ def _graph() -> GoalGraph:
 
 def _three_goal_graph() -> GoalGraph:
     return materialize_goal_graph(
-        parse_goal_graph_draft(
+        parse_legacy_goal_graph_draft(
             {
                 "schemaVersion": 1,
                 "productOutcome": "Users can complete all three workflows.",
@@ -361,7 +519,15 @@ def test_goal_prompts_bind_revision_and_exclude_raw_diagnostics() -> None:
     )
 
     assert '"graphRevision":7' in build
+    assert (
+        '"navigationContract":{"schemaVersion":1,'
+        '"navigationMode":"single_surface","routes":[]}'
+    ) in build
+    assert '"navigationContract":{"schemaVersion":1' in repair
     assert '"goalId":"G-2"' in build
+    assert "next-app-feature-first@1.0.0 (standard)" in build
+    assert '"advisoryOnly":true' in build
+    assert "next-app-feature-first@1.0.0 (standard)" in repair
     assert "Goal Manager selected the active goal" in build
     assert "shared foundations" in build
     assert "verification_evidence:ev-1" in build
@@ -438,6 +604,173 @@ def test_goal_prompts_preserve_product_scope_and_apply_design_baseline() -> None
     assert "acceptance contract is the verification floor" in building
     assert "complete active outcome and all supporting architecture" in building
     assert "make necessary subtraction" in building
+
+
+def test_goal_planner_promotes_explicit_multi_page_requests_to_route_contracts() -> None:
+    multi_route = goal_graph_planning_prompt(
+        requirement=(
+            "构建一个高难作品展示，至少 5 个真实路由，支持深链接、浏览器前进后退"
+            "和移动端导航。"
+        ),
+        starter={"routes": ["/"]},
+    )
+    single_surface = goal_graph_planning_prompt(
+        requirement="Build one focused calculator surface.",
+        starter={"routes": ["/"]},
+    )
+
+    assert "authoritative routing contract v2" in multi_route
+    assert "MULTI_ROUTE_REQUIRED" in multi_route
+    assert "schemaVersion: 2" in multi_route
+    assert "complete `routes` manifest" in multi_route
+    assert "exact `url(path)` and exact visible role=`heading`" in multi_route
+    assert "role=`link` with accessible name exactly equal" in multi_route
+    assert "`history_roundtrip`" in multi_route
+    assert "`set_viewport` width <= 480" in multi_route
+    assert "State tabs, hashes, query panels" in multi_route
+
+    assert "ROUTE_SHAPE_PLANNER_SELECTED" in single_surface
+    assert "MULTI_ROUTE_REQUIRED" not in single_surface
+
+
+def test_server_routing_validator_enforces_explicit_route_breadth() -> None:
+    draft = parse_goal_graph_draft(
+        {
+            "schemaVersion": 2,
+            "productOutcome": "Users complete one focused workflow.",
+            "routes": [
+                {
+                    "path": "/",
+                    "title": "Calculator",
+                    "owningGoalId": "G-1",
+                    "deepLinkable": True,
+                }
+            ],
+            "goals": [
+                {
+                    "goalId": "G-1",
+                    "title": "Calculator",
+                    "productOutcome": "Users calculate a result.",
+                    "userVisible": True,
+                    "dependsOn": [],
+                    "acceptance": {
+                        "criteria": [
+                            {
+                                "id": "AC-1",
+                                "title": "Calculator is directly available",
+                                "priority": "must",
+                                "given": "the product is available",
+                                "when": "the route is opened and reloaded",
+                                "then": "the calculator remains available",
+                            }
+                        ],
+                        "tests": [
+                            {
+                                "id": "T-1",
+                                "acceptanceId": "AC-1",
+                                "title": "opens the calculator directly",
+                                "actions": [
+                                    {"kind": "goto", "path": "/"},
+                                    {"kind": "reload", "target": None},
+                                ],
+                                "assertions": [
+                                    {"kind": "url", "path": "/"},
+                                    {
+                                        "kind": "visible",
+                                        "target": {
+                                            "by": "role",
+                                            "value": "heading",
+                                            "name": "Calculator",
+                                        },
+                                    },
+                                ],
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+    )
+    showcase = "构建高难成果展示，至少 5 个真实路由，支持深链接和移动端导航。"
+
+    assert requires_multi_route(showcase)
+    assert required_route_count(showcase) == 5
+    with pytest.raises(ValueError, match="expected at least 5 real routes"):
+        validate_goal_graph_routing(showcase, draft)
+    assert validate_goal_graph_routing("Build one focused calculator surface.", draft) is draft
+
+
+def test_route_intent_classifier_handles_counts_paths_and_negation() -> None:
+    assert required_route_count("Build at least seven real routes") == 7
+    assert required_route_count("Build at least seven pages.") == 7
+    assert required_route_count("至少12个真实页面") == 12
+    assert required_route_count("构建至少 12 个真实路由") == 12
+    assert explicit_route_paths("Routes: `/`, `/missions`, and `/reports`.") == (
+        "/",
+        "/missions",
+        "/reports",
+    )
+    assert required_route_count("Routes: `/`, `/missions`, and `/reports`.") == 3
+    assert not requires_multi_route("Do not build a showcase, one page only.")
+    for single_page_requirement in (
+        "No multi-page app; build one page only.",
+        "No deep links; this is a single page.",
+        "No navigation menu, make one page.",
+        "不做多页面，只做单页面。",
+    ):
+        assert not requires_multi_route(single_page_requirement)
+        assert required_route_count(single_page_requirement) == 1
+    assert required_route_count(
+        "Build a dashboard showing 50 pages of paginated records."
+    ) == 1
+    assert explicit_route_paths(
+        "Only modify /workspace and keep /tmp untouched. Use API endpoint /api/items."
+    ) == ()
+    assert explicit_route_paths("Create routes /, /missions, and /settings.") == (
+        "/",
+        "/missions",
+        "/settings",
+    )
+    assert requires_multi_route("构建无需后端的高难成果展示")
+
+
+def test_route_intent_validator_closes_deep_mobile_and_history_evidence() -> None:
+    requirement = (
+        "Build routes `/` and `/missions` with deep links, mobile navigation, "
+        "and browser back and forward."
+    )
+    valid = _routing_draft()
+
+    assert validate_goal_graph_routing(requirement, valid) is valid
+    _activated, plan = plan_goal_execution(
+        materialize_goal_graph(valid),
+        graph_revision=4,
+    )
+    build = goal_build_prompt(
+        requirement=requirement,
+        starter={"routes": ["/", "/missions"]},
+        execution_plan=plan,
+        advisory_self_check_command=_ADVISORY_SELF_CHECK_COMMAND,
+    )
+    assert '"navigationMode":"multi_route"' in build
+    assert '"path":"/missions","title":"Missions","owningGoalId":"G-2"' in build
+
+    with pytest.raises(ValueError, match="deepLinkable=true"):
+        validate_goal_graph_routing(
+            requirement,
+            _routing_draft(missions_deep_linkable=False),
+        )
+    with pytest.raises(ValueError, match="set_viewport width<=480"):
+        validate_goal_graph_routing(
+            requirement,
+            _routing_draft(viewport_widths=(390, 1024)),
+        )
+
+    without_history = valid.model_copy(deep=True)
+    history_test = without_history.goals[1].acceptance.tests[-1]
+    history_test.actions.pop()
+    with pytest.raises(ValueError, match="history_roundtrip"):
+        validate_goal_graph_routing(requirement, without_history)
 
 
 def test_goal_repair_diagnostic_has_a_hard_json_cap() -> None:

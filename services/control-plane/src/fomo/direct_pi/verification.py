@@ -8,7 +8,7 @@ import json
 import shlex
 import time
 from dataclasses import dataclass
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -86,10 +86,22 @@ _PLAYWRIGHT = fomo_runner_command(
 )
 
 
-def _with_preview_asset_prefix(command: str, asset_prefix: str | None) -> str:
-    if not asset_prefix:
+def _with_preview_base_path(command: str, base_path: str | None) -> str:
+    if not base_path:
         return command
-    return f"FOMO_PREVIEW_ASSET_PREFIX={shlex.quote(asset_prefix)} {command}"
+    return f"FOMO_PREVIEW_BASE_PATH={shlex.quote(base_path)} {command}"
+
+
+def _preview_runtime_url(url: str, base_path: str | None) -> str:
+    """Attach the build-time Next basePath to one provider endpoint."""
+
+    if not base_path:
+        return url
+    parsed = urlsplit(url)
+    endpoint_path = parsed.path.rstrip("/")
+    return urlunsplit(
+        (parsed.scheme, parsed.netloc, f"{endpoint_path}{base_path}", parsed.query, "")
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -307,9 +319,9 @@ class Verifier:
                     )
                 )
             if all(item.status == GateStatus.passed for item in gates):
-                build_command = _with_preview_asset_prefix(
+                build_command = _with_preview_base_path(
                     f"{_WORKSPACE_NEXT} build",
-                    self.settings.published_preview_asset_prefix(ref.id),
+                    self.settings.published_preview_base_path(ref.id),
                 )
                 gates.append(
                     await self._command_gate(
@@ -485,9 +497,10 @@ class Verifier:
         return gate
 
     async def _start_preview(self, ref: SandboxRef) -> tuple[GateResult, str | None]:
-        command_text = _with_preview_asset_prefix(
+        base_path = self.settings.published_preview_base_path(ref.id)
+        command_text = _with_preview_base_path(
             f"{_WORKSPACE_NEXT} start --hostname 0.0.0.0 --port 8080",
-            self.settings.published_preview_asset_prefix(ref.id),
+            base_path,
         )
         operation_id = uuid7()
         await self.repository.append_event(
@@ -535,7 +548,8 @@ class Verifier:
                 },
                 lease_token=self.lease_token,
             )
-        url = preview.url if preview and preview.status == "ready" else None
+        endpoint_url = preview.url if preview and preview.status == "ready" else None
+        url = _preview_runtime_url(endpoint_url, base_path) if endpoint_url else None
         healthy = bool(url) and await self.preview_is_healthy(str(url))
         await self.repository.append_event(
             self.run_id,
@@ -565,6 +579,8 @@ class Verifier:
                     "url": url,
                     "verificationStatus": "unverified",
                     "elapsedSeconds": self._elapsed_seconds(),
+                    "sandboxId": ref.id,
+                    "routingMode": "base_path_v1" if base_path else "host_root_v1",
                 },
                 lease_token=self.lease_token,
             )
@@ -576,6 +592,9 @@ class Verifier:
     ) -> GateResult:
         command = _PLAYWRIGHT.format(
             path=shlex.quote(test_path), config=shlex.quote(ACCEPTANCE_CONFIG_PATH)
+        )
+        command = _with_preview_base_path(
+            command, self.settings.published_preview_base_path(ref.id)
         )
         result = await self.commands.run(
             ref, command, label="smoke", stage="verifying"
@@ -612,6 +631,9 @@ class Verifier:
     ) -> GateResult:
         command = _PLAYWRIGHT.format(
             path=shlex.quote(test_path), config=shlex.quote(ACCEPTANCE_CONFIG_PATH)
+        )
+        command = _with_preview_base_path(
+            command, self.settings.published_preview_base_path(ref.id)
         )
         result = await self.commands.run(
             ref, command, label=f"acceptance:{acceptance_id}", stage="verifying"

@@ -556,8 +556,8 @@ class Settings:
             return f"{self.public_preview_base_url}/{canonical_id}/"
         return f"https://{canonical_id}.{self.public_preview_base_domain}/"
 
-    def published_preview_asset_prefix(self, sandbox_id: str) -> str | None:
-        """Return the path-mode prefix baked into a generated Next build."""
+    def published_preview_base_path(self, sandbox_id: str) -> str | None:
+        """Return the path-mode basePath baked into a generated Next build."""
 
         if not self.public_preview_base_url:
             return None

@@ -207,6 +207,9 @@ describe("run presentation reducer", () => {
         graphId: "graph-1",
         runId: "run-library",
         revision: 1,
+        schemaVersion: 1,
+        navigationMode: "single_surface",
+        routes: [],
         status: "active",
         productOutcome: "Readers can borrow books.",
         activeGoalId: "G-1",
@@ -263,7 +266,8 @@ describe("run presentation reducer", () => {
       projectId: "project-library",
       run: { id: "run-library", projectId: "project-library", status: "running", lastSeq: 0 },
       goalGraph: {
-        graphId: "graph-1", runId: "run-library", revision: 1, status: "active",
+        graphId: "graph-1", runId: "run-library", revision: 1,
+        schemaVersion: 1, navigationMode: "single_surface", routes: [], status: "active",
         productOutcome: "Readers can borrow books.", activeGoalId: "G-1",
         goals: [{
           goalId: "G-1", title: "Borrowing", userVisible: true, dependsOn: [], status: "claimed",
@@ -302,6 +306,7 @@ describe("run presentation reducer", () => {
   it("keeps a non-null snapshot GoalGraph authoritative over historical replay", () => {
     const authoritative = {
       graphId: "graph-1", runId: "run-library", revision: 2, status: "verified" as const,
+      schemaVersion: 1 as const, navigationMode: "single_surface" as const, routes: [],
       productOutcome: "Readers can borrow books.", activeGoalId: null,
       goals: [{
         goalId: "G-1", title: "Borrowing", userVisible: true, dependsOn: [], status: "verified" as const,
@@ -331,7 +336,8 @@ describe("run presentation reducer", () => {
       projectId: "project-library",
       run: { id: "run-library", projectId: "project-library", status: "running", lastSeq: 5 },
       goalGraph: {
-        graphId: "graph-1", runId: "run-library", revision: 1, status: "active",
+        graphId: "graph-1", runId: "run-library", revision: 1,
+        schemaVersion: 1, navigationMode: "single_surface", routes: [], status: "active",
         productOutcome: "Readers can borrow books.", activeGoalId: "G-1", goals: [],
       },
     });
@@ -350,6 +356,9 @@ describe("run presentation reducer", () => {
         graphId: "graph-1",
         runId: "run-library",
         revision: 1,
+        schemaVersion: 1,
+        navigationMode: "single_surface",
+        routes: [],
         status: "active",
         productOutcome: "Readers can borrow books.",
         activeGoalId: "G-1",
@@ -419,6 +428,9 @@ describe("run presentation reducer", () => {
         graphId: "graph-1",
         runId: "run-library",
         revision: 1,
+        schemaVersion: 1,
+        navigationMode: "single_surface",
+        routes: [],
         status: "active",
         productOutcome: "Ship a verified page",
         activeGoalId: "G-1",

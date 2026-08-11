@@ -16,7 +16,16 @@ Identifier = Annotated[
     StringConstraints(strip_whitespace=True, min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$"),
 ]
 
-_LOCAL_PATH = re.compile(r"^/[A-Za-z0-9/_-]*$")
+LOCAL_PATH_PATTERN = r"^/$|^/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*$"
+LocalPath = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=200,
+        pattern=LOCAL_PATH_PATTERN,
+    ),
+]
 _PLAN_ROUTE = re.compile(
     r"^/$|^/(?:[A-Za-z0-9_-]+|\[[A-Za-z][A-Za-z0-9_-]*\])"
     r"(?:/(?:[A-Za-z0-9_-]+|\[[A-Za-z][A-Za-z0-9_-]*\]))*$"
@@ -113,15 +122,7 @@ class Locator(SchemaModel):
 
 class GotoAction(SchemaModel):
     kind: Literal["goto"]
-    path: str
-
-    @field_validator("path")
-    @classmethod
-    def local_path(cls, value: str) -> str:
-        value = value.strip()
-        if len(value) > 200 or not _LOCAL_PATH.fullmatch(value):
-            raise ValueError("goto path must be a bounded local path")
-        return value
+    path: LocalPath
 
 
 class ClickAction(SchemaModel):
@@ -149,8 +150,48 @@ class ReloadAction(SchemaModel):
     target: None = None
 
 
+class BackAction(SchemaModel):
+    kind: Literal["back"]
+    target: None = None
+
+
+class ForwardAction(SchemaModel):
+    kind: Literal["forward"]
+    target: None = None
+
+
+class SetViewportAction(SchemaModel):
+    kind: Literal["set_viewport"]
+    width: int = Field(ge=320, le=2560)
+    height: int = Field(ge=480, le=2560)
+
+
+class HistoryRoundtripAction(SchemaModel):
+    """Observable browser back/forward navigation with exact URL checks."""
+
+    kind: Literal["history_roundtrip"]
+    back_path: LocalPath
+    forward_path: LocalPath
+
+    @model_validator(mode="after")
+    def distinct_history_locations(self) -> HistoryRoundtripAction:
+        if self.back_path == self.forward_path:
+            raise ValueError("history roundtrip paths must be distinct")
+        return self
+
+
 AcceptanceAction = Annotated[
-    GotoAction | ClickAction | FillAction | SelectAction | ReloadAction,
+    (
+        GotoAction
+        | ClickAction
+        | FillAction
+        | SelectAction
+        | ReloadAction
+        | BackAction
+        | ForwardAction
+        | SetViewportAction
+        | HistoryRoundtripAction
+    ),
     Field(discriminator="kind"),
 ]
 
@@ -168,15 +209,7 @@ class ValueAssertion(SchemaModel):
 
 class UrlAssertion(SchemaModel):
     kind: Literal["url"]
-    path: str
-
-    @field_validator("path")
-    @classmethod
-    def local_path(cls, value: str) -> str:
-        value = value.strip()
-        if len(value) > 200 or not _LOCAL_PATH.fullmatch(value):
-            raise ValueError("url assertion path must be a bounded local path")
-        return value
+    path: LocalPath
 
 
 AcceptanceAssertion = Annotated[

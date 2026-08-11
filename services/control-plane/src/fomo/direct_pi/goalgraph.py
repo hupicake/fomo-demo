@@ -26,9 +26,24 @@ from pydantic import (
 
 from fomo.schemas import SchemaModel
 
-from .contracts import AcceptanceContract, AcceptanceTest, Identifier
+from .contracts import (
+    AcceptanceContract,
+    AcceptanceItem,
+    AcceptanceTest,
+    ClickAction,
+    FillAction,
+    GotoAction,
+    Identifier,
+    LocalPath,
+    ReloadAction,
+    SelectAction,
+    UrlAssertion,
+    ValueAssertion,
+    VisibleAssertion,
+)
 
-SCHEMA_VERSION = 1
+LEGACY_SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 ACCEPTANCE_ROOT = "tests/fomo-acceptance"
 
 ProductOutcome = Annotated[
@@ -60,6 +75,11 @@ class GoalStatus(StrEnum):
     VERIFIED = "verified"
     FAILED = "failed"
     SUPERSEDED = "superseded"
+
+
+class NavigationMode(StrEnum):
+    SINGLE_SURFACE = "single_surface"
+    MULTI_ROUTE = "multi_route"
 
 
 QualityGate = Literal[
@@ -103,6 +123,66 @@ class GoalGraphQualityBar(SchemaModel):
 SERVER_QUALITY_BAR = GoalGraphQualityBar()
 
 
+class NavigationRoute(SchemaModel):
+    """Planner-declared route data that becomes frozen server-owned policy.
+
+    Paths describe concrete browser locations, not Next.js file patterns. Query
+    strings, fragments, dynamic brackets and trailing-slash aliases are
+    intentionally excluded so exact URL evidence has one canonical meaning.
+    """
+
+    path: LocalPath
+    title: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=1, max_length=120),
+    ]
+    owning_goal_id: Identifier
+    deep_linkable: StrictBool
+
+
+LegacyLocalPath = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=200,
+        pattern=r"^/[A-Za-z0-9/_-]*$",
+    ),
+]
+
+
+class LegacyGotoAction(GotoAction):
+    """Exact v1 decoder shape; never admitted to current planner output."""
+
+    path: LegacyLocalPath
+
+
+class LegacyUrlAssertion(UrlAssertion):
+    """Exact v1 URL assertion shape retained for historical hash checks."""
+
+    path: LegacyLocalPath
+
+
+LegacyAcceptanceAction = Annotated[
+    LegacyGotoAction | ClickAction | FillAction | SelectAction | ReloadAction,
+    Field(discriminator="kind"),
+]
+LegacyAcceptanceAssertion = Annotated[
+    VisibleAssertion | ValueAssertion | LegacyUrlAssertion,
+    Field(discriminator="kind"),
+]
+
+
+class LegacyAcceptanceTest(AcceptanceTest):
+    actions: list[LegacyAcceptanceAction] = Field(min_length=1)
+    assertions: list[LegacyAcceptanceAssertion] = Field(min_length=1)
+
+
+class LegacyAcceptanceContract(AcceptanceContract):
+    criteria: list[AcceptanceItem] = Field(min_length=1)
+    tests: list[LegacyAcceptanceTest] = Field(min_length=1)
+
+
 class GoalDraft(SchemaModel):
     """Planner-owned goal fields; lifecycle state is intentionally absent."""
 
@@ -128,44 +208,330 @@ class Goal(GoalDraft):
     status: GoalStatus
 
 
+class LegacyGoalDraft(GoalDraft):
+    """Historical goal decoder using the exact v1 acceptance path grammar."""
+
+    acceptance: LegacyAcceptanceContract
+
+
+class LegacyGoal(Goal):
+    """Historical lifecycle projection; unsafe paths remain read-only."""
+
+    acceptance: LegacyAcceptanceContract
+
+
+def _validate_goal_topology(goals: Sequence[GoalDraft]) -> None:
+    goal_ids = [goal.goal_id for goal in goals]
+    if len(goal_ids) != len(set(goal_ids)):
+        raise ValueError("goal ids must be unique")
+
+    seen: set[str] = set()
+    for goal in goals:
+        unavailable = [
+            dependency for dependency in goal.depends_on if dependency not in seen
+        ]
+        if unavailable:
+            joined = ", ".join(unavailable)
+            raise ValueError(
+                f"goal {goal.goal_id} dependencies must reference earlier goals: {joined}"
+            )
+        seen.add(goal.goal_id)
+
+
+def _validate_routing_contract(
+    *,
+    schema_version: int,
+    routes: Sequence[NavigationRoute],
+    goals: Sequence[GoalDraft],
+) -> None:
+    if schema_version == LEGACY_SCHEMA_VERSION:
+        if routes:
+            raise ValueError("legacy GoalGraph schema cannot declare routes")
+        return
+
+    violations: list[str] = []
+    if not routes:
+        raise ValueError("route contract violations: v2 requires a route manifest")
+    paths = [route.path for route in routes]
+    if "/" not in paths:
+        violations.append("the route manifest must include root path /")
+    if len(paths) != len(set(paths)):
+        violations.append("route paths must be unique")
+    normalized_titles = [route.title.casefold() for route in routes]
+    if len(normalized_titles) != len(set(normalized_titles)):
+        violations.append("route titles must be unique ignoring case")
+
+    goals_by_id = {goal.goal_id: goal for goal in goals}
+    unknown_owners = sorted(
+        {
+            route.owning_goal_id
+            for route in routes
+            if route.owning_goal_id not in goals_by_id
+        }
+    )
+    if unknown_owners:
+        violations.append(
+            "navigation routes reference unknown owning goals: "
+            + ", ".join(unknown_owners)
+        )
+
+    for route in routes:
+        if route.owning_goal_id not in goals_by_id:
+            continue
+        owner = goals_by_id[route.owning_goal_id]
+        if not _route_direct_evidence_tests(route, owner):
+            suffix = "goto(path), reload" if route.deep_linkable else "goto(path)"
+            violations.append(
+                f"route {route.path} requires an independent direct test in owner "
+                f"{route.owning_goal_id} ending with {suffix} and asserting exact URL "
+                f"plus heading {route.title!r}"
+            )
+        if len(routes) >= 2 and route.path != "/" and not _route_link_evidence_tests(
+            route,
+            owner,
+            routes=routes,
+            goals_by_id=goals_by_id,
+        ):
+            violations.append(
+                f"route {route.path} requires a separate link test in owner "
+                f"{route.owning_goal_id} from an allowed declared source, ending with "
+                f"role=link name={route.title!r} and asserting exact URL plus heading"
+            )
+
+    if violations:
+        raise ValueError(
+            "route contract violations:\n- " + "\n- ".join(violations)
+        )
+
+
+class LegacyGoalGraphDraft(SchemaModel):
+    """Read-only schema for revisions created before route manifests existed."""
+
+    schema_version: Literal[LEGACY_SCHEMA_VERSION] = LEGACY_SCHEMA_VERSION
+    product_outcome: ProductOutcome
+    goals: list[LegacyGoalDraft] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def valid_topological_graph(self) -> LegacyGoalGraphDraft:
+        _validate_goal_topology(self.goals)
+        return self
+
+
 class GoalGraphDraft(SchemaModel):
-    """Strict planner payload with no server-owned policy or lifecycle fields."""
+    """Current planner payload; new planning is fail-closed to schema v2."""
 
     schema_version: Literal[SCHEMA_VERSION] = SCHEMA_VERSION
     product_outcome: ProductOutcome
+    routes: list[NavigationRoute] = Field(min_length=1)
     goals: list[GoalDraft] = Field(min_length=1)
 
     @model_validator(mode="after")
-    def valid_topological_graph(self) -> GoalGraphDraft:
-        goal_ids = [goal.goal_id for goal in self.goals]
-        if len(goal_ids) != len(set(goal_ids)):
-            raise ValueError("goal ids must be unique")
-
-        seen: set[str] = set()
-        for goal in self.goals:
-            unavailable = [dependency for dependency in goal.depends_on if dependency not in seen]
-            if unavailable:
-                joined = ", ".join(unavailable)
-                raise ValueError(
-                    f"goal {goal.goal_id} dependencies must reference earlier goals: {joined}"
-                )
-            seen.add(goal.goal_id)
-
+    def valid_graph_contract(self) -> GoalGraphDraft:
+        _validate_goal_topology(self.goals)
+        _validate_routing_contract(
+            schema_version=self.schema_version,
+            routes=self.routes,
+            goals=self.goals,
+        )
         return self
 
 
-class GoalGraph(GoalGraphDraft):
+GoalGraphDraftLike = GoalGraphDraft | LegacyGoalGraphDraft
+
+
+class GoalGraph(SchemaModel):
     """Trusted persisted graph projection with server-owned policy and state."""
 
+    schema_version: Literal[LEGACY_SCHEMA_VERSION, SCHEMA_VERSION] = SCHEMA_VERSION
+    product_outcome: ProductOutcome
+    routes: list[NavigationRoute] = Field(default_factory=list)
     quality_bar: GoalGraphQualityBar
-    goals: list[Goal] = Field(min_length=1)
+    navigation_mode: NavigationMode = NavigationMode.SINGLE_SURFACE
+    goals: list[Goal | LegacyGoal] = Field(min_length=1)
     status: GraphStatus
 
     @model_validator(mode="after")
-    def fixed_quality_bar(self) -> GoalGraph:
+    def fixed_server_contract(self) -> GoalGraph:
+        if self.schema_version == SCHEMA_VERSION and any(
+            isinstance(goal, LegacyGoal) for goal in self.goals
+        ):
+            raise ValueError("v2 GoalGraph cannot contain legacy acceptance paths")
+        _validate_goal_topology(self.goals)
+        _validate_routing_contract(
+            schema_version=self.schema_version,
+            routes=self.routes,
+            goals=self.goals,
+        )
         if self.quality_bar != SERVER_QUALITY_BAR:
             raise ValueError("qualityBar is fixed by the server and cannot be overridden")
+        expected_navigation = _navigation_mode(self.schema_version, self.routes)
+        if self.navigation_mode is not expected_navigation:
+            raise ValueError("navigationMode is derived and fixed by the server")
         return self
+
+
+def assert_goal_graph_executable(graph: GoalGraph) -> None:
+    """Reject historical protocol-relative paths before acceptance compilation."""
+
+    if graph.schema_version != LEGACY_SCHEMA_VERSION:
+        return
+    for goal in graph.goals:
+        for test in goal.acceptance.tests:
+            for action in test.actions:
+                if action.kind == "goto" and action.path.startswith("//"):
+                    raise ValueError(
+                        "legacy GoalGraph contains an unsafe protocol-relative goto path"
+                    )
+            for assertion in test.assertions:
+                if assertion.kind == "url" and assertion.path.startswith("//"):
+                    raise ValueError(
+                        "legacy GoalGraph contains an unsafe protocol-relative URL path"
+                    )
+
+
+def _asserts_route_identity(test: AcceptanceTest, route: NavigationRoute) -> bool:
+    exact_url = any(
+        assertion.kind == "url" and assertion.path == route.path
+        for assertion in test.assertions
+    )
+    exact_heading = any(
+        assertion.kind == "visible"
+        and assertion.target.by == "role"
+        and assertion.target.value == "heading"
+        and assertion.target.name == route.title
+        for assertion in test.assertions
+    )
+    return exact_url and exact_heading
+
+
+def _route_direct_evidence_tests(
+    route: NavigationRoute,
+    owner: GoalDraft,
+) -> tuple[AcceptanceTest, ...]:
+    matches: list[AcceptanceTest] = []
+    for test in owner.acceptance.tests:
+        actions = test.actions
+        if route.deep_linkable:
+            has_terminal_direct_load = (
+                len(actions) >= 2
+                and actions[-2].kind == "goto"
+                and actions[-2].path == route.path
+                and actions[-1].kind == "reload"
+            )
+        else:
+            has_terminal_direct_load = (
+                bool(actions)
+                and actions[-1].kind == "goto"
+                and actions[-1].path == route.path
+            )
+        if has_terminal_direct_load and _asserts_route_identity(test, route):
+            matches.append(test)
+    return tuple(matches)
+
+
+def _transitive_dependencies(
+    goal_id: str,
+    goals_by_id: Mapping[str, GoalDraft],
+) -> frozenset[str]:
+    discovered: set[str] = set()
+    pending = list(goals_by_id[goal_id].depends_on)
+    while pending:
+        dependency = pending.pop()
+        if dependency in discovered:
+            continue
+        discovered.add(dependency)
+        ancestor = goals_by_id.get(dependency)
+        if ancestor is not None:
+            pending.extend(ancestor.depends_on)
+    return frozenset(discovered)
+
+
+def _route_link_evidence_tests(
+    route: NavigationRoute,
+    owner: GoalDraft,
+    *,
+    routes: Sequence[NavigationRoute],
+    goals_by_id: Mapping[str, GoalDraft],
+) -> tuple[AcceptanceTest, ...]:
+    routes_by_path = {item.path: item for item in routes}
+    allowed_source_owners = {
+        route.owning_goal_id,
+        *_transitive_dependencies(route.owning_goal_id, goals_by_id),
+    }
+    matches: list[AcceptanceTest] = []
+    for test in owner.acceptance.tests:
+        actions = test.actions
+        if not actions or not _asserts_route_identity(test, route):
+            continue
+        link = actions[-1]
+        if (
+            link.kind != "click"
+            or link.target.by != "role"
+            or link.target.value != "link"
+            or link.target.name != route.title
+        ):
+            continue
+        source_index = next(
+            (
+                index
+                for index in range(len(actions) - 2, -1, -1)
+                if actions[index].kind == "goto"
+            ),
+            None,
+        )
+        if source_index is None:
+            continue
+        source_path = actions[source_index].path
+        obscuring_navigation = any(
+            action.kind in {"goto", "back", "forward", "history_roundtrip"}
+            or (
+                action.kind == "click"
+                and action.target.by == "role"
+                and action.target.value == "link"
+            )
+            for action in actions[source_index + 1 : -1]
+        )
+        if obscuring_navigation:
+            continue
+        source_route = routes_by_path.get(source_path or "")
+        if (
+            source_route is None
+            or source_route.path == route.path
+            or source_route.owning_goal_id not in allowed_source_owners
+        ):
+            continue
+        matches.append(test)
+    return tuple(matches)
+
+
+def route_link_evidence_tests(
+    graph: GoalGraphDraft | GoalGraph,
+    target_path: str,
+) -> tuple[AcceptanceTest, ...]:
+    """Return trusted link tests for one non-root route."""
+
+    route = next((item for item in graph.routes if item.path == target_path), None)
+    if route is None:
+        return ()
+    goals_by_id = {goal.goal_id: goal for goal in graph.goals}
+    owner = goals_by_id.get(route.owning_goal_id)
+    if owner is None:
+        return ()
+    return _route_link_evidence_tests(
+        route,
+        owner,
+        routes=graph.routes,
+        goals_by_id=goals_by_id,
+    )
+
+
+def _navigation_mode(
+    schema_version: int,
+    routes: Sequence[NavigationRoute],
+) -> NavigationMode:
+    if schema_version == LEGACY_SCHEMA_VERSION or len(routes) < 2:
+        return NavigationMode.SINGLE_SURFACE
+    return NavigationMode.MULTI_ROUTE
 
 
 class ScopedAcceptanceContract(SchemaModel):
@@ -339,20 +705,46 @@ def _parse_json_object(
 def parse_goal_graph_draft(
     payload: str | bytes | bytearray | Mapping[str, Any],
 ) -> GoalGraphDraft:
-    """Parse untrusted planner output; server-owned fields are forbidden."""
+    """Parse new planner output; only current schema v2 is accepted."""
 
     return GoalGraphDraft.model_validate(_parse_json_object(payload, label="GoalGraphDraft"))
 
 
-def materialize_goal_graph(draft: GoalGraphDraft) -> GoalGraph:
+def parse_legacy_goal_graph_draft(
+    payload: str | bytes | bytearray | Mapping[str, Any],
+) -> LegacyGoalGraphDraft:
+    """Parse a historical v1 draft for compatibility reads, never planning."""
+
+    return LegacyGoalGraphDraft.model_validate(
+        _parse_json_object(payload, label="LegacyGoalGraphDraft")
+    )
+
+
+def parse_persisted_goal_graph_draft(
+    payload: str | bytes | bytearray | Mapping[str, Any],
+) -> GoalGraphDraftLike:
+    """Parse a stored draft using its explicit schema-version discriminator."""
+
+    value = _parse_json_object(payload, label="PersistedGoalGraphDraft")
+    schema_version = value.get("schemaVersion", value.get("schema_version", SCHEMA_VERSION))
+    if schema_version == LEGACY_SCHEMA_VERSION:
+        return LegacyGoalGraphDraft.model_validate(value)
+    return GoalGraphDraft.model_validate(value)
+
+
+def materialize_goal_graph(draft: GoalGraphDraftLike) -> GoalGraph:
     """Create the initial trusted projection with server-owned policy/state."""
 
+    routes = draft.routes if isinstance(draft, GoalGraphDraft) else []
+    goal_type = LegacyGoal if isinstance(draft, LegacyGoalGraphDraft) else Goal
     return GoalGraph(
         schema_version=draft.schema_version,
         product_outcome=draft.product_outcome,
+        routes=routes,
         quality_bar=SERVER_QUALITY_BAR,
+        navigation_mode=_navigation_mode(draft.schema_version, routes),
         goals=[
-            Goal.model_validate({**goal.model_dump(), "status": GoalStatus.PENDING})
+            goal_type.model_validate({**goal.model_dump(), "status": GoalStatus.PENDING})
             for goal in draft.goals
         ],
         status=GraphStatus.ACTIVE,
@@ -385,17 +777,27 @@ def serialize_goal_graph(graph: GoalGraph | Mapping[str, Any]) -> str:
 
 
 def serialize_goal_graph_draft(
-    draft: GoalGraphDraft | Mapping[str, Any],
+    draft: GoalGraphDraftLike | Mapping[str, Any],
 ) -> str:
-    """Return deterministic canonical JSON for a strict planner draft."""
+    """Return deterministic canonical JSON for a current or historical draft."""
 
-    validated = draft if isinstance(draft, GoalGraphDraft) else parse_goal_graph_draft(draft)
+    validated = (
+        draft
+        if isinstance(draft, (GoalGraphDraft, LegacyGoalGraphDraft))
+        else parse_persisted_goal_graph_draft(draft)
+    )
     return _serialize_model(validated)
 
 
-def _serialize_model(graph: GoalGraph | GoalGraphDraft) -> str:
+def _serialize_model(graph: GoalGraph | GoalGraphDraftLike) -> str:
+    payload = graph.model_dump(mode="json", by_alias=True)
+    # Schema v1 predates the routing contract. Omitting the new default fields
+    # preserves historical revision hashes and canonical persisted payloads.
+    if graph.schema_version == LEGACY_SCHEMA_VERSION:
+        payload.pop("routes", None)
+        payload.pop("navigationMode", None)
     return json.dumps(
-        graph.model_dump(mode="json", by_alias=True),
+        payload,
         ensure_ascii=False,
         allow_nan=False,
         sort_keys=True,
@@ -414,27 +816,38 @@ __all__ = [
     "GOAL_STATUS_TRANSITIONS",
     "GRAPH_STATUS_TRANSITIONS",
     "QUALITY_GATES",
+    "LEGACY_SCHEMA_VERSION",
     "SCHEMA_VERSION",
     "SERVER_QUALITY_BAR",
     "Goal",
     "GoalDraft",
     "GoalGraph",
     "GoalGraphDraft",
+    "GoalGraphDraftLike",
     "GoalGraphQualityBar",
     "GoalNode",
     "GoalStatus",
     "GraphStatus",
     "InvalidStatusTransition",
+    "LegacyGoal",
+    "LegacyGoalDraft",
+    "LegacyGoalGraphDraft",
+    "NavigationMode",
+    "NavigationRoute",
     "ScopedAcceptanceContract",
     "acceptance_persistence_key",
     "acceptance_test_path",
     "acceptance_test_paths",
     "can_transition_goal_status",
     "can_transition_graph_status",
+    "assert_goal_graph_executable",
     "materialize_goal_graph",
     "parse_goal_graph",
     "parse_goal_graph_draft",
+    "parse_legacy_goal_graph_draft",
     "parse_persisted_goal_graph",
+    "parse_persisted_goal_graph_draft",
+    "route_link_evidence_tests",
     "scope_acceptance_contract",
     "scoped_acceptance_key",
     "scoped_acceptance_test_path",

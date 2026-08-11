@@ -1,9 +1,11 @@
 import type {
   GoalAcceptancePriority,
   GoalAcceptanceStatus,
+  GoalNavigationMode,
   GoalGraphProjection,
   GoalGraphStatus,
   GoalProjection,
+  GoalRouteProjection,
 } from "@/lib/contracts";
 
 type JsonRecord = Record<string, unknown>;
@@ -12,6 +14,7 @@ const graphStatuses = new Set<GoalGraphStatus>(["active", "verified", "completed
 const goalStatuses = new Set<GoalProjection["status"]>(["pending", "active", "claimed", "verified", "failed", "superseded"]);
 const acceptanceStatuses = new Set<GoalAcceptanceStatus>(["pending", "passed", "failed", "blocked", "unverified"]);
 const acceptancePriorities = new Set<GoalAcceptancePriority>(["must", "should", "could"]);
+const navigationModes = new Set<GoalNavigationMode>(["single_surface", "multi_route"]);
 
 function record(value: unknown): JsonRecord {
   return value && typeof value === "object" && !Array.isArray(value) ? value as JsonRecord : {};
@@ -74,6 +77,30 @@ export function normalizeGoalProjection(value: unknown): GoalProjection | undefi
   };
 }
 
+function normalizeRoute(value: unknown): GoalRouteProjection | undefined {
+  const source = record(value);
+  const path = text(source.path);
+  const title = text(source.title);
+  const owningGoalId = text(source.owningGoalId || source.owning_goal_id);
+  if (
+    !path
+    || !title
+    || !owningGoalId
+    || (
+      typeof source.deepLinkable !== "boolean"
+      && typeof source.deep_linkable !== "boolean"
+    )
+  ) {
+    return undefined;
+  }
+  return {
+    path,
+    title,
+    owningGoalId,
+    deepLinkable: source.deepLinkable === true || source.deep_linkable === true,
+  };
+}
+
 /** Normalizes the server-owned read projection; malformed or legacy values fail closed to null. */
 export function normalizeGoalGraph(value: unknown): GoalGraphProjection | null {
   const source = record(value);
@@ -82,10 +109,25 @@ export function normalizeGoalGraph(value: unknown): GoalGraphProjection | null {
   const productOutcome = text(source.productOutcome || source.product_outcome);
   const status = text(source.status) as GoalGraphStatus;
   if (!graphId || !runId || !productOutcome || !graphStatuses.has(status)) return null;
+  const rawSchemaVersion = numberValue(source.schemaVersion ?? source.schema_version, 1);
+  const schemaVersion = rawSchemaVersion === 2 ? 2 : 1;
+  const rawNavigationMode = text(
+    source.navigationMode || source.navigation_mode,
+    "single_surface",
+  ) as GoalNavigationMode;
+  const navigationMode = navigationModes.has(rawNavigationMode)
+    ? rawNavigationMode
+    : "single_surface";
   return {
     graphId,
     runId,
     revision: Math.max(0, Math.floor(numberValue(source.revision))),
+    schemaVersion,
+    navigationMode,
+    routes: array(source.routes).flatMap((item) => {
+      const normalized = normalizeRoute(item);
+      return normalized ? [normalized] : [];
+    }),
     status,
     productOutcome,
     activeGoalId: text(source.activeGoalId || source.active_goal_id) || null,

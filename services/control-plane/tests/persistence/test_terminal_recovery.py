@@ -7,7 +7,7 @@ import pytest
 from sqlalchemy import select
 
 from fomo.api import create_app
-from fomo.direct_pi.goalgraph import parse_goal_graph_draft
+from fomo.direct_pi.goalgraph import parse_legacy_goal_graph_draft
 from fomo.persistence.models import RunRecord
 from fomo.schemas import RunStatus
 from tests.helpers import create_user_session
@@ -18,7 +18,7 @@ def _headers(settings, session_id: str) -> dict[str, str]:
 
 
 def _one_goal_draft():
-    return parse_goal_graph_draft(
+    return parse_legacy_goal_graph_draft(
         {
             "schemaVersion": 1,
             "productOutcome": "A visible recovered product",
@@ -107,7 +107,7 @@ async def _terminal_source_with_verified_state(repository):
     assert source.base_version_id == version.id
     claimed_source = await repository.claim_next_run("source-worker", 120)
     assert claimed_source is not None and claimed_source.lease_owner
-    await repository.create_goal_graph(
+    await repository._create_legacy_goal_graph(
         project.id,
         source.id,
         _one_goal_draft(),
@@ -206,10 +206,11 @@ async def test_terminal_recovery_forks_verified_history_and_preserves_source(
             "agentFramework": "pi",
             "profileId": "deepseek-flash",
             "thinking": "high",
-            "recoveryAvailable": False,
-            "recoveryMode": "verified_checkpoint",
-            "sourceCheckpointAvailable": False,
-        }
+                "recoveryAvailable": False,
+                "recoveryMode": "verified_checkpoint",
+                "sourceCheckpointAvailable": False,
+                "usage": None,
+            }
 
         other = await create_user_session(repository)
         forbidden = await client.post(

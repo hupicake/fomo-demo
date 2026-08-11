@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -36,6 +37,12 @@ from .acceptance import (
     compile_acceptance,
     compile_acceptance_suite,
     compile_goal_advisory_acceptance,
+)
+from .architecture_profile import (
+    ARCHITECTURE_PROFILE_ID,
+    ARCHITECTURE_PROFILE_VERSION,
+    ArchitectureProfile,
+    derive_product_architecture_profile,
 )
 from .contracts import PlanningBundle
 from .execution import (
@@ -85,6 +92,7 @@ from .prompts import (
     planning_correction_prompt,
     planning_prompt,
     repair_prompt,
+    validate_goal_graph_routing,
 )
 from .session import (
     DirectPiAwaitingUser,
@@ -103,6 +111,26 @@ from .workspace import (
 )
 
 logger = logging.getLogger(__name__)
+
+_MAX_GOAL_GRAPH_CORRECTIONS = 12
+
+
+def _planning_failure_fingerprint(plan_text: str, error: Exception) -> str:
+    """Hash one invalid semantic submission without persisting its contents."""
+
+    try:
+        normalized_plan = json.dumps(
+            json.loads(plan_text),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        normalized_plan = " ".join(plan_text.split())
+    normalized_error = " ".join(str(error)[:4_000].split())
+    return hashlib.sha256(
+        f"{normalized_plan}\n{normalized_error}".encode()
+    ).hexdigest()
 
 
 class RunKeyGateway(Protocol):
@@ -271,6 +299,9 @@ class DirectPiOrchestrator:
                         "agentFramework": agent_framework,
                         "planningPolicy": GOAL_GRAPH_PLANNING_POLICY,
                         "productDesignPolicy": PRODUCT_DESIGN_POLICY,
+                        "architectureProfilePolicy": (
+                            f"{ARCHITECTURE_PROFILE_ID}@{ARCHITECTURE_PROFILE_VERSION}"
+                        ),
                         **runtime_contract.cache_fingerprint(),
                     },
                     lease_token=active_lease,
@@ -339,12 +370,12 @@ class DirectPiOrchestrator:
             await assert_run_active(self.repository, run_id, active_lease)
 
             evidence_summaries = self._checkpoint_evidence_summaries(
-                latest_checkpoint
+                workspace_checkpoint
             )
             (
                 goal_changed_paths_by_id,
                 legacy_checkpoint_unknown_paths,
-            ) = self._checkpoint_goal_changed_paths(latest_checkpoint)
+            ) = self._checkpoint_goal_changed_paths(workspace_checkpoint)
             if projection is not None and projection.graph.status is GraphStatus.VERIFIED:
                 if latest_checkpoint is None:
                     raise DirectPiOrchestrationError(
@@ -419,6 +450,7 @@ class DirectPiOrchestrator:
                 session_id=pi_session_id,
             )
 
+            architecture_profile: ArchitectureProfile | None = None
             if projection is None:
                 await self._phase(run_id, RunPhase.planning, active_lease)
                 # Recovery may have restored a verified checkpoint after the
@@ -434,6 +466,9 @@ class DirectPiOrchestrator:
                     "goalGraph": True,
                     "planningPolicy": GOAL_GRAPH_PLANNING_POLICY,
                     "productDesignPolicy": PRODUCT_DESIGN_POLICY,
+                    "architectureProfilePolicy": (
+                        f"{ARCHITECTURE_PROFILE_ID}@{ARCHITECTURE_PROFILE_VERSION}"
+                    ),
                     **runtime_contract.cache_fingerprint(),
                 }
                 continuation_context = {"baselineHashes": before_planning}
@@ -455,7 +490,10 @@ class DirectPiOrchestrator:
                     )
                     await workspaces.assert_unchanged(generation, before_planning)
                     await assert_run_active(self.repository, run_id, active_lease)
-                    draft = self._parse_goal_graph_draft(plan_text)
+                    draft = self._parse_goal_graph_draft(
+                        plan_text,
+                        requirement=requirement,
+                    )
                     continuation = None
                 else:
                     candidates = await self.repository.list_goal_graph_cache_candidates(
@@ -471,7 +509,10 @@ class DirectPiOrchestrator:
                                 ensure_ascii=False,
                                 separators=(",", ":"),
                             )
-                            draft = self._parse_goal_graph_draft(candidate_text)
+                            draft = self._parse_goal_graph_draft(
+                                candidate_text,
+                                requirement=requirement,
+                            )
                         except (DirectPiOrchestrationError, KeyError, TypeError):
                             continue
                         await self.repository.append_event(
@@ -490,7 +531,7 @@ class DirectPiOrchestrator:
                         generation,
                         goal_graph_planning_prompt(
                             requirement=requirement,
-                            starter=starter.as_architect_context(),
+                            starter=starter.as_build_context(),
                         ),
                         stage="planning",
                         structured_output_schema=GoalGraphDraft.model_json_schema(
@@ -501,17 +542,40 @@ class DirectPiOrchestrator:
                     )
                     await workspaces.assert_unchanged(generation, before_planning)
                     await assert_run_active(self.repository, run_id, active_lease)
+                    correction_attempts = 0
+                    invalid_submission_fingerprints: set[str] = set()
                     while True:
                         try:
-                            draft = self._parse_goal_graph_draft(plan_text)
+                            draft = self._parse_goal_graph_draft(
+                                plan_text,
+                                requirement=requirement,
+                            )
                             break
                         except DirectPiOrchestrationError as exc:
+                            failure_fingerprint = _planning_failure_fingerprint(
+                                plan_text,
+                                exc,
+                            )
+                            if failure_fingerprint in invalid_submission_fingerprints:
+                                raise PlanningContractError(
+                                    "GoalGraph planning repeated the same invalid semantic "
+                                    "submission without progress"
+                                ) from exc
+                            invalid_submission_fingerprints.add(failure_fingerprint)
+                            if correction_attempts >= _MAX_GOAL_GRAPH_CORRECTIONS:
+                                raise PlanningContractError(
+                                    "GoalGraph planning did not converge within the "
+                                    f"server correction budget ({_MAX_GOAL_GRAPH_CORRECTIONS})"
+                                ) from exc
+                            correction_attempts += 1
                             await self.repository.append_event(
                                 run_id,
                                 "pi.retrying",
                                 payload={
                                     "stage": "planning",
                                     "reason": "goal_graph_contract_validation",
+                                    "attempt": correction_attempts,
+                                    "maxAttempts": _MAX_GOAL_GRAPH_CORRECTIONS,
                                     "thinkingLevel": runtime_contract.thinking,
                                 },
                                 lease_token=active_lease,
@@ -535,10 +599,16 @@ class DirectPiOrchestrator:
                 else:
                     await workspaces.assert_unchanged(generation, before_planning)
                     await assert_run_active(self.repository, run_id, active_lease)
+                architecture_profile = derive_product_architecture_profile(
+                    requirement=requirement,
+                    route_count=max(1, len(draft.routes)),
+                    goal_count=len(draft.goals),
+                )
                 projection = await self.repository.create_goal_graph(
                     run.project_id,
                     run_id,
                     draft,
+                    architecture_profile=architecture_profile,
                     provenance={"createdBy": f"run:{run_id}", "planner": "direct_pi"},
                     lease_token=active_lease,
                 )
@@ -548,6 +618,27 @@ class DirectPiOrchestrator:
                     draft.model_dump(mode="json", by_alias=True),
                     lease_token=active_lease,
                 )
+
+            if architecture_profile is None:
+                architecture_profile = projection.architecture_profile
+            if architecture_profile is None:
+                if projection.graph.schema_version == 1:
+                    # Historical v1 graphs predate the frozen profile policy.
+                    # Their compatibility path remains deterministic, while
+                    # every current v2 graph must carry durable provenance.
+                    architecture_profile = derive_product_architecture_profile(
+                        requirement=requirement,
+                        route_count=1,
+                        goal_count=len(projection.graph.goals),
+                    )
+                else:
+                    raise DirectPiOrchestrationError(
+                        "GoalGraph is missing its frozen architecture profile"
+                    )
+            evidence_summaries = self._projection_evidence_summaries(
+                projection,
+                evidence_summaries,
+            )
 
             while True:
                 current = self._current_goal(projection)
@@ -576,6 +667,7 @@ class DirectPiOrchestrator:
                         "Goal Manager did not produce exactly one active goal"
                     )
                 current_goal_id = current.goal_id
+                goal_round = 0
                 _, execution_plan = plan_goal_execution(
                     projection.graph,
                     graph_revision=projection.revision,
@@ -593,9 +685,65 @@ class DirectPiOrchestrator:
                         raise DirectPiContinuationUnavailable(
                             "the code continuation cursor does not match the active goal"
                         )
+                    self._assert_continuation_architecture_profile(
+                        continuation.context,
+                        architecture_profile,
+                    )
                     goal_start_checkpoint = self._continuation_checkpoint(
                         continuation.context,
                     )
+                    logical_turn_start_hashes = self._continuation_hashes(
+                        continuation.context,
+                        "logicalTurnStartHashes",
+                    )
+                    goal_effect_policy = self._continuation_effect_policy(
+                        continuation.context,
+                        "goalEffectPolicy",
+                    )
+                    turn_effect_policy = self._continuation_effect_policy(
+                        continuation.context,
+                        "turnEffectPolicy",
+                    )
+                    turn_kind = self._continuation_turn_kind(continuation.context)
+                    build_settled = self._continuation_boolean(
+                        continuation.context,
+                        "buildSettled",
+                    )
+                    goal_round = self._continuation_nonnegative_integer(
+                        continuation.context,
+                        "goalRound",
+                    )
+                    repair_candidate_start_checkpoint = self._continuation_optional_checkpoint(
+                        continuation.context,
+                        hashes_key="repairCandidateStartHashes",
+                        manifest_key="repairCandidateStartManifestHash",
+                    )
+                    checkpoint_bound = (
+                        workspace_checkpoint is not None
+                        and goal_start_checkpoint.manifest_hash
+                        == workspace_checkpoint.manifest_hash
+                    )
+                    if goal_effect_policy is TurnEffectPolicy.MAY_NOOP and (
+                        not checkpoint_bound
+                        or not any(
+                            goal.status is GoalStatus.VERIFIED for goal in projection.graph.goals
+                        )
+                    ):
+                        raise DirectPiContinuationUnavailable(
+                            "the no-op continuation is not bound to the verified checkpoint"
+                        )
+                    if turn_kind == "build":
+                        if continuation.stage != "building":
+                            raise DirectPiContinuationUnavailable(
+                                "the build continuation stage is invalid"
+                            )
+                    elif (
+                        continuation.stage != "repairing"
+                        or turn_effect_policy is not TurnEffectPolicy.MUST_CHANGE
+                    ):
+                        raise DirectPiContinuationUnavailable(
+                            "the repair continuation effect contract is invalid"
+                        )
                     # A question may be asked after arbitrary edits in the Pi
                     # turn. Resume conservatively with full regression breadth.
                     legacy_checkpoint_unknown_paths = True
@@ -603,6 +751,25 @@ class DirectPiOrchestrator:
                     goal_start_checkpoint = await workspaces.capture_candidate_checkpoint(
                         generation
                     )
+                    checkpoint_bound = (
+                        workspace_checkpoint is not None
+                        and goal_start_checkpoint.manifest_hash
+                        == workspace_checkpoint.manifest_hash
+                    )
+                    if workspace_checkpoint is not None and not checkpoint_bound:
+                        # G is retained between goals and may have drifted after
+                        # the last durable checkpoint. Never grant no-op authority
+                        # to that state, and re-check every verified goal.
+                        legacy_checkpoint_unknown_paths = True
+                    goal_effect_policy = self._initial_goal_effect_policy(
+                        projection,
+                        fresh_build=True,
+                        checkpoint_bound=checkpoint_bound,
+                    )
+                    turn_effect_policy = goal_effect_policy
+                    turn_kind = "build"
+                    build_settled = False
+                    repair_candidate_start_checkpoint = None
                 await assert_run_active(self.repository, run_id, active_lease)
 
                 advisory = compile_goal_advisory_acceptance(
@@ -619,12 +786,20 @@ class DirectPiOrchestrator:
                 turn_start_hashes = await workspaces.snapshot_hashes(generation)
                 await assert_run_active(self.repository, run_id, active_lease)
 
-                turn_continuation_context = {
-                    "baselineHashes": baseline,
-                    "goalStartHashes": self._checkpoint_hashes(
-                        goal_start_checkpoint
-                    ),
-                }
+                if continuation is None:
+                    logical_turn_start_hashes = turn_start_hashes
+                turn_continuation_context = self._goal_turn_continuation_context(
+                    baseline=baseline,
+                    goal_start=goal_start_checkpoint,
+                    logical_turn_start_hashes=logical_turn_start_hashes,
+                    goal_effect_policy=goal_effect_policy,
+                    turn_effect_policy=turn_effect_policy,
+                    turn_kind=turn_kind,
+                    build_settled=build_settled,
+                    goal_round=goal_round,
+                    repair_candidate_start=repair_candidate_start_checkpoint,
+                    architecture_profile=architecture_profile,
+                )
 
                 turn_stage = continuation.stage if continuation is not None else "building"
                 await self._phase(
@@ -640,13 +815,17 @@ class DirectPiOrchestrator:
                         "goalId": current_goal_id,
                         "graphRevision": projection.revision,
                         "resumed": continuation is not None,
+                        "architectureProfile": architecture_profile.as_prompt_context(),
                     },
                     lease_token=active_lease,
                 )
                 if continuation is not None:
                     await pi.invoke(
                         generation,
-                        self._continuation_prompt(continuation),
+                        self._continuation_prompt(
+                            continuation,
+                            architecture_profile=architecture_profile,
+                        ),
                         stage=turn_stage,
                         goal_id=current_goal_id,
                         continuation_key=continuation.continuation_key,
@@ -659,9 +838,10 @@ class DirectPiOrchestrator:
                         generation,
                         goal_build_prompt(
                             requirement=requirement,
-                            starter=starter.as_architect_context(),
+                            starter=starter.as_build_context(),
                             execution_plan=execution_plan,
                             advisory_self_check_command=advisory_self_check_command,
+                            architecture_profile=architecture_profile,
                         ),
                         stage="building",
                         goal_id=current_goal_id,
@@ -681,16 +861,18 @@ class DirectPiOrchestrator:
                 )
                 settlement_hashes = await workspaces.snapshot_hashes(generation)
                 settlement_paths = self._hash_delta_paths(
-                    turn_start_hashes,
+                    logical_turn_start_hashes,
                     settlement_hashes,
                 )
                 try:
-                    settlement = settle_workspace_turn(
+                    settle_workspace_turn(
                         pi.last_turn_receipt,
                         changed_paths=settlement_paths,
-                        effect_policy=TurnEffectPolicy.MUST_CHANGE,
+                        effect_policy=turn_effect_policy,
                     )
                 except AgentNoEffect as first_no_effect:
+                    if turn_kind != "build":
+                        raise
                     # One deterministic recovery turn is allowed. A second
                     # unchanged manifest is no progress and terminates with a
                     # precise runtime failure instead of verifying the starter.
@@ -707,6 +889,26 @@ class DirectPiOrchestrator:
                             "diagnostic": first_no_effect.diagnostic.event_payload(),
                         },
                         lease_token=active_lease,
+                    )
+                    logical_turn_start_hashes = settlement_hashes
+                    turn_effect_policy = TurnEffectPolicy.MUST_CHANGE
+                    turn_kind = "settlement_repair"
+                    if repair_candidate_start_checkpoint is None:
+                        with suppress(WorkspaceContractError):
+                            repair_candidate_start_checkpoint = (
+                                await workspaces.capture_candidate_checkpoint(generation)
+                            )
+                    turn_continuation_context = self._goal_turn_continuation_context(
+                        baseline=baseline,
+                        goal_start=goal_start_checkpoint,
+                        logical_turn_start_hashes=logical_turn_start_hashes,
+                        goal_effect_policy=goal_effect_policy,
+                        turn_effect_policy=turn_effect_policy,
+                        turn_kind=turn_kind,
+                        build_settled=build_settled,
+                        goal_round=goal_round,
+                        repair_candidate_start=(repair_candidate_start_checkpoint),
+                        architecture_profile=architecture_profile,
                     )
                     await pi.invoke(
                         generation,
@@ -728,6 +930,7 @@ class DirectPiOrchestrator:
                             },
                             round_number=total_repair_round,
                             advisory_self_check_command=advisory_self_check_command,
+                            architecture_profile=architecture_profile,
                         ),
                         stage="repairing",
                         goal_id=current_goal_id,
@@ -748,32 +951,40 @@ class DirectPiOrchestrator:
                     )
                     repaired_hashes = await workspaces.snapshot_hashes(generation)
                     settlement_paths = self._hash_delta_paths(
-                        settlement_hashes,
+                        logical_turn_start_hashes,
                         repaired_hashes,
                     )
-                    settlement = settle_workspace_turn(
+                    settle_workspace_turn(
                         pi.last_turn_receipt,
                         changed_paths=settlement_paths,
-                        effect_policy=TurnEffectPolicy.MUST_CHANGE,
+                        effect_policy=turn_effect_policy,
                     )
-                await self.repository.append_event(
-                    run_id,
-                    "build.turn.completed",
-                    payload={
-                        "goalId": current_goal_id,
-                        "claimOnly": True,
-                        "effectPolicy": settlement.effect_policy.value,
-                        "changedFileCount": len(settlement.changed_paths),
-                        "toolCalls": settlement.tool_calls,
-                    },
-                    lease_token=active_lease,
-                )
                 typecheck = await workspaces.typecheck_workspace(generation)
                 while typecheck.exit_code != 0 or typecheck.timed_out:
                     total_repair_round = await self.repository.increment_repair_round(
                         run_id,
                         phase=RunPhase.repairing,
                         lease_token=active_lease,
+                    )
+                    logical_turn_start_hashes = await workspaces.snapshot_hashes(generation)
+                    turn_effect_policy = TurnEffectPolicy.MUST_CHANGE
+                    turn_kind = "typecheck_repair"
+                    if repair_candidate_start_checkpoint is None:
+                        with suppress(WorkspaceContractError):
+                            repair_candidate_start_checkpoint = (
+                                await workspaces.capture_candidate_checkpoint(generation)
+                            )
+                    turn_continuation_context = self._goal_turn_continuation_context(
+                        baseline=baseline,
+                        goal_start=goal_start_checkpoint,
+                        logical_turn_start_hashes=logical_turn_start_hashes,
+                        goal_effect_policy=goal_effect_policy,
+                        turn_effect_policy=turn_effect_policy,
+                        turn_kind=turn_kind,
+                        build_settled=build_settled,
+                        goal_round=goal_round,
+                        repair_candidate_start=(repair_candidate_start_checkpoint),
+                        architecture_profile=architecture_profile,
                     )
                     await pi.invoke(
                         generation,
@@ -788,11 +999,32 @@ class DirectPiOrchestrator:
                             },
                             round_number=total_repair_round,
                             advisory_self_check_command=advisory_self_check_command,
+                            architecture_profile=architecture_profile,
                         ),
                         stage="repairing",
                         goal_id=current_goal_id,
                         continuation_key="goal_graph.typecheck_repair",
                         continuation_context=turn_continuation_context,
+                    )
+                    await self.repository.append_event(
+                        run_id,
+                        "runtime.turn.transport_finished",
+                        payload={
+                            "goalId": current_goal_id,
+                            "stage": "repairing",
+                            "framework": agent_framework,
+                            "requestId": pi.last_turn_receipt.request_id,
+                        },
+                        lease_token=active_lease,
+                    )
+                    typecheck_repair_hashes = await workspaces.snapshot_hashes(generation)
+                    settle_workspace_turn(
+                        pi.last_turn_receipt,
+                        changed_paths=self._hash_delta_paths(
+                            logical_turn_start_hashes,
+                            typecheck_repair_hashes,
+                        ),
+                        effect_policy=turn_effect_policy,
                     )
                     typecheck = await workspaces.typecheck_workspace(generation)
                 projection = await self.repository.claim_goal(
@@ -800,8 +1032,6 @@ class DirectPiOrchestrator:
                     current_goal_id,
                     lease_token=active_lease,
                 )
-                goal_round = 0
-
                 while True:
                     await assert_run_active(self.repository, run_id, active_lease)
                     while True:
@@ -856,6 +1086,26 @@ class DirectPiOrchestrator:
                                 graph_revision=projection.revision,
                                 verified_evidence=evidence_summaries,
                             )
+                            logical_turn_start_hashes = await workspaces.snapshot_hashes(generation)
+                            turn_effect_policy = TurnEffectPolicy.MUST_CHANGE
+                            turn_kind = "workspace_audit_repair"
+                            if repair_candidate_start_checkpoint is None:
+                                with suppress(WorkspaceContractError):
+                                    repair_candidate_start_checkpoint = (
+                                        await workspaces.capture_candidate_checkpoint(generation)
+                                    )
+                            turn_continuation_context = self._goal_turn_continuation_context(
+                                baseline=baseline,
+                                goal_start=goal_start_checkpoint,
+                                logical_turn_start_hashes=(logical_turn_start_hashes),
+                                goal_effect_policy=goal_effect_policy,
+                                turn_effect_policy=turn_effect_policy,
+                                turn_kind=turn_kind,
+                                build_settled=build_settled,
+                                goal_round=goal_round,
+                                repair_candidate_start=(repair_candidate_start_checkpoint),
+                                architecture_profile=architecture_profile,
+                            )
                             await pi.invoke(
                                 generation,
                                 goal_repair_prompt(
@@ -865,12 +1115,33 @@ class DirectPiOrchestrator:
                                     advisory_self_check_command=(
                                         advisory_self_check_command
                                     ),
+                                    architecture_profile=architecture_profile,
                                 ),
                                 stage="repairing",
                                 goal_id=current_goal_id,
                                 continuation_key="goal_graph.workspace_audit_repair",
                                 continuation_context=turn_continuation_context,
                                 require_existing_session=True,
+                            )
+                            await self.repository.append_event(
+                                run_id,
+                                "runtime.turn.transport_finished",
+                                payload={
+                                    "goalId": current_goal_id,
+                                    "stage": "repairing",
+                                    "framework": agent_framework,
+                                    "requestId": pi.last_turn_receipt.request_id,
+                                },
+                                lease_token=active_lease,
+                            )
+                            audit_repair_hashes = await workspaces.snapshot_hashes(generation)
+                            settle_workspace_turn(
+                                pi.last_turn_receipt,
+                                changed_paths=self._hash_delta_paths(
+                                    logical_turn_start_hashes,
+                                    audit_repair_hashes,
+                                ),
+                                effect_policy=turn_effect_policy,
                             )
                             projection = await self.repository.claim_goal(
                                 run_id,
@@ -883,13 +1154,23 @@ class DirectPiOrchestrator:
                                 active_lease,
                             )
                     await assert_run_active(self.repository, run_id, active_lease)
-                    await self._persist_goal_diff(
-                        run_id,
-                        audited,
-                        current_goal_id,
-                        active_lease,
-                    )
-                    await assert_run_active(self.repository, run_id, active_lease)
+                    if turn_kind != "build":
+                        # A repair is admitted provisionally from its raw turn
+                        # delta, then settled again only after the workspace
+                        # auditor has restored every protected file. This keeps
+                        # protected-only edits from satisfying MUST_CHANGE for a
+                        # later Goal whose goal-level policy permits a no-op.
+                        repaired_candidate_hashes = await workspaces.snapshot_hashes(
+                            generation
+                        )
+                        settle_workspace_turn(
+                            pi.last_turn_receipt,
+                            changed_paths=self._hash_delta_paths(
+                                logical_turn_start_hashes,
+                                repaired_candidate_hashes,
+                            ),
+                            effect_policy=TurnEffectPolicy.MUST_CHANGE,
+                        )
                     candidate_checkpoint = await workspaces.capture_candidate_checkpoint(
                         generation
                     )
@@ -898,6 +1179,37 @@ class DirectPiOrchestrator:
                         goal_start_checkpoint,
                         candidate_checkpoint,
                     )
+                    candidate_paths = frozenset(self._checkpoint_hashes(candidate_checkpoint))
+                    goal_settlement = settle_workspace_turn(
+                        pi.last_turn_receipt,
+                        changed_paths=goal_changed_paths,
+                        effect_policy=goal_effect_policy,
+                    )
+                    if repair_candidate_start_checkpoint is not None:
+                        settle_workspace_turn(
+                            pi.last_turn_receipt,
+                            changed_paths=self._candidate_delta_paths(
+                                repair_candidate_start_checkpoint,
+                                candidate_checkpoint,
+                            ),
+                            effect_policy=TurnEffectPolicy.MUST_CHANGE,
+                        )
+                        repair_candidate_start_checkpoint = None
+                    if not build_settled:
+                        await self.repository.append_event(
+                            run_id,
+                            "build.turn.completed",
+                            payload={
+                                "goalId": current_goal_id,
+                                "claimOnly": True,
+                                "effectPolicy": goal_settlement.effect_policy.value,
+                                "changedFileCount": len(goal_settlement.changed_paths),
+                                "toolCalls": goal_settlement.tool_calls,
+                                "noOp": goal_settlement.no_op,
+                            },
+                            lease_token=active_lease,
+                        )
+                        build_settled = True
                     prior_goal_changed_paths = {
                         path
                         for paths in goal_changed_paths_by_id.values()
@@ -954,6 +1266,18 @@ class DirectPiOrchestrator:
                             raise DirectPiOrchestrationError(
                                 "final GoalGraph checkpoint requires a full validation suite"
                             )
+                        await self._persist_goal_diff(
+                            run_id,
+                            audited,
+                            current_goal_id,
+                            active_lease,
+                            changed_paths=goal_changed_paths,
+                            deleted_paths=tuple(
+                                path
+                                for path in goal_changed_paths
+                                if path not in candidate_paths
+                            ),
+                        )
                         next_summary = VerifiedGoalEvidence(
                             goal_id=current_goal_id,
                             passed_acceptance_ids=tuple(
@@ -975,7 +1299,7 @@ class DirectPiOrchestrator:
                         }
                         legacy_checkpoint_unknown_paths = False
                         await assert_run_active(self.repository, run_id, active_lease)
-                        await self.repository.record_verified_checkpoint(
+                        workspace_checkpoint = await self.repository.record_verified_checkpoint(
                             run_id,
                             current_goal_id,
                             candidate_checkpoint.files,
@@ -1089,6 +1413,23 @@ class DirectPiOrchestrator:
                         graph_revision=projection.revision,
                         verified_evidence=evidence_summaries,
                     )
+                    repair_candidate_start_checkpoint = candidate_checkpoint
+                    logical_turn_start_hashes = await workspaces.snapshot_hashes(generation)
+                    turn_effect_policy = TurnEffectPolicy.MUST_CHANGE
+                    turn_kind = "verification_repair"
+                    turn_continuation_context = self._goal_turn_continuation_context(
+                        baseline=baseline,
+                        goal_start=goal_start_checkpoint,
+                        logical_turn_start_hashes=logical_turn_start_hashes,
+                        goal_effect_policy=goal_effect_policy,
+                        turn_effect_policy=turn_effect_policy,
+                        turn_kind=turn_kind,
+                        build_settled=build_settled,
+                        goal_round=goal_round,
+                        repair_candidate_start=(repair_candidate_start_checkpoint),
+                        architecture_profile=architecture_profile,
+                    )
+                    await assert_run_active(self.repository, run_id, active_lease)
                     await pi.invoke(
                         generation,
                         goal_repair_prompt(
@@ -1096,11 +1437,32 @@ class DirectPiOrchestrator:
                             diagnostic=outcome.as_repair_context(),
                             round_number=total_repair_round,
                             advisory_self_check_command=advisory_self_check_command,
+                            architecture_profile=architecture_profile,
                         ),
                         stage="repairing",
                         goal_id=current_goal_id,
                         continuation_key="goal_graph.verification_repair",
                         continuation_context=turn_continuation_context,
+                    )
+                    await self.repository.append_event(
+                        run_id,
+                        "runtime.turn.transport_finished",
+                        payload={
+                            "goalId": current_goal_id,
+                            "stage": "repairing",
+                            "framework": agent_framework,
+                            "requestId": pi.last_turn_receipt.request_id,
+                        },
+                        lease_token=active_lease,
+                    )
+                    repair_end_hashes = await workspaces.snapshot_hashes(generation)
+                    settle_workspace_turn(
+                        pi.last_turn_receipt,
+                        changed_paths=self._hash_delta_paths(
+                            logical_turn_start_hashes,
+                            repair_end_hashes,
+                        ),
+                        effect_policy=turn_effect_policy,
                     )
                     projection = await self.repository.claim_goal(
                         run_id,
@@ -1325,6 +1687,9 @@ class DirectPiOrchestrator:
                     "starterCapabilities": list(starter.capability_ids),
                     "agentFramework": agent_framework,
                     "productDesignPolicy": PRODUCT_DESIGN_POLICY,
+                    "architectureProfilePolicy": (
+                        f"{ARCHITECTURE_PROFILE_ID}@{ARCHITECTURE_PROFILE_VERSION}"
+                    ),
                     **runtime_contract.cache_fingerprint(),
                 },
                 lease_token=active_lease,
@@ -1396,6 +1761,9 @@ class DirectPiOrchestrator:
                 "starterVersion": starter.version,
                 "starterCapabilities": list(starter.capability_ids),
                 "productDesignPolicy": PRODUCT_DESIGN_POLICY,
+                "architectureProfilePolicy": (
+                    f"{ARCHITECTURE_PROFILE_ID}@{ARCHITECTURE_PROFILE_VERSION}"
+                ),
                 **runtime_contract.cache_fingerprint(),
             }
             candidates = await self.repository.list_planning_cache_candidates(
@@ -1423,7 +1791,7 @@ class DirectPiOrchestrator:
                     generation,
                     planning_prompt(
                         requirement=requirement,
-                        starter=starter.as_architect_context(),
+                        starter=starter.as_build_context(),
                     ),
                     stage="planning",
                     structured_output_schema=PlanningBundle.model_json_schema(
@@ -1519,18 +1887,28 @@ class DirectPiOrchestrator:
 
             await self._phase(run_id, RunPhase.building, active_lease)
             planning_payload = bundle.model_dump(mode="json", by_alias=True)
+            architecture_profile = derive_product_architecture_profile(
+                requirement=requirement,
+                route_count=max(1, len(bundle.build_plan.routes)),
+                goal_count=1,
+            )
             await self.repository.append_event(
                 run_id,
                 "build.turn.started",
-                payload={"stage": "building", "advisoryPlan": True},
+                payload={
+                    "stage": "building",
+                    "advisoryPlan": True,
+                    "architectureProfile": architecture_profile.as_prompt_context(),
+                },
                 lease_token=active_lease,
             )
             handoff = await pi.invoke(
                 generation,
                 build_prompt(
                     requirement=requirement,
-                    starter=starter.as_architect_context(),
+                    starter=starter.as_build_context(),
                     planning_bundle=planning_payload,
+                    architecture_profile=architecture_profile,
                 ),
                 stage="building",
                 continuation_key="p0.building",
@@ -1543,7 +1921,10 @@ class DirectPiOrchestrator:
                 diagnostic = (typecheck.stdout + "\n" + typecheck.stderr).strip()
                 handoff = await pi.invoke(
                     generation,
-                    build_repair_prompt(diagnostic=diagnostic),
+                    build_repair_prompt(
+                        diagnostic=diagnostic,
+                        architecture_profile=architecture_profile,
+                    ),
                     stage="repairing",
                     continuation_key="p0.typecheck_repair",
                     continuation_context={"baselineHashes": before_planning},
@@ -1646,6 +2027,7 @@ class DirectPiOrchestrator:
                         planning_bundle=bundle.model_dump(mode="json", by_alias=True),
                         diagnostic=outcome.as_repair_context(),
                         round_number=round_number,
+                        architecture_profile=architecture_profile,
                     ),
                     stage="repairing",
                     continuation_key="p0.verification_repair",
@@ -1744,7 +2126,11 @@ class DirectPiOrchestrator:
                     )
 
     @staticmethod
-    def _continuation_prompt(continuation: RunContinuation) -> str:
+    def _continuation_prompt(
+        continuation: RunContinuation,
+        *,
+        architecture_profile: ArchitectureProfile | None = None,
+    ) -> str:
         if not continuation.answer:
             raise DirectPiContinuationUnavailable(
                 "the continuation answer is unavailable"
@@ -1754,6 +2140,19 @@ class DirectPiOrchestrator:
             if continuation.stage == "planning"
             else " Continue implementation with the native coding tools and finish the prior turn."
         )
+        architecture_instruction = (
+            "\nContinue to follow this exact frozen architecture profile:\n"
+            + architecture_profile.render_brief()
+            + "\n"
+            + json.dumps(
+                architecture_profile.as_prompt_context(),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if architecture_profile is not None
+            else ""
+        )
         return (
             "USER CLARIFICATION CONTINUATION. The prior request_user_input turn ended "
             "cleanly and the user has now answered. Continue the exact prior task in "
@@ -1762,6 +2161,7 @@ class DirectPiOrchestrator:
             f"User answer: {json.dumps(continuation.answer, ensure_ascii=False)}\n"
             "Apply the answer as authoritative task context. Do not repeat the same question."
             + planning_instruction
+            + architecture_instruction
         )
 
     @staticmethod
@@ -1804,16 +2204,155 @@ class DirectPiOrchestrator:
 
     @classmethod
     def _continuation_checkpoint(
-        cls, context: dict[str, object]
+        cls,
+        context: dict[str, object],
+        *,
+        hashes_key: str = "goalStartHashes",
+        manifest_key: str = "goalStartManifestHash",
     ) -> CandidateCheckpoint:
-        hashes = cls._continuation_hashes(context, "goalStartHashes")
+        hashes = cls._continuation_hashes(context, hashes_key)
+        manifest_hash = context.get(manifest_key)
+        if (
+            not isinstance(manifest_hash, str)
+            or re.fullmatch(r"[0-9a-f]{64}", manifest_hash) is None
+        ):
+            raise DirectPiContinuationUnavailable(
+                f"the continuation {manifest_key} is invalid"
+            )
         return CandidateCheckpoint(
             files=tuple(
                 {"path": path, "sha256": digest}
                 for path, digest in sorted(hashes.items())
             ),
-            manifest_hash="continuation-cursor",
+            manifest_hash=manifest_hash,
         )
+
+    @classmethod
+    def _continuation_optional_checkpoint(
+        cls,
+        context: dict[str, object],
+        *,
+        hashes_key: str,
+        manifest_key: str,
+    ) -> CandidateCheckpoint | None:
+        if hashes_key not in context and manifest_key not in context:
+            return None
+        if hashes_key not in context or manifest_key not in context:
+            raise DirectPiContinuationUnavailable(
+                "the continuation repair checkpoint is incomplete"
+            )
+        return cls._continuation_checkpoint(
+            context,
+            hashes_key=hashes_key,
+            manifest_key=manifest_key,
+        )
+
+    @staticmethod
+    def _continuation_effect_policy(
+        context: dict[str, object],
+        key: str,
+    ) -> TurnEffectPolicy:
+        value = context.get(key)
+        try:
+            policy = TurnEffectPolicy(value)
+        except (TypeError, ValueError) as exc:
+            raise DirectPiContinuationUnavailable(
+                f"the continuation {key} is invalid"
+            ) from exc
+        if policy is TurnEffectPolicy.VERIFY_ONLY:
+            raise DirectPiContinuationUnavailable(
+                f"the continuation {key} cannot be verify-only"
+            )
+        return policy
+
+    @staticmethod
+    def _continuation_turn_kind(context: dict[str, object]) -> str:
+        value = context.get("turnKind")
+        if value not in {
+            "build",
+            "settlement_repair",
+            "typecheck_repair",
+            "workspace_audit_repair",
+            "verification_repair",
+        }:
+            raise DirectPiContinuationUnavailable("the continuation turn kind is invalid")
+        return str(value)
+
+    @staticmethod
+    def _continuation_boolean(context: dict[str, object], key: str) -> bool:
+        value = context.get(key)
+        if type(value) is not bool:
+            raise DirectPiContinuationUnavailable(f"the continuation {key} is invalid")
+        return value
+
+    @staticmethod
+    def _continuation_nonnegative_integer(
+        context: dict[str, object], key: str
+    ) -> int:
+        value = context.get(key)
+        if type(value) is not int or value < 0:
+            raise DirectPiContinuationUnavailable(f"the continuation {key} is invalid")
+        return value
+
+    @classmethod
+    def _goal_turn_continuation_context(
+        cls,
+        *,
+        baseline: dict[str, str],
+        goal_start: CandidateCheckpoint,
+        logical_turn_start_hashes: dict[str, str],
+        goal_effect_policy: TurnEffectPolicy,
+        turn_effect_policy: TurnEffectPolicy,
+        turn_kind: str,
+        build_settled: bool,
+        goal_round: int,
+        repair_candidate_start: CandidateCheckpoint | None,
+        architecture_profile: ArchitectureProfile,
+    ) -> dict[str, object]:
+        context: dict[str, object] = {
+            "baselineHashes": baseline,
+            "goalStartHashes": cls._checkpoint_hashes(goal_start),
+            "goalStartManifestHash": goal_start.manifest_hash,
+            "logicalTurnStartHashes": logical_turn_start_hashes,
+            "goalEffectPolicy": goal_effect_policy.value,
+            "turnEffectPolicy": turn_effect_policy.value,
+            "turnKind": turn_kind,
+            "buildSettled": build_settled,
+            "goalRound": goal_round,
+            "architectureProfile": architecture_profile.as_prompt_context(),
+            "architectureProfileHash": architecture_profile.fingerprint(),
+        }
+        if repair_candidate_start is not None:
+            context["repairCandidateStartHashes"] = cls._checkpoint_hashes(
+                repair_candidate_start
+            )
+            context["repairCandidateStartManifestHash"] = repair_candidate_start.manifest_hash
+        return context
+
+    @staticmethod
+    def _assert_continuation_architecture_profile(
+        context: dict[str, object],
+        expected: ArchitectureProfile,
+    ) -> None:
+        raw_profile = context.get("architectureProfile")
+        raw_hash = context.get("architectureProfileHash")
+        if not isinstance(raw_profile, dict) or not isinstance(raw_hash, str):
+            raise DirectPiContinuationUnavailable(
+                "the continuation architecture profile is unavailable"
+            )
+        try:
+            restored = ArchitectureProfile.from_prompt_context(raw_profile)
+        except ValueError as exc:
+            raise DirectPiContinuationUnavailable(
+                "the continuation architecture profile is invalid"
+            ) from exc
+        if (
+            restored.fingerprint() != raw_hash
+            or raw_hash != expected.fingerprint()
+        ):
+            raise DirectPiContinuationUnavailable(
+                "the continuation architecture profile changed"
+            )
 
     @staticmethod
     def _durable_started_at(run: object, *, recovered: bool) -> float:
@@ -1863,6 +2402,29 @@ class DirectPiOrchestrator:
         return current[0] if current else None
 
     @staticmethod
+    def _initial_goal_effect_policy(
+        projection: GoalGraphProjection,
+        *,
+        fresh_build: bool,
+        checkpoint_bound: bool,
+    ) -> TurnEffectPolicy:
+        """Allow a later goal to prove work already integrated by an earlier goal.
+
+        The persisted GoalGraph is the authority: a model cannot opt itself into
+        no-op verification.  A fresh graph still requires a real workspace delta,
+        while any graph with verified work may submit an unchanged candidate for
+        the next goal's independent acceptance suite.
+        """
+
+        if (
+            fresh_build
+            and checkpoint_bound
+            and any(goal.status is GoalStatus.VERIFIED for goal in projection.graph.goals)
+        ):
+            return TurnEffectPolicy.MAY_NOOP
+        return TurnEffectPolicy.MUST_CHANGE
+
+    @staticmethod
     def _checkpoint_evidence_summaries(
         checkpoint: VerifiedCheckpoint | None,
     ) -> tuple[VerifiedGoalEvidence, ...]:
@@ -1890,6 +2452,33 @@ class DirectPiOrchestrator:
                 "verified checkpoint evidence summary is invalid"
             ) from exc
         return tuple(summaries)
+
+    @staticmethod
+    def _projection_evidence_summaries(
+        projection: GoalGraphProjection,
+        summaries: tuple[VerifiedGoalEvidence, ...],
+    ) -> tuple[VerifiedGoalEvidence, ...]:
+        """Bind checkpoint evidence only to verified goals in this graph.
+
+        A cross-run recovery checkpoint may seed the workspace while the new run
+        deliberately plans a fresh graph. Its capsule still owns path-history and
+        legacy breadth, but source-run goal evidence cannot be transplanted onto
+        unrelated pending goals in the new graph.
+        """
+
+        verified_goal_ids = {
+            goal.goal_id
+            for goal in projection.graph.goals
+            if goal.status is GoalStatus.VERIFIED
+        }
+        selected = tuple(
+            summary for summary in summaries if summary.goal_id in verified_goal_ids
+        )
+        if {summary.goal_id for summary in selected} != verified_goal_ids:
+            raise DirectPiOrchestrationError(
+                "verified checkpoint evidence does not cover the active GoalGraph"
+            )
+        return selected
 
     @staticmethod
     def _checkpoint_goal_changed_paths(
@@ -2059,11 +2648,20 @@ class DirectPiOrchestrator:
         audited: AuditedWorkspace,
         goal_id: str,
         lease_token: str,
+        *,
+        changed_paths: tuple[str, ...] | None = None,
+        deleted_paths: tuple[str, ...] | None = None,
     ) -> None:
-        deleted = {
-            change.path for change in audited.model_changes if change.operation == "delete"
-        }
-        for path in audited.changed_paths:
+        deleted = (
+            {
+                change.path
+                for change in audited.model_changes
+                if change.operation == "delete"
+            }
+            if deleted_paths is None
+            else set(deleted_paths)
+        )
+        for path in audited.changed_paths if changed_paths is None else changed_paths:
             await self.repository.append_event(
                 run_id,
                 "file.changed",
@@ -2460,7 +3058,11 @@ class DirectPiOrchestrator:
             ) from exc
 
     @staticmethod
-    def _parse_goal_graph_draft(text: str) -> GoalGraphDraft:
+    def _parse_goal_graph_draft(
+        text: str,
+        *,
+        requirement: str,
+    ) -> GoalGraphDraft:
         value = text.strip()
         if value.startswith("```json") and value.endswith("```"):
             value = value[7:-3].strip()
@@ -2471,7 +3073,10 @@ class DirectPiOrchestrator:
             payload, end = decoder.raw_decode(value)
             if value[end:].strip():
                 raise ValueError("GoalGraphDraft has trailing content")
-            return parse_goal_graph_draft(payload)
+            return validate_goal_graph_routing(
+                requirement,
+                parse_goal_graph_draft(payload),
+            )
         except (json.JSONDecodeError, ValidationError, ValueError, TypeError) as exc:
             if isinstance(exc, ValidationError):
                 details = "; ".join(

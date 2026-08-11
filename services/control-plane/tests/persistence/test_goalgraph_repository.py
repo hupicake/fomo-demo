@@ -8,12 +8,20 @@ import pytest
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 
-from fomo.direct_pi.goalgraph import GoalStatus, GraphStatus, parse_goal_graph_draft
+from fomo.direct_pi.architecture_profile import derive_architecture_profile
+from fomo.direct_pi.goalgraph import (
+    GoalStatus,
+    GraphStatus,
+    NavigationMode,
+    parse_goal_graph_draft,
+    parse_legacy_goal_graph_draft,
+)
 from fomo.ids import utcnow
 from fomo.persistence import ConflictError, ManifestIntegrityError, RunLeaseLost
 from fomo.persistence.models import (
     CheckpointFileRecord,
     CheckpointRecord,
+    GoalGraphRevisionRecord,
     GoalNodeRecord,
     ProjectRecord,
     RunEventRecord,
@@ -55,7 +63,7 @@ def _acceptance(identifier: str) -> dict[str, Any]:
 
 
 def _draft():
-    return parse_goal_graph_draft(
+    return parse_legacy_goal_graph_draft(
         {
             "schemaVersion": 1,
             "productOutcome": "A verified two-step product",
@@ -81,6 +89,133 @@ def _draft():
     )
 
 
+def _v2_draft():
+    first_acceptance = _acceptance("AC-route-root")
+    first_acceptance["tests"][0] = {
+        "id": "T-route-root",
+        "acceptanceId": "AC-route-root",
+        "title": "opens the home route directly",
+        "actions": [
+            {"kind": "goto", "path": "/"},
+            {"kind": "reload", "target": None},
+        ],
+        "assertions": [
+            {"kind": "url", "path": "/"},
+            {
+                "kind": "visible",
+                "target": {"by": "role", "value": "heading", "name": "Home"},
+            },
+        ],
+    }
+    second_acceptance = {
+        "criteria": [
+            {
+                "id": "AC-route-missions-direct",
+                "title": "Open missions directly",
+                "priority": "must",
+                "given": "the product is available",
+                "when": "missions is opened directly",
+                "then": "the route identity is visible",
+            },
+            {
+                "id": "AC-route-missions-link",
+                "title": "Navigate to missions",
+                "priority": "must",
+                "given": "home is open",
+                "when": "the Missions link is followed",
+                "then": "the target route identity is visible",
+            },
+        ],
+        "tests": [
+            {
+                "id": "T-route-missions-direct",
+                "acceptanceId": "AC-route-missions-direct",
+                "title": "opens missions directly",
+                "actions": [
+                    {"kind": "goto", "path": "/missions"},
+                    {"kind": "reload", "target": None},
+                ],
+                "assertions": [
+                    {"kind": "url", "path": "/missions"},
+                    {
+                        "kind": "visible",
+                        "target": {
+                            "by": "role",
+                            "value": "heading",
+                            "name": "Missions",
+                        },
+                    },
+                ],
+            },
+            {
+                "id": "T-route-missions-link",
+                "acceptanceId": "AC-route-missions-link",
+                "title": "navigates to missions",
+                "actions": [
+                    {"kind": "goto", "path": "/"},
+                    {
+                        "kind": "click",
+                        "target": {
+                            "by": "role",
+                            "value": "link",
+                            "name": "Missions",
+                        },
+                    },
+                ],
+                "assertions": [
+                    {"kind": "url", "path": "/missions"},
+                    {
+                        "kind": "visible",
+                        "target": {
+                            "by": "role",
+                            "value": "heading",
+                            "name": "Missions",
+                        },
+                    },
+                ],
+            },
+        ],
+    }
+    return parse_goal_graph_draft(
+        {
+            "schemaVersion": 2,
+            "productOutcome": "A durable routed mission product",
+            "routes": [
+                {
+                    "path": "/",
+                    "title": "Home",
+                    "owningGoalId": "G-1",
+                    "deepLinkable": True,
+                },
+                {
+                    "path": "/missions",
+                    "title": "Missions",
+                    "owningGoalId": "G-2",
+                    "deepLinkable": True,
+                },
+            ],
+            "goals": [
+                {
+                    "goalId": "G-1",
+                    "title": "Home route",
+                    "productOutcome": "Users open mission control.",
+                    "userVisible": True,
+                    "dependsOn": [],
+                    "acceptance": first_acceptance,
+                },
+                {
+                    "goalId": "G-2",
+                    "title": "Mission route",
+                    "productOutcome": "Users navigate to missions.",
+                    "userVisible": True,
+                    "dependsOn": ["G-1"],
+                    "acceptance": second_acceptance,
+                },
+            ],
+        }
+    )
+
+
 async def _running_context(repository, suffix: str = "one"):
     owner = await create_user_session(repository)
     project = await repository.create_project(owner.id, f"Project {suffix}")
@@ -96,7 +231,7 @@ async def _running_context(repository, suffix: str = "one"):
 async def test_dag_projection_and_p0_none(repository) -> None:
     project, run, lease = await _running_context(repository)
     assert await repository.get_goal_graph_for_run(run.id) is None
-    created = await repository.create_goal_graph(
+    created = await repository._create_legacy_goal_graph(
         project.id, run.id, _draft(), lease_token=lease
     )
     assert created.graph.status is GraphStatus.ACTIVE
@@ -113,9 +248,149 @@ async def test_dag_projection_and_p0_none(repository) -> None:
 
 
 @pytest.mark.asyncio
+async def test_legacy_write_requires_private_admission_and_preserves_safe_old_paths(
+    repository,
+) -> None:
+    project, run, lease = await _running_context(repository, "legacy-admission")
+    draft = _draft()
+    with pytest.raises(ValueError, match="only accepts current schema v2"):
+        await repository.create_goal_graph(project.id, run.id, draft, lease_token=lease)
+
+    payload = draft.model_dump(mode="json", by_alias=True)
+    for goal in payload["goals"]:
+        test = goal["acceptance"]["tests"][0]
+        test["actions"][0]["path"] = "/legacy/"
+    legacy = parse_legacy_goal_graph_draft(payload)
+    created = await repository._create_legacy_goal_graph(
+        project.id, run.id, legacy, lease_token=lease
+    )
+    restored = await repository.get_goal_graph(run.id)
+
+    assert created.graph.schema_version == 1
+    assert restored is not None
+    assert restored.graph.goals[0].acceptance.tests[0].actions[0].path == "/legacy/"
+
+
+@pytest.mark.asyncio
+async def test_v2_route_manifest_round_trips_and_is_integrity_checked(repository) -> None:
+    project, run, lease = await _running_context(repository, "routes")
+    profile = derive_architecture_profile(
+        route_count=2,
+        goal_count=2,
+        shared_state_across_routes=True,
+    )
+    with pytest.raises(ValueError, match="requires an architecture profile"):
+        await repository.create_goal_graph(
+            project.id,
+            run.id,
+            _v2_draft(),
+            lease_token=lease,
+        )
+    created = await repository.create_goal_graph(
+        project.id,
+        run.id,
+        _v2_draft(),
+        architecture_profile=profile,
+        provenance={
+            "createdBy": "routing-test",
+            "_fomoGoalGraphRouting": {
+                "navigationMode": "single_surface",
+                "routes": [],
+            },
+            "_fomoArchitectureProfile": {"id": "caller-controlled"},
+        },
+        lease_token=lease,
+    )
+
+    assert created.graph.navigation_mode is NavigationMode.MULTI_ROUTE
+    assert created.architecture_profile == profile
+    assert [route.path for route in created.graph.routes] == ["/", "/missions"]
+    created_event = next(
+        event
+        for event in await repository.list_events(run.id)
+        if event.kind == "goal_graph.created"
+    )
+    read_projection = created_event.payload["goalGraph"]
+    assert read_projection["schemaVersion"] == 2
+    assert read_projection["navigationMode"] == "multi_route"
+    assert read_projection["routes"] == [
+        {
+            "path": "/",
+            "title": "Home",
+            "owningGoalId": "G-1",
+            "deepLinkable": True,
+        },
+        {
+            "path": "/missions",
+            "title": "Missions",
+            "owningGoalId": "G-2",
+            "deepLinkable": True,
+        },
+    ]
+    restored = await repository.get_goal_graph(run.id)
+    assert restored is not None and restored.graph == created.graph
+    assert restored.architecture_profile == profile
+
+    async with repository.database.session_factory() as session:
+        revision = await session.scalar(
+            select(GoalGraphRevisionRecord).where(
+                GoalGraphRevisionRecord.graph_id == created.graph_id
+            )
+        )
+        assert revision is not None
+        provenance = dict(revision.provenance)
+        routing = dict(provenance["_fomoGoalGraphRouting"])
+        assert routing["navigationMode"] == "multi_route"
+        routes = [dict(route) for route in routing["routes"]]
+        routes.reverse()
+        routing["routes"] = routes
+        provenance["_fomoGoalGraphRouting"] = routing
+        revision.provenance = provenance
+        await session.commit()
+
+    with pytest.raises(ManifestIntegrityError, match="content hash mismatch"):
+        await repository.get_goal_graph(run.id)
+
+
+@pytest.mark.asyncio
+async def test_v2_architecture_profile_provenance_rejects_tampering(repository) -> None:
+    project, run, lease = await _running_context(repository, "architecture-profile")
+    profile = derive_architecture_profile(route_count=2, goal_count=2)
+    created = await repository.create_goal_graph(
+        project.id,
+        run.id,
+        _v2_draft(),
+        architecture_profile=profile,
+        lease_token=lease,
+    )
+
+    async with repository.database.session_factory() as session:
+        revision = await session.scalar(
+            select(GoalGraphRevisionRecord).where(
+                GoalGraphRevisionRecord.graph_id == created.graph_id
+            )
+        )
+        assert revision is not None
+        provenance = dict(revision.provenance)
+        replacement = derive_architecture_profile(
+            route_count=2,
+            goal_count=2,
+            shared_state_across_routes=True,
+        )
+        provenance["_fomoArchitectureProfile"] = replacement.as_prompt_context()
+        revision.provenance = provenance
+        await session.commit()
+
+    with pytest.raises(ManifestIntegrityError, match="content hash mismatch"):
+        await repository.get_goal_graph(run.id)
+
+
+@pytest.mark.asyncio
 async def test_verified_checkpoint_advances_next_goal_and_detects_tampering(repository) -> None:
     project, run, lease = await _running_context(repository)
-    await repository.create_goal_graph(project.id, run.id, _draft(), lease_token=lease)
+    await repository._create_legacy_goal_graph(
+        project.id, run.id, _draft(), lease_token=lease
+    )
     await repository.activate_goal(run.id, "G-1", lease_token=lease)
     await repository.claim_goal(run.id, "G-1", lease_token=lease)
     checkpoint = await repository.record_verified_checkpoint(
@@ -167,7 +442,9 @@ async def test_legacy_verified_goal_trace_is_inferred_read_only_from_checkpoint_
     repository,
 ) -> None:
     project, run, lease = await _running_context(repository, "legacy-trace")
-    await repository.create_goal_graph(project.id, run.id, _draft(), lease_token=lease)
+    await repository._create_legacy_goal_graph(
+        project.id, run.id, _draft(), lease_token=lease
+    )
     await repository.activate_goal(run.id, "G-1", lease_token=lease)
     await repository.claim_goal(run.id, "G-1", lease_token=lease)
     first_files = [
@@ -243,7 +520,9 @@ async def test_legacy_verified_goal_trace_is_inferred_read_only_from_checkpoint_
 @pytest.mark.asyncio
 async def test_lost_lease_rolls_back_checkpoint_state_and_events(repository) -> None:
     project, run, lease = await _running_context(repository)
-    await repository.create_goal_graph(project.id, run.id, _draft(), lease_token=lease)
+    await repository._create_legacy_goal_graph(
+        project.id, run.id, _draft(), lease_token=lease
+    )
     await repository.activate_goal(run.id, "G-1", lease_token=lease)
     await repository.claim_goal(run.id, "G-1", lease_token=lease)
     async with repository.database.session_factory() as session:
@@ -325,7 +604,9 @@ async def test_usage_request_id_is_idempotent_for_p0_run(repository) -> None:
 @pytest.mark.asyncio
 async def test_partial_unique_index_allows_only_one_project_current_goal(repository) -> None:
     project, run, lease = await _running_context(repository, "first")
-    await repository.create_goal_graph(project.id, run.id, _draft(), lease_token=lease)
+    await repository._create_legacy_goal_graph(
+        project.id, run.id, _draft(), lease_token=lease
+    )
     await repository.activate_goal(run.id, "G-1", lease_token=lease)
 
     with pytest.raises(ConflictError, match="active goal"):
@@ -367,7 +648,9 @@ def test_manifest_hash_is_stable_across_file_order() -> None:
 @pytest.mark.asyncio
 async def test_graph_terminalization_releases_current_goal_and_emits_ui_event(repository) -> None:
     project, run, lease = await _running_context(repository, "terminalize")
-    await repository.create_goal_graph(project.id, run.id, _draft(), lease_token=lease)
+    await repository._create_legacy_goal_graph(
+        project.id, run.id, _draft(), lease_token=lease
+    )
     await repository.activate_goal(run.id, "G-1", lease_token=lease)
     await repository.claim_goal(run.id, "G-1", lease_token=lease)
 

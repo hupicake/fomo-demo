@@ -42,7 +42,7 @@ def test_v2_bare_manifest_is_digest_pinned_and_keeps_a_generic_buildable_boundar
     manifest = default_starter_manifest()
 
     assert manifest.id == "fomo-next-radix-v2"
-    assert manifest.version == "2.0.1"
+    assert manifest.version == "2.0.2"
     assert manifest.selected_capabilities == ()
     assert manifest.is_protected_path("app/page.tsx")
     assert manifest.is_protected_path("components/system/app-shell.tsx")
@@ -93,9 +93,9 @@ def test_v2_bare_manifest_is_digest_pinned_and_keeps_a_generic_buildable_boundar
         ".next/dev/types/**/*.ts",
     ]
     next_config = files["next.config.ts"]._content.decode("utf-8")
-    assert "assetPrefix: previewAssetPrefix()" in next_config
-    assert "FOMO_PREVIEW_ASSET_PREFIX" in next_config
-    assert "basePath" not in next_config
+    assert "basePath: previewBasePath()" in next_config
+    assert "FOMO_PREVIEW_BASE_PATH" in next_config
+    assert "assetPrefix:" not in next_config
     allowed_dev_origins = re.search(
         r"allowedDevOrigins:\s*\[(?P<origins>[^]]*)\]",
         next_config,
@@ -255,6 +255,47 @@ def test_v2_architect_context_is_compact_and_binds_selected_capability_imports()
     assert selected_context["selectedCapabilities"] == [bare_context["capabilityCatalog"][0]]
     assert "@/components/starter/crud-slots" in selected_context["availableImports"]
     assert "@/lib/starter/local-persistence" not in selected_context["availableImports"]
+
+
+def test_v2_build_context_exposes_the_editable_baseline_without_legacy_file_boundaries() -> None:
+    manifest = resolve_starter_manifest(("crud", "local-persistence"))
+    context = manifest.as_build_context()
+
+    assert context["baseline"] == {
+        "id": manifest.id,
+        "version": manifest.version,
+        "treeSha256": manifest.tree_sha256,
+    }
+    assert context["availableImports"] == list(manifest.available_imports)
+    assert context["selectedCapabilities"] == [
+        {
+            "id": capability.id,
+            "version": capability.version,
+            "treeSha256": capability.tree_sha256,
+            "availableImports": list(capability.available_imports),
+            "description": capability.description,
+            "provides": list(capability.provides),
+        }
+        for capability in manifest.selected_capabilities
+    ]
+    assert context["runtimeProtection"] == {
+        "immutable": [
+            ".gitignore",
+            "tests/harness/**",
+            "tests/fomo-acceptance/**",
+        ],
+        "rejected": [
+            "any path segment beginning with .env",
+            "symlinks and non-regular source entries",
+            "changed source that is not regular UTF-8 text",
+        ],
+    }
+
+    serialized = json.dumps(context, sort_keys=True)
+    assert "protectedPaths" not in serialized
+    assert "modelOwnedRoots" not in serialized
+    assert "extensionContracts" not in serialized
+    assert "capabilityCatalog" not in serialized
 
 
 def test_v2_root_extension_contract_is_compact_and_enforced_before_implementation() -> None:

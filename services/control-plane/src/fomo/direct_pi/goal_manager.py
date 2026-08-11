@@ -18,6 +18,8 @@ from .goalgraph import (
     GoalGraph,
     GoalStatus,
     GraphStatus,
+    NavigationMode,
+    NavigationRoute,
     ScopedAcceptanceContract,
     scope_acceptance_contract,
     transition_goal_status,
@@ -118,12 +120,24 @@ class GoalExecutionPlan:
     """One server-selected build target bound to a frozen graph revision."""
 
     graph_revision: int
+    graph_schema_version: int
+    navigation_mode: NavigationMode
+    routes: tuple[NavigationRoute, ...]
     active_goal: Goal
     verified_evidence: tuple[VerifiedGoalEvidence, ...]
 
     def __post_init__(self) -> None:
         if self.graph_revision < 1:
             raise ValueError("graph_revision must be positive")
+        if self.graph_schema_version not in {1, 2}:
+            raise ValueError("graph_schema_version must be supported")
+        expected_mode = (
+            NavigationMode.MULTI_ROUTE
+            if self.graph_schema_version == 2 and len(self.routes) >= 2
+            else NavigationMode.SINGLE_SURFACE
+        )
+        if self.navigation_mode is not expected_mode:
+            raise ValueError("execution plan navigation contract is inconsistent")
         if self.active_goal.status is not GoalStatus.ACTIVE:
             raise ValueError("an execution plan requires exactly one active goal")
 
@@ -408,6 +422,9 @@ def plan_goal_execution(
     )
     return activated, GoalExecutionPlan(
         graph_revision=graph_revision,
+        graph_schema_version=activated.schema_version,
+        navigation_mode=activated.navigation_mode,
+        routes=tuple(activated.routes),
         active_goal=current,
         verified_evidence=ordered,
     )

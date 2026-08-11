@@ -66,6 +66,7 @@ _FORWARDED_REQUEST_HEADERS = {
     "last-event-id",
     "next-action",
     "next-router-prefetch",
+    "next-router-segment-prefetch",
     "next-router-state-tree",
     "next-url",
     "origin",
@@ -408,6 +409,7 @@ def _rewrite_path_location(
     upstream_url: str,
     upstream_origin: str,
     public_url: str,
+    upstream_uses_base_path: bool = False,
 ) -> str | None:
     """Keep every internal redirect inside one verified preview path."""
 
@@ -431,11 +433,19 @@ def _rewrite_path_location(
     public = urlsplit(public_url)
     preview_root = public.path.rstrip("/")
     path = resolved.path if resolved.path.startswith("/") else f"/{resolved.path}"
+    # A basePath-aware Next server already includes the exact public prefix in
+    # internal redirects. Preserve it once; legacy servers still need it added.
+    if upstream_uses_base_path and (
+        path == preview_root or path.startswith(f"{preview_root}/")
+    ):
+        public_path = path
+    else:
+        public_path = f"{preview_root}{path}"
     return urlunsplit(
         SplitResult(
             public.scheme,
             public.netloc,
-            f"{preview_root}{path}",
+            public_path,
             resolved.query,
             resolved.fragment,
         )
@@ -665,6 +675,17 @@ def create_preview_gateway(
             return gateway_error(404, "preview not found")
         if target.preview_url != public_url:
             return gateway_error(404, "preview not found")
+        if path_mode and target.uses_base_path:
+            preview_root = public.path.rstrip("/")
+            raw_path = request.scope.get(
+                "raw_path", request.url.path.encode("ascii", "ignore")
+            )
+            public_request_path = bytes(raw_path).decode("ascii", "surrogateescape")
+            if public_request_path != preview_root and not public_request_path.startswith(
+                f"{preview_root}/"
+            ):
+                return gateway_error(404, "preview not found")
+            upstream_path = public_request_path
         try:
             request_body = await _bounded_request_body(
                 request,
@@ -703,6 +724,7 @@ def create_preview_gateway(
                             upstream_url=upstream_url,
                             upstream_origin=upstream_origin,
                             public_url=public_url,
+                            upstream_uses_base_path=target.uses_base_path,
                         )
                         if rewritten_location is None:
                             response_headers.pop("location")

@@ -56,6 +56,17 @@ def _quoted(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+_PREVIEW_PATH_HELPERS = """const fomoPreviewBasePath = process.env.FOMO_PREVIEW_BASE_PATH ?? "";
+const fomoAppPath = (path: string) =>
+  path === "/" ? fomoPreviewBasePath || "/" : `${fomoPreviewBasePath}${path}`;
+const fomoAppUrl = (path: string) =>
+  new URL(
+    fomoAppPath(path),
+    process.env.FOMO_PREVIEW_BASE_URL ?? "http://127.0.0.1:8080",
+  ).toString();
+"""
+
+
 def _locator(value: Locator) -> str:
     if value.by == "role":
         return (
@@ -110,14 +121,29 @@ def _select_action(value: SelectAction) -> str:
 
 def _action(value: AcceptanceAction) -> str:
     if value.kind == "goto":
-        return f"await page.goto({_quoted(value.path)});"
+        return f"await page.goto(fomoAppPath({_quoted(value.path)}));"
     if value.kind == "click":
         return f"await {_locator(value.target)}.click();"
     if value.kind == "fill":
         return f"await {_locator(value.target)}.fill({_quoted(value.value)});"
     if value.kind == "select":
         return _select_action(value)
-    return "await page.reload();"
+    if value.kind == "reload":
+        return "await page.reload();"
+    if value.kind == "back":
+        return "await page.goBack();"
+    if value.kind == "forward":
+        return "await page.goForward();"
+    if value.kind == "set_viewport":
+        return f"await page.setViewportSize({{ width: {value.width}, height: {value.height} }});"
+    return "\n".join(
+        (
+            "await page.goBack();",
+            f"await expect(page).toHaveURL(fomoAppUrl({_quoted(value.back_path)}));",
+            "await page.goForward();",
+            f"await expect(page).toHaveURL(fomoAppUrl({_quoted(value.forward_path)}));",
+        )
+    )
 
 
 def _assertion(value: AcceptanceAssertion) -> str:
@@ -134,7 +160,7 @@ def _assertion(value: AcceptanceAssertion) -> str:
         return f"await expect({_locator(value.target)}).not.toBeVisible();"
     if value.kind == "value":
         return f"await expect({_locator(value.target)}).toHaveValue({_quoted(value.expected)});"
-    return f"await expect(page).toHaveURL(new RegExp({_quoted(f'{value.path}$')}));"
+    return f"await expect(page).toHaveURL(fomoAppUrl({_quoted(value.path)}));"
 
 
 def _test_source(
@@ -150,6 +176,7 @@ def _test_source(
     )
     return (
         f'import {{ expect, test }} from "{playwright_test_module}";\n\n'
+        f"{_PREVIEW_PATH_HELPERS}\n"
         f"test({_quoted(title)}, async ({{ page }}) => {{\n{indented}\n}});\n"
     )
 
@@ -202,11 +229,12 @@ _ADVISORY_CONFIG_SOURCE = (
 
 _HARNESS_SOURCE = (
     f'import {{ expect, test }} from "{FOMO_PLAYWRIGHT_TEST_MODULE}";\n\n'
+    f"{_PREVIEW_PATH_HELPERS}\n"
     """test("starter renders a stable application shell", async ({ page }) => {
   const pageErrors: string[] = [];
   page.on("pageerror", (error) => pageErrors.push(error.message));
 
-  await page.goto("/", { waitUntil: "domcontentloaded" });
+  await page.goto(fomoAppPath("/"), { waitUntil: "domcontentloaded" });
 
   await expect(page.getByRole("main")).toBeVisible();
   expect(pageErrors).toEqual([]);

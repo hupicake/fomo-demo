@@ -392,11 +392,23 @@ export interface GoalProjection {
   evidenceCount: number;
 }
 
+export type GoalNavigationMode = "single_surface" | "multi_route";
+
+export interface GoalRouteProjection {
+  path: string;
+  title: string;
+  owningGoalId: string;
+  deepLinkable: boolean;
+}
+
 /** Read-only server projection. Lifecycle and acceptance states are never inferred by the UI. */
 export interface GoalGraphProjection {
   graphId: string;
   runId: string;
   revision: number;
+  schemaVersion: 1 | 2;
+  navigationMode: GoalNavigationMode;
+  routes: GoalRouteProjection[];
   status: GoalGraphStatus;
   productOutcome: string;
   activeGoalId: string | null;

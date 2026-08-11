@@ -24,6 +24,14 @@ description: FOMO 内部 Coding Agent 的 React + shadcn/ui 产品界面生成�
 
 禁止在已有 primitive 时手写 raw `button`/`input`/`textarea`/`select`、无理由自研 Dialog/Menu/Select/Tooltip，或反复堆砌 `div rounded border p-*` 卡片壳。破坏性动作必须经 `AlertDialog` 确认。
 
+## 目录与职责边界
+
+- 遵循 Next.js App Router 的路由、Route Group、private folder 与 layout 约定。`page.tsx` 保持为清晰的路由入口；跨页面共享的导航、Shell 和 Provider 放在最近的共同 `layout.tsx`，不要在每个页面重复包装。
+- 业务代码优先按 feature 纵向归组，让同一领域的组件、状态、模型、本地持久化和 fixtures 保持相邻。只有真正跨 feature 复用的布局、primitive 和工具才进入共享目录；不要把一个领域机械拆散到多套平行技术目录。
+- `components/ui` 只承载 shadcn/ui primitive；产品组合、领域状态和业务模型不应混入其中。复用 Starter 已有别名和目录，不创建第二套 design system、utils 或 components 根。
+- 目录深度随产品复杂度增长：单路由小功能优先 route-local colocation；多个路由和共享状态使用一个清晰 feature 边界；多个独立领域再拆为多个 bounded feature slice。不要为单个文件创建空壳目录，也不要预先生成未来可能用到的空目录、层级或 barrel 文件。
+- 目录示例只是职责参考，不是固定文件计划或 allowlist。先检查现有代码与路由，再选择最小且完整的结构；前端任务不得为了“架构完整”虚构 backend、service、repository 或 monorepo 层。
+
 ## 状态与本地数据
 
 每个异步或 CRUD 视图必须完整呈现：加载时用贴合布局的 `Skeleton` 并禁用重复提交；空态说明“这里为什么为空”并给出主操作；错误态使用 `Alert`、保留用户输入、提供可重试动作；成功/删除结果要有可感知反馈。不要只留控制台错误或空白区域。

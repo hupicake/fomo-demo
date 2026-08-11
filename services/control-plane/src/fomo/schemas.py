@@ -1006,10 +1006,20 @@ class GoalNodeProjection(SchemaModel):
     evidence_count: int = 0
 
 
+class GoalRouteProjection(SchemaModel):
+    path: str
+    title: str
+    owning_goal_id: str
+    deep_linkable: bool
+
+
 class GoalGraphReadProjection(SchemaModel):
     graph_id: str
     run_id: str
     revision: int
+    schema_version: Literal[1, 2]
+    navigation_mode: Literal["single_surface", "multi_route"]
+    routes: list[GoalRouteProjection] = Field(default_factory=list)
     status: Literal["active", "verified", "failed", "cancelled", "superseded"]
     product_outcome: str
     active_goal_id: str | None = None

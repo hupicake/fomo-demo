@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from fomo.agent_runtime import SOPRunner
-from fomo.direct_pi.goalgraph import GoalStatus, parse_goal_graph_draft
+from fomo.direct_pi.goalgraph import GoalStatus, parse_legacy_goal_graph_draft
 from fomo.ids import utcnow
 from fomo.persistence import RunLeaseLost
 from fomo.sandbox.fake import FakeSandboxProvider
@@ -48,7 +48,7 @@ def _acceptance(identifier: str):
 
 
 def _goal_draft():
-    return parse_goal_graph_draft(
+    return parse_legacy_goal_graph_draft(
         {
             "schemaVersion": 1,
             "productOutcome": "A recoverable app",
@@ -377,7 +377,9 @@ async def test_expired_p1_run_requeues_after_all_sandboxes_are_acknowledged(repo
     lease = await repository.get_active_lease_token(run.id)
     first_claim = await repository.get_run(run.id)
     assert first_claim.execution_started_at is not None
-    await repository.create_goal_graph(project.id, run.id, _goal_draft(), lease_token=lease)
+    await repository._create_legacy_goal_graph(
+        project.id, run.id, _goal_draft(), lease_token=lease
+    )
     await repository.activate_goal(run.id, "G-1", lease_token=lease)
     await repository.claim_goal(run.id, "G-1", lease_token=lease)
     await repository.record_verified_checkpoint(
@@ -433,7 +435,9 @@ async def test_expired_p1_run_requeues_after_all_sandboxes_are_acknowledged(repo
 async def test_expired_verified_graph_requeues_for_reverification_and_publish(repository) -> None:
     project, run = await _running_run(repository, message_id="verified-resume", lease_seconds=60)
     lease = await repository.get_active_lease_token(run.id)
-    await repository.create_goal_graph(project.id, run.id, _goal_draft(), lease_token=lease)
+    await repository._create_legacy_goal_graph(
+        project.id, run.id, _goal_draft(), lease_token=lease
+    )
     await repository.activate_goal(run.id, "G-1", lease_token=lease)
     await repository.claim_goal(run.id, "G-1", lease_token=lease)
     for goal_id, acceptance_id in (("G-1", "AC-1"), ("G-2", "AC-2")):
@@ -522,7 +526,9 @@ async def test_successful_verified_preview_is_retained_until_invalidated(
 async def test_duplicate_cleanup_does_not_ack_when_first_kill_fails(repository, settings) -> None:
     project, run = await _running_run(repository, message_id="cleanup-failure", lease_seconds=60)
     lease = await repository.get_active_lease_token(run.id)
-    await repository.create_goal_graph(project.id, run.id, _goal_draft(), lease_token=lease)
+    await repository._create_legacy_goal_graph(
+        project.id, run.id, _goal_draft(), lease_token=lease
+    )
     await repository.activate_goal(run.id, "G-1", lease_token=lease)
     await repository.claim_goal(run.id, "G-1", lease_token=lease)
     await repository.record_verified_checkpoint(

@@ -11,6 +11,7 @@ from fomo.ids import utcnow, uuid7
 from fomo.persistence import NotFoundError, VerifiedPreviewTarget
 from fomo.persistence.models import (
     ProjectRecord,
+    RunEventRecord,
     RunRecord,
     RunSandboxResourceRecord,
     SessionRecord,
@@ -49,12 +50,18 @@ def _path_config() -> PreviewGatewayConfig:
     )
 
 
-def _target(sandbox_id: str, preview_url: str | None = None) -> VerifiedPreviewTarget:
+def _target(
+    sandbox_id: str,
+    preview_url: str | None = None,
+    *,
+    uses_base_path: bool = False,
+) -> VerifiedPreviewTarget:
     return VerifiedPreviewTarget(
         run_id=uuid7(),
         project_id=uuid7(),
         sandbox_id=sandbox_id,
         preview_url=preview_url or f"https://{sandbox_id}.preview.example.test/",
+        uses_base_path=uses_base_path,
     )
 
 
@@ -127,6 +134,78 @@ async def test_path_gateway_strips_prefix_isolates_credentials_and_sandboxes_htm
     assert response.headers["access-control-allow-origin"] == "*"
     assert response.headers["cross-origin-resource-policy"] == "cross-origin"
     repository.require_verified_preview_target.assert_awaited_once_with(sandbox_id)
+    await outbound_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_path_gateway_preserves_base_path_for_routes_reload_and_redirects(
+    repository,
+) -> None:
+    sandbox_id = str(uuid4())
+    preview_root = f"/preview/{sandbox_id}"
+    public_url = f"https://app.example.test{preview_root}/"
+    repository.require_verified_preview_target = AsyncMock(
+        return_value=_target(sandbox_id, public_url, uses_base_path=True)
+    )
+    application_requests: list[tuple[str, str | None]] = []
+
+    async def outbound(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "opensandbox.test":
+            return httpx.Response(200, json={"endpoint": "localhost:55546"})
+        application_requests.append(
+            (request.url.path, request.headers.get("next-router-segment-prefetch"))
+        )
+        if request.url.path == f"{preview_root}/":
+            return httpx.Response(
+                308,
+                headers={"location": f"http://host.docker.internal:55546{preview_root}"},
+            )
+        if request.url.path == f"{preview_root}/redirect":
+            return httpx.Response(
+                307,
+                headers={"location": f"http://host.docker.internal:55546{preview_root}/packing"},
+            )
+        return httpx.Response(200, content=b"<html><body>route</body></html>")
+
+    outbound_client = httpx.AsyncClient(transport=httpx.MockTransport(outbound))
+    app = create_preview_gateway(
+        repository=repository,
+        config=_path_config(),
+        http_client=outbound_client,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="https://app.example.test",
+        follow_redirects=False,
+    ) as browser:
+        root_redirect = await browser.get(f"{preview_root}/")
+        root = await browser.get(preview_root)
+        itinerary = await browser.get(
+            f"{preview_root}/itinerary",
+            headers={"Next-Router-Segment-Prefetch": "/_tree"},
+        )
+        reloaded_itinerary = await browser.get(f"{preview_root}/itinerary")
+        packing = await browser.get(f"{preview_root}/packing")
+        redirected = await browser.get(f"{preview_root}/redirect")
+
+    assert [
+        root_redirect.status_code,
+        root.status_code,
+        itinerary.status_code,
+        reloaded_itinerary.status_code,
+        packing.status_code,
+        redirected.status_code,
+    ] == [308, 200, 200, 200, 200, 307]
+    assert root_redirect.headers["location"] == public_url.rstrip("/")
+    assert application_requests == [
+        (f"{preview_root}/", None),
+        (preview_root, None),
+        (f"{preview_root}/itinerary", "/_tree"),
+        (f"{preview_root}/itinerary", None),
+        (f"{preview_root}/packing", None),
+        (f"{preview_root}/redirect", None),
+    ]
+    assert redirected.headers["location"] == f"{public_url}packing"
     await outbound_client.aclose()
 
 
@@ -784,6 +863,24 @@ async def test_repository_allows_only_current_uncleaned_verified_preview(reposit
         sandbox_id,
         f"https://{sandbox_id}.preview.example.test/",
     )
+    assert target.uses_base_path is False
+
+    async with repository.database.session_factory() as session:
+        session.add(
+            RunEventRecord(
+                id=uuid7(),
+                run_id=run_id,
+                seq=1,
+                kind="preview.available",
+                payload={
+                    "sandboxId": sandbox_id,
+                    "routingMode": "base_path_v1",
+                },
+            )
+        )
+        await session.commit()
+    target = await repository.require_verified_preview_target(sandbox_id)
+    assert target.uses_base_path is True
 
     assert (
         await repository.expire_verified_preview_target(

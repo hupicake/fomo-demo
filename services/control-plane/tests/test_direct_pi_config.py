@@ -191,9 +191,12 @@ def test_public_preview_path_url_is_normalized_exclusive_and_defaults_in_product
     assert configured.published_preview_url(sandbox_id) == (
         f"https://app.example.test/preview/{sandbox_id}/"
     )
-    assert configured.published_preview_asset_prefix(sandbox_id) == (
+    assert configured.published_preview_base_path(sandbox_id) == (
         f"/preview/{sandbox_id}"
     )
+    assert Settings(public_preview_base_domain="preview.example.net").published_preview_base_path(
+        sandbox_id
+    ) is None
     assert Settings().public_preview_base_url is None
     assert Settings(
         app_env="production",

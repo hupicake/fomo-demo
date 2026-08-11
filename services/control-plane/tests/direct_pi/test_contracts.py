@@ -84,6 +84,37 @@ def test_contract_compiles_one_immutable_test_per_acceptance() -> None:
     assert compiled.sha256_by_path[path] == hashlib.sha256(source.encode()).hexdigest()
 
 
+def test_compiled_navigation_uses_the_server_owned_preview_base_path() -> None:
+    value = _bundle()
+    test = value["acceptanceContract"]["tests"][0]  # type: ignore[index]
+    test["actions"][0]["path"] = "/catalog"  # type: ignore[index]
+    test["assertions"].append({"kind": "url", "path": "/catalog"})  # type: ignore[index]
+
+    bundle = PlanningBundle.model_validate(value)
+    compiled = compile_acceptance(bundle.acceptance_contract)
+    sources = {item.path: item.content for item in compiled.changes}
+    source = sources["tests/fomo-acceptance/create-book.smoke.spec.ts"]
+    harness = sources[FOMO_HARNESS_PATH]
+
+    assert 'const fomoPreviewBasePath = process.env.FOMO_PREVIEW_BASE_PATH ?? "";' in source
+    assert 'process.env.FOMO_PREVIEW_BASE_URL ?? "http://127.0.0.1:8080"' in source
+    assert 'await page.goto(fomoAppPath("/catalog"));' in source
+    assert 'await expect(page).toHaveURL(fomoAppUrl("/catalog"));' in source
+    assert "new RegExp" not in source
+    assert 'await page.goto(fomoAppPath("/"), { waitUntil: "domcontentloaded" });' in harness
+
+
+@pytest.mark.parametrize("path", ["//evil.test", "/catalog/", "/catalog?tab=all", "/#x"])
+def test_navigation_paths_reject_external_or_noncanonical_aliases(path: str) -> None:
+    value = _bundle()
+    test = value["acceptanceContract"]["tests"][0]  # type: ignore[index]
+    test["actions"][0]["path"] = path  # type: ignore[index]
+    test["assertions"].append({"kind": "url", "path": path})  # type: ignore[index]
+
+    with pytest.raises(ValidationError, match="string_pattern_mismatch"):
+        PlanningBundle.model_validate(value)
+
+
 def test_text_visibility_is_existential_without_relaxing_unique_operations() -> None:
     value = _bundle()
     assertions = value["acceptanceContract"]["tests"][0]["assertions"]  # type: ignore[index]
@@ -260,7 +291,7 @@ def test_contract_rejects_unmapped_acceptance_and_external_navigation() -> None:
 
     value = _bundle()
     value["acceptanceContract"]["tests"][0]["actions"][0]["path"] = "https://example.com"  # type: ignore[index]
-    with pytest.raises(ValidationError, match="local path"):
+    with pytest.raises(ValidationError, match="string_pattern_mismatch"):
         PlanningBundle.model_validate(value)
 
 

@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from fomo.api import create_app
-from fomo.direct_pi.goalgraph import parse_goal_graph_draft
+from fomo.direct_pi.goalgraph import parse_legacy_goal_graph_draft
 from fomo.fomo_pi_ds import InferenceGatewayError
 from fomo.schemas import UserInputRequestDraft
 from tests.helpers import create_user_session
@@ -20,7 +20,7 @@ def _session_headers(settings, session_id: str) -> dict[str, str]:
 
 
 def _single_goal_draft():
-    return parse_goal_graph_draft(
+    return parse_legacy_goal_graph_draft(
         {
             "schemaVersion": 1,
             "productOutcome": "A visible goal panel",
@@ -701,7 +701,7 @@ async def test_project_snapshot_exposes_authoritative_goal_graph_projection(
         claimed = await repository.claim_next_run("goal-worker", 60)
         assert claimed is not None and claimed.lease_owner
         lease = claimed.lease_owner
-        await repository.create_goal_graph(
+        await repository._create_legacy_goal_graph(
             project_id, run_id, _single_goal_draft(), lease_token=lease
         )
         created_event = next(
@@ -737,6 +737,9 @@ async def test_project_snapshot_exposes_authoritative_goal_graph_projection(
         goal_graph = response.json()["goalGraph"]
         assert goal_graph["graphId"] == created_event.payload["goalGraph"]["graphId"]
         assert goal_graph["runId"] == run_id
+        assert goal_graph["schemaVersion"] == 1
+        assert goal_graph["navigationMode"] == "single_surface"
+        assert goal_graph["routes"] == []
         assert goal_graph["status"] == "verified"
         assert goal_graph["activeGoalId"] is None
         assert goal_graph["goals"][0]["status"] == "verified"

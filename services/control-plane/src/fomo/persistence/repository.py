@@ -20,16 +20,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from fomo.agent_framework import DEFAULT_AGENT_FRAMEWORK, AgentFramework
 from fomo.auth import hash_password, new_session_id, normalize_email, verify_password
+from fomo.direct_pi.architecture_profile import ArchitectureProfile
 from fomo.direct_pi.failures import public_failure_for_code
 from fomo.direct_pi.goalgraph import (
     Goal,
     GoalGraph,
     GoalGraphDraft,
+    GoalGraphDraftLike,
     GoalStatus,
     GraphStatus,
+    LegacyGoal,
+    LegacyGoalGraphDraft,
     acceptance_persistence_key,
+    assert_goal_graph_executable,
     materialize_goal_graph,
     parse_goal_graph_draft,
+    parse_legacy_goal_graph_draft,
     serialize_goal_graph_draft,
     transition_goal_status,
     transition_graph_status,
@@ -157,6 +163,29 @@ RECOVERABLE_TERMINAL_STATUSES = {
 # fail minutes later inside a Coding Runtime with an oversized prompt.
 MAX_RECOVERY_LINEAGE_RUNS = 8
 MAX_RECOVERY_PROMPT_CHARACTERS = 96_000
+_GOAL_GRAPH_ROUTING_PROVENANCE_KEY = "_fomoGoalGraphRouting"
+_GOAL_GRAPH_ARCHITECTURE_PROVENANCE_KEY = "_fomoArchitectureProfile"
+
+
+def _goal_graph_revision_hash(
+    draft: GoalGraphDraftLike,
+    architecture_profile: ArchitectureProfile | None,
+) -> str:
+    """Hash the executable graph and its frozen architecture policy together."""
+
+    canonical = serialize_goal_graph_draft(draft).encode()
+    if isinstance(draft, GoalGraphDraft):
+        if architecture_profile is None:
+            raise ValueError("current GoalGraph requires an architecture profile")
+        if (
+            architecture_profile.route_count != len(draft.routes)
+            or architecture_profile.goal_count != len(draft.goals)
+        ):
+            raise ValueError(
+                "architecture profile graph signals do not match the GoalGraph"
+            )
+        canonical += b"\0architecture-profile:" + architecture_profile.fingerprint().encode()
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def _is_business_implementation_path(path: str) -> bool:
@@ -231,6 +260,11 @@ class VerifiedPreviewTarget:
     project_id: str
     sandbox_id: str
     preview_url: str
+    # Old retained path previews were built with assetPrefix only and expect
+    # the gateway to strip /preview/<sandbox>. New builds use Next basePath and
+    # must receive that public path unchanged. This is derived only from a
+    # server-authored event bound to this exact sandbox.
+    uses_base_path: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,6 +276,7 @@ class GoalGraphProjection:
     revision_id: str
     content_hash: str
     graph: GoalGraph
+    architecture_profile: ArchitectureProfile | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1599,15 +1634,88 @@ class Repository:
         run_id: str,
         draft: GoalGraphDraft | Mapping[str, Any] | str | bytes,
         *,
+        architecture_profile: ArchitectureProfile | None = None,
         provenance: Mapping[str, Any] | None = None,
         reason: str | None = None,
         lease_token: str | None = None,
     ) -> GoalGraphProjection:
-        """Persist an immutable revision and mutable node lifecycle projection."""
-        validated = draft if isinstance(draft, GoalGraphDraft) else parse_goal_graph_draft(draft)
+        """Persist one current v2 graph; historical writes use the private helper."""
+        if isinstance(draft, LegacyGoalGraphDraft):
+            raise ValueError("create_goal_graph only accepts current schema v2")
+        if architecture_profile is None:
+            raise ValueError("current GoalGraph requires an architecture profile")
+        validated = (
+            draft if isinstance(draft, GoalGraphDraft) else parse_goal_graph_draft(draft)
+        )
+        return await self._persist_goal_graph(
+            project_id,
+            run_id,
+            validated,
+            architecture_profile=architecture_profile,
+            provenance=provenance,
+            reason=reason,
+            lease_token=lease_token,
+        )
+
+    async def _create_legacy_goal_graph(
+        self,
+        project_id: str,
+        run_id: str,
+        draft: LegacyGoalGraphDraft | Mapping[str, Any] | str | bytes,
+        *,
+        provenance: Mapping[str, Any] | None = None,
+        reason: str | None = None,
+        lease_token: str | None = None,
+    ) -> GoalGraphProjection:
+        """Private migration/test writer for executable historical v1 graphs."""
+
+        validated = (
+            draft
+            if isinstance(draft, LegacyGoalGraphDraft)
+            else parse_legacy_goal_graph_draft(draft)
+        )
+        assert_goal_graph_executable(materialize_goal_graph(validated))
+        return await self._persist_goal_graph(
+            project_id,
+            run_id,
+            validated,
+            architecture_profile=None,
+            provenance=provenance,
+            reason=reason,
+            lease_token=lease_token,
+        )
+
+    async def _persist_goal_graph(
+        self,
+        project_id: str,
+        run_id: str,
+        validated: GoalGraphDraftLike,
+        *,
+        architecture_profile: ArchitectureProfile | None,
+        provenance: Mapping[str, Any] | None,
+        reason: str | None,
+        lease_token: str | None,
+    ) -> GoalGraphProjection:
+        """Shared immutable revision writer after version-specific admission."""
+
         graph = materialize_goal_graph(validated)
-        canonical = serialize_goal_graph_draft(validated)
-        content_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        content_hash = _goal_graph_revision_hash(validated, architecture_profile)
+        revision_provenance = dict(provenance or {"createdBy": f"run:{run_id}"})
+        revision_provenance.pop(_GOAL_GRAPH_ROUTING_PROVENANCE_KEY, None)
+        revision_provenance.pop(_GOAL_GRAPH_ARCHITECTURE_PROVENANCE_KEY, None)
+        if isinstance(validated, GoalGraphDraft):
+            revision_provenance[_GOAL_GRAPH_ROUTING_PROVENANCE_KEY] = {
+                "schemaVersion": validated.schema_version,
+                "navigationMode": graph.navigation_mode.value,
+                "routes": [
+                    route.model_dump(mode="json", by_alias=True)
+                    for route in validated.routes
+                ],
+            }
+            if architecture_profile is not None:
+                revision_provenance[_GOAL_GRAPH_ARCHITECTURE_PROVENANCE_KEY] = (
+                    architecture_profile.as_prompt_context()
+                )
         now = utcnow()
         async with self.database.session_factory() as session:
             run = await self._run_for_write(session, run_id, lease_token=lease_token)
@@ -1638,7 +1746,7 @@ class Repository:
                 quality_bar=graph.quality_bar.model_dump(mode="json", by_alias=True),
                 content_hash=content_hash,
                 reason=reason.strip() if reason and reason.strip() else None,
-                provenance=dict(provenance or {"createdBy": f"run:{run_id}"}),
+                provenance=revision_provenance,
                 created_by_run_id=run_id,
                 created_at=now,
             )
@@ -4216,11 +4324,29 @@ class Repository:
             if row is None:
                 raise NotFoundError("verified preview not found")
             run, _resource = row
+            routing_event = await session.scalar(
+                select(RunEventRecord)
+                .where(
+                    RunEventRecord.run_id == run.id,
+                    RunEventRecord.kind == "preview.available",
+                )
+                .order_by(RunEventRecord.seq.desc())
+                .limit(1)
+            )
+            routing_payload = (
+                routing_event.payload
+                if routing_event is not None and isinstance(routing_event.payload, dict)
+                else {}
+            )
             return VerifiedPreviewTarget(
                 run_id=run.id,
                 project_id=run.project_id,
                 sandbox_id=candidate,
                 preview_url=run.preview_url,
+                uses_base_path=(
+                    routing_payload.get("sandboxId") == candidate
+                    and routing_payload.get("routingMode") == "base_path_v1"
+                ),
             )
 
     async def expire_verified_preview_target(
@@ -4660,6 +4786,8 @@ class Repository:
         graph_record: GoalGraphRecord,
         revision: GoalGraphRevisionRecord,
         nodes: list[GoalNodeRecord],
+        *,
+        executable: bool = True,
     ) -> GoalGraphProjection:
         draft_payload = {
             "schemaVersion": graph_record.schema_version,
@@ -4676,14 +4804,39 @@ class Repository:
                 for node in sorted(nodes, key=lambda item: item.position)
             ],
         }
-        draft = parse_goal_graph_draft(draft_payload)
-        actual_hash = hashlib.sha256(serialize_goal_graph_draft(draft).encode("utf-8")).hexdigest()
-        if actual_hash != revision.content_hash:
-            raise ManifestIntegrityError("GoalGraph revision content hash mismatch")
+        routing_payload: Mapping[str, Any] | None = None
+        if graph_record.schema_version == 1:
+            draft = parse_legacy_goal_graph_draft(draft_payload)
+        else:
+            raw_routing = revision.provenance.get(_GOAL_GRAPH_ROUTING_PROVENANCE_KEY)
+            if not isinstance(raw_routing, Mapping):
+                raise ManifestIntegrityError(
+                    "GoalGraph v2 revision is missing its routing manifest"
+                )
+            routing_payload = raw_routing
+            if raw_routing.get("schemaVersion") != graph_record.schema_version:
+                raise ManifestIntegrityError(
+                    "GoalGraph routing manifest schema version mismatch"
+                )
+            raw_routes = raw_routing.get("routes")
+            if not isinstance(raw_routes, list):
+                raise ManifestIntegrityError("GoalGraph routing manifest is invalid")
+            draft_payload["routes"] = raw_routes
+            try:
+                draft = parse_goal_graph_draft(draft_payload)
+            except (TypeError, ValueError) as exc:
+                raise ManifestIntegrityError(
+                    "GoalGraph routing manifest is invalid"
+                ) from exc
         trusted = materialize_goal_graph(draft)
+        if (
+            routing_payload is not None
+            and routing_payload.get("navigationMode") != trusted.navigation_mode.value
+        ):
+            raise ManifestIntegrityError("GoalGraph routing mode integrity mismatch")
         goal_by_key = {goal.goal_id: goal for goal in trusted.goals}
         projected_goals = [
-            Goal.model_validate(
+            (LegacyGoal if isinstance(goal_by_key[node.goal_key], LegacyGoal) else Goal).model_validate(
                 {
                     **goal_by_key[node.goal_key].model_dump(mode="json", by_alias=True),
                     "status": node.status,
@@ -4695,11 +4848,50 @@ class Repository:
             {
                 "schemaVersion": graph_record.schema_version,
                 "productOutcome": revision.product_outcome,
+                "routes": [
+                    route.model_dump(mode="json", by_alias=True)
+                    for route in trusted.routes
+                ],
                 "qualityBar": dict(revision.quality_bar),
+                "navigationMode": trusted.navigation_mode.value,
                 "goals": [item.model_dump(mode="json", by_alias=True) for item in projected_goals],
                 "status": graph_record.status,
             }
         )
+        if executable:
+            try:
+                assert_goal_graph_executable(projected)
+            except ValueError as exc:
+                raise ManifestIntegrityError(str(exc)) from exc
+        architecture_profile: ArchitectureProfile | None = None
+        raw_architecture = revision.provenance.get(
+            _GOAL_GRAPH_ARCHITECTURE_PROVENANCE_KEY
+        )
+        if graph_record.schema_version == 2 and raw_architecture is None:
+            raise ManifestIntegrityError(
+                "GoalGraph v2 revision is missing its architecture profile"
+            )
+        if raw_architecture is not None:
+            if not isinstance(raw_architecture, Mapping):
+                raise ManifestIntegrityError(
+                    "GoalGraph architecture profile is invalid"
+                )
+            try:
+                architecture_profile = ArchitectureProfile.from_prompt_context(
+                    raw_architecture
+                )
+            except ValueError as exc:
+                raise ManifestIntegrityError(
+                    "GoalGraph architecture profile is invalid"
+                ) from exc
+        try:
+            actual_hash = _goal_graph_revision_hash(draft, architecture_profile)
+        except ValueError as exc:
+            raise ManifestIntegrityError(
+                "GoalGraph architecture profile does not match the graph"
+            ) from exc
+        if actual_hash != revision.content_hash:
+            raise ManifestIntegrityError("GoalGraph revision content hash mismatch")
         return GoalGraphProjection(
             graph_id=graph_record.id,
             project_id=graph_record.project_id,
@@ -4708,6 +4900,7 @@ class Repository:
             revision_id=revision.id,
             content_hash=revision.content_hash,
             graph=projected,
+            architecture_profile=architecture_profile,
         )
 
     async def _goal_graph_for_run_in_session(
@@ -4792,6 +4985,12 @@ class Repository:
         checkpoint_by_node: Mapping[str, str],
         evidence_count_by_key: Mapping[tuple[str, str], int],
     ) -> dict[str, Any]:
+        trusted_graph = Repository._goal_graph_projection(
+            graph,
+            revision,
+            nodes,
+            executable=False,
+        ).graph
         active = next(
             (
                 node.goal_key
@@ -4838,6 +5037,12 @@ class Repository:
             "graphId": graph.id,
             "runId": graph.run_id,
             "revision": revision.revision,
+            "schemaVersion": trusted_graph.schema_version,
+            "navigationMode": trusted_graph.navigation_mode.value,
+            "routes": [
+                route.model_dump(mode="json", by_alias=True)
+                for route in trusted_graph.routes
+            ],
             "status": graph.status,
             "productOutcome": revision.product_outcome,
             "activeGoalId": active,

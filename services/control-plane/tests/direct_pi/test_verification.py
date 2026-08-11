@@ -46,7 +46,7 @@ _RUNNER_PROBE = (
     "&& test -r /opt/fomo/runtime-cache/fomo-next-radix-v2/node_modules/next/package.json"
 )
 _NEXT_RUNTIME_PROBE = verification_module._NEXT_RUNTIME_PROBE
-_with_preview_asset_prefix = verification_module._with_preview_asset_prefix
+_with_preview_base_path = verification_module._with_preview_base_path
 _WORKSPACE_NEXT = (
     "env PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin "
     "/usr/local/bin/node /workspace/node_modules/next/dist/bin/next"
@@ -86,11 +86,12 @@ def _contract() -> AcceptanceContract:
     )
 
 
-def _playwright_command(path: str) -> str:
-    return fomo_runner_command(
+def _playwright_command(path: str, *, base_path: str | None = None) -> str:
+    command = fomo_runner_command(
         bin_name="playwright",
         args=f"test {path} --config={ACCEPTANCE_CONFIG_PATH} --project=chromium --reporter=json",
     )
+    return _with_preview_base_path(command, base_path)
 
 
 def _playwright_report(title: str) -> str:
@@ -212,15 +213,17 @@ def _playwright_timeout_report(title: str) -> str:
     )
 
 
-def _playwright_results(*, goal_id: str | None = None) -> dict[str, ExecResult]:
+def _playwright_results(
+    *, goal_id: str | None = None, base_path: str | None = None
+) -> dict[str, ExecResult]:
     acceptance_path = "tests/fomo-acceptance/search-books.smoke.spec.ts"
     if goal_id is not None:
         acceptance_path = f"tests/fomo-acceptance/{goal_id}/search-books.smoke.spec.ts"
     return {
-        _playwright_command(_HARNESS_PATH): ExecResult(
+        _playwright_command(_HARNESS_PATH, base_path=base_path): ExecResult(
             0, _playwright_report("starter renders a stable application shell"), ""
         ),
-        _playwright_command(acceptance_path): ExecResult(
+        _playwright_command(acceptance_path, base_path=base_path): ExecResult(
             0, _playwright_report("searches books"), ""
         ),
     }
@@ -288,11 +291,11 @@ def test_fixed_runner_contract_pins_absolute_wrappers_and_trusted_path() -> None
         )
 
 
-def test_preview_asset_prefix_wraps_only_path_mode_commands() -> None:
-    assert _with_preview_asset_prefix(_WORKSPACE_NEXT_BUILD, None) == _WORKSPACE_NEXT_BUILD
-    assert _with_preview_asset_prefix(
+def test_preview_base_path_wraps_only_path_mode_commands() -> None:
+    assert _with_preview_base_path(_WORKSPACE_NEXT_BUILD, None) == _WORKSPACE_NEXT_BUILD
+    assert _with_preview_base_path(
         _WORKSPACE_NEXT_BUILD, "/preview/sandbox-id"
-    ) == f"FOMO_PREVIEW_ASSET_PREFIX=/preview/sandbox-id {_WORKSPACE_NEXT_BUILD}"
+    ) == f"FOMO_PREVIEW_BASE_PATH=/preview/sandbox-id {_WORKSPACE_NEXT_BUILD}"
 
 
 async def _run_context(repository, message_id: str = "verify-test"):
@@ -330,9 +333,18 @@ async def test_verify_full_gates_use_fixed_runner_and_never_scripts(
     repository, settings
 ) -> None:
     _project, run, lease = await _run_context(repository, "gates-pass")
-    sandbox = FakeSandboxProvider(_playwright_results())
+    sandbox = FakeSandboxProvider()
     ref = await sandbox.create(_project.id)
-    verifier = _verifier(repository, sandbox, settings, run.id, lease)
+    preview_base_path = f"/preview/{ref.id}"
+    sandbox.command_results = _playwright_results(base_path=preview_base_path)
+    path_settings = replace(
+        settings,
+        sandbox_provider="opensandbox",
+        agent_framework="direct_pi",
+        direct_pi_goal_graph_enabled=True,
+        public_preview_base_url="http://localhost:3000/preview",
+    )
+    verifier = _verifier(repository, sandbox, path_settings, run.id, lease)
     contract = _contract()
     compiled = compile_acceptance(contract)
 
@@ -345,15 +357,19 @@ async def test_verify_full_gates_use_fixed_runner_and_never_scripts(
     )
 
     assert outcome.passed
-    assert outcome.preview_url == "http://fake-preview.invalid:8080"
+    assert outcome.preview_url == (
+        f"http://fake-preview.invalid:8080{preview_base_path}"
+    )
     assert outcome.preview_elapsed_seconds is not None
     assert not outcome.has_infrastructure_failure
     recorded = sandbox.sandboxes[ref.id].commands
     assert _RUNNER_PROBE in recorded
     assert _NEXT_RUNTIME_PROBE in recorded
     assert fomo_runner_command(bin_name="tsc", args="--noEmit") in recorded
-    assert _WORKSPACE_NEXT_BUILD in recorded
-    assert _WORKSPACE_NEXT_START in recorded
+    preview_build = _with_preview_base_path(_WORKSPACE_NEXT_BUILD, preview_base_path)
+    preview_start = _with_preview_base_path(_WORKSPACE_NEXT_START, preview_base_path)
+    assert preview_build in recorded
+    assert preview_start in recorded
     assert not any(f"{FOMO_RUNNER_BIN}/next" in command for command in recorded)
     # No model-editable scripts are ever invoked; the only .bin entries come
     # from the fixed root-owned runtime cache path.
@@ -380,9 +396,21 @@ async def test_verify_full_gates_use_fixed_runner_and_never_scripts(
         "pnpm install --offline --frozen-lockfile --ignore-scripts",
         _NEXT_RUNTIME_PROBE,
         fomo_runner_command(bin_name="tsc", args="--noEmit"),
-        _WORKSPACE_NEXT_BUILD,
-        _WORKSPACE_NEXT_START,
+        preview_build,
+        preview_start,
     ]
+    preview_available = next(
+        event for event in await repository.list_events(run.id)
+        if event.kind == "preview.available"
+    )
+    assert preview_available.payload["sandboxId"] == ref.id
+    assert preview_available.payload["routingMode"] == "base_path_v1"
+    assert preview_available.payload["url"] == outcome.preview_url
+    assert _playwright_command(_HARNESS_PATH, base_path=preview_base_path) in recorded
+    assert _playwright_command(
+        "tests/fomo-acceptance/search-books.smoke.spec.ts",
+        base_path=preview_base_path,
+    ) in recorded
 
 
 @pytest.mark.asyncio
