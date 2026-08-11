@@ -18,16 +18,21 @@ async def repository(tmp_path: Path):
 
 
 @pytest_asyncio.fixture
-async def settings(tmp_path: Path) -> Settings:
+async def settings(tmp_path: Path, monkeypatch) -> Settings:
+    async def discovered_model_aliases(_self) -> set[str]:
+        return {
+            "fomo-pi-deepseek-flash",
+            "fomo-pi-gpt-5.6",
+            "fomo-pi-kimi-k2.7-code",
+        }
+
+    monkeypatch.setattr(
+        "fomo.api.app.LiteLLMRunKeyClient.discover_model_aliases",
+        discovered_model_aliases,
+    )
     return Settings(
         app_env="test",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'fomo-test.db'}",
-        # Native is a deliberately explicit test-mode diagnostic path. Runtime
-        # defaults remain Direct Pi.
-        agent_framework="native",
-        sandbox_provider="fake",
-        allow_unsafe_process_sandbox=False,
-        dev_sandbox_root=tmp_path / "sandboxes",
-        structured_output_retries=0,
+        litellm_api_key="sk-test-management",
         worker_poll_interval_seconds=0.01,
     )

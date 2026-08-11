@@ -344,9 +344,6 @@ async def test_verify_full_gates_use_fixed_runner_and_never_scripts(
     sandbox.command_results = _playwright_results(base_path=preview_base_path)
     path_settings = replace(
         settings,
-        sandbox_provider="opensandbox",
-        agent_framework="direct_pi",
-        direct_pi_goal_graph_enabled=True,
         public_preview_base_url="http://localhost:3000/preview",
     )
     verifier = _verifier(repository, sandbox, path_settings, run.id, lease)

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -150,7 +149,7 @@ async def test_orchestrator_reuses_one_goal_graph_with_the_selected_transport(se
     orchestrator = _DispatchProbe(
         repository,  # type: ignore[arg-type]
         FakeSandboxProvider(),
-        replace(settings, agent_framework="direct_pi"),
+        settings,
         object(),  # type: ignore[arg-type]
         AgentTransportRegistry(
             {"pi": pi_transport, "opencode": opencode_transport}
@@ -168,7 +167,7 @@ async def test_disabled_framework_reaches_a_safe_terminal_boundary(settings) -> 
     orchestrator = DirectPiOrchestrator(
         repository,  # type: ignore[arg-type]
         FakeSandboxProvider(),
-        replace(settings, agent_framework="direct_pi"),
+        settings,
         object(),  # type: ignore[arg-type]
         AgentTransportRegistry.pi_only(object()),  # type: ignore[arg-type]
     )
@@ -189,7 +188,7 @@ async def test_worker_task_name_exposes_the_frozen_framework(settings) -> None:
     orchestrator = _TaskNameProbe()
     worker = WorkerRunner(
         repository,  # type: ignore[arg-type]
-        replace(settings, agent_framework="direct_pi"),
+        settings,
         sandbox=FakeSandboxProvider(),
         direct_orchestrator=orchestrator,
         worker_id="dispatch-worker",
@@ -200,27 +199,9 @@ async def test_worker_task_name_exposes_the_frozen_framework(settings) -> None:
 
 
 @pytest.mark.asyncio
-async def test_legacy_native_worker_never_silently_executes_opencode(settings) -> None:
-    repository = _WorkerRepository("opencode")
-    worker = WorkerRunner(
-        repository,  # type: ignore[arg-type]
-        settings,
-        model=object(),  # type: ignore[arg-type]
-        sandbox=FakeSandboxProvider(),
-        worker_id="legacy-worker",
-    )
-
-    assert await worker.run_once()
-    assert repository.terminal == (
-        "run-opencode",
-        RunStatus.failed,
-        "coding_agent_failed",
-    )
-
-
-@pytest.mark.asyncio
 async def test_opencode_turn_disables_unsupported_user_input_tool(settings) -> None:
     transport = _RequestProbeTransport()
+    contract = resolve_runtime_contract("deepseek-flash", "off")
     session = DirectPiSession(
         _ActiveSessionRepository(),  # type: ignore[arg-type]
         transport,  # type: ignore[arg-type]
@@ -231,6 +212,7 @@ async def test_opencode_turn_disables_unsupported_user_input_tool(settings) -> N
             duration_seconds=300,
             secret="sk-test-run-key",
         ),
+        runtime_contract=contract,
         agent_framework="opencode",
         run_id="run-opencode",
         lease_token="lease-token",
@@ -246,6 +228,7 @@ async def test_opencode_turn_disables_unsupported_user_input_tool(settings) -> N
 
     assert transport.request is not None
     assert transport.request.user_input_enabled is False
+    assert transport.request.thinking == "off"
 
 
 @pytest.mark.asyncio
@@ -286,5 +269,8 @@ async def test_codex_turn_keeps_resume_independent_from_user_input(settings) -> 
 
 
 @pytest.mark.asyncio
-async def test_framework_resolution_has_a_pi_only_legacy_fallback() -> None:
-    assert await resolve_run_agent_framework(object(), "legacy-run") == "pi"
+async def test_framework_resolution_uses_the_authoritative_repository_value() -> None:
+    assert await resolve_run_agent_framework(
+        _FrameworkRepository("opencode"),
+        "run-opencode",
+    ) == "opencode"

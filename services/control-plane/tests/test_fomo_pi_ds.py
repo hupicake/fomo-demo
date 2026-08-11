@@ -12,9 +12,7 @@ from pathlib import Path
 import pytest
 
 from fomo.fomo_pi_ds import (
-    FOMO_PI_BUILD_MODEL,
     FOMO_PI_MODEL,
-    FOMO_PI_PLANNING_MODEL,
     FOMO_PI_REQUIRE_RESUME,
     FOMO_PI_STRUCTURED_OUTPUT_SCHEMA_B64,
     FOMO_PI_THINKING,
@@ -25,6 +23,7 @@ from fomo.fomo_pi_ds import (
     PiInvocation,
     PiRequest,
 )
+from fomo.runtime_contract import context_limit_for_model_ref, runtime_profile
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 BRIDGE = REPOSITORY_ROOT / "infra" / "opensandbox" / "fomo-pi-rpc-bridge.mjs"
@@ -125,7 +124,7 @@ def test_invocation_keeps_prompt_and_key_out_of_argv_and_repr(tmp_path: Path) ->
     assert environment["FOMO_PI_THINKING_LEVEL"] == "high"
     # Explicit context window travels to the bridge; no business tool policy
     # exists anymore, and an inactivity budget is absent unless requested.
-    assert environment["FOMO_PI_CONTEXT_WINDOW"] == "200000"
+    assert environment["FOMO_PI_CONTEXT_WINDOW"] == "1000000"
     assert "FOMO_PI_TOOL_POLICY_B64" not in environment
     assert "FOMO_PI_ACTIVITY_SILENCE_SECONDS" not in environment
     assert FOMO_PI_STRUCTURED_OUTPUT_SCHEMA_B64 not in environment
@@ -243,8 +242,8 @@ def test_reducer_binds_input_request_event_to_completed_payload() -> None:
 @pytest.mark.parametrize(
     ("model", "thinking"),
     [
-        (FOMO_PI_BUILD_MODEL, "max"),
-        (FOMO_PI_PLANNING_MODEL, "medium"),
+        (FOMO_PI_MODEL, "max"),
+        (runtime_profile("gpt-5.6").model_ref, "default"),
     ],
 )
 def test_invocation_rejects_unsupported_model_thinking_pairs(model: str, thinking: str) -> None:
@@ -264,9 +263,9 @@ def test_invocation_rejects_unsupported_model_thinking_pairs(model: str, thinkin
 @pytest.mark.parametrize(
     ("model", "thinking"),
     [
-        (FOMO_PI_PLANNING_MODEL, "max"),
-        (FOMO_PI_BUILD_MODEL, "high"),
-        (FOMO_PI_BUILD_MODEL, "off"),
+        (FOMO_PI_MODEL, "high"),
+        (FOMO_PI_MODEL, "off"),
+        (runtime_profile("gpt-5.6").model_ref, "xhigh"),
     ],
 )
 def test_invocation_accepts_supported_model_thinking_pairs(model: str, thinking: str) -> None:
@@ -279,6 +278,7 @@ def test_invocation_accepts_supported_model_thinking_pairs(model: str, thinking:
         virtual_key="dummy-key",
         model=model,
         thinking=thinking,
+        context_window=context_limit_for_model_ref(model),
     )
     assert request.model == model
     assert request.thinking == thinking
@@ -448,8 +448,8 @@ def send(value):
 
 def state():
     return {{
-        "model": {{"provider": "fomo-litellm", "id": "fomo-pi-flash"}},
-        "thinkingLevel": "max",
+        "model": {{"provider": "fomo-litellm", "id": "fomo-pi-deepseek-flash"}},
+        "thinkingLevel": "high",
         "sessionId": session_id,
         "messageCount": 0,
         "pendingMessageCount": 0,
@@ -523,9 +523,9 @@ def _run_bridge(tmp_path: Path, mode: str = "ok", *, timeout_seconds: int | None
         state_dir=str(tmp_path / "state"),
         bridge_bin=str(BRIDGE),
         pi_bin=str(fake_pi),
-        # The canned fake Pi reports fomo-pi-flash with thinking max.
-        model=FOMO_PI_PLANNING_MODEL,
-        thinking="max",
+        # The canned fake Pi reports the canonical default runtime.
+        model=FOMO_PI_MODEL,
+        thinking="high",
         timeout_seconds=timeout_seconds,
         grace_seconds=1,
     )
@@ -547,13 +547,13 @@ def _run_bridge(tmp_path: Path, mode: str = "ok", *, timeout_seconds: int | None
 
 
 def _fake_bridge_reducer() -> PiBridgeStreamReducer:
-    """Match the planning/max contract reported by the canned fake Pi."""
+    """Match the default runtime contract reported by the canned fake Pi."""
     return PiBridgeStreamReducer(
         request_id="request-1",
         correlation_id="run-1",
         session_id="session-1",
-        thinking_level="max",
-        model_ref=FOMO_PI_PLANNING_MODEL,
+        thinking_level="high",
+        model_ref=FOMO_PI_MODEL,
     )
 
 

@@ -92,6 +92,16 @@ class FakeSandboxProvider:
         await sink("stdout", "fake preview ready\n")
         return await self.expose(ref, port)
 
+    async def renew_preview(self, ref: SandboxRef, lifetime_seconds: int) -> str:
+        self._sandbox(ref)
+        if lifetime_seconds <= 0:
+            raise ValueError("preview lifetime must be positive")
+        return "2099-01-01T00:00:00+00:00"
+
+    async def probe_preview(self, ref: SandboxRef) -> bool:
+        self._sandbox(ref)
+        return True
+
     async def snapshot(self, ref: SandboxRef) -> SnapshotRef:
         self._sandbox(ref)
         return SnapshotRef(id=uuid7(), location="fake://snapshot")

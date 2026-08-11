@@ -452,11 +452,6 @@ class WorkspaceManager:
             )
 
     async def _register_sandbox(self, ref: SandboxRef, kind: str) -> None:
-        if not (
-            self.settings.direct_pi_goal_graph_enabled
-            and self.settings.agent_framework == "direct_pi"
-        ):
-            return
         resource_id = await self.repository.register_sandbox_resource(
             self.run_id,
             ref.id,

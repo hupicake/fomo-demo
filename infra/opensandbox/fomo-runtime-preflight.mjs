@@ -21,7 +21,6 @@ const KNOWN_ALIASES = new Set([
   "fomo-pi-gemini-3.6-flash",
   "fomo-pi-gemini-3.1-pro",
   "fomo-pi-flash",
-  "fomo-pi-build",
 ]);
 
 function requiredEnvironment(name) {

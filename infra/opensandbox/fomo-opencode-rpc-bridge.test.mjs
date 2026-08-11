@@ -459,9 +459,9 @@ function baseEnvironment(paths) {
     FOMO_PI_WORKSPACE: paths.workspace,
     FOMO_PI_STATE_DIR: paths.state,
     FOMO_PI_BIN: paths.bin,
-    FOMO_PI_THINKING_LEVEL: "high",
-    FOMO_PI_MODEL_REF: "fomo-litellm/fomo-pi-build",
-    FOMO_PI_CONTEXT_WINDOW: "200000",
+    FOMO_PI_THINKING_LEVEL: "off",
+    FOMO_PI_MODEL_REF: "fomo-litellm/fomo-pi-deepseek-flash",
+    FOMO_PI_CONTEXT_WINDOW: "1000000",
     FOMO_PI_GRACE_SECONDS: "1",
     PNPM_HOME: "/opt/fomo/pnpm",
     npm_config_store_dir: "/opt/fomo/pnpm/store",
@@ -541,7 +541,7 @@ async function processTreePids(directory, { watchdog = false } = {}) {
 }
 
 function sentinelEnvironment() {
-  const modelID = "fomo-pi-build";
+  const modelID = "fomo-pi-deepseek-flash";
   return {
     PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin",
     PNPM_HOME: "/opt/fomo/pnpm",
@@ -581,7 +581,7 @@ test("OpenCode bridge emits compatible public text lifecycle without leaking sec
   const records = envelopes(result.stdout);
   assert.deepEqual(records.map((record) => record.seq), records.map((_, index) => index + 1));
   assert.equal(records[0].type, "started");
-  assert.equal(records[0].payload.model, "fomo-litellm/fomo-pi-build");
+  assert.equal(records[0].payload.model, "fomo-litellm/fomo-pi-deepseek-flash");
   assert.deepEqual(records[0].payload.capabilities, {
     structuredOutput: false,
     repoRead: true,

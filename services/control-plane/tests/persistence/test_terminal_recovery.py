@@ -352,7 +352,6 @@ async def test_recovery_explicitly_restarts_from_base_and_freezes_selected_runti
     await repository.request_cancel(source.id)
     configured = replace(
         settings,
-        agent_framework="direct_pi",
         agent_enabled_frameworks=("pi", "opencode"),
         litellm_api_key="sk-test-management",
         runtime_enabled_profiles=("gpt-5.6",),
@@ -429,7 +428,6 @@ async def test_recovery_reselects_pair_compatible_thinking(
 
     configured = replace(
         settings,
-        agent_framework="direct_pi",
         agent_enabled_frameworks=("pi", "opencode"),
         litellm_api_key="sk-test-management",
         runtime_enabled_profiles=("deepseek-flash",),

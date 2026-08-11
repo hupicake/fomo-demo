@@ -40,7 +40,6 @@ from fomo.runtime_contract import (
     RuntimeContractError,
     compatible_profile_ids_for_agent_framework,
     compatible_thinking_levels_for_agent_framework_profile,
-    legacy_runtime_contract,
     resolve_runtime_contract,
     runtime_profile,
     validate_agent_framework_profile,
@@ -225,8 +224,6 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
     async def runtime_availability() -> tuple[set[str], bool]:
         """Resolve public availability without exposing provider routing details."""
         enabled = set(settings.runtime_enabled_profiles)
-        if settings.agent_framework != "direct_pi":
-            return set(), True
         if not settings.litellm_api_key:
             return set(), False
         gateway = LiteLLMRunKeyClient(
@@ -294,10 +291,7 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
             compatible_profile_ids = compatible_profile_ids_for_agent_framework(
                 framework.value
             )
-            framework_configured = (
-                settings.agent_framework == "direct_pi"
-                and framework.value in settings.agent_enabled_frameworks
-            )
+            framework_configured = framework.value in settings.agent_enabled_frameworks
             has_compatible_available_profile = bool(
                 compatible_profile_ids.intersection(available_profiles)
             )
@@ -513,39 +507,6 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
         )
         if selected_agent_framework not in settings.agent_enabled_frameworks:
             raise HTTPException(status_code=422, detail="agent framework is not enabled")
-        if settings.agent_framework != "direct_pi":
-            if (
-                payload.agent_framework is not None
-                or payload.profile_id is not None
-                or payload.thinking is not None
-            ):
-                raise HTTPException(
-                    status_code=422,
-                    detail="runtime selection requires the Direct Pi framework",
-                )
-            legacy_runtime = legacy_runtime_contract()
-            try:
-                validate_agent_framework_runtime(
-                    selected_agent_framework,
-                    legacy_runtime.profile_id,
-                    legacy_runtime.thinking,
-                )
-            except RuntimeContractError as exc:
-                raise HTTPException(status_code=422, detail=str(exc)) from exc
-            message, run, created = await repository.create_message_and_run(
-                project_id,
-                owner_session_id,
-                payload.client_message_id,
-                payload.content,
-                payload.base_version_id,
-                agent_framework=selected_agent_framework,
-                runtime_contract=legacy_runtime,
-                enforce_agent_framework_match=(
-                    "agent_framework" in payload.model_fields_set
-                ),
-            )
-            response.status_code = status.HTTP_202_ACCEPTED if created else status.HTTP_200_OK
-            return MessageRunResponse(message=message, run=run)
         try:
             compatible_profile_ids = compatible_profile_ids_for_agent_framework(
                 selected_agent_framework
@@ -709,35 +670,6 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
             if payload.agent_framework is not None
             else source.agent_framework.value
         )
-        if settings.agent_framework != "direct_pi":
-            if (
-                payload.agent_framework is not None
-                or payload.profile_id is not None
-                or payload.thinking is not None
-            ):
-                raise HTTPException(
-                    status_code=422,
-                    detail="runtime selection requires the Direct Pi framework",
-                )
-            message, run, created, mode, checkpoint_available = (
-                await repository.create_recovery_message_and_run(
-                    source.id,
-                    owner_session_id,
-                    payload.client_message_id,
-                    payload.content,
-                    agent_framework=selected_agent_framework,
-                )
-            )
-            response.status_code = (
-                status.HTTP_202_ACCEPTED if created else status.HTTP_200_OK
-            )
-            return RecoveryRunResponse(
-                message=message,
-                run=run,
-                recovery_mode=mode,
-                source_checkpoint_available=checkpoint_available,
-            )
-
         if selected_agent_framework not in settings.agent_enabled_frameworks:
             raise HTTPException(status_code=422, detail="agent framework is not enabled")
         selected_profile = payload.profile_id or source.runtime.profile_id

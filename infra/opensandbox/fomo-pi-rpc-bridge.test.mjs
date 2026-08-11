@@ -339,7 +339,7 @@ test("non-planning mode adds only the trusted read-only delegation tool", () => 
     [DELEGATE_EXTENSION],
   );
   assert.equal(argv.includes("--no-extensions"), true);
-  assert.equal(records.find((record) => record.type === "started").payload.contextWindow, 200_000);
+  assert.equal(records.find((record) => record.type === "started").payload.contextWindow, 1_000_000);
   assert.deepEqual(settings, {
     contents: {
       compaction: {

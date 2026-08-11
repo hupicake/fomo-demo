@@ -8,7 +8,7 @@ import pytest
 
 from fomo.fomo_pi_ds import (
     FOMO_PI_DEFAULT_PREFLIGHT_ALIASES,
-    FOMO_PI_LITELLM_ALIASES,
+    FOMO_PI_LITELLM_ALIAS,
     FOMO_PI_SELECTABLE_LITELLM_ALIASES,
     InferenceGatewayError,
     LiteLLMRunKeyClient,
@@ -63,7 +63,7 @@ async def test_run_key_is_least_privilege_and_blocked_by_exact_secret() -> None:
     }
     assert "max_parallel_requests" not in generate
     assert json.loads(requests[1].content) == {"key": "sk-run-secret"}
-    assert FOMO_PI_LITELLM_ALIASES == ("fomo-pi-flash", "fomo-pi-build")
+    assert FOMO_PI_LITELLM_ALIAS == "fomo-pi-deepseek-flash"
     assert virtual_key.model_aliases == (FOMO_PI_SELECTABLE_LITELLM_ALIASES[0],)
     assert all(request.headers["authorization"] == "Bearer master-secret" for request in requests)
     assert "sk-run-secret" not in repr(virtual_key)

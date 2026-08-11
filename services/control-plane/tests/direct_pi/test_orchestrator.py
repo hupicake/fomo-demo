@@ -17,7 +17,6 @@ from fomo.direct_pi.architecture_profile import (
     ARCHITECTURE_PROFILE_VERSION,
     derive_product_architecture_profile,
 )
-from fomo.direct_pi.contracts import PlanningBundle
 from fomo.direct_pi.failures import AgentNoEffect, PlanningContractError
 from fomo.direct_pi.goalgraph import (
     GoalStatus,
@@ -30,14 +29,8 @@ from fomo.direct_pi.orchestrator import DirectPiOrchestrationError
 from fomo.direct_pi.prompts import (
     GOAL_GRAPH_PLANNING_POLICY,
     PRODUCT_DESIGN_POLICY,
-    PRODUCT_REQUIREMENTS_POLICY,
-    build_prompt,
-    build_repair_prompt,
     goal_graph_planning_correction_prompt,
     goal_graph_planning_prompt,
-    planning_correction_prompt,
-    planning_prompt,
-    repair_prompt,
 )
 from fomo.direct_pi.session import (
     DirectPiAwaitingUser,
@@ -53,7 +46,7 @@ from fomo.direct_pi.workspace import (
     fomo_runner_command,
 )
 from fomo.fomo_pi_ds import (
-    FOMO_PI_PLANNING_MODEL,
+    FOMO_PI_MODEL,
     InferenceGatewayError,
     PiBridgeEnvelope,
     PiBridgeFailed,
@@ -115,20 +108,6 @@ def _playwright_failure_report(title: str) -> str:
         }
     ]
     return json.dumps(report)
-
-
-def _playwright_results() -> dict[str, ExecResult]:
-    return {
-        _playwright_command(_HARNESS_PATH): ExecResult(
-            0, _playwright_report("starter renders a stable application shell"), ""
-        ),
-        _playwright_command("tests/fomo-acceptance/search-books.smoke.spec.ts"): ExecResult(
-            0, _playwright_report("searches books by title"), ""
-        ),
-        _playwright_command("tests/fomo-acceptance/create-book.smoke.spec.ts"): ExecResult(
-            0, _playwright_report("creates and persists a book"), ""
-        ),
-    }
 
 
 def _plan() -> dict[str, Any]:
@@ -235,163 +214,6 @@ class _Gateway:
 
     async def block(self, _key: RunVirtualKey) -> None:
         self.blocked = True
-
-
-class _Transport:
-    """Plays the planning turn and the single full-project build turn.
-
-    BuildPlan is advisory: the build turn applies the candidate files and
-    reports a handoff; there is no batch/allowlist structure anywhere.
-    """
-
-    def __init__(
-        self,
-        sandbox: GitAwareSandbox,
-        *,
-        build_only: bool = False,
-        extra_helper: bool = False,
-        fail_planning: Exception | None = None,
-    ) -> None:
-        self.sandbox = sandbox
-        self.calls = 0
-        self.build_call = 1 if build_only else 2
-        self.extra_helper = extra_helper
-        self.fail_planning = fail_planning
-
-    async def run(self, ref, invocation, *, on_event=None, on_diagnostic=None, cancel_event=None):
-        self.calls += 1
-        text = json.dumps(_plan(), ensure_ascii=False, separators=(",", ":"))
-        if self.calls == self.build_call:
-            changes = [
-                FileChange(
-                    path="app/(generated)/composition.tsx",
-                    content='import { LibraryDesk } from "@/components/features/library-desk";\nexport function GeneratedComposition() { return <LibraryDesk />; }\n',
-                    operation="modify",
-                ),
-                FileChange(
-                    path="components/features/library-desk.tsx",
-                    content='"use client";\nexport function LibraryDesk() { return <main><h1>Library desk</h1><label>Search books<input aria-label="Search books" /></label><button>Add book</button><span>Dune</span></main>; }\n',
-                ),
-                FileChange(
-                    path="lib/domain/books.ts",
-                    content="export type Book = { id: string; title: string };\n",
-                ),
-            ]
-            if self.extra_helper:
-                changes.append(
-                    FileChange(
-                        path="components/features/native-select.tsx",
-                        content=(
-                            "export function NativeSelect() { return "
-                            '<select aria-label="Inventory" />; }\n'
-                        ),
-                    )
-                )
-            await self.sandbox.apply_changes(
-                ref,
-                changes,
-            )
-            text = "Implemented the library project."
-        elif self.fail_planning is not None and self.calls == 1:
-            raise self.fail_planning
-        session_id = invocation.request.session_id
-        structured = invocation.request.structured_output_schema is not None
-        stats = {
-            "sessionId": session_id,
-            "userMessages": self.calls,
-            "assistantMessages": self.calls,
-            "toolCalls": 3,
-            "toolResults": 3,
-            "totalMessages": 8,
-            "tokens": {"input": 100, "output": 50, "cacheRead": 0, "cacheWrite": 0, "total": 150},
-            "cost": 0.01,
-        }
-        envelopes = [
-            PiBridgeEnvelope(seq=1, type="started", payload={"sessionId": session_id}),
-            PiBridgeEnvelope(seq=2, type="pi.event", payload={"kind": "agent_start"}),
-        ]
-        if structured:
-            envelopes.extend(
-                [
-                    PiBridgeEnvelope(
-                        seq=3,
-                        type="pi.event",
-                        payload={
-                            "kind": "tool_start",
-                            "toolCallId": "structured-1",
-                            "toolName": "submit_structured_output",
-                            "args": _plan(),
-                        },
-                    ),
-                    PiBridgeEnvelope(
-                        seq=4,
-                        type="pi.event",
-                        payload={
-                            "kind": "tool_end",
-                            "toolCallId": "structured-1",
-                            "toolName": "submit_structured_output",
-                            "isError": False,
-                        },
-                    ),
-                    PiBridgeEnvelope(
-                        seq=5,
-                        type="pi.event",
-                        payload={
-                            "kind": "turn_end",
-                            "role": "assistant",
-                            "stopReason": "toolUse",
-                            "text": "",
-                        },
-                    ),
-                    PiBridgeEnvelope(
-                        seq=6,
-                        type="pi.event",
-                        payload={"kind": "agent_settled"},
-                    ),
-                    PiBridgeEnvelope(
-                        seq=7,
-                        type="completed",
-                        payload={"sessionId": session_id, "stats": stats},
-                    ),
-                ]
-            )
-        else:
-            envelopes.extend(
-                [
-                    PiBridgeEnvelope(
-                        seq=3,
-                        type="pi.event",
-                        payload={
-                            "kind": "turn_end",
-                            "role": "assistant",
-                            "text": text,
-                        },
-                    ),
-                    PiBridgeEnvelope(
-                        seq=4,
-                        type="pi.event",
-                        payload={"kind": "agent_settled"},
-                    ),
-                    PiBridgeEnvelope(
-                        seq=5,
-                        type="completed",
-                        payload={"sessionId": session_id, "stats": stats},
-                    ),
-                ]
-            )
-        if on_event is not None:
-            for envelope in envelopes:
-                await on_event(envelope)
-        return PiTransportResult(
-            bridge=PiBridgeResult(
-                started={"sessionId": session_id},
-                events=tuple(envelopes),
-                completed={"sessionId": session_id, "stats": stats},
-            ),
-            execution_id=f"fake-{self.calls}",
-            exit_code=0,
-            stderr="",
-        )
 
 
 def _goal_graph_plan() -> dict[str, object]:
@@ -620,8 +442,6 @@ def test_structured_planning_prompts_allow_schema_refills_until_success() -> Non
     prompts = (
         goal_graph_planning_prompt(requirement="Build a page.", starter={}),
         goal_graph_planning_correction_prompt(validation_error="invalid graph"),
-        planning_prompt(requirement="Build a page.", starter={}),
-        planning_correction_prompt(validation_error="invalid bundle"),
     )
 
     for prompt in prompts:
@@ -631,51 +451,6 @@ def test_structured_planning_prompts_allow_schema_refills_until_success() -> Non
         assert "at most 3 total attempts" not in prompt
         assert "Stop immediately after the successful submission" in prompt
         assert "emit prose or JSON as assistant text" in prompt
-
-
-def test_legacy_planning_prompt_does_not_use_a_file_count_quota() -> None:
-    prompt = planning_prompt(requirement="Build a page.", starter={})
-
-    assert "8-15 files" not in prompt
-    assert "as many or as few files as the complete product warrants" in prompt
-    assert "Define 4-5" not in prompt
-    assert "acceptance criteria are a non-negotiable verification floor" in prompt
-    assert PRODUCT_REQUIREMENTS_POLICY in prompt
-    assert "Act as a product manager" in prompt
-    assert "primary end-to-end journey" in prompt
-    assert "verbatim JSON string" in prompt
-
-
-def test_legacy_build_and_repair_prompts_allow_complete_sandbox_work() -> None:
-    bundle = _plan()
-    build = build_prompt(
-        requirement="Build a complete library product.",
-        starter={"routes": ["/"]},
-        planning_bundle=bundle,
-    )
-    type_repair = build_repair_prompt(diagnostic="Type error")
-    verification_repair = repair_prompt(
-        planning_bundle=bundle,
-        diagnostic={"gate": "typecheck", "summary": "Type error"},
-        round_number=1,
-    )
-
-    assert "verification floor" in build
-    assert "freely adjust architecture" in build
-    assert "run any useful local self-checks" in build
-    assert "Do not run the production build" not in build
-    assert "under 1500 characters" not in build
-    assert "every implementation, architecture, or integration change" in type_repair
-    assert "tool silence and budget limits" not in type_repair
-    assert "inspect any relevant project source" in verification_repair
-    assert "Run any useful sandbox-supported self-checks" in verification_repair
-    for prompt in (build, type_repair, verification_repair):
-        assert "FOMO frontend-only runtime contract" in prompt
-        assert "next-app-feature-first@1.0.0" in prompt
-        assert '"advisoryOnly":true' in prompt
-        assert "business logic and mutable product data must remain client-side" in prompt
-        assert "delegate_subtasks" in prompt
-        assert "You remain the only writer and integrator" in prompt
 
 
 class _GoalGraphTransport:
@@ -1619,19 +1394,22 @@ async def test_direct_pi_stage_contract_maps_model_thinking_and_inactivity_budge
     assert await session.invoke(ref, "repair it", stage="repairing") == "ok"
 
     planning, building, repairing = transport.requests
-    assert planning.model == FOMO_PI_PLANNING_MODEL
+    assert planning.model == FOMO_PI_MODEL
     assert planning.thinking == "high"
     assert planning.activity_silence_seconds == settings.model_request_timeout_seconds
     assert planning.timeout_seconds is None
-    assert building.model == FOMO_PI_PLANNING_MODEL
+    assert building.model == FOMO_PI_MODEL
     assert building.thinking == "high"
     assert building.activity_silence_seconds == settings.model_request_timeout_seconds
     assert building.timeout_seconds is None
-    assert repairing.model == FOMO_PI_PLANNING_MODEL
+    assert repairing.model == FOMO_PI_MODEL
     assert repairing.thinking == "high"
     assert repairing.activity_silence_seconds == settings.model_request_timeout_seconds
     assert repairing.timeout_seconds is None
-    assert all(request.context_window == settings.pi_context_window for request in transport.requests)
+    assert all(
+        request.context_window == resolve_runtime_contract().context_window
+        for request in transport.requests
+    )
 
 
 @pytest.mark.asyncio
@@ -1816,28 +1594,6 @@ async def test_direct_pi_length_stop_fails_closed_without_an_invoke_retry(settin
     assert len(transport.requests) == 1
 
 
-def test_planning_parser_normalizes_one_unambiguous_deepseek_nesting_error() -> None:
-    valid = _plan()
-    malformed = {
-        "buildPlan": valid["buildPlan"],
-        "acceptanceContract": {"criteria": valid["acceptanceContract"]["criteria"]},
-        "tests": valid["acceptanceContract"]["tests"],
-    }
-
-    bundle = DirectPiOrchestrator._parse_planning_bundle(
-        json.dumps(malformed, separators=(",", ":")) + "}"
-    )
-
-    assert len(bundle.acceptance_contract.tests) == 2
-
-
-def test_planning_parser_rejects_arbitrary_trailing_content() -> None:
-    with pytest.raises(DirectPiOrchestrationError, match="invalid planning contract"):
-        DirectPiOrchestrator._parse_planning_bundle(
-            json.dumps(_plan(), separators=(",", ":")) + " trailing"
-        )
-
-
 def test_goal_graph_provider_parser_requires_envelope_but_cache_can_read_raw_v3() -> None:
     plan = _one_goal_graph_plan()
     raw = json.dumps(plan, separators=(",", ":"))
@@ -1927,26 +1683,6 @@ async def _new_project_run(repository, requirement: str, message_id: str):
     return project, run, claimed.lease_owner
 
 
-def _direct_orchestrator(
-    repository,
-    settings,
-    sandbox: GitAwareSandbox,
-    gateway: _Gateway,
-    transport: _Transport,
-) -> DirectPiOrchestrator:
-    return DirectPiOrchestrator(
-        repository,
-        sandbox,
-        replace(
-            settings,
-            agent_framework="direct_pi",
-            direct_pi_goal_graph_enabled=False,
-        ),
-        gateway,
-        transport,
-    )
-
-
 def _goal_graph_orchestrator(
     repository,
     settings,
@@ -1956,11 +1692,7 @@ def _goal_graph_orchestrator(
     return DirectPiOrchestrator(
         repository,
         sandbox,
-        replace(
-            settings,
-            agent_framework="direct_pi",
-            direct_pi_goal_graph_enabled=True,
-        ),
+        settings,
         _Gateway(),
         transport,
     )
@@ -1997,11 +1729,7 @@ async def test_goal_graph_runs_two_goals_with_scoped_full_regression_and_checkpo
     orchestrator = DirectPiOrchestrator(
         repository,
         sandbox,
-        replace(
-            settings,
-            agent_framework="direct_pi",
-            direct_pi_goal_graph_enabled=True,
-        ),
+        settings,
         gateway,
         transport,
     )
@@ -2588,11 +2316,7 @@ async def test_verification_repair_continuation_preserves_must_change(repository
     resumed_orchestrator = DirectPiOrchestrator(
         repository,
         sandbox,
-        replace(
-            settings,
-            agent_framework="direct_pi",
-            direct_pi_goal_graph_enabled=True,
-        ),
+        settings,
         _Gateway(),
         answer_transport,
     )
@@ -2688,11 +2412,7 @@ async def test_verification_repair_continuation_preserves_goal_round(
     resumed_orchestrator = DirectPiOrchestrator(
         repository,
         sandbox,
-        replace(
-            settings,
-            agent_framework="direct_pi",
-            direct_pi_goal_graph_enabled=True,
-        ),
+        settings,
         _Gateway(),
         answer_transport,
     )
@@ -2839,11 +2559,7 @@ async def test_recovery_run_plans_against_the_restored_verified_checkpoint(
     orchestrator = DirectPiOrchestrator(
         repository,
         sandbox,
-        replace(
-            settings,
-            agent_framework="direct_pi",
-            direct_pi_goal_graph_enabled=True,
-        ),
+        settings,
         _Gateway(),
         _GoalGraphTransport(sandbox),
     )
@@ -2894,11 +2610,7 @@ async def test_goal_graph_repairs_workspace_audit_in_same_session(
     orchestrator = DirectPiOrchestrator(
         repository,
         sandbox,
-        replace(
-            settings,
-            agent_framework="direct_pi",
-            direct_pi_goal_graph_enabled=True,
-        ),
+        settings,
         _Gateway(),
         transport,
     )
@@ -2959,11 +2671,7 @@ async def _run_until_goal_graph_question(
     orchestrator = DirectPiOrchestrator(
         repository,
         sandbox,
-        replace(
-            settings,
-            agent_framework="direct_pi",
-            direct_pi_goal_graph_enabled=True,
-        ),
+        settings,
         _Gateway(),
         transport,
     )
@@ -3005,11 +2713,7 @@ async def test_goal_graph_wait_retains_generation_and_answer_resumes_same_sessio
     orchestrator = DirectPiOrchestrator(
         repository,
         sandbox,
-        replace(
-            settings,
-            agent_framework="direct_pi",
-            direct_pi_goal_graph_enabled=True,
-        ),
+        settings,
         _Gateway(),
         answer_transport,
     )
@@ -3055,11 +2759,7 @@ async def test_build_continuation_settles_from_pre_question_logical_start(
     orchestrator = DirectPiOrchestrator(
         repository,
         sandbox,
-        replace(
-            settings,
-            agent_framework="direct_pi",
-            direct_pi_goal_graph_enabled=True,
-        ),
+        settings,
         _Gateway(),
         answer_transport,
     )
@@ -3102,11 +2802,7 @@ async def test_goal_graph_missing_pi_session_fails_closed_without_replaying_answ
     orchestrator = DirectPiOrchestrator(
         repository,
         sandbox,
-        replace(
-            settings,
-            agent_framework="direct_pi",
-            direct_pi_goal_graph_enabled=True,
-        ),
+        settings,
         _Gateway(),
         answer_transport,
     )
@@ -3298,11 +2994,7 @@ async def test_goal_graph_reuses_failed_build_planning_artifact_and_starts_with_
     orchestrator = DirectPiOrchestrator(
         repository,
         sandbox,
-        replace(
-            settings,
-            agent_framework="direct_pi",
-            direct_pi_goal_graph_enabled=True,
-        ),
+        settings,
         _Gateway(),
         transport,
     )
@@ -3391,7 +3083,7 @@ async def test_goal_graph_recovers_from_verified_checkpoint_with_durable_session
         "prior-request",
         lease_token=lease,
         provider="fomo-litellm",
-        model="fomo-pi-build",
+        model=resolve_runtime_contract().model_ref,
         input_tokens=100,
         output_tokens=50,
         cost_micros=500_000,
@@ -3416,11 +3108,7 @@ async def test_goal_graph_recovers_from_verified_checkpoint_with_durable_session
     orchestrator = DirectPiOrchestrator(
         repository,
         sandbox,
-        replace(
-            settings,
-            agent_framework="direct_pi",
-            direct_pi_goal_graph_enabled=True,
-        ),
+        settings,
         gateway,
         transport,
     )
@@ -3560,11 +3248,7 @@ async def test_verified_graph_publish_recovery_rebuilds_and_reverifies_without_p
     orchestrator = DirectPiOrchestrator(
         repository,
         sandbox,
-        replace(
-            settings,
-            agent_framework="direct_pi",
-            direct_pi_goal_graph_enabled=True,
-        ),
+        settings,
         gateway,
         _NoPiTransport(),
     )
@@ -3626,306 +3310,6 @@ def test_legacy_checkpoint_without_goal_paths_is_fail_safe_until_rewritten() -> 
 
 
 @pytest.mark.asyncio
-async def test_direct_pi_full_loop_publishes_frozen_manifest_evidence(
-    repository, settings
-) -> None:
-    _project, run, lease = await _new_project_run(
-        repository,
-        "Build a polished library manager with search and durable create.",
-        "direct-pi-run",
-    )
-    sandbox = GitAwareSandbox(_playwright_results())
-    gateway = _Gateway()
-    transport = _Transport(sandbox)
-    orchestrator = _direct_orchestrator(repository, settings, sandbox, gateway, transport)
-
-    await orchestrator.run(run.id, lease_token=lease)
-
-    final = await repository.get_run(run.id)
-    assert final.status == RunStatus.succeeded
-    assert final.preview_url == "http://fake-preview.invalid:8080"
-    assert transport.calls == 2
-    assert gateway.blocked
-    assert await repository.get_latest_artifact(run.id, "build_plan") is not None
-    assert await repository.get_latest_artifact(run.id, "acceptance_contract") is not None
-    trace = await repository.get_trace(_project.id, run.id)
-    assert {item["status"] for item in trace["acceptance_trace"]} == {"passed"}
-    assert {item["implementationStatus"] for item in trace["acceptance_trace"]} == {"implemented"}
-    versions = await repository.list_versions(_project.id)
-    assert len(versions) == 1 and versions[0].qa_status == "passed"
-    assert versions[0].commit_sha == CANDIDATE_SHA
-    _version_id, composition, _digest = await repository.get_version_file_content(
-        _project.id, "app/(generated)/composition.tsx", versions[0].id
-    )
-    assert "LibraryDesk" in composition
-    # preview.verified only after the frozen manifest + health recheck passed.
-    events = await repository.list_events(run.id, limit=500)
-    assert any(event.kind == "preview.verified" for event in events)
-    assert not any(event.kind == "build.batch.started" for event in events)
-
-
-@pytest.mark.asyncio
-async def test_direct_pi_dependency_timeout_is_infrastructure_and_not_repaired(
-    repository, settings
-) -> None:
-    _project, run, lease = await _new_project_run(
-        repository,
-        "Build a polished library manager with search and durable create.",
-        "direct-pi-infra-failure",
-    )
-    sandbox = GitAwareSandbox(
-        {
-            "pnpm install --offline --frozen-lockfile --ignore-scripts": ExecResult(
-                -1, "", "", timed_out=True
-            )
-        }
-    )
-    gateway = _Gateway()
-    transport = _Transport(sandbox)
-    orchestrator = _direct_orchestrator(repository, settings, sandbox, gateway, transport)
-
-    await orchestrator.run(run.id, lease_token=lease)
-
-    final = await repository.get_run(run.id)
-    assert final.status == RunStatus.needs_attention
-    assert final.error_code == "direct_pi_infrastructure_failed"
-    assert final.repair_round == 0
-    assert final.preview_url is None
-    assert transport.calls == 2
-    assert gateway.blocked
-
-
-@pytest.mark.asyncio
-async def test_direct_pi_reuses_exact_validated_planning_artifacts(repository, settings) -> None:
-    requirement = "Build a polished library manager with search and durable create."
-    session = await create_user_session(repository)
-    project = await repository.create_project(session.id, "Library")
-    _message, prior, _created = await repository.create_message_and_run(
-        project.id, session.id, "prior-planning", requirement
-    )
-    prior_claim = await repository.claim_next_run("prior-worker", 60)
-    assert prior_claim is not None and prior_claim.lease_owner
-    starter = resolve_starter_manifest(("crud", "local-persistence"))
-    await repository.store_artifact(
-        prior.id,
-        "run_input",
-        {
-            "starterId": starter.id,
-            "starterVersion": starter.version,
-            "starterCapabilities": list(starter.capability_ids),
-            "productDesignPolicy": PRODUCT_DESIGN_POLICY,
-            "architectureProfilePolicy": (
-                f"{ARCHITECTURE_PROFILE_ID}@{ARCHITECTURE_PROFILE_VERSION}"
-            ),
-            **resolve_runtime_contract().cache_fingerprint(),
-        },
-        lease_token=prior_claim.lease_owner,
-    )
-    bundle = PlanningBundle.model_validate(_plan())
-    await repository.store_artifact(
-        prior.id,
-        "build_plan",
-        bundle.build_plan.model_dump(mode="json", by_alias=True),
-        lease_token=prior_claim.lease_owner,
-    )
-    await repository.store_artifact(
-        prior.id,
-        "acceptance_contract",
-        bundle.acceptance_contract.model_dump(mode="json", by_alias=True),
-        lease_token=prior_claim.lease_owner,
-    )
-    await repository.mark_terminal(
-        prior.id,
-        RunStatus.failed,
-        error_code="direct_pi_execution_error",
-        lease_token=prior_claim.lease_owner,
-    )
-
-    # A newer cache candidate has the exact input fingerprint but an invalid
-    # current contract. The orchestrator must re-validate and skip it, then
-    # reuse the older valid machine artifacts.
-    _message, invalid, _created = await repository.create_message_and_run(
-        project.id, session.id, "invalid-cached-planning", requirement
-    )
-    invalid_claim = await repository.claim_next_run("invalid-cache-worker", 60)
-    assert invalid_claim is not None and invalid_claim.lease_owner
-    await repository.store_artifact(
-        invalid.id,
-        "run_input",
-        {
-            "starterId": starter.id,
-            "starterVersion": starter.version,
-            "starterCapabilities": list(starter.capability_ids),
-            "productDesignPolicy": PRODUCT_DESIGN_POLICY,
-            "architectureProfilePolicy": (
-                f"{ARCHITECTURE_PROFILE_ID}@{ARCHITECTURE_PROFILE_VERSION}"
-            ),
-            **resolve_runtime_contract().cache_fingerprint(),
-        },
-        lease_token=invalid_claim.lease_owner,
-    )
-    invalid_plan = bundle.build_plan.model_dump(mode="json", by_alias=True)
-    invalid_plan["routes"] = ["https://invalid.example"]
-    await repository.store_artifact(
-        invalid.id,
-        "build_plan",
-        invalid_plan,
-        lease_token=invalid_claim.lease_owner,
-    )
-    await repository.store_artifact(
-        invalid.id,
-        "acceptance_contract",
-        bundle.acceptance_contract.model_dump(mode="json", by_alias=True),
-        lease_token=invalid_claim.lease_owner,
-    )
-    await repository.mark_terminal(
-        invalid.id,
-        RunStatus.failed,
-        error_code="direct_pi_execution_error",
-        lease_token=invalid_claim.lease_owner,
-    )
-
-    _message, run, _created = await repository.create_message_and_run(
-        project.id, session.id, "cached-planning", requirement
-    )
-    claimed = await repository.claim_next_run("direct-worker", 60)
-    assert claimed is not None and claimed.lease_owner
-    sandbox = GitAwareSandbox(_playwright_results())
-    gateway = _Gateway()
-    transport = _Transport(sandbox, build_only=True, extra_helper=True)
-    orchestrator = _direct_orchestrator(repository, settings, sandbox, gateway, transport)
-
-    await orchestrator.run(run.id, lease_token=claimed.lease_owner)
-
-    final = await repository.get_run(run.id)
-    events = await repository.list_events(run.id, limit=500)
-    assert final.status == RunStatus.succeeded
-    assert transport.calls == 1
-    cache_hits = [event for event in events if event.kind == "planning.cache_hit"]
-    assert len(cache_hits) == 1
-    assert cache_hits[0].payload["sourceRunId"] == prior.id
-    # The advisory plan allowed an unplanned helper: no amendment artifact is
-    # produced, and the helper is a normal part of the audited diff.
-    assert await repository.get_latest_artifact(run.id, "build_plan_amendment") is None
-    assert any(
-        event.kind == "file.changed"
-        and event.payload.get("path") == "components/features/native-select.tsx"
-        for event in events
-    )
-
-
-@pytest.mark.asyncio
-async def test_direct_pi_repair_recreates_a_clean_verification_sandbox(
-    repository, settings
-) -> None:
-    _project, run, lease = await _new_project_run(
-        repository,
-        "Build a polished library manager with search and durable create.",
-        "repair-loop",
-    )
-    results = _playwright_results()
-    # First smoke gate fails once, then passes on the re-verified round.
-    results[_playwright_command(_HARNESS_PATH)] = [
-        ExecResult(1, "", "smoke failed"),
-        ExecResult(0, _playwright_report("starter renders a stable application shell"), ""),
-    ]
-    sandbox = GitAwareSandbox(results)
-    gateway = _Gateway()
-    transport = _Transport(sandbox)
-    orchestrator = _direct_orchestrator(repository, settings, sandbox, gateway, transport)
-
-    await orchestrator.run(run.id, lease_token=lease)
-
-    final = await repository.get_run(run.id)
-    events = await repository.list_events(run.id, limit=500)
-    assert final.status == RunStatus.succeeded
-    assert final.repair_round == 1
-    # The repair turn reuses the same session (planning + build + repair).
-    assert transport.calls == 3
-    assert any(event.kind == "preview.expired" for event in events)
-    assert any(event.kind == "preview.verified" for event in events)
-    sandbox_ids = list(sandbox.sandboxes)
-    assert len(sandbox_ids) == 3  # generation, failed V, clean replacement V
-    durable_sandbox_id = await persisted_sandbox_id(repository, run.id)
-    assert durable_sandbox_id == sandbox_ids[-1]
-    assert durable_sandbox_id != sandbox_ids[-2]
-
-
-@pytest.mark.asyncio
-async def test_direct_pi_planning_failure_destroys_generation_and_blocks_key(
-    repository, settings
-) -> None:
-    _project, run, lease = await _new_project_run(
-        repository,
-        "Build a polished library manager with search and durable create.",
-        "planning-failure",
-    )
-    sandbox = GitAwareSandbox()
-    gateway = _Gateway()
-    transport = _Transport(
-        sandbox,
-        fail_planning=RuntimeError("provider exploded with password=private-value"),
-    )
-    orchestrator = _direct_orchestrator(repository, settings, sandbox, gateway, transport)
-
-    with pytest.raises(RuntimeError, match="provider exploded"):
-        await orchestrator.run(run.id, lease_token=lease)
-
-    final = await repository.get_run(run.id)
-    events = await repository.list_events(run.id)
-    failure = next(event for event in reversed(events) if event.kind == "pi.failed")
-    run_failed = next(event for event in reversed(events) if event.kind == "run.failed")
-    assert final.status == RunStatus.failed
-    assert final.error_code == "coding_agent_failed"
-    assert run_failed.payload["summary"] == "Coding Agent 运行失败，请重试；若问题持续发生，请检查服务状态。"
-    assert failure.payload == {
-        "code": "coding_agent_failed",
-        "message": "Coding Agent 运行失败，请重试；若问题持续发生，请检查服务状态。",
-    }
-    assert "private-value" not in json.dumps(failure.payload, ensure_ascii=False)
-    assert gateway.blocked
-    # The generation sandbox was destroyed and its durable reference cleared
-    # by the orchestrator's cleanup.
-    assert await persisted_sandbox_id(repository, run.id) is None
-
-
-@pytest.mark.asyncio
-async def test_direct_pi_budget_failure_persists_specific_safe_contract(
-    repository, settings
-) -> None:
-    _project, run, lease = await _new_project_run(
-        repository,
-        "Build a polished library manager.",
-        "token-budget-failure",
-    )
-    sandbox = GitAwareSandbox()
-    gateway = _Gateway()
-    transport = _Transport(
-        sandbox,
-        fail_planning=DirectPiSessionError(
-            "Direct Pi exceeded the run token budget"
-        ),
-    )
-    orchestrator = _direct_orchestrator(
-        repository, settings, sandbox, gateway, transport
-    )
-
-    with pytest.raises(DirectPiSessionError, match="token budget"):
-        await orchestrator.run(run.id, lease_token=lease)
-
-    final = await repository.get_run(run.id)
-    events = await repository.list_events(run.id)
-    failure = next(event for event in reversed(events) if event.kind == "pi.failed")
-    run_failed = next(event for event in reversed(events) if event.kind == "run.failed")
-    assert final.error_code == "run_token_budget_exceeded"
-    assert run_failed.payload["summary"] == "本次任务已达到 Token 使用上限，请缩小任务范围后重试。"
-    assert failure.payload == {
-        "code": "run_token_budget_exceeded",
-        "message": "本次任务已达到 Token 使用上限，请缩小任务范围后重试。",
-    }
-
-
-@pytest.mark.asyncio
 async def test_goal_graph_gateway_failure_is_specific_and_does_not_leak(
     repository, settings
 ) -> None:
@@ -3947,11 +3331,7 @@ async def test_goal_graph_gateway_failure_is_specific_and_does_not_leak(
     orchestrator = DirectPiOrchestrator(
         repository,
         sandbox,
-        replace(
-            settings,
-            agent_framework="direct_pi",
-            direct_pi_goal_graph_enabled=True,
-        ),
+        settings,
         gateway,
         _GoalGraphTransport(sandbox),
     )
@@ -3986,6 +3366,21 @@ class _RetainingGitAwareSandbox(GitAwareSandbox):
         return "2026-08-17T01:02:03+00:00"
 
 
+async def _publish_projection(repository, project_id: str, run_id: str, lease: str):
+    draft = parse_goal_graph_draft(_one_goal_graph_plan())
+    return await repository.create_goal_graph(
+        project_id,
+        run_id,
+        draft,
+        architecture_profile=derive_product_architecture_profile(
+            requirement="Build a polished library manager.",
+            route_count=len(draft.routes),
+            goal_count=len(draft.goals),
+        ),
+        lease_token=lease,
+    )
+
+
 @pytest.mark.asyncio
 async def test_publish_uses_frozen_snapshot_and_emits_preview_verified_after(
     repository, settings
@@ -3998,8 +3393,6 @@ async def test_publish_uses_frozen_snapshot_and_emits_preview_verified_after(
     sandbox = _RetainingGitAwareSandbox()
     settings = replace(
         settings,
-        agent_framework="direct_pi",
-        sandbox_provider="opensandbox",
         verified_preview_lifetime_seconds=123_456,
         public_preview_base_domain="preview.example.test",
     )
@@ -4028,8 +3421,9 @@ async def test_publish_uses_frozen_snapshot_and_emits_preview_verified_after(
         sandbox,
         settings,
         _Gateway(),
-        _Transport(sandbox),
+        _GoalGraphTransport(sandbox),
     )
+    projection = await _publish_projection(repository, _project.id, run.id, lease)
 
     await orchestrator._publish(
         run.id,
@@ -4039,7 +3433,7 @@ async def test_publish_uses_frozen_snapshot_and_emits_preview_verified_after(
         verifier,  # type: ignore[arg-type]
         snapshot,
         outcome,
-        PlanningBundle.model_validate(_plan()),
+        projection,
     )
 
     versions = await repository.list_versions(_project.id)
@@ -4086,7 +3480,6 @@ async def test_publish_fails_closed_when_verified_preview_cannot_be_renewed(
     sandbox = _RetainingGitAwareSandbox(
         renewal_error=RuntimeError("provider metadata must stay private")
     )
-    settings = replace(settings, sandbox_provider="opensandbox")
     starter = resolve_starter_manifest(("crud", "local-persistence"))
     commands = _commands(repository, sandbox, settings, run.id, lease)
     workspaces = _workspaces(repository, sandbox, settings, commands, starter, run.id, lease)
@@ -4109,9 +3502,14 @@ async def test_publish_fails_closed_when_verified_preview_cannot_be_renewed(
         preview_url="http://fake-preview.invalid:8080",
         preview_elapsed_seconds=1.5,
     )
-    orchestrator = _direct_orchestrator(
-        repository, settings, sandbox, _Gateway(), _Transport(sandbox)
+    orchestrator = DirectPiOrchestrator(
+        repository,
+        sandbox,
+        settings,
+        _Gateway(),
+        _GoalGraphTransport(sandbox),
     )
+    projection = await _publish_projection(repository, project.id, run.id, lease)
 
     with pytest.raises(
         DirectPiOrchestrationError,
@@ -4125,7 +3523,7 @@ async def test_publish_fails_closed_when_verified_preview_cannot_be_renewed(
             verifier,  # type: ignore[arg-type]
             snapshot,
             outcome,
-            PlanningBundle.model_validate(_plan()),
+            projection,
         )
 
     assert await repository.list_versions(project.id) == []
@@ -4197,9 +3595,14 @@ async def test_publish_fails_closed_on_drift_missing_url_or_dead_preview(
         preview_url=preview_url,
         preview_elapsed_seconds=None,
     )
-    orchestrator = _direct_orchestrator(
-        repository, settings, sandbox, _Gateway(), _Transport(sandbox)
+    orchestrator = DirectPiOrchestrator(
+        repository,
+        sandbox,
+        settings,
+        _Gateway(),
+        _GoalGraphTransport(sandbox),
     )
+    projection = await _publish_projection(repository, _project.id, run.id, lease)
 
     with pytest.raises(error_type, match=error_match):
         await orchestrator._publish(
@@ -4210,7 +3613,7 @@ async def test_publish_fails_closed_on_drift_missing_url_or_dead_preview(
             verifier,  # type: ignore[arg-type]
             snapshot,
             outcome,
-            PlanningBundle.model_validate(_plan()),
+            projection,
         )
 
     assert await repository.list_versions(_project.id) == []

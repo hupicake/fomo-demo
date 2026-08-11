@@ -9,7 +9,7 @@ from fomo.sandbox import OpenSandboxProvider
 from fomo.worker.runner import WorkerRunner
 
 
-def test_agent_framework_allowlist_defaults_and_legacy_environment_mapping(monkeypatch) -> None:
+def test_agent_framework_allowlist_defaults_and_environment_selection(monkeypatch) -> None:
     defaults = Settings()
     assert defaults.agent_enabled_frameworks == ("pi", "opencode")
     assert defaults.agent_default_framework == "pi"
@@ -20,11 +20,6 @@ def test_agent_framework_allowlist_defaults_and_legacy_environment_mapping(monke
     )
     assert codex_rollout.agent_enabled_frameworks == ("pi", "codex")
     assert codex_rollout.agent_default_framework == "codex"
-
-    monkeypatch.setenv("AGENT_FRAMEWORK", "opencode")
-    from_legacy_switch = Settings.from_env()
-    assert from_legacy_switch.agent_framework == "direct_pi"
-    assert from_legacy_switch.agent_default_framework == "opencode"
 
     monkeypatch.setenv("FOMO_AGENT_ENABLED_FRAMEWORKS", "opencode")
     monkeypatch.setenv("FOMO_AGENT_DEFAULT_FRAMEWORK", "opencode")
@@ -136,30 +131,20 @@ def test_direct_pi_budget_environment_is_loaded_as_one_validated_set(monkeypatch
     monkeypatch.setenv("LITELLM_BASE_URL", "http://litellm:4000")
     monkeypatch.setenv("SANDBOX_LITELLM_BASE_URL", "http://host.docker.internal:4000/v1")
     monkeypatch.setenv("FOMO_INFERENCE_TOKEN_TTL", "4800")
-    monkeypatch.setenv("RUN_MAX_WALL_SECONDS", "3600")
     monkeypatch.setenv("RUN_MAX_SPEND", "3.5")
     monkeypatch.setenv("RUN_INFERENCE_RPM_LIMIT", "40")
     monkeypatch.setenv("RUN_INFERENCE_TPM_LIMIT", "900000")
     monkeypatch.setenv("FOMO_RUNTIME_ENABLED_PROFILES", "gpt-5.6")
     monkeypatch.setenv("FOMO_RUNTIME_DEFAULT_PROFILE", "gpt-5.6")
-    monkeypatch.setenv("PI_CONTEXT_WINDOW", "256000")
     monkeypatch.setenv("MODEL_REQUEST_TIMEOUT_SECONDS", "420")
     settings = Settings.from_env()
 
     assert settings.inference_token_ttl_seconds == 4_800
-    assert settings.run_max_wall_seconds == 3_600
     assert settings.run_max_spend == 3.5
     assert settings.run_inference_rpm_limit == 40
     assert settings.run_inference_tpm_limit == 900_000
-    assert settings.pi_context_window == 256_000
     assert settings.model_request_timeout_seconds == 420
     assert settings.pi_provider_base_url == "http://host.docker.internal:4000/v1"
-
-
-def test_direct_pi_context_window_defaults_to_product_budget_and_is_bounded() -> None:
-    assert Settings().pi_context_window == 200_000
-    with pytest.raises(ValueError, match="pi_context_window"):
-        Settings(pi_context_window=8_000_001)
 
 
 def test_public_preview_domain_is_optional_normalized_and_validated(monkeypatch) -> None:
@@ -301,21 +286,6 @@ def test_public_preview_rejects_invalid_web_origin_without_echoing_it(
     assert "private-token" not in str(captured.value)
 
 
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        {"sandbox_provider": "process"},
-        {"agent_framework": "native"},
-        {"direct_pi_goal_graph_enabled": False},
-    ],
-)
-def test_public_preview_requires_the_resource_registering_runtime(
-    overrides: dict[str, object],
-) -> None:
-    with pytest.raises(ValueError, match="requires SANDBOX_PROVIDER=opensandbox"):
-        Settings(public_preview_base_domain="preview.example.test", **overrides)
-
-
 def test_session_cookie_key_is_host_prefixed_only_for_secure_runtime() -> None:
     development = Settings(app_env="development", session_cookie_name="fomo_session")
     production = Settings(app_env="production", session_cookie_name="fomo_session")
@@ -330,13 +300,6 @@ def test_session_cookie_key_is_host_prefixed_only_for_secure_runtime() -> None:
 
     with pytest.raises(ValueError, match="SESSION_COOKIE_NAME"):
         Settings(session_cookie_name="invalid cookie\r\n")
-
-
-def test_goal_graph_rollout_defaults_on_and_can_be_disabled(monkeypatch) -> None:
-    assert Settings().direct_pi_goal_graph_enabled is True
-
-    monkeypatch.setenv("DIRECT_PI_GOAL_GRAPH_ENABLED", "false")
-    assert Settings.from_env().direct_pi_goal_graph_enabled is False
 
 
 def test_direct_pi_virtual_key_ttl_covers_active_sandbox_and_cleanup_grace() -> None:
