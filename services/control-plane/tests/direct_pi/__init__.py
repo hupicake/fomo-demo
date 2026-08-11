@@ -1,1 +1,1 @@
-"""Direct Pi P0 contract tests and shared test fixtures."""
+"""Coding-agent contract tests and shared test fixtures."""

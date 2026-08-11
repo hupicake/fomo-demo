@@ -11,16 +11,13 @@ import re
 from dataclasses import dataclass
 from ipaddress import ip_address
 from math import isfinite
-from pathlib import Path
 from urllib.parse import urlparse
 from uuid import UUID
 
 from fomo.agent_framework import (
     DEFAULT_AGENT_FRAMEWORK,
     DEFAULT_ENABLED_AGENT_FRAMEWORKS,
-    legacy_framework_mode,
     parse_enabled_agent_frameworks,
-    public_framework_from_legacy,
     validated_default_agent_framework,
 )
 from fomo.runtime_contract import (
@@ -37,17 +34,10 @@ DEFAULT_VERIFIED_PREVIEW_LIFETIME_SECONDS = 604_800
 DEFAULT_DEV_ACCOUNT_EMAIL = "dev@fomo.local"
 DEFAULT_DEV_ACCOUNT_PASSWORD = "fomo-dev-password"
 DEFAULT_DEV_ACCOUNT_DISPLAY_NAME = "Dev"
-MAX_ENGINEER_FILE_CHARACTERS = 24_000
 INFERENCE_TOKEN_EXPIRY_GRACE_SECONDS = 600
 _DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
-_PREVIEW_PATH = re.compile(
-    r"^/(?:[A-Za-z0-9][A-Za-z0-9._~-]*)(?:/[A-Za-z0-9][A-Za-z0-9._~-]*)*$"
-)
+_PREVIEW_PATH = re.compile(r"^/(?:[A-Za-z0-9][A-Za-z0-9._~-]*)(?:/[A-Za-z0-9][A-Za-z0-9._~-]*)*$")
 _COOKIE_NAME = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
-
-
-def _bool(name: str, default: bool = False) -> bool:
-    return os.getenv(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _opensandbox_lifetime_seconds(default: int) -> int:
@@ -230,21 +220,6 @@ def _litellm_endpoints(base_url: str) -> tuple[str, str]:
     return management_url, f"{management_url}/v1"
 
 
-def _engineer_file_character_limits(default_target: int, default_hard: int) -> tuple[int, int]:
-    target = _positive_int_environment_value("ENGINEER_TARGET_FILE_CHARACTERS", default_target)
-    hard = _positive_int_environment_value("ENGINEER_MAX_FILE_CHARACTERS", default_hard)
-    if hard > MAX_ENGINEER_FILE_CHARACTERS:
-        raise ValueError(
-            f"ENGINEER_MAX_FILE_CHARACTERS must be at most {MAX_ENGINEER_FILE_CHARACTERS}"
-        )
-    if target > hard:
-        raise ValueError(
-            "ENGINEER_TARGET_FILE_CHARACTERS must be less than or equal to "
-            "ENGINEER_MAX_FILE_CHARACTERS"
-        )
-    return target, hard
-
-
 def _sandbox_proxy_url(name: str) -> str | None:
     """Read one explicit sandbox-only proxy URL without inheriting host proxy vars."""
     value = os.getenv(name, "").strip()
@@ -307,45 +282,11 @@ class Settings:
     # stays in the control plane and provider credentials stay inside LiteLLM.
     inference_token_ttl_seconds: int = 4_200
     inference_management_timeout_seconds: int = 15
-    # Legacy/native compatibility knobs. Direct Pi deliberately does not use
-    # these as development quotas; its lifetime is the sandbox resource lease.
-    run_max_wall_seconds: int = 3_600
     run_max_spend: float = 5.0
     run_inference_rpm_limit: int = 60
     run_inference_tpm_limit: int = 1_250_000
-    run_max_tool_calls: int = 300
-    pi_max_file_characters: int = 20_000
-    pi_max_changed_files: int = 24
-    # Explicit logical context window passed to the bridge. The active model
-    # supports a larger provider window; FOMO intentionally compacts within
-    # this 200K product budget.
-    pi_context_window: int = 200_000
-    # Model calls are intentionally decoupled from sandbox command timeouts.
-    # Smaller Engineer batches should complete well within this bound.
+    # Coding-agent activity is intentionally decoupled from sandbox command timeouts.
     model_request_timeout_seconds: int = 300
-    # Independent transport budget for LiteLLM gateway transient failures; it
-    # must not consume the SOP's schema/structured-output retry budget.
-    model_network_retries: int = 5
-    model_network_retry_base_delay_seconds: float = 1.0
-    model_network_retry_max_delay_seconds: float = 16.0
-    model_retry_after_max_seconds: float = 60.0
-    model_pm: str = "pm"
-    model_architect: str = "architect"
-    model_engineer: str = "engineer"
-    model_reviewer: str = "reviewer"
-    # The Engineer emits a compact plan, then complete files in bounded batches
-    # so a full project is never one unbounded model response.
-    engineer_max_batches: int = 24
-    engineer_max_files_per_batch: int = 1
-    engineer_target_file_characters: int = 12_000
-    engineer_max_file_characters: int = 20_000
-    # Direct Pi is the production path. Native remains only for legacy SOP
-    # compatibility while historical runs and focused tests are retired.
-    agent_framework: str = "direct_pi"
-    # True-default P1 rollout. Setting this false preserves the graph-less P0
-    # Direct Pi contract for controlled rollback and historical test fixtures.
-    direct_pi_goal_graph_enabled: bool = True
-    sandbox_provider: str = "opensandbox"
     opensandbox_base_url: str = "http://localhost:8080"
     opensandbox_api_key: str | None = None
     # Sandboxes never inherit the control-plane proxy environment. These are
@@ -367,35 +308,21 @@ class Settings:
     # Successful, fully verified previews outlive their build sandboxes. The
     # OpenSandbox server hard limit is kept in sync with this bounded value.
     verified_preview_lifetime_seconds: int = DEFAULT_VERIFIED_PREVIEW_LIFETIME_SECONDS
-    allow_unsafe_process_sandbox: bool = False
-    dev_sandbox_root: Path = Path("/tmp/fomo-dev-sandboxes")
     worker_poll_interval_seconds: float = 0.5
     worker_lease_seconds: int = 120
     command_timeout_seconds: int = 300
     command_output_limit_bytes: int = 64 * 1024
     preview_start_timeout_seconds: int = 25
-    # 44772 is OpenSandbox execd; generated apps only use the fixed 8080 app port.
-    preview_base_port: int = 8080
-    structured_output_retries: int = 1
-    # Native SOP compatibility only. Direct Pi repairs until verification
-    # passes, the run is cancelled, or a real infrastructure/provider failure
-    # prevents further progress.
-    max_repair_rounds: int = 3
 
     def __post_init__(self) -> None:
-        enabled_agent_frameworks = parse_enabled_agent_frameworks(
-            self.agent_enabled_frameworks
-        )
+        enabled_agent_frameworks = parse_enabled_agent_frameworks(self.agent_enabled_frameworks)
         default_agent_framework = validated_default_agent_framework(
             self.agent_default_framework,
             enabled_agent_frameworks,
         )
         object.__setattr__(self, "agent_enabled_frameworks", enabled_agent_frameworks)
         object.__setattr__(self, "agent_default_framework", default_agent_framework)
-        object.__setattr__(self, "agent_framework", legacy_framework_mode(self.agent_framework))
-        enabled_profiles = parse_enabled_profile_ids(
-            ",".join(self.runtime_enabled_profiles)
-        )
+        enabled_profiles = parse_enabled_profile_ids(",".join(self.runtime_enabled_profiles))
         default_profile = validated_default_profile_id(
             self.runtime_default_profile,
             enabled_profiles,
@@ -418,7 +345,11 @@ class Settings:
             )
         # Production defaults to the existing web origin so the path gateway can
         # be enabled without provisioning DNS or changing the deployed .env.
-        if not normalized_preview_domain and not normalized_preview_url and self.app_env == "production":
+        if (
+            not normalized_preview_domain
+            and not normalized_preview_url
+            and self.app_env == "production"
+        ):
             _web_origin_site(self.web_origin)
             normalized_preview_url = _public_preview_base_url(
                 f"{self.web_origin.strip().rstrip('/')}/preview"
@@ -433,16 +364,6 @@ class Settings:
         web_site: str | None = None
         if normalized_preview_domain or normalized_preview_url:
             web_site = _web_origin_site(self.web_origin)
-            if (
-                self.sandbox_provider != "opensandbox"
-                or self.agent_framework != "direct_pi"
-                or not self.direct_pi_goal_graph_enabled
-            ):
-                raise ValueError(
-                    "PUBLIC_PREVIEW_BASE_URL or PUBLIC_PREVIEW_BASE_DOMAIN requires "
-                    "SANDBOX_PROVIDER=opensandbox, "
-                    "AGENT_FRAMEWORK=direct_pi, and DIRECT_PI_GOAL_GRAPH_ENABLED=true"
-                )
         if normalized_preview_domain:
             preview_site = _registrable_site(normalized_preview_domain)
             assert web_site is not None
@@ -459,10 +380,9 @@ class Settings:
         if normalized_preview_url:
             preview_host = urlparse(normalized_preview_url).hostname
             assert preview_host is not None and web_site is not None
-            if (
-                _registrable_site(preview_host) == web_site
-                and _origin_identity(normalized_preview_url) != _origin_identity(self.web_origin)
-            ):
+            if _registrable_site(preview_host) == web_site and _origin_identity(
+                normalized_preview_url
+            ) != _origin_identity(self.web_origin):
                 raise ValueError(
                     "PUBLIC_PREVIEW_BASE_URL must use WEB_ORIGIN itself or a different "
                     "registrable site"
@@ -473,13 +393,8 @@ class Settings:
         positive_values = {
             "inference_token_ttl_seconds": self.inference_token_ttl_seconds,
             "inference_management_timeout_seconds": self.inference_management_timeout_seconds,
-            "run_max_wall_seconds": self.run_max_wall_seconds,
             "run_inference_rpm_limit": self.run_inference_rpm_limit,
             "run_inference_tpm_limit": self.run_inference_tpm_limit,
-            "run_max_tool_calls": self.run_max_tool_calls,
-            "pi_max_file_characters": self.pi_max_file_characters,
-            "pi_max_changed_files": self.pi_max_changed_files,
-            "pi_context_window": self.pi_context_window,
             "model_request_timeout_seconds": self.model_request_timeout_seconds,
             "opensandbox_ready_timeout_seconds": self.opensandbox_ready_timeout_seconds,
             "verified_preview_lifetime_seconds": self.verified_preview_lifetime_seconds,
@@ -487,8 +402,6 @@ class Settings:
         for name, value in positive_values.items():
             if value <= 0:
                 raise ValueError(f"{name} must be greater than 0")
-        if self.pi_context_window > 8_000_000:
-            raise ValueError("pi_context_window must not exceed 8000000")
         if self.verified_preview_lifetime_seconds > DEFAULT_VERIFIED_PREVIEW_LIFETIME_SECONDS:
             raise ValueError("verified_preview_lifetime_seconds must not exceed 604800")
         if not isfinite(self.run_max_spend) or self.run_max_spend <= 0:
@@ -570,9 +483,6 @@ class Settings:
         defaults = cls()
         app_env = os.getenv("APP_ENV", defaults.app_env).strip().lower()
         database_url = os.getenv("DATABASE_URL", defaults.database_url)
-        legacy_agent_framework_raw = os.getenv(
-            "AGENT_FRAMEWORK", defaults.agent_framework
-        ).strip().lower()
         enabled_agent_frameworks_raw = os.getenv("FOMO_AGENT_ENABLED_FRAMEWORKS")
         default_agent_framework_raw = os.getenv("FOMO_AGENT_DEFAULT_FRAMEWORK")
         enabled_agent_frameworks = parse_enabled_agent_frameworks(
@@ -587,14 +497,8 @@ class Settings:
             )
             if default_agent_framework_raw is not None
             else validated_default_agent_framework(
-                public_framework_from_legacy(legacy_agent_framework_raw),
+                defaults.agent_default_framework,
                 enabled_agent_frameworks,
-            )
-        )
-        engineer_target_file_characters, engineer_max_file_characters = (
-            _engineer_file_character_limits(
-                defaults.engineer_target_file_characters,
-                defaults.engineer_max_file_characters,
             )
         )
         # SQLAlchemy's PostgreSQL async driver is selected by the supplied URL.
@@ -624,11 +528,7 @@ class Settings:
                 os.getenv("LITELLM_API_KEY") or os.getenv("LITELLM_MASTER_KEY") or None
             ),
             runtime_enabled_profiles=tuple(
-                sorted(
-                    parse_enabled_profile_ids(
-                        os.getenv("FOMO_RUNTIME_ENABLED_PROFILES")
-                    )
-                )
+                sorted(parse_enabled_profile_ids(os.getenv("FOMO_RUNTIME_ENABLED_PROFILES")))
             ),
             runtime_default_profile=(
                 os.getenv("FOMO_RUNTIME_DEFAULT_PROFILE", defaults.runtime_default_profile).strip()
@@ -643,9 +543,6 @@ class Settings:
                 "INFERENCE_MANAGEMENT_TIMEOUT_SECONDS",
                 defaults.inference_management_timeout_seconds,
             ),
-            run_max_wall_seconds=_positive_int_environment_value(
-                "RUN_MAX_WALL_SECONDS", defaults.run_max_wall_seconds
-            ),
             run_max_spend=_positive_float_environment_value(
                 "RUN_MAX_SPEND", defaults.run_max_spend
             ),
@@ -655,59 +552,9 @@ class Settings:
             run_inference_tpm_limit=_positive_int_environment_value(
                 "RUN_INFERENCE_TPM_LIMIT", defaults.run_inference_tpm_limit
             ),
-            run_max_tool_calls=_positive_int_environment_value(
-                "RUN_MAX_TOOL_CALLS", defaults.run_max_tool_calls
-            ),
-            pi_max_file_characters=_positive_int_environment_value(
-                "PI_MAX_FILE_CHARACTERS", defaults.pi_max_file_characters
-            ),
-            pi_max_changed_files=_positive_int_environment_value(
-                "PI_MAX_CHANGED_FILES", defaults.pi_max_changed_files
-            ),
-            pi_context_window=_positive_int_environment_value(
-                "PI_CONTEXT_WINDOW", defaults.pi_context_window
-            ),
             model_request_timeout_seconds=_positive_int_environment_value(
                 "MODEL_REQUEST_TIMEOUT_SECONDS", defaults.model_request_timeout_seconds
             ),
-            model_network_retries=int(
-                os.getenv("MODEL_NETWORK_RETRIES", str(defaults.model_network_retries))
-            ),
-            model_network_retry_base_delay_seconds=float(
-                os.getenv(
-                    "MODEL_NETWORK_RETRY_BASE_DELAY_SECONDS",
-                    str(defaults.model_network_retry_base_delay_seconds),
-                )
-            ),
-            model_network_retry_max_delay_seconds=float(
-                os.getenv(
-                    "MODEL_NETWORK_RETRY_MAX_DELAY_SECONDS",
-                    str(defaults.model_network_retry_max_delay_seconds),
-                )
-            ),
-            model_retry_after_max_seconds=float(
-                os.getenv(
-                    "MODEL_RETRY_AFTER_MAX_SECONDS",
-                    str(defaults.model_retry_after_max_seconds),
-                )
-            ),
-            model_pm=os.getenv("MODEL_PM", defaults.model_pm),
-            model_architect=os.getenv("MODEL_ARCHITECT", defaults.model_architect),
-            model_engineer=os.getenv("MODEL_ENGINEER", defaults.model_engineer),
-            model_reviewer=os.getenv("MODEL_REVIEWER", defaults.model_reviewer),
-            engineer_max_batches=int(
-                os.getenv("ENGINEER_MAX_BATCHES", str(defaults.engineer_max_batches))
-            ),
-            engineer_max_files_per_batch=int(
-                os.getenv(
-                    "ENGINEER_MAX_FILES_PER_BATCH", str(defaults.engineer_max_files_per_batch)
-                )
-            ),
-            engineer_target_file_characters=engineer_target_file_characters,
-            engineer_max_file_characters=engineer_max_file_characters,
-            agent_framework=legacy_agent_framework_raw,
-            direct_pi_goal_graph_enabled=_bool("DIRECT_PI_GOAL_GRAPH_ENABLED", True),
-            sandbox_provider=os.getenv("SANDBOX_PROVIDER", defaults.sandbox_provider).lower(),
             opensandbox_base_url=os.getenv("OPENSANDBOX_BASE_URL", defaults.opensandbox_base_url),
             opensandbox_api_key=os.getenv("OPENSANDBOX_API_KEY") or None,
             sandbox_http_proxy=_sandbox_proxy_url("SANDBOX_HTTP_PROXY"),
@@ -727,15 +574,9 @@ class Settings:
             public_preview_base_domain=_public_preview_base_domain(
                 os.getenv("PUBLIC_PREVIEW_BASE_DOMAIN")
             ),
-            public_preview_base_url=_public_preview_base_url(
-                os.getenv("PUBLIC_PREVIEW_BASE_URL")
-            ),
+            public_preview_base_url=_public_preview_base_url(os.getenv("PUBLIC_PREVIEW_BASE_URL")),
             verified_preview_lifetime_seconds=_verified_preview_lifetime_seconds(
                 defaults.verified_preview_lifetime_seconds
-            ),
-            allow_unsafe_process_sandbox=_bool("ALLOW_UNSAFE_PROCESS_SANDBOX"),
-            dev_sandbox_root=Path(
-                os.getenv("FOMO_DEV_SANDBOX_ROOT", str(defaults.dev_sandbox_root))
             ),
             worker_poll_interval_seconds=float(
                 os.getenv(
@@ -756,9 +597,4 @@ class Settings:
                     "PREVIEW_START_TIMEOUT_SECONDS", str(defaults.preview_start_timeout_seconds)
                 )
             ),
-            preview_base_port=int(os.getenv("PREVIEW_BASE_PORT", str(defaults.preview_base_port))),
-            structured_output_retries=int(
-                os.getenv("STRUCTURED_OUTPUT_RETRIES", str(defaults.structured_output_retries))
-            ),
-            max_repair_rounds=int(os.getenv("MAX_REPAIR_ROUNDS", str(defaults.max_repair_rounds))),
         )

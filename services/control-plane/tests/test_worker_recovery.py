@@ -8,7 +8,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from fomo.agent_runtime import SOPRunner
 from fomo.direct_pi.goalgraph import GoalStatus, parse_goal_graph_draft
 from fomo.ids import utcnow
 from fomo.persistence import RunLeaseLost
@@ -74,22 +73,22 @@ def _goal_draft():
     )
 
 
-class _BlockingModel:
-    """A model call that only finishes when the SOP cancels its task."""
+class _BlockingOrchestrator:
+    """An orchestrator that only finishes when the worker cancels its task."""
 
     def __init__(self) -> None:
         self.started = asyncio.Event()
         self.cancelled = asyncio.Event()
         self._never = asyncio.Event()
 
-    async def complete_json(self, _model_alias, _messages, _schema_name, *, on_retry=None):
+    async def run(self, _run_id: str, *, lease_token: str | None = None) -> None:
         self.started.set()
         try:
             await self._never.wait()
         except asyncio.CancelledError:
             self.cancelled.set()
             raise
-        raise AssertionError("blocking model unexpectedly completed")
+        raise AssertionError("blocking orchestrator unexpectedly completed")
 
 
 class _TrackingSandbox(FakeSandboxProvider):
@@ -165,7 +164,7 @@ async def test_worker_preflight_failure_does_not_claim_and_recovery_claims(
     orchestrator = _RecordingOrchestrator()
     worker = WorkerRunner(
         repository,
-        replace(settings, agent_framework="direct_pi"),
+        settings,
         sandbox=FakeSandboxProvider(),
         direct_orchestrator=orchestrator,
         runtime_preflight=runtime_preflight,
@@ -203,7 +202,7 @@ async def test_worker_does_not_spend_on_preflight_while_queue_is_empty(
 
     worker = WorkerRunner(
         repository,
-        replace(settings, agent_framework="direct_pi"),
+        settings,
         sandbox=FakeSandboxProvider(),
         direct_orchestrator=_RecordingOrchestrator(),
         runtime_preflight=runtime_preflight,
@@ -215,39 +214,27 @@ async def test_worker_does_not_spend_on_preflight_while_queue_is_empty(
 
 
 @pytest.mark.asyncio
-async def test_model_cancel_stops_the_underlying_task_and_marks_run_cancelled(repository, settings) -> None:
-    _project, run = await _running_run(repository, message_id="cancel-model")
-    model = _BlockingModel()
-    task = asyncio.create_task(SOPRunner(repository, model, FakeSandboxProvider(), settings).run(run.id))
-
-    await asyncio.wait_for(model.started.wait(), timeout=1)
-    await repository.request_cancel(run.id)
-    await asyncio.wait_for(task, timeout=2)
-
-    assert model.cancelled.is_set()
-    assert (await repository.get_run(run.id)).status == RunStatus.cancelled
-
-
-@pytest.mark.asyncio
 async def test_worker_heartbeat_prevents_live_run_recovery(repository, settings) -> None:
     _project, run = await _queued_run(repository, message_id="heartbeat")
-    model = _BlockingModel()
+    orchestrator = _BlockingOrchestrator()
     worker = WorkerRunner(
         repository,
         replace(settings, worker_lease_seconds=1),
-        model=model,
         sandbox=FakeSandboxProvider(),
+        direct_orchestrator=orchestrator,
         worker_id="heartbeat-worker",
     )
     task = asyncio.create_task(worker.run_once())
 
-    await asyncio.wait_for(model.started.wait(), timeout=1)
+    await asyncio.wait_for(orchestrator.started.wait(), timeout=1)
     await asyncio.sleep(1.1)
     assert await repository.recover_expired_running_runs() == []
     assert (await repository.get_run(run.id)).status == RunStatus.running
 
-    await repository.request_cancel(run.id)
-    assert await asyncio.wait_for(task, timeout=2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert orchestrator.cancelled.is_set()
 
 
 @pytest.mark.asyncio
@@ -263,19 +250,21 @@ async def test_expired_lease_cannot_be_renewed(repository) -> None:
 
 
 @pytest.mark.asyncio
-async def test_recovered_lease_cancels_blocking_model_without_post_terminal_events(repository, settings) -> None:
+async def test_recovered_lease_cancels_blocking_model_without_post_terminal_events(
+    repository, settings
+) -> None:
     _project, run = await _queued_run(repository, message_id="recovered-lease")
-    model = _BlockingModel()
+    orchestrator = _BlockingOrchestrator()
     worker = WorkerRunner(
         repository,
         replace(settings, worker_lease_seconds=1),
-        model=model,
         sandbox=FakeSandboxProvider(),
+        direct_orchestrator=orchestrator,
         worker_id="recovery-worker",
     )
     task = asyncio.create_task(worker.run_once())
 
-    await asyncio.wait_for(model.started.wait(), timeout=1)
+    await asyncio.wait_for(orchestrator.started.wait(), timeout=1)
     assert await repository.recover_expired_running_runs(now=utcnow() + timedelta(seconds=2)) == []
     terminal_events = await repository.list_events(run.id)
     terminal_seq = terminal_events[-1].seq
@@ -284,7 +273,7 @@ async def test_recovered_lease_cancels_blocking_model_without_post_terminal_even
     assert terminal_events[-1].payload["message"].startswith("执行 Worker")
 
     assert await asyncio.wait_for(task, timeout=2)
-    assert model.cancelled.is_set()
+    assert orchestrator.cancelled.is_set()
     assert (await repository.get_run(run.id)).status == RunStatus.failed
     assert all(event.seq <= terminal_seq for event in await repository.list_events(run.id))
 
@@ -335,6 +324,7 @@ async def test_expired_cancelled_run_is_terminal_once_releases_active_project_an
         repository,
         settings,
         sandbox=sandbox,
+        direct_orchestrator=_RecordingOrchestrator(),
         worker_id="recovery-worker",
     )
     assert not await worker.run_once()
@@ -350,7 +340,9 @@ async def test_expired_cancelled_run_is_terminal_once_releases_active_project_an
 
 
 @pytest.mark.asyncio
-async def test_expired_run_fails_releases_active_project_and_destroys_sandbox(repository, settings) -> None:
+async def test_expired_run_fails_releases_active_project_and_destroys_sandbox(
+    repository, settings
+) -> None:
     project, run = await _running_run(repository, message_id="expired-failed", lease_seconds=0)
     sandbox = _TrackingSandbox()
     ref = await sandbox.create(project.id)
@@ -360,6 +352,7 @@ async def test_expired_run_fails_releases_active_project_and_destroys_sandbox(re
         repository,
         settings,
         sandbox=sandbox,
+        direct_orchestrator=_RecordingOrchestrator(),
         worker_id="recovery-worker",
     )
     assert not await worker.run_once()
@@ -404,9 +397,7 @@ async def test_expired_p1_run_requeues_after_all_sandboxes_are_acknowledged(repo
     await repository.set_sandbox_id(run.id, "sandbox-v", lease_token=lease)
     await repository.set_preview_url(run.id, "http://preview.test", lease_token=lease)
 
-    cleanup = await repository.recover_expired_running_runs(
-        now=utcnow() + timedelta(seconds=120)
-    )
+    cleanup = await repository.recover_expired_running_runs(now=utcnow() + timedelta(seconds=120))
     assert {item.resource_id for item in cleanup} == {generation_id, verification_id}
     requeued = await repository.get_run(run.id)
     assert requeued.status == RunStatus.queued
@@ -422,9 +413,7 @@ async def test_expired_p1_run_requeues_after_all_sandboxes_are_acknowledged(repo
     reclaimed = await repository.claim_next_run("new-worker", 60)
     assert reclaimed is not None and reclaimed.id == run.id and reclaimed.lease_owner != lease
     assert reclaimed.execution_started_at == first_claim.execution_started_at.replace(tzinfo=None)
-    resumed = await repository.resume_goal(
-        run.id, "G-2", lease_token=reclaimed.lease_owner
-    )
+    resumed = await repository.resume_goal(run.id, "G-2", lease_token=reclaimed.lease_owner)
     assert resumed.graph.goals[1].status is GoalStatus.ACTIVE
     assert (await repository.list_events(run.id))[-1].kind == "goal.resumed"
 
@@ -456,9 +445,9 @@ async def test_expired_verified_graph_requeues_for_reverification_and_publish(re
     graph = await repository.get_goal_graph(run.id)
     assert graph is not None and graph.graph.status.value == "verified"
 
-    assert await repository.recover_expired_running_runs(
-        now=utcnow() + timedelta(seconds=120)
-    ) == []
+    assert (
+        await repository.recover_expired_running_runs(now=utcnow() + timedelta(seconds=120)) == []
+    )
     assert (await repository.get_run(run.id)).status == RunStatus.queued
     event = (await repository.list_events(run.id))[-1]
     assert event.kind == "goal.resume_scheduled"
@@ -473,10 +462,14 @@ async def test_healthy_running_registry_resource_is_not_cleaned(repository, sett
     lease = await repository.get_active_lease_token(run.id)
     sandbox = _TrackingSandbox()
     ref = await sandbox.create(project.id)
-    await repository.register_sandbox_resource(
-        run.id, ref.id, "generation", lease_token=lease
+    await repository.register_sandbox_resource(run.id, ref.id, "generation", lease_token=lease)
+    worker = WorkerRunner(
+        repository,
+        settings,
+        sandbox=sandbox,
+        direct_orchestrator=_RecordingOrchestrator(),
+        worker_id="other-worker",
     )
-    worker = WorkerRunner(repository, settings, sandbox=sandbox, worker_id="other-worker")
 
     assert not await worker.run_once()
     assert sandbox.killed_ids == []
@@ -487,9 +480,7 @@ async def test_healthy_running_registry_resource_is_not_cleaned(repository, sett
 async def test_successful_verified_preview_is_retained_until_invalidated(
     repository, settings
 ) -> None:
-    project, run = await _running_run(
-        repository, message_id="retained-preview", lease_seconds=60
-    )
+    project, run = await _running_run(repository, message_id="retained-preview", lease_seconds=60)
     lease = await repository.get_active_lease_token(run.id)
     sandbox = _TrackingSandbox()
     ref = await sandbox.create(project.id)
@@ -497,13 +488,15 @@ async def test_successful_verified_preview_is_retained_until_invalidated(
         run.id, ref.id, "verification", lease_token=lease
     )
     await repository.set_sandbox_id(run.id, ref.id, lease_token=lease)
-    await repository.set_preview_url(
-        run.id, "https://preview.invalid", lease_token=lease
+    await repository.set_preview_url(run.id, "https://preview.invalid", lease_token=lease)
+    await repository.mark_terminal(run.id, RunStatus.succeeded, lease_token=lease)
+    worker = WorkerRunner(
+        repository,
+        settings,
+        sandbox=sandbox,
+        direct_orchestrator=_RecordingOrchestrator(),
+        worker_id="preview-worker",
     )
-    await repository.mark_terminal(
-        run.id, RunStatus.succeeded, lease_token=lease
-    )
-    worker = WorkerRunner(repository, settings, sandbox=sandbox, worker_id="preview-worker")
 
     assert not await worker.run_once()
     assert sandbox.killed_ids == []
@@ -542,13 +535,17 @@ async def test_duplicate_cleanup_does_not_ack_when_first_kill_fails(repository, 
     resource_id = await repository.register_sandbox_resource(
         run.id, "sandbox-duplicate", "generation", lease_token=lease
     )
-    cleanup = await repository.recover_expired_running_runs(
-        now=utcnow() + timedelta(seconds=120)
-    )
+    cleanup = await repository.recover_expired_running_runs(now=utcnow() + timedelta(seconds=120))
     assert cleanup[0].resource_id == resource_id
     repository.recover_expired_running_runs = AsyncMock(return_value=cleanup)
     sandbox = _FailingCleanupSandbox()
-    worker = WorkerRunner(repository, settings, sandbox=sandbox, worker_id="cleanup-worker")
+    worker = WorkerRunner(
+        repository,
+        settings,
+        sandbox=sandbox,
+        direct_orchestrator=_RecordingOrchestrator(),
+        worker_id="cleanup-worker",
+    )
 
     assert not await worker.run_once()
     assert sandbox.attempts == 1

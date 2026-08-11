@@ -24,7 +24,7 @@ from fomo.runtime_contract import (
     CODEX_COMPATIBLE_PROFILE_IDS,
     CODEX_COMPATIBLE_THINKING_LEVELS,
     RuntimeContract,
-    legacy_runtime_contract,
+    resolve_runtime_contract,
 )
 from fomo.sandbox.base import SandboxRef
 from fomo.schemas import UserInputRequestDraft
@@ -90,7 +90,7 @@ class DirectPiSession:
         self.transport = transport
         self.settings = settings
         self.virtual_key = virtual_key
-        self.runtime_contract = runtime_contract or legacy_runtime_contract()
+        self.runtime_contract = runtime_contract or resolve_runtime_contract()
         if self.runtime_contract.litellm_alias not in virtual_key.model_aliases:
             raise ValueError("virtual key does not authorize the run runtime profile")
         self.run_id = run_id
@@ -244,7 +244,7 @@ class DirectPiSession:
         if diagnostic:
             await self.repository.append_event(
                 self.run_id,
-                "pi.diagnostic",
+                "coding_agent.diagnostic",
                 payload={
                     "stage": stage,
                     "framework": self.agent_framework,

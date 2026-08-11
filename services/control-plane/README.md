@@ -3,10 +3,10 @@
 FastAPI control plane plus an independent durable worker for FOMO's coding
 agent runtimes. Each run freezes `pi`, `opencode`, or `codex`; all execute inside an
 OpenSandbox generation sandbox and reuse the same GoalGraph, safety audit,
-clean verification and publication pipeline. The runtime contains the **P0 Pi
-baseline** and the **P1-A GoalGraph vertical slice**.
+clean verification and publication pipeline. GoalGraph is the sole planning
+and execution model.
 
-**Status (honest): P0 and P1-A code are landed.** GoalGraph, goal-scoped
+**Status (honest):** GoalGraph, goal-scoped
 acceptance, durable checkpoints, recovery, selectable model runtime contracts,
 and authenticated account/session isolation are implemented. A standalone
 Context Inspector, semantic Verified Reuse registry, same-condition A/B
@@ -40,14 +40,13 @@ run in the worker through a `SandboxProvider`.
   key (`LiteLLMRunKeyClient`). Public model profiles are restricted by
   `FOMO_RUNTIME_ENABLED_PROFILES` (default: `deepseek-flash`), discovered
   aliases, and explicit thinking compatibility with **no silent fallback**.
-  Legacy `fomo-pi-flash` (planning) and `fomo-pi-build` (building/repairing)
-  aliases remain for persisted-run compatibility. Provider credentials stay in
+  Legacy `fomo-pi-flash` remains only for persisted-run compatibility.
+  Provider credentials stay in
   LiteLLM and never enter a sandbox.
 - An uninterrupted run reuses one `fomo-pi-ds` session across planning,
   multiple GoalGraph goals, and repair turns. Recovery never trusts an orphan
   process: it creates a fresh session from the latest verified checkpoint and
-  persisted usage balance. GoalGraph is authoritative when enabled; the legacy
-  BuildPlan is **advisory/read-only compatibility data**. BUILDING uses Pi's native
+  persisted usage balance. GoalGraph is authoritative. BUILDING uses Pi's native
   `read/write/edit/bash` tools and **no business-file write allowlist**. The
   Base Snapshot (starter base + capabilities + prior verified state) is
   mutable: package.json, lockfiles, config, routes, app shell, components, and
@@ -99,8 +98,8 @@ run in the worker through a `SandboxProvider`.
   in the store fails the install gate honestly and goes to repair (an
   ordinary non-zero install is a repairable source/package problem; only
   timeouts, missing runners, or restore failures are infrastructure).
-- A/B telemetry is emitted by production events (bridge `pi.tool.*`/
-  `pi.completed` telemetry, `preview.available/verified` elapsedSeconds);
+- A/B telemetry is emitted by production events (`coding_agent.tool.*`/
+  `coding_agent.completed`, `preview.available/verified` elapsedSeconds);
   there is no benchmark runner. A/B execution is part of the upcoming
   central verification matrix and has not been executed yet.
 - `SandboxProvider` defaults to `opensandbox` (OpenSandbox Server v0.2.2, SDK
@@ -119,22 +118,6 @@ run in the worker through a `SandboxProvider`.
   `SANDBOX_HTTP_PROXY` / `SANDBOX_HTTPS_PROXY` / `SANDBOX_NO_PROXY` cross the
   boundary when set, and only the run-scoped virtual key is injected as a
   credential.
-- `ProcessSandboxProvider` is **only** for trusted local development/CI and
-  requires `ALLOW_UNSAFE_PROCESS_SANDBOX=true`; it is not a fallback for
-  OpenSandbox and is not safe for public user input.
-
-## Legacy native SOP path
-
-The MetaGPT integration has been retired; `AGENT_FRAMEWORK` accepts only
-`direct_pi` and `native`.
-
-The four-role chain (Product Manager → Architect → Engineer → Reviewer) is
-retained while historical runs and focused compatibility tests are retired.
-It is not the production default and is not read-only: explicitly selecting
-`AGENT_FRAMEWORK=native` makes it a fully writable compatibility
-path, and its Engineer batch/file-size policy and Reviewer repair-scope rules
-apply only there. No new features are added to it.
-
 ## Local development
 
 Use a Python 3.11 interpreter:
@@ -170,18 +153,6 @@ then revokes the temporary key and destroys the sandbox. Optional profiles must
 be added explicitly to `FOMO_RUNTIME_ENABLED_PROFILES` only after their real
 credential is configured. A failing enabled route blocks worker startup and
 cannot silently fall back. The canary can incur a very small provider charge.
-For trusted local development of the legacy native path only, the process
-adapter can exercise the file/command/Git/QA path:
-
-```bash
-export AGENT_FRAMEWORK=native
-export SANDBOX_PROVIDER=process
-export ALLOW_UNSAFE_PROCESS_SANDBOX=true
-export LITELLM_BASE_URL=http://localhost:4000/v1
-uv run --env-file .env.local --project services/control-plane fomo-worker
-```
-
-The worker never starts a host process unless that explicit opt-in is present.
 The FOMO system `.gitignore` baseline is owned by the control plane and cannot
 be weakened by agent output.
 
@@ -209,7 +180,7 @@ The gateway service must use a minimal environment: `DATABASE_URL`,
 `APP_ENV`, `WEB_ORIGIN`, `OPENSANDBOX_BASE_URL`, `OPENSANDBOX_API_KEY`,
 one public Preview setting, `PREVIEW_UPSTREAM_HOST_OVERRIDE`, and
 `PREVIEW_GATEWAY_PORT` only. It must not inherit the API/worker environment or
-receive LiteLLM/model, Redis, MinIO, or AWS credentials.
+receive LiteLLM/model or unrelated worker credentials.
 
 The named-Tunnel example in
 [`deploy/cloudflared/config.example.yml`](../../deploy/cloudflared/config.example.yml)
@@ -220,7 +191,7 @@ exact wildcard depth, and leave the final `http_status:404` ingress rule in
 place. The production origin exposes no inbound port when using Tunnel; at
 most, a non-Tunnel deployment exposes its TLS ingress. OpenSandbox `8080`,
 LiteLLM `4000`, random Preview host ports including `40000-60000`, PostgreSQL,
-Redis, and MinIO must never be publicly reachable.
+and other internal service ports must never be publicly reachable.
 
 Retention is a single bounded seven-day renewal, not indefinite hosting. Keep
 the host services and Tunnel alive and renew or rerun before the review window
@@ -258,7 +229,7 @@ uv run pytest
 uv run ruff check src tests
 ```
 
-Tests use `ScriptedModelClient`, `FakeSandboxProvider`, and a fake Pi bridge,
+Tests use `FakeSandboxProvider` and fake coding-agent transports,
 so they make no network/model calls and execute no generated host code. Per
 `AGENTS.md`, there is no pre-approval gate: verification is designed as one
 minimal sufficient matrix per big module and executed centrally, with

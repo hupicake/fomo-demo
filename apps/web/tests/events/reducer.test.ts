@@ -161,7 +161,7 @@ describe("run presentation reducer", () => {
     });
 
     expect(state.contextUsage).toBeUndefined();
-    state = reduceDomainEvent(state, event(1, "pi.started", {
+    state = reduceDomainEvent(state, event(1, "coding_agent.started", {
       contextTokens: 40_000,
       contextWindow: 200_000,
       stage: "building",
@@ -173,7 +173,7 @@ describe("run presentation reducer", () => {
       capturedAt: "2026-08-07T12:00:00.000Z",
     });
 
-    state = reduceDomainEvent(state, event(2, "pi.completed", {
+    state = reduceDomainEvent(state, event(2, "coding_agent.completed", {
       contextTokens: 62_500,
       contextWindow: 200_000,
       stage: "building",

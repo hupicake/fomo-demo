@@ -15,12 +15,11 @@ from fomo.runtime_contract import (
     resolve_runtime_contract,
     validated_default_profile_id,
 )
-from fomo.sandbox import create_sandbox_provider
+from fomo.sandbox import create_opensandbox_provider
 from fomo.sandbox.base import Command, FileChange, SandboxPathError, SourceRef
 from fomo.sandbox.fake import FakeSandboxProvider
 from fomo.sandbox.opensandbox import OpenSandboxProvider, _OutputCollector
-from fomo.sandbox.process import ProcessSandboxProvider
-from fomo.schemas import MessageCreate, PreviewResponse, ProductSpec
+from fomo.schemas import MessageCreate, PreviewResponse
 
 
 def test_runtime_selection_uses_the_selected_profile_default_thinking() -> None:
@@ -57,30 +56,30 @@ def test_opensandbox_exit_code_minus_one_is_a_timeout_without_sdk_error() -> Non
     assert OpenSandboxProvider._execution_timed_out(None, exit_code=-1)
 
 
-def test_product_spec_requires_unique_acceptance_ids() -> None:
-    with pytest.raises(ValidationError):
-        ProductSpec.model_validate(
-            {
-                "title": "Duplicate ACs",
-                "problem": "test",
-                "visualDirection": {"tone": "clear"},
-                "acceptanceCriteria": [
-                    {"id": "AC-1", "given": "a", "when": "b", "then": "c"},
-                    {"id": "AC-1", "given": "d", "when": "e", "then": "f"},
-                ],
-            }
-        )
-
-
 def test_preview_ready_requires_run_id_and_absolute_http_url() -> None:
     PreviewResponse.model_validate(
-        {"status": "ready", "url": "https://preview.example.test/app", "runId": "run-1", "verificationStatus": "verified"}
+        {
+            "status": "ready",
+            "url": "https://preview.example.test/app",
+            "runId": "run-1",
+            "verificationStatus": "verified",
+        }
     )
     PreviewResponse.model_validate(
-        {"status": "ready", "url": "http://localhost:3000/app", "runId": "run-1", "verificationStatus": "unverified"}
+        {
+            "status": "ready",
+            "url": "http://localhost:3000/app",
+            "runId": "run-1",
+            "verificationStatus": "unverified",
+        }
     )
     PreviewResponse.model_validate(
-        {"status": "ready", "url": "https://preview.example.test:8443/app?x=1", "runId": "run-1", "verificationStatus": "verified"}
+        {
+            "status": "ready",
+            "url": "https://preview.example.test:8443/app?x=1",
+            "runId": "run-1",
+            "verificationStatus": "verified",
+        }
     )
 
     with pytest.raises(ValidationError, match="verificationStatus"):
@@ -89,20 +88,32 @@ def test_preview_ready_requires_run_id_and_absolute_http_url() -> None:
         )
 
     with pytest.raises(ValidationError, match="runId"):
-        PreviewResponse.model_validate({"status": "ready", "url": "https://preview.example.test/app"})
+        PreviewResponse.model_validate(
+            {"status": "ready", "url": "https://preview.example.test/app"}
+        )
     with pytest.raises(ValidationError, match="url"):
         PreviewResponse.model_validate({"status": "ready", "url": None, "runId": "run-1"})
     with pytest.raises(ValidationError, match="absolute"):
-        PreviewResponse.model_validate({"status": "ready", "url": "/relative/path", "runId": "run-1"})
+        PreviewResponse.model_validate(
+            {"status": "ready", "url": "/relative/path", "runId": "run-1"}
+        )
     with pytest.raises(ValidationError, match="absolute"):
         PreviewResponse.model_validate({"status": "ready", "url": "app/page", "runId": "run-1"})
     with pytest.raises(ValidationError, match="absolute"):
-        PreviewResponse.model_validate({"status": "ready", "url": "javascript:alert(1)", "runId": "run-1"})
+        PreviewResponse.model_validate(
+            {"status": "ready", "url": "javascript:alert(1)", "runId": "run-1"}
+        )
     with pytest.raises(ValidationError, match="absolute"):
-        PreviewResponse.model_validate({"status": "ready", "url": "ftp://preview.example.test/app", "runId": "run-1"})
+        PreviewResponse.model_validate(
+            {"status": "ready", "url": "ftp://preview.example.test/app", "runId": "run-1"}
+        )
     with pytest.raises(ValidationError, match="userinfo"):
         PreviewResponse.model_validate(
-            {"status": "ready", "url": "https://user:pass@preview.example.test/app", "runId": "run-1"}
+            {
+                "status": "ready",
+                "url": "https://user:pass@preview.example.test/app",
+                "runId": "run-1",
+            }
         )
 
 
@@ -127,7 +138,9 @@ def test_opensandbox_image_defaults_to_curated_base_and_stays_overridable(monkey
     assert Settings.from_env().opensandbox_image == "registry.example/fomo:custom"
 
 
-def test_opensandbox_lifetime_defaults_stays_overridable_and_rejects_invalid_values(monkeypatch) -> None:
+def test_opensandbox_lifetime_defaults_stays_overridable_and_rejects_invalid_values(
+    monkeypatch,
+) -> None:
     monkeypatch.delenv("OPENSANDBOX_LIFETIME_SECONDS", raising=False)
     assert Settings.from_env().opensandbox_lifetime_seconds == 21_600
 
@@ -165,7 +178,7 @@ def test_opensandbox_lifetime_is_forwarded_by_factory(monkeypatch) -> None:
 
     monkeypatch.setattr("fomo.sandbox.OpenSandboxProvider", CapturingOpenSandboxProvider)
 
-    create_sandbox_provider(
+    create_opensandbox_provider(
         Settings(opensandbox_lifetime_seconds=1234, opensandbox_ready_timeout_seconds=90)
     )
 
@@ -231,7 +244,9 @@ async def _noop() -> None:
 
 
 @pytest.mark.asyncio
-async def test_opensandbox_output_collector_joins_messages_like_sdk_and_keeps_truncation_streaming() -> None:
+async def test_opensandbox_output_collector_joins_messages_like_sdk_and_keeps_truncation_streaming() -> (
+    None
+):
     emitted: list[tuple[str, str]] = []
 
     async def sink(stream: str, text: str) -> None:
@@ -295,29 +310,6 @@ async def test_opensandbox_read_file_normalizes_sdk_not_found() -> None:
 
 
 @pytest.mark.asyncio
-async def test_process_sandbox_contract(tmp_path) -> None:
-    provider = ProcessSandboxProvider(tmp_path / "sandbox-root", enabled=True, default_timeout_seconds=5)
-    ref = await provider.create("project-1")
-    await provider.apply_changes(
-        ref,
-        [
-            FileChange(path="hello.txt", content="hello"),
-            FileChange(path="node_modules/pkg/index.js", content="dependency"),
-            FileChange(path="playwright-report/index.html", content="report"),
-        ],
-    )
-    output: list[str] = []
-
-    async def sink(_stream: str, text: str) -> None:
-        output.append(text)
-
-    result = await provider.exec(ref, Command("cat hello.txt", timeout_seconds=5), sink)
-    assert result.exit_code == 0
-    assert "hello" in "".join(output)
-    files = await provider.list_files(ref)
-    assert files[0]["path"] == "hello.txt"
-    assert (await provider.snapshot(ref)).location
-    await provider.kill(ref)
 
 
 @pytest.mark.asyncio
@@ -354,10 +346,7 @@ async def test_opensandbox_provider_uses_pinned_sdk_contract_and_application_por
             return self.files[path]
 
         async def search(self, _entry):
-            return [
-                SimpleNamespace(path=path, entry_type="file")
-                for path in sorted(self.files)
-            ]
+            return [SimpleNamespace(path=path, entry_type="file") for path in sorted(self.files)]
 
     class Commands:
         def __init__(self) -> None:
@@ -370,7 +359,9 @@ async def test_opensandbox_provider_uses_pinned_sdk_contract_and_application_por
                 await handlers.on_stdout(SimpleNamespace(text="streamed output\n"))
             if handlers.on_stderr:
                 await handlers.on_stderr(SimpleNamespace(text="streamed warning\n"))
-            return SimpleNamespace(id=f"command-{len(self.runs)}", exit_code=0, error=None, logs=None)
+            return SimpleNamespace(
+                id=f"command-{len(self.runs)}", exit_code=0, error=None, logs=None
+            )
 
         async def interrupt(self, execution_id: str) -> None:
             self.interrupted.append(execution_id)
@@ -571,7 +562,9 @@ async def test_opensandbox_preview_probe_evicts_only_confirmed_missing_resource(
 
 
 @pytest.mark.asyncio
-async def test_opensandbox_proxy_environment_is_allowlisted_and_injected_only_when_explicit() -> None:
+async def test_opensandbox_proxy_environment_is_allowlisted_and_injected_only_when_explicit() -> (
+    None
+):
     class Files:
         async def create_directories(self, _entries) -> None:
             return None

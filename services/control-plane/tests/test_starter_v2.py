@@ -4,14 +4,10 @@ import hashlib
 import json
 import re
 from dataclasses import replace
-from types import SimpleNamespace
 
 import pytest
-from pydantic import ValidationError
 
-from fomo.agent_runtime.sop import ArtifactContractViolation, SOPRunner
 from fomo.sandbox.opensandbox import OpenSandboxProvider
-from fomo.schemas import TechnicalSpec
 from fomo.starter import (
     StarterIntegrityError,
     capability_catalog,
@@ -19,23 +15,6 @@ from fomo.starter import (
     resolve_starter_manifest,
     starter_validation_variants,
 )
-
-
-def _minimal_technical_spec(**overrides: object) -> dict[str, object]:
-    payload: dict[str, object] = {
-        "framework": "Next.js",
-        "starterCapabilities": [],
-        "componentDecisions": [
-            {
-                "component": "GeneratedComposition",
-                "strategy": "reuse",
-                "source": "Golden Starter v2",
-                "rationale": "Keeps product code inside the generated extension boundary.",
-            }
-        ],
-    }
-    payload.update(overrides)
-    return payload
 
 
 def test_v2_bare_manifest_is_digest_pinned_and_keeps_a_generic_buildable_boundary() -> None:
@@ -169,30 +148,15 @@ def test_v2_rejects_unknown_duplicate_and_synthetic_conflicting_capabilities() -
     crud = next(capability for capability in capability_catalog() if capability.id == "crud")
     conflicting = replace(crud, id="synthetic-conflict", conflicts=("crud",))
     with pytest.raises(StarterIntegrityError, match="conflicting capabilities"):
-        resolve_starter_manifest(("crud", "synthetic-conflict"), catalog=(*capability_catalog(), conflicting))
+        resolve_starter_manifest(
+            ("crud", "synthetic-conflict"), catalog=(*capability_catalog(), conflicting)
+        )
 
     colliding = replace(crud, id="synthetic-collision", conflicts=())
     with pytest.raises(StarterIntegrityError, match="overlay path collision"):
-        resolve_starter_manifest(("crud", "synthetic-collision"), catalog=(*capability_catalog(), colliding))
-
-
-def test_technical_spec_exposes_only_the_fixed_capability_enum() -> None:
-    technical = TechnicalSpec.model_validate(
-        _minimal_technical_spec(starterCapabilities=["crud", "local-persistence"])
-    )
-    assert [capability.value for capability in technical.starter_capabilities] == [
-        "crud",
-        "local-persistence",
-    ]
-
-    omitted_selection = _minimal_technical_spec()
-    omitted_selection.pop("starterCapabilities")
-    with pytest.raises(ValidationError):
-        TechnicalSpec.model_validate(omitted_selection)
-    with pytest.raises(ValidationError):
-        TechnicalSpec.model_validate(_minimal_technical_spec(starterCapabilities=["npm-install"]))
-    with pytest.raises(ValidationError, match="duplicate"):
-        TechnicalSpec.model_validate(_minimal_technical_spec(starterCapabilities=["crud", "crud"]))
+        resolve_starter_manifest(
+            ("crud", "synthetic-collision"), catalog=(*capability_catalog(), colliding)
+        )
 
 
 def test_v2_provenance_binds_the_resolved_base_capabilities_composite_and_files() -> None:
@@ -201,7 +165,11 @@ def test_v2_provenance_binds_the_resolved_base_capabilities_composite_and_files(
 
     assert provenance["base"]["id"] == "fomo-next-radix-v2"
     assert provenance["selectedCapabilities"] == [
-        {"id": "crud", "version": "1.0.0", "treeSha256": manifest.selected_capabilities[0].tree_sha256},
+        {
+            "id": "crud",
+            "version": "1.0.0",
+            "treeSha256": manifest.selected_capabilities[0].tree_sha256,
+        },
         {
             "id": "local-persistence",
             "version": "1.0.0",
@@ -249,7 +217,11 @@ def test_v2_architect_context_is_compact_and_binds_selected_capability_imports()
             "protectedPaths": ["lib/starter/local-persistence.ts"],
             "conflicts": [],
             "description": "A browser-only persistence boundary with explicit validation and migration.",
-            "provides": ["SSR-safe localStorage access", "typed versioned envelopes", "migration adapter"],
+            "provides": [
+                "SSR-safe localStorage access",
+                "typed versioned envelopes",
+                "migration adapter",
+            ],
         },
     ]
     assert selected_context["selectedCapabilities"] == [bare_context["capabilityCatalog"][0]]
@@ -257,9 +229,7 @@ def test_v2_architect_context_is_compact_and_binds_selected_capability_imports()
     assert "@/lib/starter/local-persistence" not in selected_context["availableImports"]
 
 
-def test_v2_root_extension_contract_is_compact_and_enforced_before_implementation() -> None:
-    runner = object.__new__(SOPRunner)
-    runner.settings = SimpleNamespace(engineer_max_batches=1, engineer_max_files_per_batch=4)
+def test_v2_root_extension_contract_is_part_of_the_starter_context() -> None:
     manifest = default_starter_manifest()
     extension = manifest.root_extension_contract
 
@@ -267,152 +237,9 @@ def test_v2_root_extension_contract_is_compact_and_enforced_before_implementatio
     assert extension.operation == "modify"
     assert extension.export_style == "named"
     assert extension.symbol == "GeneratedComposition"
-    assert manifest.as_architect_context()["extensionContracts"] == [extension.as_architect_context()]
-
-    valid = TechnicalSpec.model_validate(
-        _minimal_technical_spec(
-            filePlan=[
-                {
-                    "path": extension.path,
-                    "operation": extension.operation,
-                    "reason": extension.purpose,
-                }
-            ],
-            publicApiContracts=[
-                {
-                    "filePath": extension.path,
-                    "exportStyle": extension.export_style,
-                    "symbol": extension.symbol,
-                    "props": [],
-                    "type": "React.ComponentType",
-                }
-            ],
-        )
-    )
-    runner._validate_technical_file_plan(valid)
-
-    wrong_operation = TechnicalSpec.model_validate(
-        _minimal_technical_spec(
-            filePlan=[{"path": extension.path, "operation": "create", "reason": "must fail"}],
-            publicApiContracts=[
-                {
-                    "filePath": extension.path,
-                    "exportStyle": extension.export_style,
-                    "symbol": extension.symbol,
-                    "props": [],
-                    "type": "React.ComponentType",
-                }
-            ],
-        )
-    )
-    with pytest.raises(ArtifactContractViolation) as operation_error:
-        runner._validate_technical_file_plan(wrong_operation)
-    assert operation_error.value.code == "technical_spec.extension_contract.operation_invalid"
-
-    missing_public_api = TechnicalSpec.model_validate(
-        _minimal_technical_spec(
-            filePlan=[
-                {
-                    "path": extension.path,
-                    "operation": extension.operation,
-                    "reason": extension.purpose,
-                }
-            ]
-        )
-    )
-    with pytest.raises(ArtifactContractViolation) as public_api_error:
-        runner._validate_technical_file_plan(missing_public_api)
-    assert public_api_error.value.code == "technical_spec.extension_contract.public_api_required"
-
-    forbidden_page = TechnicalSpec.model_validate(
-        _minimal_technical_spec(
-            filePlan=[
-                {"path": extension.path, "operation": extension.operation, "reason": extension.purpose},
-                {"path": "app/(generated)/page.tsx", "operation": "create", "reason": "must fail"},
-            ],
-            publicApiContracts=[
-                {
-                    "filePath": extension.path,
-                    "exportStyle": extension.export_style,
-                    "symbol": extension.symbol,
-                    "props": [],
-                    "type": "React.ComponentType",
-                }
-            ],
-        )
-    )
-    with pytest.raises(ArtifactContractViolation) as page_error:
-        runner._validate_technical_file_plan(forbidden_page)
-    assert page_error.value.code == "technical_spec.extension_contract.page_path_rejected"
-
-
-def test_v2_sop_validates_model_roots_and_protected_capabilities_from_the_same_selection() -> None:
-    runner = object.__new__(SOPRunner)
-    runner.settings = SimpleNamespace(engineer_max_batches=1, engineer_max_files_per_batch=4)
-    technical = TechnicalSpec.model_validate(
-        _minimal_technical_spec(
-            starterCapabilities=["crud"],
-            filePlan=[
-                {
-                    "path": "app/(generated)/composition.tsx",
-                    "operation": "modify",
-                    "reason": "product composition",
-                },
-                {
-                    "path": "tests/generated/app.smoke.spec.ts",
-                    "operation": "create",
-                    "reason": "smoke coverage",
-                },
-            ],
-        )
-    )
-    resolved = runner._starter_for_technical(technical)
-    assert [capability.id for capability in resolved.selected_capabilities] == ["crud"]
-    assert runner._technical_file_plan_paths(technical) == [
-        "app/(generated)/composition.tsx",
-        "tests/generated/app.smoke.spec.ts",
+    assert manifest.as_architect_context()["extensionContracts"] == [
+        extension.as_architect_context()
     ]
-
-    protected_capability = TechnicalSpec.model_validate(
-        _minimal_technical_spec(
-            starterCapabilities=["crud"],
-            filePlan=[
-                {
-                    "path": "components/starter/crud-slots.tsx",
-                    "operation": "modify",
-                    "reason": "must fail",
-                }
-            ],
-        )
-    )
-    with pytest.raises(ArtifactContractViolation) as protected:
-        runner._technical_file_plan_paths(protected_capability)
-    assert protected.value.code == "technical_spec.file_plan.starter_protected"
-
-    outside_generated_tests = TechnicalSpec.model_validate(
-        _minimal_technical_spec(
-            starterCapabilities=["crud"],
-            filePlan=[
-                {
-                    "path": "tests/app.smoke.spec.ts",
-                    "operation": "create",
-                    "reason": "must fail",
-                }
-            ],
-        )
-    )
-    with pytest.raises(ArtifactContractViolation) as outside_root:
-        runner._technical_file_plan_paths(outside_generated_tests)
-    assert outside_root.value.code == "technical_spec.file_plan.model_root"
-
-
-def test_v2_workspace_manifest_rejects_extra_assets_before_file_hash_verification() -> None:
-    manifest = default_starter_manifest()
-    listed = [{"path": entry.path} for entry in manifest.files]
-    listed.append({"path": "unexpected.ts"})
-
-    with pytest.raises(StarterIntegrityError, match="starter workspace file set verification failed"):
-        SOPRunner._verify_starter_workspace_file_set(manifest, listed)
 
 
 def test_v2_opensandbox_copy_command_accepts_only_the_fixed_capability_enum() -> None:

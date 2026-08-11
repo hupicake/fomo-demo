@@ -94,11 +94,11 @@ async def test_authenticated_project_idempotent_message_and_persistent_event_rep
         assert first.json()["run"]["runtime"] == {
             "profileId": "deepseek-flash",
             "thinking": "high",
-            "contextWindow": 200_000,
-            "policyVersion": "direct-pi-legacy-v0",
-            "runTokenBudget": 400_000,
-            "runTokenBudgetUnlimited": False,
-            "inferenceTpmLimit": 1_000_000,
+            "contextWindow": 1_000_000,
+            "policyVersion": "direct-pi-runtime-v2",
+            "runTokenBudget": None,
+            "runTokenBudgetUnlimited": True,
+            "inferenceTpmLimit": 1_250_000,
         }
         project_snapshot = await client.get(f"/v1/projects/{project_id}", headers=headers)
         assert project_snapshot.status_code == 200
@@ -175,7 +175,7 @@ async def test_runtime_options_fail_closed_without_management_discovery(
     repository, settings
 ) -> None:
     app = create_app(
-        replace(settings, agent_framework="direct_pi", litellm_api_key=None),
+        replace(settings, litellm_api_key=None),
         repository,
     )
     async with httpx.AsyncClient(
@@ -212,7 +212,6 @@ async def test_agent_framework_is_available_frozen_and_idempotent(
     )
     configured = replace(
         settings,
-        agent_framework="direct_pi",
         agent_enabled_frameworks=("pi", "opencode"),
         agent_default_framework="opencode",
         litellm_api_key="sk-test-management",
@@ -347,7 +346,6 @@ async def test_codex_framework_requires_gpt_and_replays_after_rollout_is_disable
     )
     configured = replace(
         settings,
-        agent_framework="direct_pi",
         agent_enabled_frameworks=("pi", "codex"),
         agent_default_framework="pi",
         litellm_api_key="sk-test-management",
@@ -468,7 +466,6 @@ async def test_runtime_selection_uses_enabled_discovered_profile_and_replays_whe
     )
     direct_settings = replace(
         settings,
-        agent_framework="direct_pi",
         litellm_api_key="sk-test-management",
         runtime_enabled_profiles=("deepseek-flash", "gpt-5.6"),
         runtime_default_profile="gpt-5.6",

@@ -37,9 +37,9 @@ from fomo.runtime_contract import (
     CODEX_COMPATIBLE_THINKING_LEVELS,
     DEFAULT_PROFILE_ID,
     RUNTIME_PROFILES,
+    RuntimeContract,
     RuntimeContractError,
     compatible_profile_ids_for_agent_framework,
-    legacy_runtime_contract,
     resolve_runtime_contract,
     validate_agent_framework_profile,
     validate_agent_framework_runtime,
@@ -223,8 +223,6 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
     async def runtime_availability() -> tuple[set[str], bool]:
         """Resolve public availability without exposing provider routing details."""
         enabled = set(settings.runtime_enabled_profiles)
-        if settings.agent_framework != "direct_pi":
-            return set(), True
         if not settings.litellm_api_key:
             return set(), False
         gateway = LiteLLMRunKeyClient(
@@ -241,6 +239,75 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
             for profile in RUNTIME_PROFILES
             if profile.profile_id in enabled and profile.litellm_alias in discovered
         }, True
+
+    async def resolve_available_runtime(
+        agent_framework: str,
+        profile_id: str | None,
+        thinking: str | None,
+    ) -> RuntimeContract:
+        """Resolve one public selection against framework, deployment, and gateway state."""
+
+        try:
+            compatible_profile_ids = compatible_profile_ids_for_agent_framework(
+                agent_framework
+            )
+            if profile_id is not None:
+                validate_agent_framework_profile(agent_framework, profile_id)
+        except RuntimeContractError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        available_profiles, discovery_succeeded = await runtime_availability()
+        compatible_available_profiles = available_profiles.intersection(
+            compatible_profile_ids
+        )
+        selected_profile = profile_id
+        if selected_profile is None:
+            if settings.runtime_default_profile in compatible_available_profiles:
+                selected_profile = settings.runtime_default_profile
+            elif DEFAULT_PROFILE_ID in compatible_available_profiles:
+                selected_profile = DEFAULT_PROFILE_ID
+            else:
+                selected_profile = next(
+                    (
+                        profile.profile_id
+                        for profile in RUNTIME_PROFILES
+                        if profile.profile_id in compatible_available_profiles
+                    ),
+                    None,
+                )
+        if selected_profile is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "runtime model availability could not be verified"
+                    if not discovery_succeeded
+                    else "no compatible runtime profile is available"
+                ),
+            )
+        if selected_profile not in settings.runtime_enabled_profiles:
+            raise HTTPException(status_code=422, detail="runtime profile is not enabled")
+        if not discovery_succeeded:
+            raise HTTPException(
+                status_code=503,
+                detail="runtime model availability could not be verified",
+            )
+        if selected_profile not in available_profiles:
+            raise HTTPException(status_code=422, detail="runtime profile is unavailable")
+        try:
+            contract = resolve_runtime_contract(
+                selected_profile,
+                thinking,
+                inference_tpm_limit=settings.run_inference_tpm_limit,
+                max_spend_micros=int(settings.run_max_spend * 1_000_000),
+            )
+            validate_agent_framework_runtime(
+                agent_framework,
+                contract.profile_id,
+                contract.thinking,
+            )
+        except RuntimeContractError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return contract
 
     @app.get("/v1/runtime/options", response_model=RuntimeOptionsResponse)
     async def runtime_options() -> RuntimeOptionsResponse:
@@ -289,29 +356,18 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
         }
         framework_options: list[AgentFrameworkOption] = []
         for framework in AgentFramework:
-            compatible_profile_ids = compatible_profile_ids_for_agent_framework(
-                framework.value
-            )
-            framework_configured = (
-                settings.agent_framework == "direct_pi"
-                and framework.value in settings.agent_enabled_frameworks
-            )
+            compatible_profile_ids = compatible_profile_ids_for_agent_framework(framework.value)
+            framework_configured = framework.value in settings.agent_enabled_frameworks
             has_compatible_available_profile = bool(
                 compatible_profile_ids.intersection(available_profiles)
             )
-            framework_available = (
-                framework_configured and has_compatible_available_profile
-            )
+            framework_available = framework_configured and has_compatible_available_profile
             if not framework_configured:
                 framework_disabled_reason = "Not enabled by the server."
             elif not discovery_succeeded:
-                framework_disabled_reason = (
-                    "Model availability could not be verified."
-                )
+                framework_disabled_reason = "Model availability could not be verified."
             elif not has_compatible_available_profile:
-                framework_disabled_reason = (
-                    "No compatible runtime profile is available."
-                )
+                framework_disabled_reason = "No compatible runtime profile is available."
             else:
                 framework_disabled_reason = None
             framework_options.append(
@@ -475,9 +531,7 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
                     and payload.agent_framework != existing_run.agent_framework
                 )
             ):
-                raise ConflictError(
-                    "Idempotency-Key was already used with a different request"
-                )
+                raise ConflictError("Idempotency-Key was already used with a different request")
             response.status_code = status.HTTP_200_OK
             return MessageRunResponse(message=existing_message, run=existing_run)
         selected_agent_framework = (
@@ -487,101 +541,11 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
         )
         if selected_agent_framework not in settings.agent_enabled_frameworks:
             raise HTTPException(status_code=422, detail="agent framework is not enabled")
-        if settings.agent_framework != "direct_pi":
-            if (
-                payload.agent_framework is not None
-                or payload.profile_id is not None
-                or payload.thinking is not None
-            ):
-                raise HTTPException(
-                    status_code=422,
-                    detail="runtime selection requires the Direct Pi framework",
-                )
-            legacy_runtime = legacy_runtime_contract()
-            try:
-                validate_agent_framework_runtime(
-                    selected_agent_framework,
-                    legacy_runtime.profile_id,
-                    legacy_runtime.thinking,
-                )
-            except RuntimeContractError as exc:
-                raise HTTPException(status_code=422, detail=str(exc)) from exc
-            message, run, created = await repository.create_message_and_run(
-                project_id,
-                owner_session_id,
-                payload.client_message_id,
-                payload.content,
-                payload.base_version_id,
-                agent_framework=selected_agent_framework,
-                runtime_contract=legacy_runtime,
-                enforce_agent_framework_match=(
-                    "agent_framework" in payload.model_fields_set
-                ),
-            )
-            response.status_code = status.HTTP_202_ACCEPTED if created else status.HTTP_200_OK
-            return MessageRunResponse(message=message, run=run)
-        try:
-            compatible_profile_ids = compatible_profile_ids_for_agent_framework(
-                selected_agent_framework
-            )
-            if payload.profile_id is not None:
-                validate_agent_framework_profile(
-                    selected_agent_framework,
-                    payload.profile_id,
-                )
-        except RuntimeContractError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        available_profiles, discovery_succeeded = await runtime_availability()
-        compatible_available_profiles = available_profiles.intersection(
-            compatible_profile_ids
+        runtime_contract = await resolve_available_runtime(
+            selected_agent_framework,
+            payload.profile_id,
+            payload.thinking,
         )
-        selected_profile = payload.profile_id
-        if selected_profile is None:
-            if settings.runtime_default_profile in compatible_available_profiles:
-                selected_profile = settings.runtime_default_profile
-            elif DEFAULT_PROFILE_ID in compatible_available_profiles:
-                selected_profile = DEFAULT_PROFILE_ID
-            else:
-                selected_profile = next(
-                    (
-                        profile.profile_id
-                        for profile in RUNTIME_PROFILES
-                        if profile.profile_id in compatible_available_profiles
-                    ),
-                    None,
-                )
-        if selected_profile is None:
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "runtime model availability could not be verified"
-                    if not discovery_succeeded
-                    else "no compatible runtime profile is available"
-                ),
-            )
-        if selected_profile not in settings.runtime_enabled_profiles:
-            raise HTTPException(status_code=422, detail="runtime profile is not enabled")
-        if not discovery_succeeded:
-            raise HTTPException(
-                status_code=503,
-                detail="runtime model availability could not be verified",
-            )
-        if selected_profile not in available_profiles:
-            raise HTTPException(status_code=422, detail="runtime profile is unavailable")
-        try:
-            runtime_contract = resolve_runtime_contract(
-                selected_profile,
-                payload.thinking,
-                inference_tpm_limit=settings.run_inference_tpm_limit,
-                max_spend_micros=int(settings.run_max_spend * 1_000_000),
-            )
-            validate_agent_framework_runtime(
-                selected_agent_framework,
-                runtime_contract.profile_id,
-                runtime_contract.thinking,
-            )
-        except RuntimeContractError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
         message, run, created = await repository.create_message_and_run(
             project_id,
             owner_session_id,
@@ -593,9 +557,7 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
             enforce_runtime_match=bool(
                 {"profile_id", "thinking"}.intersection(payload.model_fields_set)
             ),
-            enforce_agent_framework_match=(
-                "agent_framework" in payload.model_fields_set
-            ),
+            enforce_agent_framework_match=("agent_framework" in payload.model_fields_set),
         )
         response.status_code = status.HTTP_202_ACCEPTED if created else status.HTTP_200_OK
         return MessageRunResponse(message=message, run=run)
@@ -648,17 +610,13 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
                     and payload.agent_framework != existing_run.agent_framework
                 )
             ):
-                raise ConflictError(
-                    "Idempotency-Key was already used with a different request"
-                )
+                raise ConflictError("Idempotency-Key was already used with a different request")
             response.status_code = status.HTTP_200_OK
             return RecoveryRunResponse(
                 message=existing_message,
                 run=existing_run,
                 recovery_mode=existing_run.recovery_mode,
-                source_checkpoint_available=(
-                    existing_run.recovered_from_checkpoint_id is not None
-                ),
+                source_checkpoint_available=(existing_run.recovered_from_checkpoint_id is not None),
             )
 
         if source.status.value not in {"failed", "needs_attention", "cancelled"}:
@@ -669,84 +627,34 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
             if payload.agent_framework is not None
             else source.agent_framework.value
         )
-        if settings.agent_framework != "direct_pi":
-            if (
-                payload.agent_framework is not None
-                or payload.profile_id is not None
-                or payload.thinking is not None
-            ):
-                raise HTTPException(
-                    status_code=422,
-                    detail="runtime selection requires the Direct Pi framework",
-                )
-            message, run, created, mode, checkpoint_available = (
-                await repository.create_recovery_message_and_run(
-                    source.id,
-                    owner_session_id,
-                    payload.client_message_id,
-                    payload.content,
-                    agent_framework=selected_agent_framework,
-                )
-            )
-            response.status_code = (
-                status.HTTP_202_ACCEPTED if created else status.HTTP_200_OK
-            )
-            return RecoveryRunResponse(
-                message=message,
-                run=run,
-                recovery_mode=mode,
-                source_checkpoint_available=checkpoint_available,
-            )
-
         if selected_agent_framework not in settings.agent_enabled_frameworks:
             raise HTTPException(status_code=422, detail="agent framework is not enabled")
         selected_profile = payload.profile_id or source.runtime.profile_id
         selected_thinking = payload.thinking
         if selected_thinking is None and selected_profile == source.runtime.profile_id:
             selected_thinking = source.runtime.thinking
-        try:
-            validate_agent_framework_profile(selected_agent_framework, selected_profile)
-        except RuntimeContractError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        if selected_profile not in settings.runtime_enabled_profiles:
-            raise HTTPException(status_code=422, detail="runtime profile is not enabled")
-        available_profiles, discovery_succeeded = await runtime_availability()
-        if not discovery_succeeded:
-            raise HTTPException(
-                status_code=503,
-                detail="runtime model availability could not be verified",
-            )
-        if selected_profile not in available_profiles:
-            raise HTTPException(status_code=422, detail="runtime profile is unavailable")
-        try:
-            runtime_contract = resolve_runtime_contract(
-                selected_profile,
-                selected_thinking,
-                inference_tpm_limit=settings.run_inference_tpm_limit,
-                max_spend_micros=int(settings.run_max_spend * 1_000_000),
-            )
-            validate_agent_framework_runtime(
-                selected_agent_framework,
-                runtime_contract.profile_id,
-                runtime_contract.thinking,
-            )
-        except RuntimeContractError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        message, run, created, mode, checkpoint_available = (
-            await repository.create_recovery_message_and_run(
-                source.id,
-                owner_session_id,
-                payload.client_message_id,
-                payload.content,
-                agent_framework=selected_agent_framework,
-                runtime_contract=runtime_contract,
-                enforce_runtime_match=bool(
-                    {"profile_id", "thinking"}.intersection(payload.model_fields_set)
-                ),
-                enforce_agent_framework_match=(
-                    "agent_framework" in payload.model_fields_set
-                ),
-            )
+        runtime_contract = await resolve_available_runtime(
+            selected_agent_framework,
+            selected_profile,
+            selected_thinking,
+        )
+        (
+            message,
+            run,
+            created,
+            mode,
+            checkpoint_available,
+        ) = await repository.create_recovery_message_and_run(
+            source.id,
+            owner_session_id,
+            payload.client_message_id,
+            payload.content,
+            agent_framework=selected_agent_framework,
+            runtime_contract=runtime_contract,
+            enforce_runtime_match=bool(
+                {"profile_id", "thinking"}.intersection(payload.model_fields_set)
+            ),
+            enforce_agent_framework_match=("agent_framework" in payload.model_fields_set),
         )
         response.status_code = status.HTTP_202_ACCEPTED if created else status.HTTP_200_OK
         return RecoveryRunResponse(

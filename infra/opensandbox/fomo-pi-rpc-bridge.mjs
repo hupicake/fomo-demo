@@ -7,7 +7,7 @@
  * stdout is reserved for the versioned FOMO JSONL protocol. Secrets and Pi
  * stderr never enter that protocol.
  *
- * Scope (P0): transport, event/usage observation, cancellation, total
+ * Scope: transport, event/usage observation, cancellation, total
  * resource liveness, redaction, fail-closed protocol, and
  * session reuse. Build and repair turns keep Pi's official builtin tools with
  * full /workspace permission. Planning turns may instead expose one trusted,
@@ -24,7 +24,7 @@ import { TextDecoder } from "node:util";
 
 const SCHEMA_VERSION = 1;
 const PROVIDER_ID = "fomo-litellm";
-const DEFAULT_MODEL_REF = `${PROVIDER_ID}/fomo-pi-flash`;
+const DEFAULT_MODEL_REF = `${PROVIDER_ID}/fomo-pi-deepseek-flash`;
 
 function runtimeModel(
   id,
@@ -67,10 +67,6 @@ const MODEL_CONFIGS = Object.freeze({
       maxContextWindow: 1_000_000,
       maxOutputTokens: 384_000,
     },
-  ),
-  [`${PROVIDER_ID}/fomo-pi-build`]: runtimeModel(
-    "fomo-pi-build", ["off", "medium", "high"],
-    { minimal: null, low: null, medium: "medium", high: "high", xhigh: null, max: null },
   ),
   [`${PROVIDER_ID}/fomo-pi-gpt-5.6`]: runtimeModel(
     "fomo-pi-gpt-5.6", ["off", "low", "medium", "high", "xhigh", "max"],

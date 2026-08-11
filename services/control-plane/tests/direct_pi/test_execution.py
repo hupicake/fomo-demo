@@ -61,7 +61,7 @@ async def test_pi_lifecycle_projects_only_safe_flat_context_usage() -> None:
     )
 
     assert _persisted(repository, 0) == (
-        "pi.started",
+        "coding_agent.started",
         {
             "bridgeSeq": 1,
             "contextTokens": 12_345,
@@ -69,7 +69,7 @@ async def test_pi_lifecycle_projects_only_safe_flat_context_usage() -> None:
         },
     )
     assert _persisted(repository, 1) == (
-        "pi.completed",
+        "coding_agent.completed",
         {
             "bridgeSeq": 2,
             "contextTokens": 80_000,
@@ -95,7 +95,7 @@ async def test_pi_lifecycle_projects_only_safe_flat_context_usage() -> None:
         )
     )
     assert _persisted(repository) == (
-        "pi.started",
+        "coding_agent.started",
         {"bridgeSeq": 3, "contextWindow": 200_000},
     )
 
@@ -119,7 +119,7 @@ async def test_pi_failed_projects_only_a_closed_public_failure_contract() -> Non
     )
 
     kind, payload = _persisted(repository)
-    assert kind == "pi.failed"
+    assert kind == "coding_agent.failed"
     assert payload == {
         "stage": "building",
         "bridgeSeq": 4,
@@ -147,7 +147,7 @@ async def test_pi_failed_projects_only_a_closed_public_failure_contract() -> Non
         "code": "coding_agent_runtime_failed",
         "message": (
             "Coding Agent 运行环境暂时不可用，请重试；若问题持续发生，"
-            "请检查 OpenCode 服务状态。"
+            "请检查当前选择的 Agent 框架状态。"
         ),
     }
     assert "private-value" not in json.dumps(runtime_payload, ensure_ascii=False)
@@ -178,7 +178,7 @@ async def test_pi_event_writer_projects_tool_events_without_commands_or_output()
         stage="building",
     )
     kind, payload = _persisted(repository)
-    assert kind == "pi.tool.started"
+    assert kind == "coding_agent.tool.started"
     assert payload == {
         "activity": "tool_start",
         "stage": "building",
@@ -254,7 +254,7 @@ async def test_pi_event_writer_projects_tool_events_without_commands_or_output()
         stage="building",
     )
     kind, command_output = _persisted(repository)
-    assert kind == "pi.command.output"
+    assert kind == "coding_agent.command.output"
     assert command_output == {
         "activity": "bash_output",
         "stage": "building",
@@ -300,7 +300,7 @@ async def test_pi_event_writer_never_persists_structured_form_arguments() -> Non
     await writer(envelope, stage="planning")
 
     kind, payload = _persisted(repository)
-    assert kind == "pi.tool.started"
+    assert kind == "coding_agent.tool.started"
     assert payload == {
         "activity": "tool_start",
         "stage": "planning",
@@ -347,7 +347,7 @@ async def test_pi_event_writer_redacts_public_text_and_drops_hidden_reasoning() 
         stage="building",
     )
     kind, payload = _persisted(repository)
-    assert kind == "pi.message.delta"
+    assert kind == "coding_agent.message.delta"
     assert payload["delta"].startswith("Continuing implementation.")
     serialized = json.dumps(payload)
     for private_value in (
@@ -389,7 +389,7 @@ async def test_pi_event_writer_redacts_public_text_and_drops_hidden_reasoning() 
         stage="building",
     )
     kind, completed = _persisted(repository)
-    assert kind == "pi.message.completed"
+    assert kind == "coding_agent.message.completed"
     assert completed["toolResults"] == [
         {"toolCallId": "tool-1", "toolName": "read", "isError": False}
     ]
@@ -424,7 +424,7 @@ async def test_pi_event_writer_suppresses_non_text_message_deltas() -> None:
     )
 
     kind, payload = _persisted(repository)
-    assert kind == "pi.message.delta"
+    assert kind == "coding_agent.message.delta"
     assert payload == {
         "activity": "message_delta",
         "stage": "building",
@@ -480,8 +480,15 @@ async def test_repository_sse_source_contains_only_the_public_projection(reposit
         stage="building",
     )
 
-    events = [event for event in await repository.list_events(run.id) if event.kind.startswith("pi.")]
-    assert [event.kind for event in events] == ["pi.tool.started", "pi.command.output"]
+    events = [
+        event
+        for event in await repository.list_events(run.id)
+        if event.kind.startswith("coding_agent.")
+    ]
+    assert [event.kind for event in events] == [
+        "coding_agent.tool.started",
+        "coding_agent.command.output",
+    ]
     assert events[1].payload["suppressed"] is True
     serialized = "\n".join(event.model_dump_json(by_alias=True) for event in events)
     for private_value in (

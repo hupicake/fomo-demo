@@ -161,8 +161,7 @@ MODEL_RESPONSE_FAILED = PublicRunFailure(
 CODING_AGENT_RUNTIME_FAILED = PublicRunFailure(
     code="coding_agent_runtime_failed",
     message=(
-        "Coding Agent 运行环境暂时不可用，请重试；若问题持续发生，"
-        "请检查当前选择的 Agent 框架状态。"
+        "Coding Agent 运行环境暂时不可用，请重试；若问题持续发生，请检查当前选择的 Agent 框架状态。"
     ),
 )
 AGENT_CAPABILITY_UNAVAILABLE = PublicRunFailure(
@@ -220,9 +219,7 @@ DIRECT_PI_INFRASTRUCTURE_FAILED = PublicRunFailure(
 )
 GOAL_VERIFICATION_INFRASTRUCTURE_FAILED = PublicRunFailure(
     code="goal_verification_infrastructure_failed",
-    message=(
-        "当前目标的验收基础设施未能完成检查。请稍后重试；这不代表当前代码一定有问题。"
-    ),
+    message=("当前目标的验收基础设施未能完成检查。请稍后重试；这不代表当前代码一定有问题。"),
 )
 WORKER_LEASE_EXPIRED = PublicRunFailure(
     code="worker_lease_expired",
@@ -241,10 +238,6 @@ CONTINUATION_CURSOR_INVALID = PublicRunFailure(
 PI_SESSION_RESUME_UNAVAILABLE = PublicRunFailure(
     code="pi_session_resume_unavailable",
     message="原 Coding Agent 会话或沙箱已不可用，无法安全续接。请重新提交该需求。",
-)
-P0_CONTINUATION_UNSUPPORTED = PublicRunFailure(
-    code="p0_continuation_unsupported",
-    message="当前兼容运行模式不支持安全续接澄清回答。请重新提交该需求。",
 )
 REPAIR_NO_PROGRESS = PublicRunFailure(
     code="repair_no_progress",
@@ -289,7 +282,6 @@ PUBLIC_FAILURES_BY_CODE = {
         CONTINUATION_ANSWER_MISSING,
         CONTINUATION_CURSOR_INVALID,
         PI_SESSION_RESUME_UNAVAILABLE,
-        P0_CONTINUATION_UNSUPPORTED,
         REPAIR_NO_PROGRESS,
         REPAIR_LIMIT_REACHED,
         SOP_EXECUTION_ERROR,
@@ -383,9 +375,7 @@ def classify_direct_pi_failure(error: BaseException) -> PublicRunFailure:
         if isinstance(current, PiBridgeProtocolError):
             return MODEL_RUNTIME_PROTOCOL_FAILED
         if isinstance(current, PiBridgeFailed):
-            failure = _BRIDGE_FAILURES_BY_INTERNAL_CODE.get(
-                current.payload.get("code")
-            )
+            failure = _BRIDGE_FAILURES_BY_INTERNAL_CODE.get(current.payload.get("code"))
             if failure is not None:
                 return failure
         exact_message = _single_string_argument(current)
@@ -426,9 +416,7 @@ def safe_diagnostic_for_error(error: BaseException) -> SafeRunDiagnostic | None:
             return diagnostic
         if isinstance(current, WorkspaceContractError):
             repair = current.repair
-            reason_code = (
-                repair.code.value if repair is not None else "workspace_contract_rejected"
-            )
+            reason_code = repair.code.value if repair is not None else "workspace_contract_rejected"
             frame = workspace_frames.get(
                 reason_code,
                 "The candidate failed a server-owned workspace integrity check.",

@@ -22,13 +22,13 @@ from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 from fomo.runtime_contract import (
-    MAX_CONTEXT_WINDOW as RUNTIME_MAX_CONTEXT_WINDOW,
-)
-from fomo.runtime_contract import (
+    DEFAULT_PROFILE_ID,
     allowed_model_refs,
     context_limit_for_model_ref,
+    runtime_profile,
     thinking_levels_for_model_ref,
 )
+from fomo.runtime_contract import MAX_CONTEXT_WINDOW as RUNTIME_MAX_CONTEXT_WINDOW
 
 # Environment contract shared with infra/opensandbox/fomo-pi-rpc-bridge.mjs.
 FOMO_PI_PROMPT_B64 = "FOMO_PI_PROMPT_B64"
@@ -54,13 +54,10 @@ DEFAULT_BRIDGE_BIN = "/opt/fomo/bin/fomo-pi-rpc-bridge.mjs"
 DEFAULT_PI_BIN = "/opt/fomo/pi/bin/pi"
 DEFAULT_STATE_DIR = "/var/lib/fomo-pi"
 DEFAULT_WORKSPACE = "/workspace"
-FOMO_PI_PLANNING_MODEL = "fomo-litellm/fomo-pi-flash"
-FOMO_PI_BUILD_MODEL = "fomo-litellm/fomo-pi-build"
-FOMO_PI_MODEL = FOMO_PI_BUILD_MODEL
+_DEFAULT_RUNTIME_PROFILE = runtime_profile(DEFAULT_PROFILE_ID)
+FOMO_PI_MODEL = _DEFAULT_RUNTIME_PROFILE.model_ref
 FOMO_PI_MODELS = allowed_model_refs()
-# Default thinking must be legal for the default model (fomo-pi-build):
-# "high" is the shared level between the flash and build aliases.
-FOMO_PI_THINKING = "high"
+FOMO_PI_THINKING = _DEFAULT_RUNTIME_PROFILE.default_thinking
 FOMO_PI_THINKING_LEVELS = frozenset(
     level
     for model_ref in FOMO_PI_MODELS
@@ -81,10 +78,7 @@ MAX_VIRTUAL_KEY_LENGTH = 4096
 MAX_GRACE_SECONDS = 60
 MAX_STRUCTURED_OUTPUT_SCHEMA_BYTES = 64 * 1024
 
-# FOMO declares a 200K logical context budget even when the upstream model
-# supports more. The bridge couples this window to explicit compaction settings
-# so output headroom is reserved before the product budget is exhausted.
-DEFAULT_CONTEXT_WINDOW = 200_000
+DEFAULT_CONTEXT_WINDOW = _DEFAULT_RUNTIME_PROFILE.context_window
 MAX_CONTEXT_WINDOW = RUNTIME_MAX_CONTEXT_WINDOW
 MAX_ACTIVITY_SILENCE_SECONDS = 3_600
 

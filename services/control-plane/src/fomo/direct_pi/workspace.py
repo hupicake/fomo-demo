@@ -1,7 +1,8 @@
 """Base Snapshot seeding, settle safety audit, and G-to-V candidate transfer.
 
-P0 semantics: the Base Snapshot is mutable. Pi has full project development
-permission in G (/workspace read/write, package/config/starter included), so
+Workspace semantics: the Base Snapshot is mutable. The coding agent has full
+project development permission in G (/workspace read/write,
+package/config/starter included), so
 settle audit enforces only real safety invariants:
 
 - normalized in-workspace paths; `.env`/`.env.*` files are rejected outright;
@@ -152,9 +153,7 @@ _WORKSPACE_REPAIR_POLICY: dict[
     ),
     WorkspaceRepairCode.INVALID_SOURCE_ENCODING: (
         "A changed candidate path is not a complete regular UTF-8 text file.",
-        (
-            "Rewrite the affected path as regular UTF-8 text or remove it.",
-        ),
+        ("Rewrite the affected path as regular UTF-8 text or remove it.",),
         False,
     ),
 }
@@ -275,9 +274,7 @@ class WorkspaceManager:
         ref = await self.sandbox.create(self.project_id)
         try:
             await self._register_sandbox(ref, "generation")
-            await self.repository.set_sandbox_id(
-                self.run_id, ref.id, lease_token=self.lease_token
-            )
+            await self.repository.set_sandbox_id(self.run_id, ref.id, lease_token=self.lease_token)
             await self._seed(ref, base_version_id=base_version_id)
             commit = await self._initialize_git(ref, "chore(starter): prepare Direct Pi workspace")
             await self.repository.store_artifact(
@@ -316,9 +313,7 @@ class WorkspaceManager:
         ref = await self.sandbox.create(self.project_id)
         try:
             await self._register_sandbox(ref, "generation")
-            await self.repository.set_sandbox_id(
-                self.run_id, ref.id, lease_token=self.lease_token
-            )
+            await self.repository.set_sandbox_id(self.run_id, ref.id, lease_token=self.lease_token)
             await self._seed(ref, base_version_id=base_version_id)
             baseline = await self.snapshot_hashes(ref)
             await self._restore_checkpoint(ref, checkpoint)
@@ -390,18 +385,16 @@ class WorkspaceManager:
             # Freeze the initial manifest from this single listing; initial_hashes
             # is derived from the same capture (never a second list).
             initial_files = await self._list_files(ref)
-            initial_hashes = {
-                str(item["path"]): str(item["sha256"]) for item in initial_files
-            }
+            initial_hashes = {str(item["path"]): str(item["sha256"]) for item in initial_files}
             # Bind the frozen manifest to the initial commit before any candidate
             # process can start: HEAD must equal the commit and the worktree must
             # be clean. This is a verified binding, not an atomic snapshot.
             binding = await self.commands.run(
                 ref,
                 (
-                    "test \"$(git rev-parse HEAD)\" = "
+                    'test "$(git rev-parse HEAD)" = '
                     + self._shell_single_quote(commit)
-                    + " && test -z \"$(git status --porcelain=v1 --untracked-files=all)\""
+                    + ' && test -z "$(git status --porcelain=v1 --untracked-files=all)"'
                 ),
                 label="Bind verification manifest to commit",
                 stage="verifying",
@@ -412,9 +405,7 @@ class WorkspaceManager:
                     "verification sandbox is not bound to the frozen commit "
                     "(HEAD mismatch or dirty worktree)"
                 )
-            await self.repository.set_sandbox_id(
-                self.run_id, ref.id, lease_token=self.lease_token
-            )
+            await self.repository.set_sandbox_id(self.run_id, ref.id, lease_token=self.lease_token)
             return VerificationSnapshot(
                 ref=ref,
                 commit_sha=commit,
@@ -452,11 +443,6 @@ class WorkspaceManager:
             )
 
     async def _register_sandbox(self, ref: SandboxRef, kind: str) -> None:
-        if not (
-            self.settings.direct_pi_goal_graph_enabled
-            and self.settings.agent_framework == "direct_pi"
-        ):
-            return
         resource_id = await self.repository.register_sandbox_resource(
             self.run_id,
             ref.id,
@@ -560,9 +546,7 @@ class WorkspaceManager:
                 ) from exc
             digest = hashlib.sha256(content).hexdigest()
             if digest != expected_hashes[path]:
-                raise WorkspaceContractError(
-                    "generation advisory acceptance spec hash mismatch"
-                )
+                raise WorkspaceContractError("generation advisory acceptance spec hash mismatch")
             installed_hashes[path] = digest
 
         refreshed_baseline = {
@@ -603,13 +587,10 @@ class WorkspaceManager:
         }
         for entry in self.starter.files:
             if self._is_fomo_owned_path(entry.path):
-                expected_sources[entry.path] = entry._content.decode(
-                    "utf-8", errors="strict"
-                )
+                expected_sources[entry.path] = entry._content.decode("utf-8", errors="strict")
         for change in compiled.changes:
-            if (
-                change.operation not in {"create", "modify"}
-                or not self._is_fomo_owned_path(change.path)
+            if change.operation not in {"create", "modify"} or not self._is_fomo_owned_path(
+                change.path
             ):
                 raise WorkspaceContractError(
                     "generation protected restore received an invalid source"
@@ -686,9 +667,7 @@ class WorkspaceManager:
             if self._is_excluded_path(path) or self._is_fomo_owned_path(path):
                 continue
             if self._is_secret_path(path):
-                raise WorkspaceContractError(
-                    f"checkpoint contains a rejected secret file: {path}"
-                )
+                raise WorkspaceContractError(f"checkpoint contains a rejected secret file: {path}")
             if path in seen:
                 raise WorkspaceContractError("checkpoint file paths must be unique")
             try:
@@ -721,10 +700,7 @@ class WorkspaceManager:
         return CandidateCheckpoint(files=tuple(files), manifest_hash=manifest_hash)
 
     async def snapshot_hashes(self, ref: SandboxRef) -> dict[str, str]:
-        return {
-            str(item["path"]): str(item["sha256"])
-            for item in await self._list_files(ref)
-        }
+        return {str(item["path"]): str(item["sha256"]) for item in await self._list_files(ref)}
 
     async def assert_unchanged(
         self,
@@ -747,7 +723,10 @@ class WorkspaceManager:
     ) -> AuditedWorkspace:
         """Settle audit: safety invariants and the real full-project diff."""
         try:
-            if await self.sandbox.read_file(ref, SYSTEM_GITIGNORE_PATH) != SYSTEM_GITIGNORE.encode():
+            if (
+                await self.sandbox.read_file(ref, SYSTEM_GITIGNORE_PATH)
+                != SYSTEM_GITIGNORE.encode()
+            ):
                 raise WorkspaceContractError(
                     "system .gitignore changed",
                     repair=WorkspaceRepairDiagnostic(
@@ -781,9 +760,7 @@ class WorkspaceManager:
             )
 
         listed = await self._list_files(ref)
-        current_hashes: dict[str, str] = {
-            str(item["path"]): str(item["sha256"]) for item in listed
-        }
+        current_hashes: dict[str, str] = {str(item["path"]): str(item["sha256"]) for item in listed}
         changes: list[FileChange] = []
         changed_paths: list[str] = []
 
@@ -876,9 +853,7 @@ class WorkspaceManager:
             # FileChange deletes, no tombstones) so deletions survive across
             # runs. FOMO-owned roots are restored from the trusted starter;
             # the system .gitignore is restored by the control plane below.
-            manifest = await self.repository.list_version_files(
-                self.project_id, base_version_id
-            )
+            manifest = await self.repository.list_version_files(self.project_id, base_version_id)
             manifest_paths = {str(item["path"]) for item in manifest}
             changes: list[FileChange] = []
             for item in manifest:
@@ -888,7 +863,10 @@ class WorkspaceManager:
                 _version_id, content, digest = await self.repository.get_version_file_content(
                     self.project_id, path, base_version_id
                 )
-                if digest != str(item["sha256"]) or hashlib.sha256(content.encode()).hexdigest() != digest:
+                if (
+                    digest != str(item["sha256"])
+                    or hashlib.sha256(content.encode()).hexdigest() != digest
+                ):
                     raise WorkspaceContractError("base version source hash mismatch")
                 changes.append(FileChange(path=path, content=content, operation="create"))
             for entry in self.starter.files:
@@ -938,7 +916,10 @@ class WorkspaceManager:
             )
             changes.append(FileChange(path=path, content=content, operation="create"))
         expected_files.sort(key=lambda item: str(item["path"]).encode("utf-8"))
-        if not expected_files or self._candidate_manifest_hash(expected_files) != checkpoint.manifest_hash:
+        if (
+            not expected_files
+            or self._candidate_manifest_hash(expected_files) != checkpoint.manifest_hash
+        ):
             raise WorkspaceContractError("durable checkpoint manifest hash mismatch")
 
         for item in await self._list_files(ref):
@@ -993,19 +974,18 @@ class WorkspaceManager:
     async def _verify_starter(self, ref: SandboxRef) -> None:
         try:
             for entry in self.starter.files:
-                self.starter.verify_file(
-                    entry.path, await self.sandbox.read_file(ref, entry.path)
-                )
+                self.starter.verify_file(entry.path, await self.sandbox.read_file(ref, entry.path))
         except (FileNotFoundError, StarterIntegrityError) as exc:
             raise WorkspaceContractError("starter base verification failed") from exc
 
-    async def _verify_protected(
-        self, ref: SandboxRef, compiled: CompiledAcceptance
-    ) -> None:
+    async def _verify_protected(self, ref: SandboxRef, compiled: CompiledAcceptance) -> None:
         """Verify FOMO-owned files inside V: injected acceptance tests and the
         system .gitignore. Starter/base files are intentionally mutable."""
         try:
-            if await self.sandbox.read_file(ref, SYSTEM_GITIGNORE_PATH) != SYSTEM_GITIGNORE.encode():
+            if (
+                await self.sandbox.read_file(ref, SYSTEM_GITIGNORE_PATH)
+                != SYSTEM_GITIGNORE.encode()
+            ):
                 raise WorkspaceContractError("system .gitignore changed")
             for path, digest in compiled.sha256_by_path.items():
                 content = await self.sandbox.read_file(ref, path)

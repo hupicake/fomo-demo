@@ -39,6 +39,13 @@ const maxPublicProgressCharacters = 1_200;
 const maxPublicDetailCharacters = 280;
 const maxPublicCommandOutputCharacters = 8_000;
 
+function normalizeCodingAgentEvent(event: DomainEvent): DomainEvent {
+  const prefix = "coding_agent.";
+  return event.kind.startsWith(prefix)
+    ? { ...event, kind: `pi.${event.kind.slice(prefix.length)}` }
+    : event;
+}
+
 const publicFailureContracts = {
   inference_gateway_unavailable: {
     title: "模型运行问题：服务不可用",
@@ -131,10 +138,6 @@ const publicFailureContracts = {
   pi_session_resume_unavailable: {
     title: "Agent 会话无法续接",
     message: "原 Coding Agent 会话或沙箱已不可用，无法安全续接。请重新提交该需求。",
-  },
-  p0_continuation_unsupported: {
-    title: "当前模式无法续接",
-    message: "当前兼容运行模式不支持安全续接澄清回答。请重新提交该需求。",
   },
   repair_no_progress: {
     title: "自动修复没有进展",
@@ -325,7 +328,8 @@ function legacyFailureCode(payload: Record<string, unknown>): keyof typeof publi
 }
 
 function inferredLegacyFailureCode(events: DomainEvent[]): keyof typeof publicFailureContracts | undefined {
-  for (const event of [...events].reverse()) {
+  for (const candidate of [...events].reverse()) {
+    const event = normalizeCodingAgentEvent(candidate);
     const directCode = event.payload.code ?? event.payload.errorCode ?? event.payload.error_code;
     if (
       ["pi.failed", "run.failed"].includes(event.kind)
@@ -1161,6 +1165,7 @@ function projectWorklogEvent(
 }
 
 export function reduceDomainEvent(state: RunPresentation, event: DomainEvent): RunPresentation {
+  event = normalizeCodingAgentEvent(event);
   if (event.runId !== state.runId && state.runId) {
     return state;
   }
@@ -1325,6 +1330,7 @@ function dataChunk<Name extends DataName>(
 export function domainEventToMessageChunks(
   event: DomainEvent,
 ): UIMessageChunk<AgentMessageMetadata, AgentDataParts>[] {
+  event = normalizeCodingAgentEvent(event);
   if (event.kind.startsWith("agent.")) {
     const activity = activityFromEvent(event);
     return activity ? [dataChunk("agent-role", activity, `role-${event.runId}-${activity.role}`)] : [];

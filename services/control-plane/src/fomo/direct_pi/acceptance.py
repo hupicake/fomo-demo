@@ -362,10 +362,10 @@ def compile_acceptance(
     *,
     goal_id: str | None = None,
 ) -> CompiledAcceptance:
-    """Compile P0 acceptance, or one isolated goal when ``goal_id`` is supplied.
+    """Compile one acceptance contract, optionally scoped to a GoalGraph goal.
 
-    The no-``goal_id`` call is the P0 contract and intentionally preserves its
-    original paths and acceptance-id keyed maps exactly.
+    The no-``goal_id`` call intentionally preserves its historical paths and
+    acceptance-id keyed maps for focused compiler/verifier compatibility tests.
     """
 
     if goal_id is not None:
@@ -377,7 +377,7 @@ def compile_acceptance(
     for item in contract.tests:
         path = f"{ACCEPTANCE_ROOT}/{item.id}.smoke.spec.ts"
         if path in sources or item.acceptance_id in test_paths:
-            raise AcceptanceCompilationError("duplicate P0 acceptance path or id")
+            raise AcceptanceCompilationError("duplicate acceptance path or id")
         sources[path] = _test_source(item.title, item.actions, item.assertions)
         test_paths[item.acceptance_id] = path
         test_names[item.acceptance_id] = item.title

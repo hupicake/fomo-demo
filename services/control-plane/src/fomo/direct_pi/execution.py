@@ -147,21 +147,21 @@ class PiEventWriter:
     async def __call__(self, envelope: PiBridgeEnvelope, *, stage: str | None = None) -> None:
         payload = dict(envelope.payload)
         if envelope.type == "started":
-            kind = "pi.started"
+            kind = "coding_agent.started"
         elif envelope.type == "completed":
-            kind = "pi.completed"
+            kind = "coding_agent.completed"
         elif envelope.type == "failed":
-            kind = "pi.failed"
+            kind = "coding_agent.failed"
         else:
             pi_kind = str(payload.pop("kind", "activity"))
             kind = {
-                "message_delta": "pi.message.delta",
-                "turn_end": "pi.message.completed",
-                "tool_start": "pi.tool.started",
-                "tool_output": "pi.tool.output",
-                "tool_end": "pi.tool.completed",
-                "bash_output": "pi.command.output",
-            }.get(pi_kind, "pi.activity")
+                "message_delta": "coding_agent.message.delta",
+                "turn_end": "coding_agent.message.completed",
+                "tool_start": "coding_agent.tool.started",
+                "tool_output": "coding_agent.tool.output",
+                "tool_end": "coding_agent.tool.completed",
+                "bash_output": "coding_agent.command.output",
+            }.get(pi_kind, "coding_agent.activity")
             payload["activity"] = pi_kind
         payload["bridgeSeq"] = envelope.seq
         if stage:
@@ -300,7 +300,7 @@ def _public_payload(kind: str, source: dict[str, Any]) -> dict[str, Any]:
 
     output = _public_event_context(source)
 
-    if kind == "pi.started":
+    if kind == "coding_agent.started":
         # The Pi session id is an internal continuation capability. Keep it in
         # the bridge/runtime result and durable RunRecord, never in browser/SSE
         # telemetry where it has no user-facing value.
@@ -312,16 +312,16 @@ def _public_payload(kind: str, source: dict[str, Any]) -> dict[str, Any]:
         _public_boolean(output, source, "resumed")
         return output
 
-    if kind == "pi.completed":
+    if kind == "coding_agent.completed":
         _public_context_usage(output, source, "stats")
         return output
 
-    if kind == "pi.failed":
+    if kind == "coding_agent.failed":
         failure = public_bridge_failure(source.get("code"))
         output.update(failure.event_payload())
         return output
 
-    if kind == "pi.message.delta":
+    if kind == "coding_agent.message.delta":
         delta_type = source.get("deltaType")
         if delta_type not in _PUBLIC_TEXT_DELTA_TYPES:
             output["suppressed"] = True
@@ -332,7 +332,7 @@ def _public_payload(kind: str, source: dict[str, Any]) -> dict[str, Any]:
             _public_string(output, source, "delta", limit=_PUBLIC_MESSAGE_CHARACTERS)
         return output
 
-    if kind == "pi.message.completed":
+    if kind == "coding_agent.message.completed":
         _public_string(output, source, "role", limit=80)
         _public_string(output, source, "stopReason", limit=256)
         _public_string(output, source, "text", limit=_PUBLIC_MESSAGE_CHARACTERS)
@@ -341,7 +341,7 @@ def _public_payload(kind: str, source: dict[str, Any]) -> dict[str, Any]:
             output["toolResults"] = tool_results
         return output
 
-    if kind == "pi.tool.started":
+    if kind == "coding_agent.tool.started":
         _public_string(output, source, "toolCallId", limit=256)
         _public_string(output, source, "toolName", limit=80)
         _public_number(output, source, "elapsedMs")
@@ -350,7 +350,7 @@ def _public_payload(kind: str, source: dict[str, Any]) -> dict[str, Any]:
             output["path"] = path
         return output
 
-    if kind == "pi.tool.output":
+    if kind == "coding_agent.tool.output":
         _public_string(output, source, "toolCallId", limit=256)
         _public_string(output, source, "toolName", limit=80)
         _public_boolean(output, source, "cumulative")
@@ -358,18 +358,18 @@ def _public_payload(kind: str, source: dict[str, Any]) -> dict[str, Any]:
         output["suppressed"] = True
         return output
 
-    if kind == "pi.tool.completed":
+    if kind == "coding_agent.tool.completed":
         _public_string(output, source, "toolCallId", limit=256)
         _public_string(output, source, "toolName", limit=80)
         _public_boolean(output, source, "isError")
         _public_number(output, source, "elapsedMs")
         return output
 
-    if kind == "pi.command.output":
+    if kind == "coding_agent.command.output":
         output["suppressed"] = True
         return output
 
-    if kind == "pi.activity":
+    if kind == "coding_agent.activity":
         activity = output.get("activity")
         for key in _ACTIVITY_FIELDS.get(activity, ()):
             if key in {"willRetry", "aborted", "success"}:

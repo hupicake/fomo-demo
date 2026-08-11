@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -9,7 +8,6 @@ import pytest
 from fomo.agent_framework import (
     AgentTransportRegistry,
     normalize_agent_framework,
-    resolve_run_agent_framework,
 )
 from fomo.direct_pi import DirectPiOrchestrator
 from fomo.direct_pi.session import DirectPiSession
@@ -131,9 +129,7 @@ class _RequestProbeTransport:
 def test_agent_transport_registry_is_closed_and_framework_specific() -> None:
     pi_transport = object()
     opencode_transport = object()
-    registry = AgentTransportRegistry(
-        {"pi": pi_transport, "opencode": opencode_transport}
-    )
+    registry = AgentTransportRegistry({"pi": pi_transport, "opencode": opencode_transport})
 
     assert normalize_agent_framework(" OpenCode ") == "opencode"
     assert registry.require("pi") is pi_transport
@@ -150,11 +146,9 @@ async def test_orchestrator_reuses_one_goal_graph_with_the_selected_transport(se
     orchestrator = _DispatchProbe(
         repository,  # type: ignore[arg-type]
         FakeSandboxProvider(),
-        replace(settings, agent_framework="direct_pi"),
+        settings,
         object(),  # type: ignore[arg-type]
-        AgentTransportRegistry(
-            {"pi": pi_transport, "opencode": opencode_transport}
-        ),
+        AgentTransportRegistry({"pi": pi_transport, "opencode": opencode_transport}),
     )
 
     await orchestrator.run("run-opencode", lease_token="lease-token")
@@ -168,7 +162,7 @@ async def test_disabled_framework_reaches_a_safe_terminal_boundary(settings) -> 
     orchestrator = DirectPiOrchestrator(
         repository,  # type: ignore[arg-type]
         FakeSandboxProvider(),
-        replace(settings, agent_framework="direct_pi"),
+        settings,
         object(),  # type: ignore[arg-type]
         AgentTransportRegistry.pi_only(object()),  # type: ignore[arg-type]
     )
@@ -189,7 +183,7 @@ async def test_worker_task_name_exposes_the_frozen_framework(settings) -> None:
     orchestrator = _TaskNameProbe()
     worker = WorkerRunner(
         repository,  # type: ignore[arg-type]
-        replace(settings, agent_framework="direct_pi"),
+        settings,
         sandbox=FakeSandboxProvider(),
         direct_orchestrator=orchestrator,
         worker_id="dispatch-worker",
@@ -197,25 +191,6 @@ async def test_worker_task_name_exposes_the_frozen_framework(settings) -> None:
 
     assert await worker.run_once()
     assert orchestrator.task_name == "fomo-opencode-agent:run-opencode"
-
-
-@pytest.mark.asyncio
-async def test_legacy_native_worker_never_silently_executes_opencode(settings) -> None:
-    repository = _WorkerRepository("opencode")
-    worker = WorkerRunner(
-        repository,  # type: ignore[arg-type]
-        settings,
-        model=object(),  # type: ignore[arg-type]
-        sandbox=FakeSandboxProvider(),
-        worker_id="legacy-worker",
-    )
-
-    assert await worker.run_once()
-    assert repository.terminal == (
-        "run-opencode",
-        RunStatus.failed,
-        "coding_agent_failed",
-    )
 
 
 @pytest.mark.asyncio
@@ -283,8 +258,3 @@ async def test_codex_turn_keeps_resume_independent_from_user_input(settings) -> 
     assert transport.request.require_resume is True
     assert transport.request.model == contract.model_ref
     assert transport.request.thinking == "xhigh"
-
-
-@pytest.mark.asyncio
-async def test_framework_resolution_has_a_pi_only_legacy_fallback() -> None:
-    assert await resolve_run_agent_framework(object(), "legacy-run") == "pi"

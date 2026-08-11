@@ -82,4 +82,20 @@ describe("error-state chat submission", () => {
     await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
     expect(textarea.value).toBe("Keep this product brief");
   });
+
+  it("never resubmits while generation is active without a stop handler", () => {
+    const onSubmit = vi.fn();
+
+    render(createElement(
+      PromptInput,
+      { onSubmit },
+      createElement(PromptInputTextarea),
+      createElement(PromptInputSubmit, { status: "streaming" }),
+    ));
+
+    const generating = screen.getByRole("button", { name: "Generating" });
+    expect(generating.getAttribute("type")).toBe("button");
+    fireEvent.click(generating);
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
 });

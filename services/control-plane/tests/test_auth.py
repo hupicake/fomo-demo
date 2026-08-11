@@ -154,17 +154,18 @@ async def test_production_session_cookie_is_host_only_secure_and_deleted_symmetr
         app_env="production",
         session_cookie_name="fomo_session",
     )
+    await repository.register_user("secure@example.com", "secure password")
     transport = _transport(repository, production)
     async with httpx.AsyncClient(
         transport=transport,
         base_url="https://api.example.test",
     ) as client:
-        registered = await client.post(
-            "/v1/auth/register",
+        logged_in = await client.post(
+            "/v1/auth/login",
             json={"email": "secure@example.com", "password": "secure password"},
         )
-        assert registered.status_code == 201
-        set_cookie = registered.headers["set-cookie"]
+        assert logged_in.status_code == 200
+        set_cookie = logged_in.headers["set-cookie"]
         normalized_set = set_cookie.lower()
         assert set_cookie.startswith("__Host-fomo_session=")
         assert "path=/" in normalized_set

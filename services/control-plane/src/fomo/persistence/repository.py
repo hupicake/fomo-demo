@@ -1691,7 +1691,7 @@ class Repository:
             return self._goal_graph_projection(graph_record, revision, nodes)
 
     async def get_goal_graph_for_run(self, run_id: str) -> GoalGraphProjection | None:
-        """Return None for a P0 run that has no GoalGraph."""
+        """Return None for a historical run that predates GoalGraph."""
         async with self.database.session_factory() as session:
             return await self._goal_graph_for_run_in_session(session, run_id)
 
@@ -2197,7 +2197,7 @@ class Repository:
             node = None
             if goal_id is not None:
                 if graph is None:
-                    raise ConflictError("P0 run has no goal for scoped usage")
+                    raise ConflictError("historical run has no goal for scoped usage")
                 revision = await self._current_revision_in_session(session, graph)
                 node = await session.scalar(
                     select(GoalNodeRecord).where(
@@ -2337,7 +2337,7 @@ class Repository:
             node = None
             if goal_id is not None:
                 if graph is None:
-                    raise ConflictError("P0 run has no goal for scoped usage")
+                    raise ConflictError("historical run has no goal for scoped usage")
                 revision = await self._current_revision_in_session(session, graph)
                 node = await session.scalar(
                     select(GoalNodeRecord).where(
@@ -2433,102 +2433,6 @@ class Repository:
             record.metadata_json = metadata
             await session.commit()
             return UsageLedgerResult(entry_id=record.id, created=True)
-
-    async def list_planning_cache_candidates(
-        self,
-        project_id: str,
-        requirement: str,
-        base_version_id: str | None,
-        starter_fingerprint: dict[str, Any],
-        *,
-        limit: int = 3,
-    ) -> list[dict[str, str]]:
-        """Return bounded prior planning outputs for exact-input revalidation.
-
-        Cache entries remain untrusted text: the current Direct Pi contract
-        must parse and validate each candidate before it can be reused.
-
-        A prior run qualifies by input fingerprint (project, requirement,
-        base version, starter fingerprint) — regardless of its final phase or
-        status — so runs that failed later in building/verifying still
-        contribute their planning output. The machine truth is the pair of
-        already-validated ``build_plan`` and ``acceptance_contract``
-        artifacts, never the public (display-capped) ``pi.message.completed``
-        text; a run without either artifact is skipped. The combined JSON is
-        re-validated by the current PlanningBundle parser before reuse. This
-        is a bounded cache lookup, not a fingerprint guarantee; there is no
-        separate schemaVersion field on the artifacts.
-        """
-        async with self.database.session_factory() as session:
-            runs = list(
-                await session.scalars(
-                    select(RunRecord)
-                    .join(MessageRecord, MessageRecord.run_id == RunRecord.id)
-                    .where(
-                        RunRecord.project_id == project_id,
-                        RunRecord.base_version_id == base_version_id,
-                        MessageRecord.content == requirement,
-                    )
-                    .order_by(RunRecord.created_at.desc(), RunRecord.id.desc())
-                    .limit(max(1, min(limit, 10)))
-                )
-            )
-            candidates: list[dict[str, str]] = []
-            for run in runs:
-                run_input = await session.scalar(
-                    select(ArtifactRecord)
-                    .where(
-                        ArtifactRecord.run_id == run.id,
-                        ArtifactRecord.kind == "run_input",
-                    )
-                    .order_by(ArtifactRecord.created_at.desc(), ArtifactRecord.id.desc())
-                    .limit(1)
-                )
-                if run_input is None or any(
-                    run_input.content.get(key) != value
-                    for key, value in starter_fingerprint.items()
-                ):
-                    continue
-                # Machine cache truth is the pair of already-validated
-                # planning artifacts (never display-capped message text).
-                build_plan = await session.scalar(
-                    select(ArtifactRecord)
-                    .where(
-                        ArtifactRecord.run_id == run.id,
-                        ArtifactRecord.kind == "build_plan",
-                    )
-                    .order_by(ArtifactRecord.created_at.desc(), ArtifactRecord.id.desc())
-                    .limit(1)
-                )
-                acceptance = await session.scalar(
-                    select(ArtifactRecord)
-                    .where(
-                        ArtifactRecord.run_id == run.id,
-                        ArtifactRecord.kind == "acceptance_contract",
-                    )
-                    .order_by(ArtifactRecord.created_at.desc(), ArtifactRecord.id.desc())
-                    .limit(1)
-                )
-                if build_plan is None or acceptance is None:
-                    continue
-                if not isinstance(build_plan.content, dict) or not isinstance(
-                    acceptance.content, dict
-                ):
-                    continue
-                candidates.append(
-                    {
-                        "runId": run.id,
-                        "text": json.dumps(
-                            {
-                                "buildPlan": build_plan.content,
-                                "acceptanceContract": acceptance.content,
-                            },
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        ),
-                    }
-                )
-            return candidates
 
     async def list_goal_graph_cache_candidates(
         self,
@@ -2854,7 +2758,7 @@ class Repository:
                 # through a later worker merely because it shares a hostname.
                 lease_token = uuid7()
                 run.status = RunStatus.running.value
-                run.phase = RunPhase.product_analysis.value
+                run.phase = RunPhase.preparing.value
                 if run.continuation_request_id is not None:
                     # User wait time is outside the active execution budget;
                     # durable token/tool/spend ledgers still cap repeated turns.
@@ -2911,10 +2815,11 @@ class Repository:
     ) -> list[SandboxCleanupTarget]:
         """Recover abandoned runs and return stale sandboxes for destruction.
 
-        P0 runs retain the terminal failure/cancellation behavior. P1 runs
-        with an integrity-checked verified checkpoint are requeued so a fresh
-        sandbox/session can resume; registered resources fence the next claim
-        until cleanup is acknowledged. A cancellation request always wins.
+        Historical GoalGraph-less runs retain terminal failure/cancellation
+        behavior. Runs with an integrity-checked verified checkpoint are
+        requeued so a fresh sandbox/session can resume; registered resources
+        fence the next claim until cleanup is acknowledged. A cancellation
+        request always wins.
         """
         cutoff = now or utcnow()
         if cutoff.tzinfo is None:
@@ -3267,7 +3172,7 @@ class Repository:
         self,
         run_id: str,
         *,
-        phase: RunPhase = RunPhase.repair,
+        phase: RunPhase = RunPhase.repairing,
         lease_token: str | None = None,
     ) -> int:
         async with self.database.session_factory() as session:

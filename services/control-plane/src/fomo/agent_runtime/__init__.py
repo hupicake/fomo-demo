@@ -1,10 +1,1 @@
-"""Structured four-role SOP runtime."""
-
-from .llm import ModelClient, OpenAICompatibleClient
-from .sop import SOPRunner
-
-__all__ = [
-    "ModelClient",
-    "OpenAICompatibleClient",
-    "SOPRunner",
-]
+"""Shared runtime adapters retained by the coding-agent verification path."""

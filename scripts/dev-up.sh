@@ -22,7 +22,7 @@ docker compose --env-file "$env_file" stop api worker web
 docker compose --env-file "$env_file" build sandbox-image api web
 docker compose --env-file "$env_file" up --detach --no-build --wait \
   --wait-timeout "$wait_timeout" \
-  postgres redis minio litellm opensandbox
+  postgres litellm opensandbox
 # Run the paid, bounded OpenSandbox -> LiteLLM canary only after infrastructure
 # is healthy and before the user-facing app is declared ready. The command reads
 # credentials from the service environment and never places them in argv/output.

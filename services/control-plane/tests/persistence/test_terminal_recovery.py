@@ -113,12 +113,8 @@ async def _terminal_source_with_verified_state(repository):
         _one_goal_draft(),
         lease_token=claimed_source.lease_owner,
     )
-    await repository.activate_goal(
-        source.id, "G-1", lease_token=claimed_source.lease_owner
-    )
-    await repository.claim_goal(
-        source.id, "G-1", lease_token=claimed_source.lease_owner
-    )
+    await repository.activate_goal(source.id, "G-1", lease_token=claimed_source.lease_owner)
+    await repository.claim_goal(source.id, "G-1", lease_token=claimed_source.lease_owner)
     checkpoint = await repository.record_verified_checkpoint(
         source.id,
         "G-1",
@@ -151,8 +147,8 @@ async def _terminal_source_with_verified_state(repository):
 async def test_terminal_recovery_forks_verified_history_and_preserves_source(
     repository, settings
 ) -> None:
-    owner, project, source, version, checkpoint = (
-        await _terminal_source_with_verified_state(repository)
+    owner, project, source, version, checkpoint = await _terminal_source_with_verified_state(
+        repository
     )
     source_before = await repository.get_run(source.id)
     source_events_before = await repository.list_events(source.id)
@@ -209,6 +205,7 @@ async def test_terminal_recovery_forks_verified_history_and_preserves_source(
             "recoveryAvailable": False,
             "recoveryMode": "verified_checkpoint",
             "sourceCheckpointAvailable": False,
+            "usage": None,
         }
 
         other = await create_user_session(repository)
@@ -243,16 +240,20 @@ async def test_terminal_recovery_forks_verified_history_and_preserves_source(
 async def test_failed_recovery_without_a_new_checkpoint_inherits_verified_source_state(
     repository,
 ) -> None:
-    owner, _project, source, _version, checkpoint = (
-        await _terminal_source_with_verified_state(repository)
+    owner, _project, source, _version, checkpoint = await _terminal_source_with_verified_state(
+        repository
     )
-    _message, first_recovery, created, mode, checkpoint_available = (
-        await repository.create_recovery_message_and_run(
-            source.id,
-            owner.id,
-            "first-recovery",
-            "Continue from the verified counter checkpoint.",
-        )
+    (
+        _message,
+        first_recovery,
+        created,
+        mode,
+        checkpoint_available,
+    ) = await repository.create_recovery_message_and_run(
+        source.id,
+        owner.id,
+        "first-recovery",
+        "Continue from the verified counter checkpoint.",
     )
     assert created and mode == "verified_checkpoint" and checkpoint_available
 
@@ -267,13 +268,17 @@ async def test_failed_recovery_without_a_new_checkpoint_inherits_verified_source
         lease_token=claimed.lease_owner,
     )
 
-    _message, second_recovery, created, mode, checkpoint_available = (
-        await repository.create_recovery_message_and_run(
-            first_recovery.id,
-            owner.id,
-            "second-recovery",
-            "Retry without losing the already verified counter.",
-        )
+    (
+        _message,
+        second_recovery,
+        created,
+        mode,
+        checkpoint_available,
+    ) = await repository.create_recovery_message_and_run(
+        first_recovery.id,
+        owner.id,
+        "second-recovery",
+        "Retry without losing the already verified counter.",
     )
 
     assert created and mode == "verified_checkpoint" and checkpoint_available
@@ -310,21 +315,23 @@ async def test_verified_version_is_used_when_source_has_no_checkpoint(
         ],
         lease_token=claimed.lease_owner,
     )
-    await repository.mark_terminal(
-        seed.id, RunStatus.succeeded, lease_token=claimed.lease_owner
-    )
+    await repository.mark_terminal(seed.id, RunStatus.succeeded, lease_token=claimed.lease_owner)
     _message, source, _created = await repository.create_message_and_run(
         project.id, owner.id, "version-source", "Extend the verified baseline"
     )
     await repository.request_cancel(source.id)
 
-    _message, recovered, created, mode, checkpoint_available = (
-        await repository.create_recovery_message_and_run(
-            source.id,
-            owner.id,
-            "version-recovery",
-            "Retry from the verified baseline",
-        )
+    (
+        _message,
+        recovered,
+        created,
+        mode,
+        checkpoint_available,
+    ) = await repository.create_recovery_message_and_run(
+        source.id,
+        owner.id,
+        "version-recovery",
+        "Retry from the verified baseline",
     )
 
     assert created is True
@@ -340,9 +347,7 @@ async def test_recovery_explicitly_restarts_from_base_and_freezes_selected_runti
     async def discovered(_self) -> set[str]:
         return {"fomo-pi-gpt-5.6"}
 
-    monkeypatch.setattr(
-        "fomo.api.app.LiteLLMRunKeyClient.discover_model_aliases", discovered
-    )
+    monkeypatch.setattr("fomo.api.app.LiteLLMRunKeyClient.discover_model_aliases", discovered)
     owner = await create_user_session(repository)
     project = await repository.create_project(owner.id, "Base restart")
     _message, source, _created = await repository.create_message_and_run(
@@ -351,7 +356,6 @@ async def test_recovery_explicitly_restarts_from_base_and_freezes_selected_runti
     await repository.request_cancel(source.id)
     configured = replace(
         settings,
-        agent_framework="direct_pi",
         agent_enabled_frameworks=("pi", "opencode"),
         litellm_api_key="sk-test-management",
         runtime_enabled_profiles=("gpt-5.6",),
@@ -398,7 +402,5 @@ async def test_recovery_explicitly_restarts_from_base_and_freezes_selected_runti
         assert rejected.status_code == 409
 
     async with repository.database.session_factory() as session:
-        source_record = await session.scalar(
-            select(RunRecord).where(RunRecord.id == source.id)
-        )
+        source_record = await session.scalar(select(RunRecord).where(RunRecord.id == source.id))
         assert source_record is not None and source_record.status == "cancelled"

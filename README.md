@@ -3,8 +3,8 @@
 FOMO is a web coding agent workbench that runs **Pi, OpenCode, or Codex CLI as a
 per-run selectable Coding Agent runtime** inside an OpenSandbox generation
 sandbox, with FOMO as the single persistent control plane for verification,
-versions, and provenance. The current implementation contains the **P0 Pi baseline**
-and the **P1-A GoalGraph vertical slice**. A real OpenSandbox canary has reached
+versions, and provenance. GoalGraph is the single planning and execution model.
+A real OpenSandbox canary has reached
 `succeeded / ready`, and local Chrome/Playwright has verified both the direct
 generated-app endpoint and the host-based Preview gateway through interaction
 plus reload persistence. These are real local-runtime results, not evidence of
@@ -16,16 +16,13 @@ Pi uses its official builtin tools with full project permission over a
 verification sandbox with FOMO-owned direct commands and injected acceptance
 tests.
 
-**Transition state (honest):** GoalGraph, deterministic multi-goal execution,
+**Current execution model:** GoalGraph, deterministic multi-goal execution,
 goal-scoped acceptance, durable verified checkpoints/recovery, and the workbench
-Goal panel are implemented behind `DIRECT_PI_GOAL_GRAPH_ENABLED` (enabled by
-default). A reusable Pi session, automatic compaction, verified checkpoint
+Goal panel are the production execution path. A reusable Pi session, automatic
+compaction, verified checkpoint
 capsules, and bounded repair diagnostics are implemented; a standalone Context
 Inspector, semantic reuse registry, and benchmark-driven routing policy are
-**not implemented**. The legacy native
-four-role SOP still exists as a **non-default writable compatibility path**
-(explicit `AGENT_FRAMEWORK=native`) and is not the production chain
-(`AGENT_FRAMEWORK=direct_pi` is the default).
+**not implemented**.
 
 The release-candidate verification results and known limitations are recorded
 in [SUBMISSION.md](SUBMISSION.md). Gateway unit/integration coverage, a real
@@ -63,7 +60,7 @@ Start the complete stack:
 ```
 
 The script validates Compose configuration, builds the sandbox image before the
-application images, waits for PostgreSQL, Redis, MinIO, LiteLLM, and OpenSandbox,
+application images, waits for PostgreSQL, LiteLLM, and OpenSandbox,
 then runs a bounded Direct Pi runtime preflight before starting API, worker, and
 Web. The preflight creates a short-lived OpenSandbox, executes a silent probe
 inside it against `SANDBOX_LITELLM_BASE_URL`, and proves a bounded streamed
@@ -85,7 +82,6 @@ Local endpoints:
 - API health: `http://localhost:8000/health`
 - Optional Preview gateway health: `http://localhost:8001/_fomo_gateway/healthz`
 - LiteLLM: `http://localhost:4000`
-- MinIO console: `http://localhost:9001`
 
 Use `docker compose --env-file .env.local logs -f api worker web` for runtime
 logs, and `docker compose --env-file .env.local down` to stop the stack without
@@ -115,8 +111,7 @@ A run is executed by `WorkerRunner → DirectPiOrchestrator → fomo-pi-ds`:
   ls`, it may add/move/delete project files and modify package/config/starter
   files, run `pnpm` commands, dev servers, and self-checks. There is **no
   business-file allowlist** and no frozen file plan enforcement; GoalGraph is
-  authoritative when enabled, while the legacy BuildPlan is advisory/read-only
-  compatibility data.
+  the authoritative delivery contract.
 - **Settle audit:** FOMO keeps only real safety invariants — normalized
   in-workspace paths; `.env*` files are rejected outright; `.git/**` (the
   G-internal checkpoint) is excluded; no symlinks/devices or non-regular
@@ -187,19 +182,6 @@ does not impose a cumulative run-token ceiling. The bridge does not proxy or
 rewrite Pi tool semantics. The per-run virtual key is blocked at run end as a
 best-effort step, with the key TTL as the fallback.
 
-## Legacy native SOP path (non-default, writable)
-
-MetaGPT has been retired; `AGENT_FRAMEWORK` accepts only `direct_pi` and
-`native`.
-
-The old four-role chain (Product Manager → Architect → Engineer → Reviewer)
-remains available while historical runs and focused compatibility tests are
-retired. It is **not** the production path and is not read-only: explicitly
-selecting `AGENT_FRAMEWORK=native` makes it a fully writable
-compatibility path. Legacy role aliases (`MODEL_PM`, `MODEL_ARCHITECT`,
-`MODEL_ENGINEER`, `MODEL_REVIEWER`), the Engineer file-size/batch policy, and
-the Reviewer repair scope rules apply only to that legacy path.
-
 ## Optional desktop proxy
 
 Proxying is disabled by default. If an opt-in local proxy listens at
@@ -265,10 +247,8 @@ development is fine; **public untrusted deployment is a release blocker**
 until an authenticated dns+nft/credential-proxy egress path is implemented
 and verified.
 
-FOMO does not silently fall back to a host-process sandbox if OpenSandbox is
-unavailable. `SANDBOX_PROVIDER=process` is an explicit, separately guarded
-trusted-development option only; a failed OpenSandbox run must surface as a
-failed run rather than a false preview success.
+FOMO has no host-process sandbox fallback. If OpenSandbox is unavailable, the
+run fails closed instead of executing generated code on the control-plane host.
 
 ## Controlled public Preview gateway
 
@@ -300,7 +280,7 @@ The Compose service has its own minimal environment instead of inheriting the
 control-plane environment. It receives only the application database URL,
 OpenSandbox lifecycle URL/key, `APP_ENV`, `WEB_ORIGIN`, public Preview route,
 upstream host override, and listen port. In particular, it has no LiteLLM master key, provider/model
-credential, Redis URL, MinIO endpoint, or AWS credential.
+credential, or unrelated worker configuration.
 
 Start the local profile with
 `docker compose --profile public-preview up -d preview-gateway` after building
@@ -348,7 +328,7 @@ The public surface is HTTPS at the Cloudflare edge only. With Tunnel, the
 origin needs no inbound Internet port; otherwise its firewall may expose only
 the TLS ingress. Never expose OpenSandbox `8080`, LiteLLM `4000`, Docker's
 random generated-Preview ports (including `40000-60000`), PostgreSQL `5432`,
-Redis `6379`, or MinIO `9000-9001`. Recreate older Compose containers after
+or other internal service ports. Recreate older Compose containers after
 changing loopback port bindings and verify the live bindings, not just the YAML.
 
 The generated-app gateway supports ordinary HTTP request/response Next.js

@@ -1,8 +1,8 @@
 """Run-scoped LiteLLM virtual-key management for Direct Pi.
 
 Only the control plane may hold the LiteLLM master key. Generation sandbox G
-receives the opaque :class:`RunVirtualKey` secret and can call only the two
-stage-specific Direct Pi aliases;
+receives the opaque :class:`RunVirtualKey` secret and can call only its frozen
+runtime alias;
 provider credentials never cross this module's boundary.
 """
 
@@ -27,12 +27,7 @@ from fomo.runtime_contract import (
 
 from .invocation import IDENTIFIER_PATTERN, MAX_IDENTIFIER_LENGTH, MAX_VIRTUAL_KEY_LENGTH
 
-FOMO_PI_LITELLM_ALIAS = "fomo-pi-flash"
-FOMO_PI_BUILD_LITELLM_ALIAS = "fomo-pi-build"
-FOMO_PI_LITELLM_ALIASES = (
-    FOMO_PI_LITELLM_ALIAS,
-    FOMO_PI_BUILD_LITELLM_ALIAS,
-)
+FOMO_PI_LITELLM_ALIAS = runtime_profile(DEFAULT_PROFILE_ID).litellm_alias
 FOMO_PI_SELECTABLE_LITELLM_ALIASES = selectable_litellm_aliases()
 FOMO_PI_ALLOWED_LITELLM_ALIASES = allowed_litellm_aliases()
 FOMO_PI_DEFAULT_PREFLIGHT_ALIASES = (

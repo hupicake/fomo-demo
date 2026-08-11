@@ -68,7 +68,7 @@ function assistant({
     time: { created: 2, ...(completed ? { completed: 3 } : {}) },
     ...(error ? { error } : {}),
     parentID,
-    modelID: "fomo-pi-build",
+    modelID: "fomo-pi-deepseek-flash",
     providerID: "fomo-litellm",
     mode: "build",
     agent: "build",
@@ -86,7 +86,7 @@ function user(id = "user-1") {
     role: "user",
     time: { created: 1 },
     agent: "build",
-    model: { providerID: "fomo-litellm", modelID: "fomo-pi-build" },
+    model: { providerID: "fomo-litellm", modelID: "fomo-pi-deepseek-flash" },
   };
 }
 
@@ -183,7 +183,7 @@ export function createOpencodeClient() {
     tool: {
       async list(parameters) {
         trace("tool.list", parameters);
-        if (parameters.provider !== "fomo-litellm" || parameters.model !== "fomo-pi-build") {
+        if (parameters.provider !== "fomo-litellm" || parameters.model !== "fomo-pi-deepseek-flash") {
           throw new Error("wrong tool registry model");
         }
         const ids = ["read", "glob", "grep", "list", "bash", "todowrite"];
@@ -397,8 +397,8 @@ function baseEnvironment(paths) {
     FOMO_PI_STATE_DIR: paths.state,
     FOMO_PI_BIN: paths.bin,
     FOMO_PI_THINKING_LEVEL: "high",
-    FOMO_PI_MODEL_REF: "fomo-litellm/fomo-pi-build",
-    FOMO_PI_CONTEXT_WINDOW: "200000",
+    FOMO_PI_MODEL_REF: "fomo-litellm/fomo-pi-deepseek-flash",
+    FOMO_PI_CONTEXT_WINDOW: "1000000",
     FOMO_PI_GRACE_SECONDS: "1",
   };
 }
@@ -437,7 +437,7 @@ test("OpenCode bridge emits compatible public text lifecycle without leaking sec
   const records = envelopes(result.stdout);
   assert.deepEqual(records.map((record) => record.seq), records.map((_, index) => index + 1));
   assert.equal(records[0].type, "started");
-  assert.equal(records[0].payload.model, "fomo-litellm/fomo-pi-build");
+  assert.equal(records[0].payload.model, "fomo-litellm/fomo-pi-deepseek-flash");
   assert.deepEqual(records[0].payload.capabilities, {
     structuredOutput: false,
     repoRead: true,
