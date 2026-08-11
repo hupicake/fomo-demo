@@ -24,7 +24,7 @@ import { TextDecoder } from "node:util";
 
 const SCHEMA_VERSION = 1;
 const PROVIDER_ID = "fomo-litellm";
-const DEFAULT_MODEL_REF = `${PROVIDER_ID}/fomo-pi-flash`;
+const DEFAULT_MODEL_REF = `${PROVIDER_ID}/fomo-pi-deepseek-flash`;
 
 function runtimeModel(
   id,
@@ -67,10 +67,6 @@ const MODEL_CONFIGS = Object.freeze({
       maxContextWindow: 1_000_000,
       maxOutputTokens: 384_000,
     },
-  ),
-  [`${PROVIDER_ID}/fomo-pi-build`]: runtimeModel(
-    "fomo-pi-build", ["off", "medium", "high"],
-    { minimal: null, low: null, medium: "medium", high: "high", xhigh: null, max: null },
   ),
   [`${PROVIDER_ID}/fomo-pi-gpt-5.6`]: runtimeModel(
     "fomo-pi-gpt-5.6", ["off", "low", "medium", "high", "xhigh", "max"],
@@ -118,8 +114,8 @@ const MODEL_CONFIGS = Object.freeze({
     { maxOutputTokens: 65_536 },
   ),
 });
-const DEFAULT_THINKING_LEVEL = "max";
-const DEFAULT_CONTEXT_WINDOW = 200_000;
+const DEFAULT_THINKING_LEVEL = "high";
+const DEFAULT_CONTEXT_WINDOW = 1_000_000;
 const MAX_CONTEXT_WINDOW = 1_000_000;
 const COMPACTION_SETTINGS = Object.freeze({
   enabled: true,

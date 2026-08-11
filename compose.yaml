@@ -4,13 +4,6 @@ x-control-plane-environment: &control-plane-environment
   APP_ENV: ${APP_ENV:-development}
   WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost:3000}
   DATABASE_URL: ${DATABASE_URL_DOCKER:-postgresql+asyncpg://fomo:fomo-local-only@postgres:5432/fomo}
-  REDIS_URL: ${REDIS_URL_DOCKER:-redis://redis:6379/0}
-  S3_ENDPOINT_URL: ${S3_ENDPOINT_URL_DOCKER:-http://minio:9000}
-  S3_REGION: ${S3_REGION:-us-east-1}
-  S3_BUCKET: ${S3_BUCKET:-fomo-artifacts}
-  S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
-  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-fomo}
-  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-fomo-minio-local-only-0123456789}
   LITELLM_BASE_URL: ${LITELLM_BASE_URL_DOCKER:-http://litellm:4000}
   # Pi runs in an OpenSandbox-created container outside the Compose network;
   # it reaches the published LiteLLM port through the Docker host.
@@ -25,14 +18,6 @@ x-control-plane-environment: &control-plane-environment
   FOMO_RUNTIME_DEFAULT_PROFILE: ${FOMO_RUNTIME_DEFAULT_PROFILE:-deepseek-flash}
   FOMO_AGENT_ENABLED_FRAMEWORKS: ${FOMO_AGENT_ENABLED_FRAMEWORKS:-pi,opencode,codex}
   FOMO_AGENT_DEFAULT_FRAMEWORK: ${FOMO_AGENT_DEFAULT_FRAMEWORK:-pi}
-  MODEL_PM: ${MODEL_PM:-pm}
-  MODEL_ARCHITECT: ${MODEL_ARCHITECT:-architect}
-  MODEL_ENGINEER: ${MODEL_ENGINEER:-engineer}
-  MODEL_REVIEWER: ${MODEL_REVIEWER:-reviewer}
-  ENGINEER_TARGET_FILE_CHARACTERS: ${ENGINEER_TARGET_FILE_CHARACTERS:-12000}
-  ENGINEER_MAX_FILE_CHARACTERS: ${ENGINEER_MAX_FILE_CHARACTERS:-20000}
-  AGENT_FRAMEWORK: ${AGENT_FRAMEWORK:-direct_pi}
-  SANDBOX_PROVIDER: ${SANDBOX_PROVIDER:-opensandbox}
   OPENSANDBOX_BASE_URL: ${OPENSANDBOX_BASE_URL_DOCKER:-http://opensandbox:8080}
   OPENSANDBOX_API_KEY: ${OPENSANDBOX_API_KEY:-fomo-opensandbox-local-development-only}
   OPENSANDBOX_IMAGE: ${OPENSANDBOX_IMAGE:-fomo-sandbox-node:2026-08-08}
@@ -41,7 +26,6 @@ x-control-plane-environment: &control-plane-environment
   VERIFIED_PREVIEW_LIFETIME_SECONDS: ${VERIFIED_PREVIEW_LIFETIME_SECONDS:-604800}
   PUBLIC_PREVIEW_BASE_URL: ${PUBLIC_PREVIEW_BASE_URL:-}
   PUBLIC_PREVIEW_BASE_DOMAIN: ${PUBLIC_PREVIEW_BASE_DOMAIN:-}
-  PI_CONTEXT_WINDOW: ${PI_CONTEXT_WINDOW:-200000}
   # Generated-code sandboxes never inherit generic container proxy variables.
   # These are the only explicit, non-secret egress values passed to
   # OpenSandbox's Sandbox.create(env=...).
@@ -53,10 +37,6 @@ x-control-plane-depends-on: &control-plane-depends-on
   postgres:
     condition: service_healthy
   migrate:
-    condition: service_completed_successfully
-  redis:
-    condition: service_healthy
-  minio-init:
     condition: service_completed_successfully
   litellm:
     condition: service_healthy
@@ -100,54 +80,6 @@ services:
         psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE fomo_litellm"
     restart: "no"
 
-  redis:
-    image: redis:7.4-alpine
-    command: ["redis-server", "--appendonly", "yes"]
-    ports:
-      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
-    volumes:
-      - redis-data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-    restart: unless-stopped
-
-  minio:
-    image: minio/minio:RELEASE.2025-09-07T16-13-09Z-cpuv1
-    command: ["server", "/data", "--console-address", ":9001"]
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-fomo}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-fomo-minio-local-only-0123456789}
-    ports:
-      - "127.0.0.1:${MINIO_API_HOST_PORT:-9000}:9000"
-      - "127.0.0.1:${MINIO_CONSOLE_HOST_PORT:-9001}:9001"
-    volumes:
-      - minio-data:/data
-    healthcheck:
-      test: ["CMD-SHELL", "mc alias set health http://127.0.0.1:9000 \"$${MINIO_ROOT_USER}\" \"$${MINIO_ROOT_PASSWORD}\" >/dev/null && mc ready health >/dev/null"]
-      interval: 5s
-      timeout: 5s
-      retries: 20
-    restart: unless-stopped
-
-  minio-init:
-    image: minio/mc:RELEASE.2025-08-13T08-35-41Z-cpuv1
-    depends_on:
-      minio:
-        condition: service_healthy
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-fomo}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-fomo-minio-local-only-0123456789}
-      S3_BUCKET: ${S3_BUCKET:-fomo-artifacts}
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - >-
-        mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}" &&
-        mc mb --ignore-existing "local/$${S3_BUCKET}"
-    restart: "no"
-
   litellm:
     image: ghcr.io/berriai/litellm:v1.95.0
     command: ["--config", "/app/config.yaml", "--port", "4000"]
@@ -155,7 +87,6 @@ services:
       DATABASE_URL: ${LITELLM_DATABASE_URL_DOCKER:-postgresql://fomo:fomo-local-only@postgres:5432/fomo_litellm}
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY must be set}
       LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:-local-litellm-salt-change-before-production-0123456789}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
       OPENAI_API_BASE: ${OPENAI_API_BASE:-https://api.openai.com/v1}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
@@ -167,10 +98,10 @@ services:
       # from Docker containers through host.docker.internal:7890.
       HTTP_PROXY: ${DOCKER_HTTP_PROXY:-}
       HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-}
-      NO_PROXY: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,::1,postgres,redis,minio,minio-init,litellm,opensandbox,api,worker,web,api.deepseek.com}
+      NO_PROXY: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,::1,postgres,litellm,opensandbox,api,worker,web,api.deepseek.com}
       http_proxy: ${DOCKER_HTTP_PROXY:-}
       https_proxy: ${DOCKER_HTTPS_PROXY:-}
-      no_proxy: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,::1,postgres,redis,minio,minio-init,litellm,opensandbox,api,worker,web,api.deepseek.com}
+      no_proxy: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,::1,postgres,litellm,opensandbox,api,worker,web,api.deepseek.com}
     depends_on:
       litellm-db-init:
         condition: service_completed_successfully
@@ -221,7 +152,7 @@ services:
       args:
         HTTP_PROXY: ${DOCKER_HTTP_PROXY:-}
         HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-}
-        NO_PROXY: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,::1,postgres,redis,minio,minio-init,litellm,opensandbox,api,worker,web,api.deepseek.com}
+        NO_PROXY: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,::1,postgres,litellm,opensandbox,api,worker,web,api.deepseek.com}
     image: fomo-sandbox-node:2026-08-08
     entrypoint: ["/bin/true"]
     restart: "no"
@@ -249,7 +180,7 @@ services:
       args:
         HTTP_PROXY: ${DOCKER_HTTP_PROXY:-}
         HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-}
-        NO_PROXY: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,::1,postgres,redis,minio,minio-init,litellm,opensandbox,api,worker,web,api.deepseek.com}
+        NO_PROXY: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,::1,postgres,litellm,opensandbox,api,worker,web,api.deepseek.com}
     image: fomo-control-plane:local
     command: ["fomo-api"]
     environment: *control-plane-environment
@@ -265,7 +196,7 @@ services:
     restart: unless-stopped
 
   # Optional verified-preview proxy. It supports either an isolated wildcard
-  # host or the same-origin /preview path; it never receives model/object-store
+  # host or the same-origin /preview path; it never receives model
   # credentials or forwards account cookies into generated applications.
   preview-gateway:
     profiles: ["public-preview"]
@@ -273,7 +204,7 @@ services:
     command: ["fomo-preview-gateway"]
     # Deliberately do not inherit *control-plane-environment.  The public
     # request path needs persistence plus OpenSandbox endpoint discovery only;
-    # it must never receive model, object-store, or Redis credentials.
+    # it must never receive model credentials.
     environment:
       DATABASE_URL: ${DATABASE_URL_DOCKER:-postgresql+asyncpg://fomo:fomo-local-only@postgres:5432/fomo}
       APP_ENV: ${APP_ENV:-development}
@@ -321,7 +252,7 @@ services:
         PREVIEW_GATEWAY_INTERNAL_URL: ${PREVIEW_GATEWAY_INTERNAL_URL:-http://preview-gateway:8001}
         HTTP_PROXY: ${DOCKER_HTTP_PROXY:-}
         HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-}
-        NO_PROXY: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,::1,postgres,redis,minio,minio-init,litellm,opensandbox,api,worker,web,api.deepseek.com}
+        NO_PROXY: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,::1,postgres,litellm,opensandbox,api,worker,web,api.deepseek.com}
     image: fomo-web:local
     environment:
       NODE_ENV: production
@@ -342,6 +273,4 @@ services:
 
 volumes:
   postgres-data:
-  redis-data:
-  minio-data:
   opensandbox-metadata:

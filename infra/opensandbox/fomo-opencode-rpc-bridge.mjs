@@ -85,9 +85,6 @@ const MODEL_CONFIGS = Object.freeze({
   [`${PROVIDER_ID}/fomo-pi-flash`]: modelConfig(
     "fomo-pi-flash", ["off", "high", "max"], 1_000_000, 384_000,
   ),
-  [`${PROVIDER_ID}/fomo-pi-build`]: modelConfig(
-    "fomo-pi-build", ["off", "medium", "high"], 250_000, 128_000,
-  ),
   [`${PROVIDER_ID}/fomo-pi-gpt-5.6`]: modelConfig(
     "fomo-pi-gpt-5.6", ["off", "low", "medium", "high", "xhigh", "max"], 250_000, 128_000,
   ),
@@ -140,9 +137,9 @@ const DEFAULTS = Object.freeze({
   workspace: "/workspace",
   stateDir: "/var/lib/fomo-opencode",
   openCodeBin: "/opt/fomo/pi/bin/opencode",
-  modelRef: `${PROVIDER_ID}/fomo-pi-build`,
-  thinkingLevel: "high",
-  contextWindow: 200_000,
+  modelRef: `${PROVIDER_ID}/fomo-pi-deepseek-flash`,
+  thinkingLevel: "off",
+  contextWindow: 1_000_000,
   graceSeconds: 10,
 });
 

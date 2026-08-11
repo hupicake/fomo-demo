@@ -16,10 +16,8 @@ from fomo.agent_framework import (
     normalize_agent_framework,
     resolve_run_agent_framework,
 )
-from fomo.agent_runtime import ModelClient, OpenAICompatibleClient, SOPRunner
 from fomo.config import Settings
 from fomo.direct_pi import DirectPiOrchestrator
-from fomo.direct_pi.failures import CODING_AGENT_FAILED
 from fomo.fomo_pi_ds import (
     LiteLLMRunKeyClient,
     OpenSandboxCodexTransport,
@@ -29,8 +27,12 @@ from fomo.fomo_pi_ds import (
 from fomo.persistence import Database, Repository, SandboxCleanupTarget
 from fomo.runtime_contract import runtime_profile
 from fomo.runtime_preflight import DirectPiRuntimePreflight
-from fomo.sandbox import OpenSandboxProvider, SandboxProvider, SandboxRef, create_sandbox_provider
-from fomo.schemas import RunStatus
+from fomo.sandbox import (
+    OpenSandboxProvider,
+    SandboxProvider,
+    SandboxRef,
+    create_opensandbox_provider,
+)
 
 logger = logging.getLogger(__name__)
 _PREFLIGHT_SUCCESS_TTL_SECONDS = 60.0
@@ -85,7 +87,6 @@ class WorkerRunner:
         repository: Repository,
         settings: Settings,
         *,
-        model: ModelClient | None = None,
         sandbox: SandboxProvider | None = None,
         direct_orchestrator: RunOrchestrator | None = None,
         runtime_preflight: Callable[[], Awaitable[None]] | None = None,
@@ -94,108 +95,80 @@ class WorkerRunner:
     ) -> None:
         if settings.worker_lease_seconds <= 0:
             raise ValueError("WORKER_LEASE_SECONDS must be positive")
-        if (
-            settings.agent_framework == "direct_pi"
-            and settings.sandbox_provider == "opensandbox"
-        ):
+        if sandbox is None:
             _validate_opensandbox_pi_provider_url(settings)
         self.repository = repository
         self.settings = settings
-        self.sandbox = sandbox or create_sandbox_provider(settings)
-        self.direct_orchestrator: RunOrchestrator | None = None
-        self.model: ModelClient | None = None
+        self.sandbox = sandbox or create_opensandbox_provider(settings)
         self._runtime_preflight = runtime_preflight
         self._monotonic = monotonic
         self._preflight_ready_until = 0.0
         self._preflight_next_attempt_at = 0.0
         self._preflight_retry_seconds = _PREFLIGHT_RETRY_BASE_SECONDS
-        if settings.agent_framework == "direct_pi":
-            if model is not None:
-                raise ValueError("direct_pi does not accept a legacy model")
-            if direct_orchestrator is None and not settings.opensandbox_api_key:
-                raise ValueError("direct_pi requires OPENSANDBOX_API_KEY")
-            if direct_orchestrator is not None:
-                self.direct_orchestrator = direct_orchestrator
-            else:
-                if not isinstance(self.sandbox, OpenSandboxProvider):
-                    raise ValueError("direct_pi production requires OpenSandbox")
-                if not settings.litellm_api_key:
-                    raise ValueError("direct_pi requires a LiteLLM master key")
-                gateway = LiteLLMRunKeyClient(
-                    management_url=settings.litellm_management_url,
-                    master_key=settings.litellm_api_key,
-                    timeout_seconds=settings.inference_management_timeout_seconds,
-                )
-                enabled_frameworks = tuple(
-                    normalize_agent_framework(framework)
-                    for framework in getattr(
-                        settings, "agent_enabled_frameworks", ("pi",)
-                    )
-                )
-                transports = {}
-                pi_transport = OpenSandboxPiTransport(
+        if direct_orchestrator is not None:
+            self.direct_orchestrator = direct_orchestrator
+        else:
+            if not settings.opensandbox_api_key:
+                raise ValueError("coding-agent worker requires OPENSANDBOX_API_KEY")
+            if not isinstance(self.sandbox, OpenSandboxProvider):
+                raise ValueError("coding-agent production requires OpenSandbox")
+            if not settings.litellm_api_key:
+                raise ValueError("coding-agent worker requires a LiteLLM master key")
+            gateway = LiteLLMRunKeyClient(
+                management_url=settings.litellm_management_url,
+                master_key=settings.litellm_api_key,
+                timeout_seconds=settings.inference_management_timeout_seconds,
+            )
+            enabled_frameworks = tuple(
+                normalize_agent_framework(framework)
+                for framework in settings.agent_enabled_frameworks
+            )
+            transports = {}
+            pi_transport = OpenSandboxPiTransport(
+                self.sandbox,
+                # This is the provider resource lifetime, not a FOMO run
+                # budget. Individual turns have no bridge wall timer.
+                default_timeout_seconds=settings.opensandbox_lifetime_seconds,
+                stderr_limit_bytes=settings.command_output_limit_bytes,
+            )
+            if "pi" in enabled_frameworks:
+                transports["pi"] = pi_transport
+            if "opencode" in enabled_frameworks:
+                transports["opencode"] = OpenSandboxOpenCodeTransport(
                     self.sandbox,
-                    # This is the provider resource lifetime, not a FOMO run
-                    # budget. Individual Pi turns have no bridge wall timer.
                     default_timeout_seconds=settings.opensandbox_lifetime_seconds,
                     stderr_limit_bytes=settings.command_output_limit_bytes,
                 )
-                if "pi" in enabled_frameworks:
-                    transports["pi"] = pi_transport
-                if "opencode" in enabled_frameworks:
-                    transports["opencode"] = OpenSandboxOpenCodeTransport(
-                        self.sandbox,
-                        default_timeout_seconds=settings.opensandbox_lifetime_seconds,
-                        stderr_limit_bytes=settings.command_output_limit_bytes,
-                    )
-                if "codex" in enabled_frameworks:
-                    transports["codex"] = OpenSandboxCodexTransport(
-                        self.sandbox,
-                        default_timeout_seconds=settings.opensandbox_lifetime_seconds,
-                        stderr_limit_bytes=settings.command_output_limit_bytes,
-                    )
-                transport_registry = AgentTransportRegistry(transports)
-                # The startup probe validates the shared run-scoped LiteLLM
-                # route from OpenSandbox. It is framework-neutral and must
-                # remain enabled when both Pi and OpenCode are available, so a
-                # provider outage never consumes a queued user run.
-                if self._runtime_preflight is None:
-                    self._runtime_preflight = DirectPiRuntimePreflight(
-                        gateway=gateway,
-                        sandbox=self.sandbox,
-                        transport=pi_transport,
-                        provider_base_url=settings.pi_provider_base_url,
-                        sandbox_ready_timeout_seconds=settings.opensandbox_ready_timeout_seconds,
-                        sandbox_lifetime_seconds=settings.opensandbox_lifetime_seconds,
-                        management_timeout_seconds=(
-                            settings.inference_management_timeout_seconds
-                        ),
-                        model_aliases=tuple(
-                            runtime_profile(profile_id).litellm_alias
-                            for profile_id in settings.runtime_enabled_profiles
-                        ),
-                    )
-                self.direct_orchestrator = DirectPiOrchestrator(
-                    repository,
+            if "codex" in enabled_frameworks:
+                transports["codex"] = OpenSandboxCodexTransport(
                     self.sandbox,
-                    settings,
-                    gateway,
-                    transport_registry,
+                    default_timeout_seconds=settings.opensandbox_lifetime_seconds,
+                    stderr_limit_bytes=settings.command_output_limit_bytes,
                 )
-        elif settings.agent_framework == "native":
-            if direct_orchestrator is not None:
-                raise ValueError("legacy agent framework cannot receive a Direct Pi orchestrator")
-            self.model = model or OpenAICompatibleClient(
-                settings.litellm_base_url,
-                api_key=settings.litellm_api_key,
-                timeout_seconds=settings.model_request_timeout_seconds,
-                network_retries=settings.model_network_retries,
-                network_retry_base_delay_seconds=settings.model_network_retry_base_delay_seconds,
-                network_retry_max_delay_seconds=settings.model_network_retry_max_delay_seconds,
-                retry_after_max_seconds=settings.model_retry_after_max_seconds,
+            transport_registry = AgentTransportRegistry(transports)
+            # The startup probe validates the shared run-scoped LiteLLM route
+            # before a queued run is claimed.
+            if self._runtime_preflight is None:
+                self._runtime_preflight = DirectPiRuntimePreflight(
+                    gateway=gateway,
+                    sandbox=self.sandbox,
+                    transport=pi_transport,
+                    provider_base_url=settings.pi_provider_base_url,
+                    sandbox_ready_timeout_seconds=settings.opensandbox_ready_timeout_seconds,
+                    sandbox_lifetime_seconds=settings.opensandbox_lifetime_seconds,
+                    management_timeout_seconds=settings.inference_management_timeout_seconds,
+                    model_aliases=tuple(
+                        runtime_profile(profile_id).litellm_alias
+                        for profile_id in settings.runtime_enabled_profiles
+                    ),
+                )
+            self.direct_orchestrator = DirectPiOrchestrator(
+                repository,
+                self.sandbox,
+                settings,
+                gateway,
+                transport_registry,
             )
-        else:
-            raise ValueError("AGENT_FRAMEWORK must be direct_pi or native")
         self.worker_id = worker_id or f"{socket.gethostname()}:{id(self)}"
 
     async def run_once(self) -> bool:
@@ -217,32 +190,10 @@ class WorkerRunner:
             if claimed_framework is not None
             else await resolve_run_agent_framework(self.repository, run.id)
         )
-        if self.direct_orchestrator is not None:
-            orchestrator = self.direct_orchestrator
-            task_name = f"fomo-{framework}-agent:{run.id}"
-        else:
-            if framework != "pi":
-                # Legacy SOP has no OpenCode semantics. Never silently execute
-                # an OpenCode run with the historical native implementation.
-                await self.repository.mark_terminal(
-                    run.id,
-                    RunStatus.failed,
-                    error_code=CODING_AGENT_FAILED.code,
-                    summary=CODING_AGENT_FAILED.summary,
-                    lease_token=lease_token,
-                )
-                return True
-            assert self.model is not None
-            orchestrator = SOPRunner(
-                self.repository,
-                self.model,
-                self.sandbox,
-                self.settings,
-            )
-            task_name = f"fomo-legacy-sop:{run.id}"
+        task_name = f"fomo-{framework}-agent:{run.id}"
         lease_lost = asyncio.Event()
         run_task = asyncio.create_task(
-            orchestrator.run(run.id, lease_token=lease_token),
+            self.direct_orchestrator.run(run.id, lease_token=lease_token),
             name=task_name,
         )
         heartbeat = asyncio.create_task(

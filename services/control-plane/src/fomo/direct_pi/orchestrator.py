@@ -33,8 +33,6 @@ from fomo.schemas import RunPhase, RunStatus
 from fomo.starter import resolve_starter_manifest
 
 from .acceptance import (
-    CompiledAcceptance,
-    compile_acceptance,
     compile_acceptance_suite,
     compile_goal_advisory_acceptance,
 )
@@ -44,7 +42,6 @@ from .architecture_profile import (
     ArchitectureProfile,
     derive_product_architecture_profile,
 )
-from .contracts import PlanningBundle
 from .execution import (
     CommandExecutor,
     DirectPiRunCancelled,
@@ -87,15 +84,10 @@ from .goalgraph import (
 from .prompts import (
     GOAL_GRAPH_PLANNING_POLICY,
     PRODUCT_DESIGN_POLICY,
-    build_prompt,
-    build_repair_prompt,
     goal_build_prompt,
     goal_graph_planning_correction_prompt,
     goal_graph_planning_prompt,
     goal_repair_prompt,
-    planning_correction_prompt,
-    planning_prompt,
-    repair_prompt,
     validate_goal_graph_routing,
 )
 from .session import (
@@ -288,15 +280,7 @@ class DirectPiOrchestrator:
             except RunLeaseLost:
                 pass
             return
-        if self.settings.direct_pi_goal_graph_enabled:
-            await self._run_goal_graph(
-                run_id,
-                transport=transport,
-                agent_framework=framework,
-                lease_token=lease_token,
-            )
-            return
-        await self._run_p0(
+        await self._run_goal_graph(
             run_id,
             transport=transport,
             agent_framework=framework,
@@ -496,8 +480,7 @@ class DirectPiOrchestrator:
                     verifier,
                     snapshot,
                     outcome,
-                    None,
-                    goal_graph=projection,
+                    projection,
                 )
                 keep_verification = True
                 return
@@ -1450,8 +1433,7 @@ class DirectPiOrchestrator:
                                 verifier,
                                 snapshot,
                                 outcome,
-                                None,
-                                goal_graph=projection,
+                                projection,
                             )
                             keep_verification = True
                             return
@@ -1748,508 +1730,6 @@ class DirectPiOrchestrator:
                     await self._discard_goal_workspace(workspaces, generation)
                 if verification is not None and not keep_verification:
                     await self._discard_goal_workspace(workspaces, verification)
-            if virtual_key is not None:
-                try:
-                    await self.gateway.block(virtual_key)
-                except Exception:
-                    logger.warning(
-                        "Direct Pi run key revocation failed; TTL remains active",
-                        extra={"run_id": run_id},
-                    )
-
-    async def _run_p0(
-        self,
-        run_id: str,
-        *,
-        transport: PiTransport,
-        agent_framework: str,
-        lease_token: str | None = None,
-    ) -> None:
-        run = await self.repository.get_run(run_id)
-        runtime_contract = await self.repository.get_run_runtime_contract(run_id)
-        if run.status in {
-            RunStatus.cancelled,
-            RunStatus.succeeded,
-            RunStatus.failed,
-            RunStatus.needs_attention,
-            RunStatus.waiting_for_user,
-        }:
-            return
-        try:
-            active_lease = lease_token or await self.repository.get_active_lease_token(run_id)
-        except RunLeaseLost:
-            return
-
-        continuation = await self.repository.get_run_continuation(run_id)
-        if continuation is not None:
-            await self.repository.append_event(
-                run_id,
-                "run.continuation_unavailable",
-                payload={"requestId": continuation.request_id, "runtime": "p0"},
-                lease_token=active_lease,
-            )
-            await self.repository.mark_terminal(
-                run_id,
-                RunStatus.needs_attention,
-                error_code="p0_continuation_unsupported",
-                summary=(
-                    "This legacy execution mode cannot reconstruct the exact continuation; "
-                    "the answer was not replayed in a replacement session."
-                ),
-                lease_token=active_lease,
-            )
-            return
-
-        started_at = time.monotonic()
-        generation: SandboxRef | None = None
-        verification: SandboxRef | None = None
-        keep_verification = False
-        virtual_key: RunVirtualKey | None = None
-        try:
-            await assert_run_active(self.repository, run_id, active_lease)
-            await self._phase(run_id, RunPhase.preparing, active_lease)
-            requirement = await self.repository.get_run_prompt(run_id)
-            starter = resolve_starter_manifest(("crud", "local-persistence"))
-            run_input_id = await self.repository.store_artifact(
-                run_id,
-                "run_input",
-                {
-                    "title": "User request",
-                    "requirement": requirement,
-                    "starterId": starter.id,
-                    "starterVersion": starter.version,
-                    "starterCapabilities": list(starter.capability_ids),
-                    "agentFramework": agent_framework,
-                    "productDesignPolicy": PRODUCT_DESIGN_POLICY,
-                    "architectureProfilePolicy": (
-                        f"{ARCHITECTURE_PROFILE_ID}@{ARCHITECTURE_PROFILE_VERSION}"
-                    ),
-                    **runtime_contract.cache_fingerprint(),
-                },
-                lease_token=active_lease,
-            )
-            await assert_run_active(self.repository, run_id, active_lease)
-            virtual_key = await self.gateway.issue(
-                run_id=run_id,
-                duration_seconds=self.settings.active_run_inference_token_ttl_seconds,
-                max_budget=await self._remaining_spend_budget(
-                    run_id,
-                    runtime_contract.max_spend_micros,
-                ),
-                rpm_limit=self.settings.run_inference_rpm_limit,
-                tpm_limit=runtime_contract.inference_tpm_limit,
-                model_aliases=(runtime_contract.litellm_alias,),
-            )
-            commands = CommandExecutor(
-                self.repository,
-                self.sandbox,
-                self.settings,
-                run_id=run_id,
-                lease_token=active_lease,
-            )
-            workspaces = WorkspaceManager(
-                self.repository,
-                self.sandbox,
-                self.settings,
-                commands,
-                starter,
-                run_id=run_id,
-                project_id=run.project_id,
-                lease_token=active_lease,
-            )
-            pi_session_id = await self.repository.ensure_pi_session_id(
-                run_id,
-                f"fomo-{run_id}",
-                lease_token=active_lease,
-            )
-            pi = DirectPiSession(
-                self.repository,
-                transport,
-                self.settings,
-                virtual_key,
-                runtime_contract=runtime_contract,
-                agent_framework=agent_framework,
-                run_id=run_id,
-                lease_token=active_lease,
-                started_at=started_at,
-                session_id=pi_session_id,
-            )
-            verifier = Verifier(
-                self.repository,
-                self.sandbox,
-                self.settings,
-                commands,
-                run_id=run_id,
-                lease_token=active_lease,
-                started_at=started_at,
-            )
-
-            await assert_run_active(self.repository, run_id, active_lease)
-            generation = await workspaces.create_generation(run.base_version_id)
-            before_planning = await workspaces.snapshot_hashes(generation)
-            await assert_run_active(self.repository, run_id, active_lease)
-            await self._phase(run_id, RunPhase.planning, active_lease)
-            bundle: PlanningBundle | None = None
-            starter_fingerprint = {
-                "starterId": starter.id,
-                "starterVersion": starter.version,
-                "starterCapabilities": list(starter.capability_ids),
-                "productDesignPolicy": PRODUCT_DESIGN_POLICY,
-                "architectureProfilePolicy": (
-                    f"{ARCHITECTURE_PROFILE_ID}@{ARCHITECTURE_PROFILE_VERSION}"
-                ),
-                **runtime_contract.cache_fingerprint(),
-            }
-            candidates = await self.repository.list_planning_cache_candidates(
-                run.project_id,
-                requirement,
-                run.base_version_id,
-                starter_fingerprint,
-            )
-            for candidate in candidates:
-                try:
-                    candidate_bundle = self._parse_planning_bundle(candidate["text"])
-                except (DirectPiOrchestrationError, KeyError):
-                    continue
-                bundle = candidate_bundle
-                await self.repository.append_event(
-                    run_id,
-                    "planning.cache_hit",
-                    payload={"sourceRunId": candidate["runId"]},
-                    lease_token=active_lease,
-                )
-                break
-
-            if bundle is None:
-                plan_text = await pi.invoke(
-                    generation,
-                    planning_prompt(
-                        requirement=requirement,
-                        starter=starter.as_build_context(),
-                    ),
-                    stage="planning",
-                    structured_output_schema=PlanningBundle.model_json_schema(
-                        by_alias=True
-                    ),
-                    continuation_key="p0.planning",
-                    continuation_context={"baselineHashes": before_planning},
-                )
-                await workspaces.assert_unchanged(generation, before_planning)
-                await assert_run_active(self.repository, run_id, active_lease)
-                while True:
-                    try:
-                        bundle = self._parse_planning_bundle(plan_text)
-                        break
-                    except DirectPiOrchestrationError as exc:
-                        await self.repository.append_event(
-                            run_id,
-                            "pi.retrying",
-                            payload={
-                                "stage": "planning",
-                                "reason": "contract_validation",
-                                "thinkingLevel": runtime_contract.thinking,
-                            },
-                            lease_token=active_lease,
-                        )
-                        plan_text = await pi.invoke(
-                            generation,
-                            planning_correction_prompt(validation_error=str(exc)),
-                            stage="planning",
-                            structured_output_schema=PlanningBundle.model_json_schema(
-                                by_alias=True
-                            ),
-                            continuation_key="p0.planning_correction",
-                            continuation_context={"baselineHashes": before_planning},
-                        )
-                        await workspaces.assert_unchanged(generation, before_planning)
-                        await assert_run_active(
-                            self.repository, run_id, active_lease
-                        )
-            else:
-                await workspaces.assert_unchanged(generation, before_planning)
-                await assert_run_active(self.repository, run_id, active_lease)
-
-            build_plan_content = bundle.build_plan.model_dump(
-                mode="json", by_alias=True
-            )
-            acceptance_content = bundle.acceptance_contract.model_dump(
-                mode="json", by_alias=True
-            )
-            build_plan_id = await self.repository.store_artifact(
-                run_id,
-                "build_plan",
-                build_plan_content,
-                lease_token=active_lease,
-            )
-            acceptance_id = await self.repository.store_artifact(
-                run_id,
-                "acceptance_contract",
-                acceptance_content,
-                lease_token=active_lease,
-            )
-            await self.repository.append_trace_link(
-                run_id,
-                "artifact",
-                run_input_id,
-                "planned_by",
-                "artifact",
-                build_plan_id,
-                lease_token=active_lease,
-            )
-            await self.repository.append_trace_link(
-                run_id,
-                "artifact",
-                build_plan_id,
-                "verified_by",
-                "artifact",
-                acceptance_id,
-                lease_token=active_lease,
-            )
-            await self.repository.upsert_acceptance_items(
-                run.project_id,
-                run_id,
-                [
-                    item.model_dump(mode="json", by_alias=True)
-                    for item in bundle.acceptance_contract.criteria
-                ],
-                lease_token=active_lease,
-            )
-            compiled = compile_acceptance(bundle.acceptance_contract)
-            await self._persist_plan_trace(
-                run_id, bundle, compiled, active_lease
-            )
-
-            await self._phase(run_id, RunPhase.building, active_lease)
-            planning_payload = bundle.model_dump(mode="json", by_alias=True)
-            architecture_profile = derive_product_architecture_profile(
-                requirement=requirement,
-                route_count=max(1, len(bundle.build_plan.routes)),
-                goal_count=1,
-            )
-            await self.repository.append_event(
-                run_id,
-                "build.turn.started",
-                payload={
-                    "stage": "building",
-                    "advisoryPlan": True,
-                    "architectureProfile": architecture_profile.as_prompt_context(),
-                },
-                lease_token=active_lease,
-            )
-            handoff = await pi.invoke(
-                generation,
-                build_prompt(
-                    requirement=requirement,
-                    starter=starter.as_build_context(),
-                    planning_bundle=planning_payload,
-                    architecture_profile=architecture_profile,
-                ),
-                stage="building",
-                continuation_key="p0.building",
-                continuation_context={"baselineHashes": before_planning},
-            )
-            typecheck = await workspaces.typecheck_workspace(generation)
-            repaired = False
-            if typecheck.exit_code != 0 or typecheck.timed_out:
-                repaired = True
-                diagnostic = (typecheck.stdout + "\n" + typecheck.stderr).strip()
-                handoff = await pi.invoke(
-                    generation,
-                    build_repair_prompt(
-                        diagnostic=diagnostic,
-                        architecture_profile=architecture_profile,
-                    ),
-                    stage="repairing",
-                    continuation_key="p0.typecheck_repair",
-                    continuation_context={"baselineHashes": before_planning},
-                )
-                typecheck = await workspaces.typecheck_workspace(generation)
-            if typecheck.exit_code != 0 or typecheck.timed_out:
-                raise DirectPiOrchestrationError(
-                    "candidate did not pass the direct typecheck"
-                )
-            checkpoint = await workspaces.checkpoint_workspace(generation)
-            await assert_run_active(self.repository, run_id, active_lease)
-            await self.repository.store_artifact(
-                run_id,
-                "build_handoff",
-                {
-                    "stage": "building",
-                    "checkpointSha": checkpoint,
-                    "repaired": repaired,
-                    "handoff": handoff[:2_000],
-                },
-                lease_token=active_lease,
-            )
-            await self.repository.append_event(
-                run_id,
-                "build.turn.completed",
-                payload={
-                    "checkpointSha": checkpoint,
-                    "repaired": repaired,
-                },
-                lease_token=active_lease,
-            )
-            audited = await workspaces.audit(
-                generation,
-                baseline=before_planning,
-            )
-            await assert_run_active(self.repository, run_id, active_lease)
-            await self._persist_actual_diff(run_id, audited, bundle, active_lease)
-
-            round_number = 0
-            while True:
-                await self._phase(run_id, RunPhase.verifying, active_lease)
-                await assert_run_active(self.repository, run_id, active_lease)
-                snapshot = await workspaces.create_verification(
-                    audited, compiled, base_version_id=run.base_version_id
-                )
-                verification = snapshot.ref
-                await assert_run_active(self.repository, run_id, active_lease)
-                outcome = await verifier.verify(
-                    verification,
-                    bundle.acceptance_contract,
-                    compiled,
-                    round_number=round_number,
-                    candidate_paths=audited.changed_paths,
-                )
-                await assert_run_active(self.repository, run_id, active_lease)
-                if outcome.passed:
-                    await self._publish(
-                        run_id,
-                        run.project_id,
-                        active_lease,
-                        workspaces,
-                        verifier,
-                        snapshot,
-                        outcome,
-                        bundle,
-                    )
-                    keep_verification = True
-                    return
-                if outcome.has_infrastructure_failure:
-                    await self._discard_workspace(
-                        run_id, verification, active_lease
-                    )
-                    verification = None
-                    await self.repository.set_preview_url(
-                        run_id, None, lease_token=active_lease
-                    )
-                    await self.repository.mark_terminal(
-                        run_id,
-                        RunStatus.needs_attention,
-                        error_code="direct_pi_infrastructure_failed",
-                        summary=(
-                            "Deterministic verification infrastructure failed before "
-                            "a trustworthy source repair could be attempted."
-                        ),
-                        lease_token=active_lease,
-                    )
-                    return
-                await self._retire_verification(
-                    run_id, verification, generation, active_lease
-                )
-                verification = None
-                round_number = await self.repository.increment_repair_round(
-                    run_id,
-                    phase=RunPhase.repairing,
-                    lease_token=active_lease,
-                )
-                await pi.invoke(
-                    generation,
-                    repair_prompt(
-                        planning_bundle=bundle.model_dump(mode="json", by_alias=True),
-                        diagnostic=outcome.as_repair_context(),
-                        round_number=round_number,
-                        architecture_profile=architecture_profile,
-                    ),
-                    stage="repairing",
-                    continuation_key="p0.verification_repair",
-                    continuation_context={"baselineHashes": before_planning},
-                )
-                audited = await workspaces.audit(
-                    generation,
-                    baseline=before_planning,
-                )
-                await assert_run_active(self.repository, run_id, active_lease)
-                await self._persist_actual_diff(
-                    run_id, audited, bundle, active_lease
-                )
-        except DirectPiAwaitingUser:
-            # The exact legacy sandbox/session is retained, but P0 deliberately
-            # refuses to fake a resume after the answer; see the early guard.
-            generation = None
-            verification = None
-            return
-        except DirectPiRunCancelled:
-            with suppress(RunLeaseLost):
-                await self.repository.set_preview_url(
-                    run_id, None, lease_token=active_lease
-                )
-            await self._discard_workspace(run_id, verification, active_lease)
-            await self._discard_workspace(run_id, generation, active_lease)
-            generation = None
-            verification = None
-            with suppress(RunLeaseLost):
-                await self.repository.mark_terminal(
-                    run_id,
-                    RunStatus.cancelled,
-                    summary="Cancelled safely by request.",
-                    lease_token=active_lease,
-                )
-        except RunLeaseLost:
-            await self._destroy(generation)
-            await self._destroy(verification)
-            generation = None
-            verification = None
-            if await self.repository.is_cancel_requested(run_id):
-                with suppress(RunLeaseLost):
-                    await self.repository.set_preview_url(
-                        run_id, None, lease_token=active_lease
-                    )
-                    await self.repository.mark_terminal(
-                        run_id,
-                        RunStatus.cancelled,
-                        summary="Cancelled safely by request.",
-                        lease_token=active_lease,
-                    )
-        except asyncio.CancelledError:
-            await self._destroy(generation)
-            if not keep_verification:
-                await self._destroy(verification)
-            raise
-        except Exception as exc:
-            logger.error("Direct Pi run failed", extra={"run_id": run_id})
-            public_failure = classify_direct_pi_failure(exc)
-            try:
-                await self.repository.set_preview_url(
-                    run_id, None, lease_token=active_lease
-                )
-                await self._discard_workspace(run_id, verification, active_lease)
-                await self._discard_workspace(run_id, generation, active_lease)
-                generation = None
-                verification = None
-                await self.repository.append_event(
-                    run_id,
-                    "pi.failed",
-                    payload=public_failure.event_payload(),
-                    lease_token=active_lease,
-                )
-                await self.repository.mark_terminal(
-                    run_id,
-                    RunStatus.failed,
-                    error_code=public_failure.code,
-                    summary=public_failure.summary,
-                    lease_token=active_lease,
-                )
-            except RunLeaseLost:
-                pass
-            raise
-        finally:
-            if generation is not None:
-                await self._destroy(generation)
-            if verification is not None and not keep_verification:
-                await self._destroy(verification)
             if virtual_key is not None:
                 try:
                     await self.gateway.block(virtual_key)
@@ -2950,9 +2430,7 @@ class DirectPiOrchestrator:
         verifier: Verifier,
         snapshot: VerificationSnapshot,
         outcome: VerificationOutcome,
-        bundle: PlanningBundle | None,
-        *,
-        goal_graph: GoalGraphProjection | None = None,
+        goal_graph: GoalGraphProjection,
     ) -> None:
         verification = snapshot.ref
         await assert_run_active(self.repository, run_id, lease_token)
@@ -2968,41 +2446,40 @@ class DirectPiOrchestrator:
         commit_sha = snapshot.commit_sha
         if not re.fullmatch(r"[0-9a-f]{40}", commit_sha):
             raise DirectPiOrchestrationError("verification commit sha is invalid")
-        if self.settings.sandbox_provider == "opensandbox":
-            renew_preview = getattr(self.sandbox, "renew_preview", None)
-            if not callable(renew_preview):
-                raise DirectPiOrchestrationError(
-                    "OpenSandbox provider cannot retain the verified preview"
-                )
-            try:
-                expires_at = await renew_preview(
-                    verification,
-                    self.settings.verified_preview_lifetime_seconds,
-                )
-            except Exception as exc:
-                # Do not interpolate the provider exception: SDK errors may
-                # include request metadata that does not belong in user-facing
-                # run summaries or events.
-                logger.warning(
-                    "verified preview renewal failed for run=%s sandbox=%s error_type=%s",
-                    run_id,
-                    verification.id,
-                    type(exc).__name__,
-                )
-                raise DirectPiOrchestrationError(
-                    "unable to retain the verified preview"
-                ) from exc
-            await self.repository.append_event(
-                run_id,
-                "preview.retention_extended",
-                payload={
-                    "sandboxId": verification.id,
-                    "expiresAt": expires_at,
-                    "lifetimeSeconds": self.settings.verified_preview_lifetime_seconds,
-                },
-                lease_token=lease_token,
+        renew_preview = getattr(self.sandbox, "renew_preview", None)
+        if not callable(renew_preview):
+            raise DirectPiOrchestrationError(
+                "OpenSandbox provider cannot retain the verified preview"
             )
-            await assert_run_active(self.repository, run_id, lease_token)
+        try:
+            expires_at = await renew_preview(
+                verification,
+                self.settings.verified_preview_lifetime_seconds,
+            )
+        except Exception as exc:
+            # Do not interpolate the provider exception: SDK errors may
+            # include request metadata that does not belong in user-facing
+            # run summaries or events.
+            logger.warning(
+                "verified preview renewal failed for run=%s sandbox=%s error_type=%s",
+                run_id,
+                verification.id,
+                type(exc).__name__,
+            )
+            raise DirectPiOrchestrationError(
+                "unable to retain the verified preview"
+            ) from exc
+        await self.repository.append_event(
+            run_id,
+            "preview.retention_extended",
+            payload={
+                "sandboxId": verification.id,
+                "expiresAt": expires_at,
+                "lifetimeSeconds": self.settings.verified_preview_lifetime_seconds,
+            },
+            lease_token=lease_token,
+        )
+        await assert_run_active(self.repository, run_id, lease_token)
         number = await self.repository.next_version_number(project_id)
         commands = CommandExecutor(
             self.repository,
@@ -3023,22 +2500,12 @@ class DirectPiOrchestrator:
         if tag.exit_code != 0 or tag.timed_out:
             raise DirectPiOrchestrationError("unable to tag the verified version")
         await assert_run_active(self.repository, run_id, lease_token)
-        if bundle is not None:
-            trace_items = tuple(
-                (item.id, None) for item in bundle.acceptance_contract.criteria
-            )
-            product_title = bundle.build_plan.title
-        elif goal_graph is not None:
-            trace_items = tuple(
-                (f"{goal.goal_id}:{item.id}", goal.goal_id)
-                for goal in goal_graph.graph.goals
-                for item in goal.acceptance.criteria
-            )
-            product_title = goal_graph.graph.product_outcome
-        else:
-            raise DirectPiOrchestrationError(
-                "publication requires a P0 bundle or GoalGraph"
-            )
+        trace_items = tuple(
+            (f"{goal.goal_id}:{item.id}", goal.goal_id)
+            for goal in goal_graph.graph.goals
+            for item in goal.acceptance.criteria
+        )
+        product_title = goal_graph.graph.product_outcome
         # This is the sole durable publication/terminal write. The repository
         # atomically rechecks lease + cancellation, creates the version and
         # frozen files, advances project head, emits trace/preview/summary,
@@ -3058,153 +2525,10 @@ class DirectPiOrchestrator:
             lease_token=lease_token,
         )
 
-    async def _persist_plan_trace(
-        self,
-        run_id: str,
-        bundle: PlanningBundle,
-        compiled: CompiledAcceptance,
-        lease_token: str,
-    ) -> None:
-        for item in bundle.acceptance_contract.criteria:
-            await self.repository.append_trace_link(
-                run_id,
-                "acceptance_criterion",
-                item.id,
-                "has_test",
-                "file",
-                compiled.test_path_by_acceptance_id[item.id],
-                metadata={"testName": compiled.test_name_by_acceptance_id[item.id]},
-                lease_token=lease_token,
-            )
-
-    async def _persist_actual_diff(
-        self,
-        run_id: str,
-        audited: AuditedWorkspace,
-        bundle: PlanningBundle,
-        lease_token: str,
-    ) -> None:
-        changed = set(audited.changed_paths)
-        deleted = {
-            change.path for change in audited.model_changes if change.operation == "delete"
-        }
-        for path in audited.changed_paths:
-            await self.repository.append_event(
-                run_id,
-                "file.changed",
-                payload={
-                    "path": path,
-                    "status": "deleted" if path in deleted else "modified",
-                },
-                lease_token=lease_token,
-            )
-        for item in bundle.build_plan.files:
-            if item.path not in changed:
-                continue
-            for acceptance_id in item.acceptance_ids:
-                await self.repository.append_trace_link(
-                    run_id,
-                    "acceptance_criterion",
-                    acceptance_id,
-                    "implemented_in",
-                    "file",
-                    item.path,
-                    lease_token=lease_token,
-                )
-
-    async def _retire_verification(
-        self,
-        run_id: str,
-        verification: SandboxRef,
-        generation: SandboxRef,
-        lease_token: str,
-    ) -> None:
-        await self._destroy(verification)
-        await self.repository.set_preview_url(run_id, None, lease_token=lease_token)
-        await self.repository.set_sandbox_id(
-            run_id, generation.id, lease_token=lease_token
-        )
-        await self.repository.append_event(
-            run_id,
-            "preview.expired",
-            payload={"reason": "repairing"},
-            lease_token=lease_token,
-        )
-
     async def _phase(self, run_id: str, phase: RunPhase, lease_token: str) -> None:
         await self.repository.set_run_phase(
             run_id, phase, lease_token=lease_token
         )
-
-    async def _destroy(self, ref: SandboxRef | None) -> None:
-        if ref is None:
-            return
-        with suppress(Exception):
-            await self.sandbox.kill(ref)
-
-    async def _discard_workspace(
-        self,
-        run_id: str,
-        ref: SandboxRef | None,
-        lease_token: str,
-    ) -> None:
-        if ref is None:
-            return
-        try:
-            await self.sandbox.kill(ref)
-        except Exception:
-            return
-        with suppress(RunLeaseLost):
-            await self.repository.clear_sandbox_id(
-                run_id, ref.id, lease_token=lease_token
-            )
-
-    @staticmethod
-    def _parse_planning_bundle(text: str) -> PlanningBundle:
-        value = text.strip()
-        if value.startswith("```json") and value.endswith("```"):
-            value = value[7:-3].strip()
-        elif value.startswith("```") and value.endswith("```"):
-            value = value[3:-3].strip()
-        try:
-            decoder = json.JSONDecoder()
-            payload, end = decoder.raw_decode(value)
-            remainder = value[end:].strip()
-            if remainder:
-                # DeepSeek occasionally closes ``acceptanceContract`` before
-                # ``tests`` and then balances the intended shape with one
-                # final brace. This exact shape is unambiguous and contains no
-                # ignored content, so normalize it before strict validation.
-                if remainder != "}" or not isinstance(payload, dict):
-                    raise ValueError("planning contract has trailing content")
-                acceptance = payload.get("acceptanceContract")
-                if (
-                    set(payload) != {"buildPlan", "acceptanceContract", "tests"}
-                    or not isinstance(acceptance, dict)
-                    or set(acceptance) != {"criteria"}
-                ):
-                    raise ValueError("planning contract has an unsupported JSON shape")
-                payload = {
-                    "buildPlan": payload["buildPlan"],
-                    "acceptanceContract": {
-                        "criteria": acceptance["criteria"],
-                        "tests": payload["tests"],
-                    },
-                }
-            return PlanningBundle.model_validate(payload)
-        except (json.JSONDecodeError, ValidationError, ValueError, TypeError) as exc:
-            if isinstance(exc, ValidationError):
-                details = "; ".join(
-                    f"{'.'.join(str(part) for part in item['loc'])}: {item['msg']}"
-                    for item in exc.errors()[:5]
-                )
-            elif isinstance(exc, json.JSONDecodeError):
-                details = f"JSON syntax error at character {exc.pos}"
-            else:
-                details = str(exc) or type(exc).__name__
-            raise PlanningContractError(
-                f"Direct Pi returned an invalid planning contract: {details}"
-            ) from exc
 
     @staticmethod
     def _parse_goal_graph_draft(

@@ -171,15 +171,11 @@ _V1_RUN_MAX_TOKENS_BY_PROFILE_ID: dict[str, int] = {
 
 # Existing queued/waiting runs were persisted before a runtime snapshot existed.
 # Their historical route is accepted only as an immutable legacy tuple.
-LEGACY_BUILD_MODEL_REF = "fomo-litellm/fomo-pi-build"
-LEGACY_BUILD_LITELLM_ALIAS = "fomo-pi-build"
 LEGACY_MODEL_THINKING_LEVELS: dict[str, frozenset[str]] = {
     LEGACY_MODEL_REF: frozenset({"off", "high", "max"}),
-    LEGACY_BUILD_MODEL_REF: frozenset({"off", "medium", "high"}),
 }
 LEGACY_MODEL_CONTEXT_LIMITS: dict[str, int] = {
     LEGACY_MODEL_REF: 1_000_000,
-    LEGACY_BUILD_MODEL_REF: 250_000,
 }
 
 
@@ -318,7 +314,6 @@ def allowed_litellm_aliases() -> frozenset[str]:
         {
             *selectable_litellm_aliases(),
             LEGACY_LITELLM_ALIAS,
-            LEGACY_BUILD_LITELLM_ALIAS,
         }
     )
 
@@ -488,8 +483,6 @@ __all__ = [
     "DEFAULT_ENABLED_PROFILE_IDS",
     "DEFAULT_PROFILE_ENV",
     "ENABLED_PROFILES_ENV",
-    "LEGACY_BUILD_LITELLM_ALIAS",
-    "LEGACY_BUILD_MODEL_REF",
     "LEGACY_CONTEXT_WINDOW",
     "LEGACY_INFERENCE_TPM_LIMIT",
     "LEGACY_LITELLM_ALIAS",

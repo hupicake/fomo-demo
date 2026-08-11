@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Generic, Protocol, TypeVar, cast
+from typing import Generic, Protocol, TypeVar
 
 
 class AgentFramework(StrEnum):
@@ -51,25 +51,6 @@ def validated_default_agent_framework(value: str, enabled: Iterable[str]) -> str
     return candidate
 
 
-def public_framework_from_legacy(value: str) -> str:
-    """Map the retired process-wide switch without silently accepting typos."""
-
-    candidate = value.strip().lower()
-    if candidate in {"direct_pi", "native", AgentFramework.pi.value}:
-        return AgentFramework.pi.value
-    if candidate == AgentFramework.opencode.value:
-        return AgentFramework.opencode.value
-    raise ValueError("AGENT_FRAMEWORK must be direct_pi, native, pi, or opencode")
-
-
-def legacy_framework_mode(value: str) -> str:
-    """Keep old config consumers functional while runs become authoritative."""
-
-    candidate = value.strip().lower()
-    public_framework_from_legacy(candidate)
-    return "native" if candidate == "native" else "direct_pi"
-
-
 class RunFrameworkRepository(Protocol):
     async def get_run_agent_framework(self, run_id: str) -> str: ...
 
@@ -86,25 +67,12 @@ def normalize_agent_framework(value: object) -> str:
 
 
 async def resolve_run_agent_framework(
-    repository: object,
+    repository: RunFrameworkRepository,
     run_id: str,
-    *,
-    fallback: str = "pi",
 ) -> str:
-    """Resolve the immutable run choice, with a narrow legacy-fake fallback.
+    """Resolve the immutable run choice from the authoritative repository."""
 
-    Production repositories expose ``get_run_agent_framework``. The fallback
-    exists only so legacy repositories and focused test doubles created before
-    the column was introduced keep selecting Pi deterministically.
-    """
-
-    getter = getattr(repository, "get_run_agent_framework", None)
-    if getter is None:
-        return normalize_agent_framework(fallback)
-    value = await cast(RunFrameworkRepository, repository).get_run_agent_framework(
-        run_id
-    )
-    return normalize_agent_framework(value)
+    return normalize_agent_framework(await repository.get_run_agent_framework(run_id))
 
 
 TransportT = TypeVar("TransportT")

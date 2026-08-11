@@ -11,7 +11,7 @@ from .acceptance import (
     compile_acceptance_suite,
     compile_goal_acceptance,
 )
-from .contracts import AcceptanceContract, BuildPlan, PlanningBundle
+from .contracts import AcceptanceContract
 from .goal_manager import (
     GoalExecutionPlan,
     GoalGraphBlocked,
@@ -71,7 +71,6 @@ __all__ = [
     "ACCEPTANCE_ROOT",
     "AcceptanceCompilationError",
     "AcceptanceContract",
-    "BuildPlan",
     "CompiledAcceptance",
     "DirectPiOrchestrator",
     "Goal",
@@ -85,7 +84,6 @@ __all__ = [
     "GoalStatus",
     "GoalStateConflict",
     "GraphStatus",
-    "PlanningBundle",
     "RegressionSuite",
     "RuntimeValidationMode",
     "RuntimeValidationReason",

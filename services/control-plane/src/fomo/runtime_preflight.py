@@ -15,7 +15,7 @@ from fomo.fomo_pi_ds import (
     RunVirtualKey,
 )
 from fomo.runtime_contract import runtime_profile
-from fomo.sandbox import OpenSandboxProvider, SandboxRef, create_sandbox_provider
+from fomo.sandbox import OpenSandboxProvider, SandboxRef, create_opensandbox_provider
 
 _PREFLIGHT_CREATE_MARGIN_SECONDS = 15
 _PREFLIGHT_COMMAND_TIMEOUT_SECONDS = 195
@@ -187,15 +187,11 @@ class DirectPiRuntimePreflight:
 async def preflight(settings: Settings) -> None:
     """Run the same complete readiness gate used before worker claims."""
 
-    if settings.agent_framework != "direct_pi":
-        return
     if not settings.litellm_api_key:
         raise InferenceGatewayError("LiteLLM runtime preflight requires a master key")
     if not settings.opensandbox_api_key:
         raise RuntimePreflightError("OpenSandbox runtime preflight requires an API key")
-    sandbox = create_sandbox_provider(settings)
-    if not isinstance(sandbox, OpenSandboxProvider):
-        raise RuntimePreflightError("Direct Pi runtime preflight requires OpenSandbox")
+    sandbox = create_opensandbox_provider(settings)
     gateway = LiteLLMRunKeyClient(
         management_url=settings.litellm_management_url,
         master_key=settings.litellm_api_key,
@@ -203,7 +199,7 @@ async def preflight(settings: Settings) -> None:
     )
     transport = OpenSandboxPiTransport(
         sandbox,
-        default_timeout_seconds=settings.run_max_wall_seconds,
+        default_timeout_seconds=settings.opensandbox_lifetime_seconds,
         stderr_limit_bytes=settings.command_output_limit_bytes,
     )
     await DirectPiRuntimePreflight(
@@ -238,9 +234,6 @@ def run() -> None:
             file=sys.stderr,
         )
         raise SystemExit(1) from None
-    if settings.agent_framework == "direct_pi":
-        print(
-            "FOMO runtime preflight passed: OpenSandbox and all enabled sandbox-side model aliases are ready."
-        )
-    else:
-        print("FOMO Direct Pi runtime preflight skipped for the selected legacy framework.")
+    print(
+        "FOMO runtime preflight passed: OpenSandbox and all enabled sandbox-side model aliases are ready."
+    )

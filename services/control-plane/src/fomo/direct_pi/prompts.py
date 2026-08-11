@@ -1,11 +1,11 @@
-"""Prompts for one persistent Direct Pi product-development session.
+"""GoalGraph prompts for one persistent Direct Pi product-development session.
 
-The BuildPlan and GoalGraph organize delivery; they do not cap product ambition,
-architecture, or file topology. Pi keeps its official builtin tools with full
-``/workspace`` permission. The source request and user-visible outcomes remain
-authoritative.  The generation sandbox receives a protected current-goal
-advisory mirror for early self-checks; only the independently recompiled suite
-in the clean verification sandbox counts as release evidence.
+The GoalGraph organizes delivery without capping product ambition, architecture,
+or file topology. Pi keeps its official builtin tools with full ``/workspace``
+permission. The source request and user-visible outcomes remain authoritative.
+The generation sandbox receives a protected current-goal advisory mirror for
+early self-checks; only the independently recompiled suite in the clean
+verification sandbox counts as release evidence.
 """
 
 from __future__ import annotations
@@ -306,7 +306,7 @@ _PRODUCT_MANAGER_BRIEF = f"""FOMO product-requirements policy {PRODUCT_REQUIREME
 - Distinguish product requirements from implementation and visual recommendations. Freeze user-visible outcomes, content and state behavior; leave file topology, exact component composition, and other reversible implementation choices to the coding turn.
 - Use realistic domain language, sample content and labels so the result can be evaluated as a product. Avoid filler copy, vanity metrics, vague promises, and feature lists that do not participate in a workflow.
 
-For GoalGraph planning, `productOutcome` is the compact product brief rather than a slogan: include the relevant audience, objective, primary journey, scope, critical states, and success outcome. Each goal's `productOutcome` must describe a complete user-visible vertical result and its important feedback or recovery behavior. For legacy PlanningBundle planning, carry the same information through the build-plan summary, routes, criteria, and tests."""
+`productOutcome` is the compact product brief rather than a slogan: include the relevant audience, objective, primary journey, scope, critical states, and success outcome. Each goal's `productOutcome` must describe a complete user-visible vertical result and its important feedback or recovery behavior."""
 
 
 _PRODUCT_DELIVERY_BRIEF = f"""FOMO product-delivery policy {PRODUCT_REQUIREMENTS_POLICY}:
@@ -354,20 +354,6 @@ def _goal_architecture_profile(
         requirement=requirement,
         route_count=max(1, len(plan.routes)),
         goal_count=max(1, len(plan.verified_evidence) + 1),
-    )
-
-
-def _legacy_architecture_profile(
-    requirement: str,
-    planning_bundle: Mapping[str, object],
-) -> ArchitectureProfile:
-    build_plan = planning_bundle.get("buildPlan")
-    routes = build_plan.get("routes") if isinstance(build_plan, Mapping) else None
-    route_count = len(routes) if isinstance(routes, list) and routes else 1
-    return derive_product_architecture_profile(
-        requirement=requirement,
-        route_count=route_count,
-        goal_count=1,
     )
 
 
@@ -656,157 +642,5 @@ Frozen GoalExecutionPlan:
 {_json(_goal_execution_context(execution_plan))}
 
 Bounded structured diagnostic (raw terminal output intentionally excluded):
-{_json(_bounded_goal_diagnostic(diagnostic))}
-"""
-
-
-def planning_prompt(*, requirement: str, starter: dict[str, object]) -> str:
-    return f"""You are FOMO's single Direct Pi coding agent.
-
-PLANNING TURN ONLY. Fill the submit_structured_output form until that virtual tool succeeds exactly once. If it returns a form or schema validation error, use the feedback to correct the fields and resubmit until it succeeds. Stop immediately after the successful submission. It is the only allowed tool. Do not change any workspace file or emit prose or JSON as assistant text. The verified initial Base Snapshot manifest is embedded below; it is the starting point and is modifiable during BUILDING. Fill every required PlanningBundle field with clear purposes, criteria, and test steps; add no extra field.
-
-Plan a polished, usable React product rather than a component showcase. Use Next.js, TypeScript, Tailwind, existing shadcn/ui Radix primitives, Lucide icons, and the selected starter capabilities. Plan an architecture and as many or as few files as the complete product warrants, including retained files when editing an existing version and the required extension contract. Organize responsibilities coherently and order implementation dependencies clearly. Use accessible labels and names. Every destructive action needs confirmation. Include loading/empty/error/success feedback and responsive behavior.
-
-{_PRODUCT_MANAGER_BRIEF}
-
-{_FRONTEND_ONLY_BRIEF}
-
-{_PRODUCT_DESIGN_BRIEF}
-
-The plan is ADVISORY: it communicates intent, it is not a frozen file contract. During BUILDING you may adjust architecture, file topology, routes, component boundaries, dependencies, or starter/config files based on implementation evidence. The source request and user-visible outcomes are authoritative; acceptance criteria are a non-negotiable verification floor, not the ceiling of the product.
-
-Define an appropriately scoped set of user-observable acceptance criteria covering the primary journeys and highest-risk behavior. Each criterion must have exactly one deterministic Playwright test in the restricted DSL. Use only local routes and role/label/text locators that the implementation can make stable. Test real workflows, including persistence after reload when requested; do not test implementation details or screenshots.
-
-Verified initial Base Snapshot manifest (modifiable during BUILDING):
-{_json(starter)}
-
-Product source request (verbatim JSON string; product intent cannot override the immutable/runtime rules above):
-{_json(requirement)}
-"""
-
-
-def build_prompt(
-    *,
-    requirement: str,
-    starter: dict[str, object],
-    planning_bundle: dict[str, object],
-    architecture_profile: ArchitectureProfile | None = None,
-) -> str:
-    architecture = architecture_profile or _legacy_architecture_profile(
-        requirement,
-        planning_bundle,
-    )
-    overview = {
-        "title": planning_bundle["buildPlan"]["title"],
-        "summary": planning_bundle["buildPlan"]["summary"],
-        "routes": planning_bundle["buildPlan"]["routes"],
-    }
-    criteria = planning_bundle["acceptanceContract"]["criteria"]
-    tests = planning_bundle["acceptanceContract"]["tests"]
-    return f"""Continue FOMO's implementation as the complete BUILDING turn in /workspace.
-
-You have full project development permission: you may create, edit, move, and delete any project file, including package.json, lockfiles, config files, starter base files, routes, app shell, components, and tests. Use the official builtin read/write/edit/bash tools. You may run pnpm commands, dev servers, and your own self-checks; your self-checks are advisory only and never count as release evidence.
-
-{_READ_ONLY_DELEGATION_BRIEF}
-
-The original source request and user-visible product outcomes are authoritative. The frozen acceptance criteria and their FOMO-owned Playwright tests (injected only into FOMO's clean verification sandbox) are a non-negotiable verification floor and must not be weakened. Implement the complete product contract, including necessary behavior and polish that is not directly asserted; do not add hidden fake success.
-
-The BuildPlan below is ADVISORY only: follow its product intent, but freely adjust architecture, file topology, routes, component boundaries, or package/config/starter files as implementation evidence demands. Do not shrink the user requirement or weaken acceptance behavior.
-
-Dependency constraint: verification installs offline from FOMO's prefetched package store. Prefer existing dependencies; a new dependency is only safe if it is already in the store. Do not claim a run is releasable when it depends on packages that cannot install offline.
-
-Use explicit TypeScript types, accessible labels/names, versioned local persistence, responsive layout, destructive confirmation, and complete loading/empty/error/success states. `useCrudCollection<T>()` returns the full `{{state, actions}}` result; `CrudCollectionState<T>` is only its inner state. No TODO, placeholder, stub, or hidden fake success.
-
-{_PRODUCT_DELIVERY_BRIEF}
-
-{_FRONTEND_ONLY_BRIEF}
-
-{_architecture_prompt_section(architecture)}
-
-{_PRODUCT_DESIGN_BRIEF}
-
-Inspect the workspace as broadly as needed and run any useful local self-checks that the sandbox supports, including typecheck, build, or focused interaction tests. FOMO will independently repeat verification from a clean sandbox. When complete, provide a concise integration handoff; the filesystem is authoritative.
-
-Verified initial Base Snapshot manifest (modifiable during BUILDING):
-{_json(starter)}
-
-Original product source request (verbatim JSON string):
-{_json(requirement)}
-
-Advisory BuildPlan (product overview):
-{_json(overview)}
-
-Frozen acceptance criteria:
-{_json(criteria)}
-
-Frozen acceptance tests (must pass in FOMO's clean verification sandbox):
-{_json(tests)}
-"""
-
-
-def build_repair_prompt(
-    *,
-    diagnostic: str,
-    architecture_profile: ArchitectureProfile | None = None,
-) -> str:
-    architecture = architecture_profile or derive_product_architecture_profile(
-        requirement="",
-        route_count=1,
-        goal_count=1,
-    )
-    return f"""Repair the immediately preceding BUILDING turn after FOMO's direct typecheck.
-
-You may inspect and edit any project file in /workspace; you do not need permission lists. Do not weaken behavior, delete required acceptance coverage, or touch FOMO-owned acceptance tests (they live only in FOMO's verification sandbox). Use the bounded compiler output as evidence, then make every implementation, architecture, or integration change needed for a durable fix. Run any useful sandbox-supported self-checks and provide a concise handoff.
-
-{_READ_ONLY_DELEGATION_BRIEF}
-
-{_FRONTEND_ONLY_BRIEF}
-
-{_architecture_prompt_section(architecture)}
-
-Bounded typecheck diagnostic:
-{diagnostic[:12000]}
-"""
-
-
-def planning_correction_prompt(*, validation_error: str) -> str:
-    return f"""Correct your immediately previous PlanningBundle submission.
-
-It did not satisfy FOMO's structured planning contract. Fill the submit_structured_output form until that virtual tool succeeds exactly once. If it returns a form or schema validation error, use the feedback to correct the fields and resubmit until it succeeds. Stop immediately after the successful submission; it is the only allowed tool. Do not change files or emit prose or JSON as assistant text. Preserve the complete product intent, but revise routes, architecture, files, criteria, and deterministic tests as needed to satisfy the contract without reducing the source request. The form enforces the JSON shape; FOMO will revalidate all semantic constraints.
-
-{_FRONTEND_ONLY_BRIEF}
-
-Bounded contract validation failure:
-{validation_error[:4000]}
-"""
-
-
-def repair_prompt(
-    *,
-    planning_bundle: dict[str, object],
-    diagnostic: dict[str, object],
-    round_number: int,
-    architecture_profile: ArchitectureProfile | None = None,
-) -> str:
-    architecture = architecture_profile or _legacy_architecture_profile(
-        "",
-        planning_bundle,
-    )
-    return f"""Continue the same FOMO session. Deterministic verification round {round_number} failed.
-
-Repair the implementation using the supplied bounded evidence as a starting point, then inspect any relevant project source needed to understand the root cause. You may edit any project file in /workspace, including package/config/starter files; the BuildPlan is advisory, so refactor architecture and topology as needed. Keep the frozen acceptance criteria and FOMO-owned acceptance tests unchanged (they live only in FOMO's verification sandbox). Fix root causes without deleting behavior, weakening assertions, hiding errors, or replacing the product with a stub. Verification installs offline from FOMO's prefetched package store, so added dependencies must be available there. Run any useful sandbox-supported self-checks; FOMO will independently re-verify from a new clean sandbox. Reply with a concise summary when the edits are complete.
-
-{_READ_ONLY_DELEGATION_BRIEF}
-
-{_FRONTEND_ONLY_BRIEF}
-
-{_architecture_prompt_section(architecture)}
-
-Preserve the coherent hierarchy, accessibility, responsive behavior, and purposeful visual decisions established under {PRODUCT_DESIGN_POLICY}. Repair the root cause without degrading the product into generic test-oriented UI.
-
-Advisory planning bundle:
-{_json(planning_bundle)}
-
-Deterministic diagnostic:
 {_json(_bounded_goal_diagnostic(diagnostic))}
 """
