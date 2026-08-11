@@ -1,13 +1,13 @@
-# FOMO Demo — 交付总结
+# FOMO — 交付总结
 
 FOMO 是一个 AI Coding Agent 工作台：用户登录后输入产品需求，可为每次任务选择 Pi、OpenCode 或 Codex CLI 以及兼容模型。控制面在 OpenSandbox 中统一驱动规划、开发和修复，再由独立干净沙箱执行确定性验收，最终保存版本并提供可交互 Preview。
 
 ## 交付入口
 
-- 源码：[github.com/hupicake/fomo-demo](https://github.com/hupicake/fomo-demo)
+- 源码：[github.com/hupicake/fomo](https://github.com/hupicake/fomo)
 - 本地运行与架构说明：[README.md](README.md)
 - 控制面运行手册：[services/control-plane/README.md](services/control-plane/README.md)
-- 公网 Demo：尚未完成 Cloudflare 外网验收，因此不提供未经验证的临时链接
+- 公网访问：尚未完成 Cloudflare 外网验收，因此不提供未经验证的临时链接
 
 ## 1. 实现思路与关键取舍
 
