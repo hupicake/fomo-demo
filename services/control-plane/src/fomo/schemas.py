@@ -639,12 +639,52 @@ class UserInputAnswerCreate(SchemaModel):
         return value
 
 
+class RecoveryRunCreate(SchemaModel):
+    """User-authored follow-up that forks a new run from terminal history."""
+
+    client_message_id: str = Field(min_length=1, max_length=128)
+    content: str = Field(min_length=1, max_length=50_000)
+    attachments: list[dict[str, Any]] = Field(default_factory=list, max_length=0)
+    profile_id: str | None = Field(default=None, min_length=1, max_length=64)
+    thinking: str | None = Field(default=None, min_length=1, max_length=32)
+    agent_framework: AgentFramework | None = None
+
+    @field_validator("content")
+    @classmethod
+    def _non_blank_content(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("content must be non-blank")
+        return value
+
+    @model_validator(mode="after")
+    def _supported_runtime(self) -> RecoveryRunCreate:
+        if self.profile_id is not None:
+            RuntimeSelection(profile_id=self.profile_id, thinking=self.thinking)
+        return self
+
+
+RecoveryMode = Literal["verified_checkpoint", "verified_version", "base_restart"]
+
+
+class ProjectLatestRunResponse(SchemaModel):
+    id: str
+    status: RunStatus
+    error_code: str | None = None
+    agent_framework: AgentFramework
+    profile_id: str
+    thinking: str
+    recovery_available: bool = False
+    recovery_mode: RecoveryMode | None = None
+    source_checkpoint_available: bool = False
+
+
 class ProjectResponse(SchemaModel):
     id: str
     title: str
     status: str
     head_version_id: str | None = None
     active_run_id: str | None = None
+    latest_run: ProjectLatestRunResponse | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -732,6 +772,12 @@ class RunResponse(SchemaModel):
     repair_round: int
     last_seq: int = 0
     base_version_id: str | None = None
+    recovered_from_run_id: str | None = None
+    recovered_from_goal_id: str | None = None
+    recovered_from_checkpoint_id: str | None = None
+    recovery_mode: RecoveryMode | None = None
+    recovery_available: bool = False
+    source_checkpoint_available: bool = False
     cancel_requested_at: datetime | None = None
     error_code: str | None = None
     preview_url: str | None = None
@@ -746,6 +792,11 @@ class RunResponse(SchemaModel):
 class MessageRunResponse(SchemaModel):
     message: MessageResponse
     run: RunResponse
+
+
+class RecoveryRunResponse(MessageRunResponse):
+    recovery_mode: RecoveryMode
+    source_checkpoint_available: bool
 
 
 class UserInputAnswerResponse(SchemaModel):

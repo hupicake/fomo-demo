@@ -30,6 +30,14 @@ from fomo.sandbox.base import SandboxRef
 from fomo.schemas import UserInputRequestDraft
 
 from .execution import DirectPiRunCancelled, PiEventWriter, redact
+from .failures import (
+    AgentCapabilityUnavailable,
+    FailureCategory,
+    FailureOutcome,
+    FailureStage,
+    SafeRunDiagnostic,
+)
+from .settlement import RuntimeCapabilityAttestation, RuntimeTurnReceipt
 
 _STRUCTURED_OUTPUT_TOOL_NAME = "submit_structured_output"
 _USER_INPUT_TOOL_NAME = "request_user_input"
@@ -100,6 +108,13 @@ class DirectPiSession:
         self._writer = PiEventWriter(
             repository, run_id=run_id, lease_token=lease_token
         )
+        self._last_turn_receipt: RuntimeTurnReceipt | None = None
+
+    @property
+    def last_turn_receipt(self) -> RuntimeTurnReceipt:
+        if self._last_turn_receipt is None:
+            raise DirectPiSessionError("the Coding Runtime turn has no settlement receipt")
+        return self._last_turn_receipt
 
     async def invoke(
         self,
@@ -114,6 +129,7 @@ class DirectPiSession:
         resume_request_id: str | None = None,
         require_existing_session: bool = False,
     ) -> str:
+        self._last_turn_receipt = None
         if structured_output_schema is not None and stage != "planning":
             raise DirectPiSessionError(
                 "structured output is only available during planning"
@@ -200,12 +216,25 @@ class DirectPiSession:
         # A completed provider turn has already incurred usage. Settle it by
         # request id before observing cancellation or lease loss; the opaque
         # reservation token makes this safe and idempotent after fencing.
-        await self._record_usage(
+        usage = await self._record_usage(
             request=request,
             result=result,
             stage=stage,
             goal_id=goal_id,
             usage_token=usage_token,
+        )
+        attestation = self._runtime_capability_attestation(
+            result,
+            stage=stage,
+            structured_output=structured_output_schema is not None,
+        )
+        self._last_turn_receipt = RuntimeTurnReceipt(
+            request_id=request.request_id,
+            framework=self.agent_framework,
+            stage=stage,
+            session_id=self.session_id,
+            tool_calls=usage["tool_calls"],
+            attestation=attestation,
         )
         await self._check_active()
         if watcher_failures:
@@ -292,7 +321,7 @@ class DirectPiSession:
         stage: str,
         goal_id: str | None,
         usage_token: str | None,
-    ) -> None:
+    ) -> dict[str, int]:
         usage = self._usage_delta(result)
         settler = getattr(self.repository, "settle_usage_entry", None)
         if usage_token is not None:
@@ -306,12 +335,12 @@ class DirectPiSession:
                 usage_token=usage_token,
                 **usage,
             )
-            return
+            return usage
 
         # Compatibility for repositories/fakes predating two-phase usage.
         recorder = getattr(self.repository, "record_usage_entry", None)
         if not callable(recorder):
-            return
+            return usage
         provider, separator, model = request.model.partition("/")
         if not separator:
             provider, model = "unknown", request.model
@@ -334,6 +363,71 @@ class DirectPiSession:
             },
             goal_id=goal_id,
             lease_token=self.lease_token,
+        )
+        return usage
+
+    def _runtime_capability_attestation(
+        self,
+        result: PiTransportResult,
+        *,
+        stage: str,
+        structured_output: bool,
+    ) -> RuntimeCapabilityAttestation | None:
+        try:
+            attestation = RuntimeCapabilityAttestation.from_started_payload(
+                result.bridge.started
+            )
+        except ValueError:
+            raise AgentCapabilityUnavailable(
+                self._capability_diagnostic(
+                    stage,
+                    reason_code="runtime_capability_attestation_invalid",
+                    frame="The runtime returned a malformed capability attestation.",
+                )
+            ) from None
+        # OpenCode had a real production regression where planning persisted a
+        # deny permission into the resumed build session. Its bridge therefore
+        # has to attest the effective stage permissions on every turn. Pi and
+        # Codex remain compatible until their bridges adopt the same protocol.
+        if self.agent_framework == "opencode" and attestation is None:
+            raise AgentCapabilityUnavailable(
+                self._capability_diagnostic(
+                    stage,
+                    reason_code="runtime_capability_attestation_missing",
+                    frame="OpenCode did not attest the effective session capabilities.",
+                )
+            )
+        if attestation is not None:
+            attestation.assert_stage_ready(
+                framework=self.agent_framework,
+                stage=stage,
+                structured_output=structured_output,
+            )
+        return attestation
+
+    def _capability_diagnostic(
+        self,
+        stage: str,
+        *,
+        reason_code: str,
+        frame: str,
+    ) -> SafeRunDiagnostic:
+        try:
+            failure_stage = FailureStage(stage)
+        except ValueError:
+            failure_stage = FailureStage.INITIALIZING
+        return SafeRunDiagnostic(
+            stage=failure_stage,
+            component=f"{self.agent_framework}_adapter",
+            check="runtime_capability_binding",
+            category=FailureCategory.RUNTIME_FAILED,
+            reason_code=reason_code,
+            outcome=FailureOutcome.PROTOCOL_INVALID,
+            retryable=True,
+            frames=(
+                frame,
+                "The turn was rejected before workspace verification.",
+            ),
         )
 
     async def _reserve_usage(

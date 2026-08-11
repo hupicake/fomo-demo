@@ -168,6 +168,50 @@ def _playwright_failure_report(title: str) -> str:
     )
 
 
+def _playwright_timeout_report(title: str) -> str:
+    import json
+
+    return json.dumps(
+        {
+            "errors": [],
+            "suites": [
+                {
+                    "specs": [
+                        {
+                            "title": title,
+                            "errors": [],
+                            "tests": [
+                                {
+                                    "status": "unexpected",
+                                    "results": [
+                                        {
+                                            "status": "timedOut",
+                                            "error": {
+                                                "message": (
+                                                    "TimeoutError: locator.click: Timeout 5000ms exceeded.\n"
+                                                    "Call log:\n"
+                                                    "  - waiting for getByRole('button', { name: 'Increment' })\n"
+                                                    "TOKEN=timeout-diagnostic-secret"
+                                                ),
+                                                "stack": "raw-timeout-stack-must-not-persist",
+                                                "location": {
+                                                    "file": "/workspace/tests/fomo-acceptance/private.spec.ts",
+                                                    "line": 14,
+                                                    "column": 9,
+                                                },
+                                            },
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ]
+                }
+            ],
+        }
+    )
+
+
 def _playwright_results(*, goal_id: str | None = None) -> dict[str, ExecResult]:
     acceptance_path = "tests/fomo-acceptance/search-books.smoke.spec.ts"
     if goal_id is not None:
@@ -387,6 +431,99 @@ async def test_failed_acceptance_persists_safe_assertion_diagnostic(
         "x" * 1_000,
     ):
         assert forbidden not in serialized
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("result", "expected_outcome", "expected_infrastructure_failure"),
+    [
+        (
+            ExecResult(1, _playwright_timeout_report("searches books"), ""),
+            "failed",
+            False,
+        ),
+        (
+            ExecResult(
+                1,
+                '{"errors":[{"message":"browser startup failed"}],"suites":[]}',
+                "",
+            ),
+            "infrastructure_failed",
+            True,
+        ),
+        (ExecResult(1, "not-json", ""), "infrastructure_failed", True),
+        (
+            ExecResult(
+                -1,
+                _playwright_timeout_report("searches books"),
+                "",
+                timed_out=True,
+            ),
+            "infrastructure_failed",
+            True,
+        ),
+    ],
+    ids=(
+        "locator-timeout-is-repairable",
+        "browser-startup-error-is-infrastructure",
+        "malformed-report-is-infrastructure",
+        "outer-command-timeout-is-infrastructure",
+    ),
+)
+async def test_acceptance_timeout_classification_replays_trusted_runner_results(
+    repository,
+    settings,
+    result: ExecResult,
+    expected_outcome: str,
+    expected_infrastructure_failure: bool,
+) -> None:
+    project, run, lease = await _run_context(
+        repository, f"timeout-classification-{expected_outcome}-{result.timed_out}"
+    )
+    contract = _contract()
+    results = _playwright_results()
+    acceptance_command = _playwright_command(
+        "tests/fomo-acceptance/search-books.smoke.spec.ts"
+    )
+    results[acceptance_command] = result
+    sandbox = FakeSandboxProvider(results)
+    ref = await sandbox.create(project.id)
+
+    outcome = await _verifier(repository, sandbox, settings, run.id, lease).verify(
+        ref,
+        contract,
+        compile_acceptance(contract),
+        round_number=0,
+        candidate_paths=("app/page.tsx",),
+    )
+
+    acceptance_gate = next(
+        gate for gate in outcome.gates if gate.gate == "acceptance_test"
+    )
+    assert acceptance_gate.outcome == expected_outcome
+    assert outcome.has_infrastructure_failure is expected_infrastructure_failure
+
+    artifact = await repository.get_latest_artifact(run.id, "diagnostic_report")
+    assert artifact is not None
+    serialized = __import__("json").dumps(artifact, ensure_ascii=False)
+    for forbidden in (
+        "timeout-diagnostic-secret",
+        "raw-timeout-stack-must-not-persist",
+        "/workspace/tests/fomo-acceptance/private.spec.ts",
+        "browser startup failed",
+    ):
+        assert forbidden not in serialized
+
+    if expected_outcome == "failed":
+        assert acceptance_gate.diagnostic is not None
+        assert acceptance_gate.diagnostic.locator == (
+            "getByRole('button', { name: 'Increment' })"
+        )
+        assert acceptance_gate.diagnostic.line == 14
+        assert acceptance_gate.exit_code == 1
+    else:
+        assert acceptance_gate.diagnostic is None
+        assert acceptance_gate.exit_code is None
 
 
 @pytest.mark.asyncio

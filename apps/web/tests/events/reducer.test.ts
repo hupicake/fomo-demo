@@ -542,6 +542,96 @@ describe("run presentation reducer", () => {
     }));
   });
 
+  it("shows only server-owned bounded causal frames for runtime failures", () => {
+    const initial = createRunPresentation({
+      projectId: "project-library",
+      run: { id: "run-library", projectId: "project-library", status: "running", lastSeq: 0 },
+    });
+
+    const state = reduceDomainEvent(initial, event(1, "pi.failed", {
+      code: "agent_capability_unavailable",
+      diagnostic: {
+        version: 1,
+        stage: "building",
+        component: "opencode_adapter",
+        check: "runtime_capability_binding",
+        category: "runtime_failed",
+        reasonCode: "repository_tools_unavailable",
+        outcome: "unavailable",
+        retryable: true,
+        frames: [
+          "OpenCode build session is missing required capabilities.",
+          "Missing capability: repo.mutate.",
+          "The model turn was not admitted to workspace verification.",
+        ],
+      },
+    }));
+
+    expect(state.worklog.at(-1)).toEqual(expect.objectContaining({
+      title: "Coding Agent 工具不可用",
+      detail: "OpenCode build session is missing required capabilities. → Missing capability: repo.mutate. → The model turn was not admitted to workspace verification.",
+      stage: undefined,
+    }));
+  });
+
+  it("ignores unrecognized diagnostic frames", () => {
+    const initial = createRunPresentation({
+      projectId: "project-library",
+      run: { id: "run-library", projectId: "project-library", status: "running", lastSeq: 0 },
+    });
+
+    const state = reduceDomainEvent(initial, event(1, "pi.failed", {
+      code: "agent_capability_unavailable",
+      diagnostic: {
+        version: 1,
+        stage: "building",
+        category: "runtime_failed",
+        reasonCode: "provider_supplied_reason",
+        frames: ["password=private-value"],
+      },
+    }));
+
+    expect(state.worklog.at(-1)?.detail).toBe(
+      "当前 Coding Agent 未获得完成此阶段所需的仓库或命令工具，本轮没有进入代码验收。",
+    );
+    expect(JSON.stringify(state)).not.toContain("private-value");
+  });
+
+  it("keeps the causal diagnostic when the generic terminal event follows", () => {
+    let state = createRunPresentation({
+      projectId: "project-library",
+      run: { id: "run-library", projectId: "project-library", status: "running", lastSeq: 0 },
+    });
+    state = reduceDomainEvent(state, event(1, "pi.failed", {
+      code: "agent_no_effect",
+      diagnostic: {
+        version: 1,
+        stage: "building",
+        component: "turn_settlement",
+        check: "workspace_delta",
+        category: "runtime_failed",
+        reasonCode: "agent_no_effect",
+        outcome: "blocked",
+        retryable: true,
+        frames: [
+          "The Coding Agent completed without a workspace change.",
+          "The unchanged starter was not sent to verification.",
+        ],
+      },
+    }));
+    state = reduceDomainEvent(state, event(2, "run.failed", {
+      code: "agent_no_effect",
+      status: "failed",
+    }));
+
+    expect(state.problems.at(-1)?.title).toBe(
+      "The Coding Agent completed without a workspace change. → The unchanged starter was not sent to verification.",
+    );
+    expect(state.worklog.at(-1)?.detail).toBe(
+      "The Coding Agent completed without a workspace change. → The unchanged starter was not sent to verification.",
+    );
+  });
+
   it("never renders unknown, malformed, or mismatched pi.failed text", () => {
     let state = createRunPresentation({
       projectId: "project-library",

@@ -3,6 +3,78 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
+from typing import Any
+
+
+class FailureStage(StrEnum):
+    INITIALIZING = "initializing"
+    PLANNING = "planning"
+    BUILDING = "building"
+    REPAIRING = "repairing"
+    VERIFYING = "verifying"
+    PUBLISHING = "publishing"
+
+
+class FailureCategory(StrEnum):
+    RUNTIME_FAILED = "runtime_failed"
+    PRODUCT_FAILED = "product_failed"
+    INFRASTRUCTURE_FAILED = "infrastructure_failed"
+    WORKSPACE_REJECTED = "workspace_rejected"
+
+
+class FailureOutcome(StrEnum):
+    BLOCKED = "blocked"
+    REJECTED = "rejected"
+    NONZERO_EXIT = "nonzero_exit"
+    TIMED_OUT = "timed_out"
+    PROTOCOL_INVALID = "protocol_invalid"
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True, slots=True)
+class SafeRunDiagnostic:
+    """A browser-safe causal chain assembled only from server-owned values."""
+
+    stage: FailureStage
+    component: str
+    check: str
+    category: FailureCategory
+    reason_code: str
+    outcome: FailureOutcome
+    retryable: bool
+    frames: tuple[str, ...]
+    exit_code: int | None = None
+    timed_out: bool | None = None
+    affected_files: tuple[str, ...] = ()
+
+    def event_payload(self) -> dict[str, Any]:
+        if not 1 <= len(self.frames) <= 4:
+            raise ValueError("safe diagnostic requires between one and four frames")
+        if any(not frame or len(frame) > 240 for frame in self.frames):
+            raise ValueError("safe diagnostic frames must be non-empty and bounded")
+        if len(self.affected_files) > 8:
+            raise ValueError("safe diagnostic affected files exceed the public limit")
+        payload: dict[str, Any] = {
+            "version": 1,
+            "stage": self.stage.value,
+            "component": self.component,
+            "check": self.check,
+            "category": self.category.value,
+            "reasonCode": self.reason_code,
+            "outcome": self.outcome.value,
+            "retryable": self.retryable,
+            "frames": list(self.frames),
+        }
+        if self.exit_code is not None:
+            if not -255 <= self.exit_code <= 255:
+                raise ValueError("safe diagnostic exit code is out of range")
+            payload["exitCode"] = self.exit_code
+        if self.timed_out is not None:
+            payload["timedOut"] = self.timed_out
+        if self.affected_files:
+            payload["affectedFiles"] = list(self.affected_files)
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,10 +88,17 @@ class PublicRunFailure:
     def summary(self) -> str:
         return self.message
 
-    def event_payload(self, *, goal_id: str | None = None) -> dict[str, str]:
-        payload = {"code": self.code, "message": self.message}
+    def event_payload(
+        self,
+        *,
+        goal_id: str | None = None,
+        diagnostic: SafeRunDiagnostic | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"code": self.code, "message": self.message}
         if goal_id is not None:
             payload["goalId"] = goal_id
+        if diagnostic is not None:
+            payload["diagnostic"] = diagnostic.event_payload()
         return payload
 
 
@@ -29,6 +108,22 @@ class DirectPiOrchestrationError(RuntimeError):
 
 class PlanningContractError(DirectPiOrchestrationError):
     """The model did not return the server-owned planning contract."""
+
+
+class AgentCapabilityUnavailable(DirectPiOrchestrationError):
+    """The selected runtime did not bind a capability required by this stage."""
+
+    def __init__(self, diagnostic: SafeRunDiagnostic) -> None:
+        super().__init__(diagnostic.reason_code)
+        self.diagnostic = diagnostic
+
+
+class AgentNoEffect(DirectPiOrchestrationError):
+    """A code-changing turn settled without a server-observed candidate delta."""
+
+    def __init__(self, diagnostic: SafeRunDiagnostic) -> None:
+        super().__init__(diagnostic.reason_code)
+        self.diagnostic = diagnostic
 
 
 INFERENCE_GATEWAY_UNAVAILABLE = PublicRunFailure(
@@ -68,6 +163,20 @@ CODING_AGENT_RUNTIME_FAILED = PublicRunFailure(
     message=(
         "Coding Agent 运行环境暂时不可用，请重试；若问题持续发生，"
         "请检查当前选择的 Agent 框架状态。"
+    ),
+)
+AGENT_CAPABILITY_UNAVAILABLE = PublicRunFailure(
+    code="agent_capability_unavailable",
+    message=(
+        "当前 Coding Agent 未获得完成此阶段所需的仓库或命令工具，"
+        "本轮没有进入代码验收。请重试或切换 Agent 框架。"
+    ),
+)
+AGENT_NO_EFFECT = PublicRunFailure(
+    code="agent_no_effect",
+    message=(
+        "Coding Agent 已结束本轮开发，但工作区没有产生可验收的代码变更。"
+        "系统已停止验证未修改的项目，请调整需求或切换 Agent 框架后重试。"
     ),
 )
 PLANNING_CONTRACT_FAILED = PublicRunFailure(
@@ -166,6 +275,8 @@ PUBLIC_FAILURES_BY_CODE = {
         MODEL_RUNTIME_PROTOCOL_FAILED,
         MODEL_RESPONSE_FAILED,
         CODING_AGENT_RUNTIME_FAILED,
+        AGENT_CAPABILITY_UNAVAILABLE,
+        AGENT_NO_EFFECT,
         PLANNING_CONTRACT_FAILED,
         WORKSPACE_CONTRACT_FAILED,
         DIRECT_PI_VERIFICATION_FAILED,
@@ -231,6 +342,7 @@ _BRIDGE_FAILURES_BY_INTERNAL_CODE = {
     "codex_bridge_failed": CODING_AGENT_RUNTIME_FAILED,
     "codex_profile_unsupported": CODING_AGENT_RUNTIME_FAILED,
     "codex_thinking_unsupported": CODING_AGENT_RUNTIME_FAILED,
+    "opencode_capability_unavailable": AGENT_CAPABILITY_UNAVAILABLE,
 }
 
 
@@ -264,6 +376,10 @@ def classify_direct_pi_failure(error: BaseException) -> PublicRunFailure:
             return WORKSPACE_CONTRACT_FAILED
         if isinstance(current, PlanningContractError):
             return PLANNING_CONTRACT_FAILED
+        if isinstance(current, AgentCapabilityUnavailable):
+            return AGENT_CAPABILITY_UNAVAILABLE
+        if isinstance(current, AgentNoEffect):
+            return AGENT_NO_EFFECT
         if isinstance(current, PiBridgeProtocolError):
             return MODEL_RUNTIME_PROTOCOL_FAILED
         if isinstance(current, PiBridgeFailed):
@@ -283,6 +399,56 @@ def classify_direct_pi_failure(error: BaseException) -> PublicRunFailure:
                 return failure
         current = current.__cause__ or current.__context__
     return CODING_AGENT_FAILED
+
+
+def safe_diagnostic_for_error(error: BaseException) -> SafeRunDiagnostic | None:
+    """Extract only a server-authored diagnostic from a bounded cause chain."""
+
+    # Local import avoids a module cycle: workspace imports the shared redactor.
+    from fomo.direct_pi.workspace import WorkspaceContractError
+
+    workspace_frames = {
+        "protected_file_changed": "A FOMO-owned validation file was modified.",
+        "protected_file_missing": "A FOMO-owned validation file is missing.",
+        "rejected_secret_file": "A forbidden environment or secret file was created.",
+        "unsupported_source_type": "A symlink or unsupported source entry was created.",
+        "invalid_source_encoding": "A candidate file is not complete UTF-8 text.",
+    }
+
+    current: BaseException | None = error
+    seen: set[int] = set()
+    for _ in range(8):
+        if current is None or id(current) in seen:
+            break
+        seen.add(id(current))
+        diagnostic = getattr(current, "diagnostic", None)
+        if isinstance(diagnostic, SafeRunDiagnostic):
+            return diagnostic
+        if isinstance(current, WorkspaceContractError):
+            repair = current.repair
+            reason_code = (
+                repair.code.value if repair is not None else "workspace_contract_rejected"
+            )
+            frame = workspace_frames.get(
+                reason_code,
+                "The candidate failed a server-owned workspace integrity check.",
+            )
+            return SafeRunDiagnostic(
+                stage=FailureStage.BUILDING,
+                component="workspace_auditor",
+                check="workspace_contract",
+                category=FailureCategory.WORKSPACE_REJECTED,
+                reason_code=reason_code,
+                outcome=FailureOutcome.REJECTED,
+                retryable=repair is not None,
+                frames=(
+                    frame,
+                    "The candidate was rejected before publication.",
+                ),
+                affected_files=repair.affected_files if repair is not None else (),
+            )
+        current = current.__cause__ or current.__context__
+    return None
 
 
 def public_bridge_failure(code: object) -> PublicRunFailure:

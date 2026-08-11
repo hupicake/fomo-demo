@@ -8,29 +8,158 @@ import test from "node:test";
 const BRIDGE = new URL("./fomo-opencode-rpc-bridge.mjs", import.meta.url);
 
 const FAKE_SDK = String.raw`
+import { appendFileSync } from "node:fs";
+
 let messageQueryCount = 0;
-const assistant = {
-  id: "assistant-1",
-  sessionID: "oc-session-1",
-  role: "assistant",
-  parentID: "user-1",
-  modelID: "fomo-pi-build",
-  providerID: "fomo-litellm",
-  mode: "build",
-  agent: "build",
-  path: { cwd: "/workspace", root: "/workspace" },
-  cost: 0.001,
-  tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
-  finish: "stop",
+let activeSessionID = "";
+let workspaceMessageID = "";
+let workspaceBusy = false;
+let workspaceComplete = false;
+let workspaceError = null;
+const eventQueue = [];
+const eventWaiters = [];
+
+const permissions = {
+  planner: [
+    ["read", "deny"], ["edit", "deny"], ["glob", "deny"], ["grep", "deny"],
+    ["list", "deny"], ["bash", "deny"], ["todowrite", "deny"], ["task", "deny"],
+    ["question", "deny"], ["skill", "deny"], ["webfetch", "deny"], ["websearch", "deny"],
+    ["external_directory", "deny"], ["doom_loop", "deny"],
+  ],
+  workspace: [
+    ["read", "allow"], ["edit", "allow"], ["glob", "allow"], ["grep", "allow"],
+    ["list", "allow"], ["bash", "allow"], ["todowrite", "allow"], ["task", "deny"],
+    ["question", "deny"], ["skill", "deny"], ["webfetch", "deny"], ["websearch", "deny"],
+    ["external_directory", "deny"], ["doom_loop", "deny"],
+  ],
 };
-const user = {
-  id: "user-1",
-  sessionID: "oc-session-1",
-  role: "user",
-  time: { created: 1 },
-  agent: "build",
-  model: { providerID: "fomo-litellm", modelID: "fomo-pi-build" },
-};
+
+function permissionProfile(stage) {
+  return permissions[stage].map(([permission, action]) => ({ permission, pattern: "*", action }));
+}
+
+function stageFromSessionID(sessionID) {
+  if (sessionID === "oc-planner-1") return "planner";
+  if (sessionID === "oc-workspace-1") return "workspace";
+  throw new Error("unknown fake session");
+}
+
+function sessionRecord(sessionID) {
+  const stage = stageFromSessionID(sessionID);
+  return {
+    id: sessionID,
+    metadata: { fomoSessionStage: stage, fomoSessionPolicyVersion: 1 },
+    permission: process.env.FOMO_TEST_INVALID_SESSION_PERMISSION === "1"
+      ? []
+      : permissionProfile(stage),
+  };
+}
+
+function assistant({
+  id = "assistant-1",
+  parentID = "user-1",
+  completed = true,
+  error = undefined,
+} = {}) {
+  return {
+    id,
+    sessionID: activeSessionID,
+    role: "assistant",
+    time: { created: 2, ...(completed ? { completed: 3 } : {}) },
+    ...(error ? { error } : {}),
+    parentID,
+    modelID: "fomo-pi-build",
+    providerID: "fomo-litellm",
+    mode: "build",
+    agent: "build",
+    path: { cwd: "/workspace", root: "/workspace" },
+    cost: 0.001,
+    tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
+    finish: "stop",
+  };
+}
+
+function user(id = "user-1") {
+  return {
+    id,
+    sessionID: activeSessionID,
+    role: "user",
+    time: { created: 1 },
+    agent: "build",
+    model: { providerID: "fomo-litellm", modelID: "fomo-pi-build" },
+  };
+}
+
+function pushEvent(event) {
+  const waiter = eventWaiters.shift();
+  if (waiter) waiter(event);
+  else eventQueue.push(event);
+}
+
+async function nextEvent(signal) {
+  if (eventQueue.length) return eventQueue.shift();
+  return new Promise((resolve) => {
+    const done = (value) => {
+      signal.removeEventListener("abort", aborted);
+      resolve(value);
+    };
+    const aborted = () => done(null);
+    eventWaiters.push(done);
+    signal.addEventListener("abort", aborted, { once: true });
+  });
+}
+
+function workspaceAssistant() {
+  return assistant({
+    id: "assistant-workspace-1",
+    parentID: workspaceMessageID,
+    completed: workspaceComplete,
+    error: workspaceError,
+  });
+}
+
+function workspaceParts() {
+  return [
+    {
+      id: "part-tool-1",
+      sessionID: activeSessionID,
+      messageID: "assistant-workspace-1",
+      type: "tool",
+      callID: "tool-1",
+      tool: "apply_patch",
+      state: {
+        status: "completed",
+        input: { patch: "safe fake patch" },
+        output: "patched",
+        title: "patch",
+        metadata: {},
+        time: { start: 2, end: 3 },
+      },
+    },
+    {
+      id: "part-text-1",
+      sessionID: activeSessionID,
+      messageID: "assistant-workspace-1",
+      type: "text",
+      text: "done",
+      time: { start: 2, end: 3 },
+    },
+    {
+      id: "part-step-1",
+      sessionID: activeSessionID,
+      messageID: "assistant-workspace-1",
+      type: "step-finish",
+      reason: "stop",
+      cost: 0.001,
+      tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
+    },
+  ];
+}
+
+function trace(kind, value = {}) {
+  if (!process.env.FOMO_TEST_TRACE_FILE) return;
+  appendFileSync(process.env.FOMO_TEST_TRACE_FILE, JSON.stringify({ kind, ...value }) + "\n");
+}
 
 export async function createOpencodeServer(options) {
   if (process.env.FOMO_TEST_RUNTIME_FAILURE === "1") {
@@ -51,45 +180,27 @@ export async function createOpencodeServer(options) {
 
 export function createOpencodeClient() {
   return {
+    tool: {
+      async list(parameters) {
+        trace("tool.list", parameters);
+        if (parameters.provider !== "fomo-litellm" || parameters.model !== "fomo-pi-build") {
+          throw new Error("wrong tool registry model");
+        }
+        const ids = ["read", "glob", "grep", "list", "bash", "todowrite"];
+        if (process.env.FOMO_TEST_MISSING_MUTATE_TOOL !== "1") ids.push("apply_patch");
+        return { data: ids.map((id) => ({ id, description: id, parameters: {} })) };
+      },
+    },
     event: {
       async subscribe(_parameters, options) {
         return {
           stream: (async function* () {
             yield { type: "server.connected", properties: {} };
-            if (!process.env.FOMO_PI_STRUCTURED_OUTPUT_SCHEMA_B64) {
-              yield {
-                type: "session.next.step.started",
-                properties: { sessionID: "oc-session-1", assistantMessageID: "assistant-1" },
-              };
-              yield {
-                type: "session.next.text.started",
-                properties: {
-                  sessionID: "oc-session-1", assistantMessageID: "assistant-1", textID: "text-1",
-                },
-              };
-              yield {
-                type: "session.next.text.delta",
-                properties: {
-                  sessionID: "oc-session-1", assistantMessageID: "assistant-1", textID: "text-1", delta: "done",
-                },
-              };
-              yield {
-                type: "session.next.text.ended",
-                properties: {
-                  sessionID: "oc-session-1", assistantMessageID: "assistant-1", textID: "text-1", text: "done",
-                },
-              };
-              yield {
-                type: "session.next.step.ended",
-                properties: {
-                  sessionID: "oc-session-1", assistantMessageID: "assistant-1", finish: "stop",
-                },
-              };
+            while (!options.signal.aborted) {
+              const event = await nextEvent(options.signal);
+              if (!event) break;
+              yield event;
             }
-            await new Promise((resolve) => {
-              if (options.signal.aborted) resolve();
-              else options.signal.addEventListener("abort", resolve, { once: true });
-            });
           })(),
         };
       },
@@ -97,50 +208,160 @@ export function createOpencodeClient() {
     session: {
       async create(parameters) {
         if (parameters.model.providerID !== "fomo-litellm") throw new Error("wrong provider");
-        return { data: { id: "oc-session-1" } };
+        const stage = parameters.metadata?.fomoSessionStage;
+        if (!permissions[stage]) throw new Error("missing stage metadata");
+        if (parameters.metadata.fomoSessionPolicyVersion !== 1) throw new Error("wrong policy version");
+        if (JSON.stringify(parameters.permission) !== JSON.stringify(permissionProfile(stage))) {
+          throw new Error("wrong stage permission profile");
+        }
+        activeSessionID = "oc-" + stage + "-1";
+        trace("session.create", { sessionID: activeSessionID, stage, permission: parameters.permission });
+        return { data: sessionRecord(activeSessionID) };
       },
-      async get() { return { data: { id: "oc-session-1" } }; },
+      async get(parameters) {
+        activeSessionID = parameters.sessionID;
+        trace("session.get", { sessionID: activeSessionID });
+        return { data: sessionRecord(activeSessionID) };
+      },
       async messages() {
         messageQueryCount += 1;
         if (process.env.FOMO_TEST_INITIAL_MESSAGES_FAILURE === "1" && messageQueryCount === 1) {
           return { error: { message: "resume leaked api_key=resume-private-value" } };
         }
-        if (messageQueryCount === 1) return { data: [] };
+        if (messageQueryCount === 1 && process.env.FOMO_TEST_HAS_HISTORY !== "1") return { data: [] };
         if (process.env.FOMO_TEST_FINAL_MESSAGES_FAILURE === "1") {
           return { error: { message: "history leaked api_key=history-private-value" } };
         }
+        if (workspaceMessageID) {
+          return {
+            data: [
+              { info: user(workspaceMessageID), parts: [] },
+              { info: workspaceAssistant(), parts: workspaceComplete && !workspaceError ? workspaceParts() : [] },
+            ],
+          };
+        }
         const info = process.env.FOMO_PI_STRUCTURED_OUTPUT_SCHEMA_B64
-          ? { ...assistant, structured: { answer: "ok" } }
-          : assistant;
-        return { data: [{ info: user, parts: [] }, { info, parts: [{ type: "text", text: "done" }] }] };
+          ? { ...assistant(), structured: { answer: "ok" } }
+          : assistant();
+        return { data: [{ info: user(), parts: [] }, { info, parts: [{ type: "text", text: "done" }] }] };
+      },
+      async status() {
+        return { data: workspaceBusy ? { [activeSessionID]: { type: "busy" } } : {} };
       },
       async prompt(parameters) {
         if (parameters.model.providerID !== "fomo-litellm") throw new Error("wrong prompt provider");
-        if (process.env.FOMO_TEST_MODEL_FAILURE === "1") {
-          return {
-            data: {
-              info: {
-                ...assistant,
-                error: {
-                  name: "APIError",
-                  data: {
-                    message: "provider leaked api_key=model-private-value",
-                    isRetryable: false,
-                  },
-                },
-              },
-              parts: [],
-            },
-          };
-        }
+        if (Object.hasOwn(parameters, "tools")) throw new Error("deprecated prompt tools supplied");
+        if (parameters.sessionID !== activeSessionID) throw new Error("wrong active session");
+        trace("session.prompt", {
+          sessionID: parameters.sessionID,
+          structured: parameters.format?.type === "json_schema",
+          hasTools: Object.hasOwn(parameters, "tools"),
+        });
+        // Real SDK prompt completion follows its streamed tool terminal events.
+        await new Promise((resolve) => setTimeout(resolve, 5));
         if (process.env.FOMO_PI_STRUCTURED_OUTPUT_SCHEMA_B64) {
+          if (stageFromSessionID(parameters.sessionID) !== "planner") throw new Error("wrong planning session");
           if (parameters.format?.type !== "json_schema" || parameters.format.retryCount !== 2) {
             throw new Error("missing structured format");
           }
-          if (Object.values(parameters.tools).some(Boolean)) throw new Error("structured tools enabled");
-          return { data: { info: { ...assistant, structured: { answer: "ok" } }, parts: [] } };
+          return { data: { info: { ...assistant(), structured: { answer: "ok" } }, parts: [] } };
         }
-        return { data: { info: assistant, parts: [{ type: "text", text: "done" }] } };
+        throw new Error("workspace must use promptAsync");
+      },
+      async promptAsync(parameters) {
+        if (stageFromSessionID(parameters.sessionID) !== "workspace") throw new Error("wrong workspace session");
+        if (!parameters.messageID?.startsWith("msg")) throw new Error("missing deterministic message id");
+        if (Object.hasOwn(parameters, "tools")) throw new Error("deprecated prompt tools supplied");
+        workspaceMessageID = parameters.messageID;
+        workspaceBusy = true;
+        workspaceComplete = false;
+        workspaceError = null;
+        trace("session.promptAsync", {
+          sessionID: parameters.sessionID,
+          messageID: parameters.messageID,
+          hasTools: Object.hasOwn(parameters, "tools"),
+        });
+        pushEvent({
+          type: "message.updated",
+          properties: { sessionID: activeSessionID, info: user(workspaceMessageID) },
+        });
+        pushEvent({
+          type: "session.status",
+          properties: { sessionID: activeSessionID, status: { type: "busy" } },
+        });
+        pushEvent({
+          type: "message.updated",
+          properties: { sessionID: activeSessionID, info: workspaceAssistant() },
+        });
+        pushEvent({
+          type: "message.part.updated",
+          properties: {
+            sessionID: activeSessionID,
+            part: {
+              id: "part-step-start-1", sessionID: activeSessionID,
+              messageID: "assistant-workspace-1", type: "step-start",
+            },
+          },
+        });
+        setTimeout(() => {
+          if (process.env.FOMO_TEST_MODEL_FAILURE === "1") {
+            workspaceError = {
+              name: "APIError",
+              data: { message: "provider leaked api_key=model-private-value", isRetryable: false },
+            };
+            workspaceComplete = true;
+            workspaceBusy = false;
+            pushEvent({
+              type: "message.updated",
+              properties: { sessionID: activeSessionID, info: workspaceAssistant() },
+            });
+            pushEvent({
+              type: "session.error",
+              properties: { sessionID: activeSessionID, error: workspaceError },
+            });
+            pushEvent({
+              type: "session.status",
+              properties: { sessionID: activeSessionID, status: { type: "idle" } },
+            });
+            return;
+          }
+          const [tool, text, step] = workspaceParts();
+          pushEvent({
+            type: "message.part.updated",
+            properties: {
+              sessionID: activeSessionID,
+              part: { ...tool, state: { ...tool.state, status: "running", time: { start: 2 } } },
+            },
+          });
+          pushEvent({ type: "message.part.updated", properties: { sessionID: activeSessionID, part: tool } });
+          pushEvent({
+            type: "message.part.updated",
+            properties: {
+              sessionID: activeSessionID,
+              part: { ...text, text: "", time: { start: 2 } },
+            },
+          });
+          pushEvent({
+            type: "message.part.delta",
+            properties: {
+              sessionID: activeSessionID, messageID: text.messageID,
+              partID: text.id, field: "text", delta: "done",
+            },
+          });
+          pushEvent({ type: "message.part.updated", properties: { sessionID: activeSessionID, part: text } });
+          pushEvent({ type: "message.part.updated", properties: { sessionID: activeSessionID, part: step } });
+          workspaceComplete = true;
+          workspaceBusy = false;
+          pushEvent({
+            type: "message.updated",
+            properties: { sessionID: activeSessionID, info: workspaceAssistant() },
+          });
+          pushEvent({
+            type: "session.status",
+            properties: { sessionID: activeSessionID, status: { type: "idle" } },
+          });
+        }, 10);
+        return { data: undefined, response: { status: 204 } };
       },
       async abort() { return { data: true }; },
     },
@@ -208,7 +429,7 @@ function envelopes(stdout) {
 test("OpenCode bridge emits compatible public text lifecycle without leaking secrets", async () => {
   const paths = await fixture();
   const result = await runBridge(baseEnvironment(paths));
-  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.code, 0, `${result.stderr}\n${result.stdout}`);
   assert.equal(result.signal, null);
   assert.doesNotMatch(result.stdout, /private prompt|sk-run-secret/);
   assert.doesNotMatch(result.stderr, /private prompt|sk-run-secret/);
@@ -217,6 +438,14 @@ test("OpenCode bridge emits compatible public text lifecycle without leaking sec
   assert.deepEqual(records.map((record) => record.seq), records.map((_, index) => index + 1));
   assert.equal(records[0].type, "started");
   assert.equal(records[0].payload.model, "fomo-litellm/fomo-pi-build");
+  assert.deepEqual(records[0].payload.capabilities, {
+    structuredOutput: false,
+    repoRead: true,
+    repoMutate: true,
+    commandExec: true,
+    sessionResume: true,
+    sessionCancel: true,
+  });
   assert.ok(records.some((record) =>
     record.type === "pi.event" && record.payload.kind === "message_delta" && record.payload.delta === "done"));
   assert.equal(records.at(-1).type, "completed", JSON.stringify(records.at(-1)));
@@ -225,9 +454,11 @@ test("OpenCode bridge emits compatible public text lifecycle without leaking sec
 
   const mapping = JSON.parse(await readFile(join(paths.state, "session-map", "session-1.json"), "utf8"));
   assert.deepEqual(mapping, {
-    schemaVersion: 1,
+    schemaVersion: 2,
+    policyVersion: 1,
     fomoSessionId: "session-1",
-    openCodeSessionId: "oc-session-1",
+    plannerSessionId: null,
+    workspaceSessionId: "oc-workspace-1",
   });
 });
 
@@ -241,6 +472,14 @@ test("OpenCode bridge exposes SDK JSON Schema result as the existing terminating
   const result = await runBridge(environment);
   assert.equal(result.code, 0, result.stderr);
   const records = envelopes(result.stdout);
+  assert.deepEqual(records[0].payload.capabilities, {
+    structuredOutput: true,
+    repoRead: false,
+    repoMutate: false,
+    commandExec: false,
+    sessionResume: true,
+    sessionCancel: true,
+  });
   const toolStart = records.find((record) =>
     record.type === "pi.event" && record.payload.kind === "tool_start");
   const toolEnd = records.find((record) =>
@@ -272,13 +511,18 @@ test("OpenCode bridge keeps a successful structured result when final telemetry 
   assert.equal(records.at(-1).payload.stats.assistantMessages, 1);
 });
 
-test("OpenCode bridge resumes a mapped session when history telemetry cannot project it", async () => {
+test("OpenCode bridge limits unavailable history fallback to the structured planner session", async () => {
   const paths = await fixture();
-  const first = await runBridge(baseEnvironment(paths));
+  const schema = { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] };
+  const structuredEnvironment = {
+    ...baseEnvironment(paths),
+    FOMO_PI_STRUCTURED_OUTPUT_SCHEMA_B64: Buffer.from(JSON.stringify(schema)).toString("base64"),
+  };
+  const first = await runBridge(structuredEnvironment);
   assert.equal(first.code, 0, first.stderr);
 
   const resumed = await runBridge({
-    ...baseEnvironment(paths),
+    ...structuredEnvironment,
     FOMO_PI_REQUIRE_RESUME: "1",
     FOMO_TEST_INITIAL_MESSAGES_FAILURE: "1",
   });
@@ -291,6 +535,143 @@ test("OpenCode bridge resumes a mapped session when history telemetry cannot pro
   assert.equal(records[0].payload.resumed, true);
   assert.equal(records.at(-1).type, "completed");
 });
+
+test("OpenCode bridge fails closed when workspace repair history is unreadable", async () => {
+  const paths = await fixture();
+  const first = await runBridge(baseEnvironment(paths));
+  assert.equal(first.code, 0, first.stderr);
+
+  const resumed = await runBridge({
+    ...baseEnvironment(paths),
+    FOMO_PI_REQUIRE_RESUME: "1",
+    FOMO_TEST_INITIAL_MESSAGES_FAILURE: "1",
+  });
+
+  assert.equal(resumed.code, 1, resumed.stderr);
+  assert.doesNotMatch(resumed.stdout, /resume-private-value|api_key/);
+  const records = envelopes(resumed.stdout);
+  assert.equal(records.some((record) => record.type === "started"), false);
+  assert.equal(records.at(-1).type, "failed");
+  assert.equal(records.at(-1).payload.code, "opencode_runtime_failed");
+});
+
+test("structured planning cannot poison the isolated workspace session and workspace resume", async () => {
+  const paths = await fixture();
+  const traceFile = join(paths.root, "sdk-trace.jsonl");
+  await writeFile(traceFile, "");
+  const schema = { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] };
+
+  const planning = await runBridge({
+    ...baseEnvironment(paths),
+    FOMO_TEST_TRACE_FILE: traceFile,
+    FOMO_PI_STRUCTURED_OUTPUT_SCHEMA_B64: Buffer.from(JSON.stringify(schema)).toString("base64"),
+  });
+  assert.equal(planning.code, 0, planning.stderr);
+
+  const workspace = await runBridge({
+    ...baseEnvironment(paths),
+    FOMO_TEST_TRACE_FILE: traceFile,
+  });
+  assert.equal(workspace.code, 0, workspace.stderr);
+  const workspaceRecords = envelopes(workspace.stdout);
+  assert.deepEqual(workspaceRecords[0].payload.capabilities, {
+    structuredOutput: false,
+    repoRead: true,
+    repoMutate: true,
+    commandExec: true,
+    sessionResume: true,
+    sessionCancel: true,
+  });
+  assert.equal(workspaceRecords.at(-1).payload.telemetry.toolCounts.apply_patch, 1);
+  assert.equal(typeof workspaceRecords.at(-1).payload.telemetry.firstEditOrWriteToolElapsedMs, "number");
+
+  const resumed = await runBridge({
+    ...baseEnvironment(paths),
+    FOMO_TEST_TRACE_FILE: traceFile,
+    FOMO_TEST_HAS_HISTORY: "1",
+    FOMO_PI_REQUIRE_RESUME: "1",
+  });
+  assert.equal(resumed.code, 0, resumed.stderr);
+  assert.equal(envelopes(resumed.stdout)[0].payload.resumed, true);
+
+  const mapping = JSON.parse(await readFile(join(paths.state, "session-map", "session-1.json"), "utf8"));
+  assert.deepEqual(mapping, {
+    schemaVersion: 2,
+    policyVersion: 1,
+    fomoSessionId: "session-1",
+    plannerSessionId: "oc-planner-1",
+    workspaceSessionId: "oc-workspace-1",
+  });
+
+  const trace = (await readFile(traceFile, "utf8"))
+    .trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  assert.deepEqual(
+    trace.filter((entry) => entry.kind === "session.create").map((entry) => [entry.stage, entry.sessionID]),
+    [["planner", "oc-planner-1"], ["workspace", "oc-workspace-1"]],
+  );
+  assert.deepEqual(
+    trace.filter((entry) => entry.kind === "session.prompt")
+      .map((entry) => [entry.sessionID, entry.structured, entry.hasTools]),
+    [["oc-planner-1", true, false]],
+  );
+  assert.deepEqual(
+    trace.filter((entry) => entry.kind === "session.promptAsync")
+      .map((entry) => [entry.sessionID, entry.hasTools]),
+    [["oc-workspace-1", false], ["oc-workspace-1", false]],
+  );
+});
+
+test("OpenCode bridge fails closed before prompting when required tools are unavailable", async () => {
+  const paths = await fixture();
+  const traceFile = join(paths.root, "sdk-trace.jsonl");
+  await writeFile(traceFile, "");
+  const result = await runBridge({
+    ...baseEnvironment(paths),
+    FOMO_TEST_TRACE_FILE: traceFile,
+    FOMO_TEST_MISSING_MUTATE_TOOL: "1",
+  });
+
+  assert.equal(result.code, 1, result.stderr);
+  const records = envelopes(result.stdout);
+  assert.equal(records.at(-1).type, "failed");
+  assert.equal(records.at(-1).payload.code, "opencode_capability_unavailable");
+  const trace = (await readFile(traceFile, "utf8"))
+    .trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  assert.ok(trace.some((entry) => entry.kind === "tool.list"));
+  assert.ok(!trace.some((entry) => ["session.prompt", "session.promptAsync"].includes(entry.kind)));
+});
+
+test("OpenCode bridge fails closed when stage session permissions are not effective", async () => {
+  const paths = await fixture();
+  const result = await runBridge({
+    ...baseEnvironment(paths),
+    FOMO_TEST_INVALID_SESSION_PERMISSION: "1",
+  });
+
+  assert.equal(result.code, 1, result.stderr);
+  const failure = envelopes(result.stdout).at(-1);
+  assert.equal(failure.type, "failed");
+  assert.equal(failure.payload.code, "opencode_capability_unavailable");
+  assert.equal(failure.payload.phase, "booting");
+});
+
+test("OpenCode bridge rejects legacy shared-session mappings before prompting", async () => {
+  const paths = await fixture();
+  await mkdir(join(paths.state, "session-map"), { recursive: true });
+  await writeFile(join(paths.state, "session-map", "session-1.json"), JSON.stringify({
+    schemaVersion: 1,
+    fomoSessionId: "session-1",
+    openCodeSessionId: "oc-session-legacy",
+  }));
+  const result = await runBridge(baseEnvironment(paths));
+
+  assert.equal(result.code, 1, result.stderr);
+  const failure = envelopes(result.stdout).at(-1);
+  assert.equal(failure.type, "failed");
+  assert.equal(failure.payload.code, "opencode_capability_unavailable");
+  assert.equal(failure.payload.phase, "booting");
+});
+
 test("OpenCode bridge classifies provider responses without exposing their body", async () => {
   const paths = await fixture();
   const result = await runBridge({ ...baseEnvironment(paths), FOMO_TEST_MODEL_FAILURE: "1" });

@@ -1,6 +1,6 @@
 "use client";
 
-import { ArrowRightIcon, BookOpenCheckIcon, BoxesIcon, CircleAlertIcon, LoaderCircleIcon, PlusIcon, SparklesIcon } from "lucide-react";
+import { ArrowRightIcon, BookOpenCheckIcon, BoxesIcon, CircleAlertIcon, LoaderCircleIcon, MessageSquarePlusIcon, PlusIcon, SparklesIcon } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
@@ -9,13 +9,15 @@ import useSWR from "swr";
 import { PromptInput, PromptInputFooter, PromptInputSubmit, PromptInputTextarea, PromptInputTools } from "@/components/ai-elements/prompt-input";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { ButtonGroup } from "@/components/ui/button-group";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Textarea } from "@/components/ui/textarea";
 import { ThemeToggle } from "@/components/theme/theme-toggle";
 import { AccountEntry } from "@/components/workbench/account-entry";
 import { RuntimeSelector } from "@/components/workbench/runtime-selector";
 import { ApiProblem, controlPlane } from "@/lib/api/client";
 import type { AgentFrameworkId, ProjectSummary, RuntimeOptionsResponse } from "@/lib/contracts";
-import { projectStatusLabel } from "@/lib/project-status";
 import { useAuthStore } from "@/lib/store/auth-store";
 
 const examples = [
@@ -45,27 +47,37 @@ const examples = [
   },
 ] as const;
 
-const statusLabels: Record<string, string> = {
-  idle: "空闲",
-  queued: "排队中",
-  running: "运行中",
-  waiting_for_user: "等待回答",
-  needs_attention: "需关注",
-  completed: "已完成",
-  planning: "规划中",
-  building: "构建中",
-  verifying: "验证中",
-  repairing: "修复中",
-  streaming: "生成中",
-  submitted: "已提交",
-  ready: "已完成",
-  error: "出错",
-  cancelled: "已取消",
-  failed: "失败",
-};
+type ProjectListTab = "active" | "attention";
 
-function projectStatusText(status: string): string {
-  return statusLabels[status] || status || "空闲";
+const needsAttentionStatuses = new Set(["failed", "needs_attention", "cancelled"]);
+
+function projectListTab(project: ProjectSummary): ProjectListTab {
+  const status = project.latestRun?.status ?? project.status;
+  return status && needsAttentionStatuses.has(status) ? "attention" : "active";
+}
+
+function runStatusPresentation(project: ProjectSummary): { label: string; variant: "secondary" | "destructive"; className?: string } {
+  const status = project.latestRun?.status ?? project.status;
+  if (status === "completed") {
+    return {
+      label: "Success",
+      variant: "secondary",
+      className: "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
+    };
+  }
+  if (status === "cancelled") return { label: "Interrupted", variant: "destructive" };
+  if (status === "needs_attention") return { label: "Needs attention", variant: "destructive" };
+  if (status === "failed") return { label: "Failed", variant: "destructive" };
+  if (status === "waiting_for_user") return { label: "Waiting", variant: "secondary" };
+  if (status === "queued") return { label: "Queued", variant: "secondary" };
+  if (status === "running") return { label: "Running", variant: "secondary" };
+  return { label: "Ready", variant: "secondary" };
+}
+
+function frameworkLabel(framework: AgentFrameworkId): string {
+  if (framework === "opencode") return "OpenCode";
+  if (framework === "codex") return "Codex";
+  return "Pi";
 }
 
 function projectLabel(prompt: string): string {
@@ -77,15 +89,33 @@ function projectLabel(prompt: string): string {
   return firstLine || "未命名项目";
 }
 
-function ProjectLink({ project }: { project: ProjectSummary }) {
+function ProjectLink({ project, onRecover }: { project: ProjectSummary; onRecover: (project: ProjectSummary) => void }) {
+  const status = runStatusPresentation(project);
+  const runtime = project.latestRun;
   return (
-    <Link className="group flex items-center justify-between rounded-xl border bg-card px-4 py-3 transition-colors hover:border-primary/40 hover:bg-accent/50" href={`/projects/${project.id}`}>
-      <span className="min-w-0">
-        <span className="block truncate text-sm font-medium">{project.name}</span>
-        <span className="mt-1 block text-xs text-muted-foreground">{projectStatusText(projectStatusLabel(project))}</span>
-      </span>
-      <ArrowRightIcon className="size-4 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5 group-hover:text-primary" />
-    </Link>
+    <article className="rounded-xl border bg-card p-3 transition-colors hover:border-primary/40 hover:bg-accent/30">
+      <Link className="group flex min-w-0 items-start justify-between gap-3" href={`/projects/${project.id}`}>
+        <span className="min-w-0">
+          <span className="block truncate text-sm font-medium">{project.name}</span>
+          <span className="mt-2 flex flex-wrap items-center gap-1.5">
+            <Badge className={status.className} variant={status.variant}>{status.label}</Badge>
+            {runtime ? <span className="text-xs text-muted-foreground">{frameworkLabel(runtime.agentFramework)} · {runtime.profileId} · {runtime.thinking}</span> : null}
+          </span>
+          {runtime?.errorCode ? (
+            <span className="mt-2 block truncate text-xs text-destructive">
+              {runtime.errorCode.replaceAll("_", " ")}
+            </span>
+          ) : null}
+        </span>
+        <ArrowRightIcon className="mt-1 size-4 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5 group-hover:text-primary" />
+      </Link>
+      {runtime?.recoveryAvailable ? (
+        <Button className="mt-3 w-full justify-start" onClick={() => onRecover(project)} size="sm" variant="outline">
+          <MessageSquarePlusIcon aria-hidden="true" />
+          Continue with a message
+        </Button>
+      ) : null}
+    </article>
   );
 }
 
@@ -116,6 +146,14 @@ export function HomeScreen() {
   );
   const [creating, setCreating] = useState(false);
   const [submitError, setSubmitError] = useState<string>();
+  const [projectTab, setProjectTab] = useState<ProjectListTab>("active");
+  const [recoveryProject, setRecoveryProject] = useState<ProjectSummary>();
+  const [recoveryContent, setRecoveryContent] = useState("");
+  const [recovering, setRecovering] = useState(false);
+  const [recoveryError, setRecoveryError] = useState<string>();
+  const [recoveryAgentFramework, setRecoveryAgentFramework] = useState<AgentFrameworkId>();
+  const [recoveryProfileId, setRecoveryProfileId] = useState<string>();
+  const [recoveryThinking, setRecoveryThinking] = useState<string>();
   const checkingAuth = authStatus === "unknown" || authLoading;
 
   const { data: runtimeOptions, error: runtimeError } = useSWR<RuntimeOptionsResponse>(
@@ -168,6 +206,10 @@ export function HomeScreen() {
     : compatibleThinkingLevels.includes(activeProfile?.defaultThinking ?? "")
       ? activeProfile?.defaultThinking
       : compatibleThinkingLevels[0];
+
+  const visibleProjects = projects?.filter((project) => projectListTab(project) === projectTab) ?? [];
+  const activeProjectCount = projects?.filter((project) => projectListTab(project) === "active").length ?? 0;
+  const attentionProjectCount = projects?.filter((project) => projectListTab(project) === "attention").length ?? 0;
 
   useEffect(() => {
     if (!runtimeOptions || selectedAgentFramework) return;
@@ -246,6 +288,75 @@ export function HomeScreen() {
     },
     [activeAgentFramework, activeProfileId, activeThinking, hasAvailableFramework, hasAvailableModel, invalidateSession, mutate, router, userId],
   );
+
+  const openRecovery = useCallback((project: ProjectSummary) => {
+    const source = project.latestRun;
+    const framework = runtimeOptions?.agentFrameworks.find(
+      (candidate) => candidate.id === source?.agentFramework && candidate.available,
+    ) ?? runtimeOptions?.agentFrameworks.find(
+      (candidate) => candidate.id === runtimeOptions.defaultAgentFramework && candidate.available,
+    ) ?? runtimeOptions?.agentFrameworks.find((candidate) => candidate.available);
+    const compatibleProfiles = availableProfiles.filter(
+      (profile) => !framework
+        || framework.compatibleProfileIds.length === 0
+        || framework.compatibleProfileIds.includes(profile.profileId),
+    );
+    const profile = compatibleProfiles.find((candidate) => candidate.profileId === source?.profileId)
+      ?? compatibleProfiles.find((candidate) => candidate.profileId === runtimeOptions?.defaultProfileId)
+      ?? compatibleProfiles[0];
+    const thinkingLevels = profile?.thinkingLevels.filter(
+      (level) => framework?.compatibleThinkingLevels == null
+        || framework.compatibleThinkingLevels.includes(level),
+    ) ?? [];
+    const thinking = thinkingLevels.includes(source?.thinking ?? "")
+      ? source?.thinking
+      : thinkingLevels.includes(profile?.defaultThinking ?? "")
+        ? profile?.defaultThinking
+        : thinkingLevels[0];
+    setRecoveryProject(project);
+    setRecoveryContent("");
+    setRecoveryError(undefined);
+    setRecoveryAgentFramework(framework?.id);
+    setRecoveryProfileId(profile?.profileId);
+    setRecoveryThinking(thinking);
+  }, [availableProfiles, runtimeOptions]);
+
+  const recoverProject = useCallback(async () => {
+    const content = recoveryContent.trim();
+    const source = recoveryProject?.latestRun;
+    if (!recoveryProject || !source) return;
+    if (!content) {
+      setRecoveryError("请说明希望 Agent 继续修复或完成什么。");
+      return;
+    }
+    if (!recoveryAgentFramework || !recoveryProfileId || !recoveryThinking) {
+      setRecoveryError("当前没有兼容的 Coding Agent 与模型组合。");
+      return;
+    }
+    setRecovering(true);
+    setRecoveryError(undefined);
+    try {
+      const recovered = await controlPlane.recoverRun(source.id, {
+        clientMessageId: globalThis.crypto?.randomUUID?.() || `recover-${Date.now()}`,
+        content,
+        agentFramework: recoveryAgentFramework,
+        profileId: recoveryProfileId,
+        thinking: recoveryThinking,
+      });
+      await mutate();
+      setRecoveryProject(undefined);
+      router.push(`/projects/${recoveryProject.id}?run=${encodeURIComponent(recovered.runId)}`);
+    } catch (recoverError) {
+      if (recoverError instanceof ApiProblem && recoverError.status === 401) {
+        invalidateSession();
+        router.push("/login?mode=signin&redirect=%2F");
+        return;
+      }
+      setRecoveryError(recoverError instanceof Error ? recoverError.message : "无法创建恢复任务。");
+    } finally {
+      setRecovering(false);
+    }
+  }, [invalidateSession, mutate, recoveryAgentFramework, recoveryContent, recoveryProfileId, recoveryProject, recoveryThinking, router]);
 
   if (checkingAuth || !userId) {
     return (
@@ -360,18 +471,47 @@ export function HomeScreen() {
       </section>
 
       <section className="mx-auto max-w-6xl border-t pt-8">
-        <div className="mb-4 flex items-center justify-between">
-          <h2 className="text-sm font-medium">最近的项目</h2>
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 className="text-sm font-medium">最近的项目</h2>
+            <p className="mt-1 text-xs text-muted-foreground">失败任务会保留原记录，并从可信断点创建新的恢复任务。</p>
+          </div>
           {projectsLoading ? <span className="text-xs text-muted-foreground">正在加载项目……</span> : null}
         </div>
+        {projects && projects.length > 0 ? (
+          <ButtonGroup aria-label="项目状态分组" className="mb-4" role="tablist">
+            <Button
+              aria-selected={projectTab === "active"}
+              onClick={() => setProjectTab("active")}
+              role="tab"
+              size="sm"
+              variant={projectTab === "active" ? "secondary" : "outline"}
+            >
+              Active &amp; Success <Badge variant="outline">{activeProjectCount}</Badge>
+            </Button>
+            <Button
+              aria-selected={projectTab === "attention"}
+              onClick={() => setProjectTab("attention")}
+              role="tab"
+              size="sm"
+              variant={projectTab === "attention" ? "secondary" : "outline"}
+            >
+              Needs Attention <Badge variant="outline">{attentionProjectCount}</Badge>
+            </Button>
+          </ButtonGroup>
+        ) : null}
         {error ? (
           <div className="rounded-xl border border-amber-500/25 bg-amber-500/5 p-4 text-sm text-amber-800 dark:text-amber-200">
             <p className="font-medium">FastAPI 控制面不可用。</p>
             <p className="mt-1 text-amber-800/80 dark:text-amber-200/80">请启动本地服务后重试。</p>
             <Button className="mt-3" onClick={() => mutate()} size="sm" variant="outline">重新连接</Button>
           </div>
+        ) : projects && projects.length > 0 && visibleProjects.length > 0 ? (
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">{visibleProjects.map((project) => <ProjectLink key={project.id} onRecover={openRecovery} project={project} />)}</div>
         ) : projects && projects.length > 0 ? (
-          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">{projects.map((project) => <ProjectLink key={project.id} project={project} />)}</div>
+          <div className="rounded-xl border border-dashed p-8 text-center text-sm text-muted-foreground">
+            这个分组暂时没有项目。
+          </div>
         ) : projectsLoading ? (
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
             {Array.from({ length: 3 }).map((_, index) => <ProjectSkeleton key={index} />)}
@@ -380,6 +520,59 @@ export function HomeScreen() {
           <div className="rounded-xl border border-dashed p-8 text-center text-sm text-muted-foreground">还没有项目。在上方描述一个产品需求开始吧。</div>
         )}
       </section>
+
+      <Dialog open={Boolean(recoveryProject)} onOpenChange={(open) => {
+        if (!open && !recovering) setRecoveryProject(undefined);
+      }}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Continue from a trusted state</DialogTitle>
+            <DialogDescription>
+              原失败任务保持不变。FOMO 会创建新任务，并优先恢复最近通过验收的 checkpoint；没有 checkpoint 时从已验证版本或基础模板重新开始。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div className="rounded-lg border bg-muted/40 p-3 text-xs text-muted-foreground">
+              <p className="truncate font-medium text-foreground">{recoveryProject?.name}</p>
+              <p className="mt-1">
+                {recoveryProject?.latestRun?.sourceCheckpointAvailable
+                  ? "Verified checkpoint available"
+                  : "Will restart from the safest available base"}
+              </p>
+            </div>
+            <Textarea
+              aria-label="恢复任务补充说明"
+              disabled={recovering}
+              onChange={(event) => setRecoveryContent(event.target.value)}
+              placeholder="例如：保留现有页面，修复新增和重置按钮，并确保刷新后数据仍然存在。"
+              rows={5}
+              value={recoveryContent}
+            />
+            <RuntimeSelector
+              disabled={recovering || runtimeLoading}
+              onSelectAgentFramework={setRecoveryAgentFramework}
+              onSelectProfile={(profileId) => {
+                setRecoveryProfileId(profileId);
+                const profile = runtimeOptions?.profiles.find((candidate) => candidate.profileId === profileId);
+                if (profile) setRecoveryThinking(profile.defaultThinking);
+              }}
+              onSelectThinking={setRecoveryThinking}
+              options={runtimeOptions}
+              selectedAgentFramework={recoveryAgentFramework}
+              selectedProfileId={recoveryProfileId}
+              selectedThinking={recoveryThinking}
+            />
+            {recoveryError ? <p className="text-sm text-destructive" role="alert">{recoveryError}</p> : null}
+          </div>
+          <DialogFooter>
+            <Button disabled={recovering} onClick={() => setRecoveryProject(undefined)} variant="outline">Cancel</Button>
+            <Button disabled={recovering || runtimeLoading} onClick={recoverProject}>
+              {recovering ? <LoaderCircleIcon aria-hidden="true" className="animate-spin" /> : null}
+              Create recovery task
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <footer className="mx-auto max-w-6xl border-t pb-10 pt-8 text-center text-xs text-muted-foreground">
         <p>© FOMO 编程工作台 · Next.js · FastAPI · OpenSandbox · LiteLLM</p>

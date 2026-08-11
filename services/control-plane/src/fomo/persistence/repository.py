@@ -47,7 +47,9 @@ from fomo.schemas import (
     VISIBLE_ARTIFACT_KIND_ORDER,
     EventEnvelope,
     MessageResponse,
+    ProjectLatestRunResponse,
     ProjectResponse,
+    RecoveryMode,
     RunPhase,
     RunResponse,
     RunRuntimeResponse,
@@ -142,6 +144,18 @@ TERMINAL_STATUSES = {
     RunStatus.cancelled.value,
     RunStatus.needs_attention.value,
 }
+
+RECOVERABLE_TERMINAL_STATUSES = {
+    RunStatus.failed.value,
+    RunStatus.cancelled.value,
+    RunStatus.needs_attention.value,
+}
+
+# Recovery prompts share the same strict bridge envelope as ordinary prompts.
+# Bound lineage before a new run is queued so a long recovery chain cannot
+# fail minutes later inside a Coding Runtime with an oversized prompt.
+MAX_RECOVERY_LINEAGE_RUNS = 8
+MAX_RECOVERY_PROMPT_CHARACTERS = 96_000
 
 
 def _is_business_implementation_path(path: str) -> bool:
@@ -297,13 +311,17 @@ def _as_utc(value: datetime) -> datetime:
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
-def _project_response(record: ProjectRecord) -> ProjectResponse:
+def _project_response(
+    record: ProjectRecord,
+    latest_run: ProjectLatestRunResponse | None = None,
+) -> ProjectResponse:
     return ProjectResponse(
         id=record.id,
         title=record.title,
         status=record.status,
         head_version_id=record.head_version_id,
         active_run_id=record.active_run_id,
+        latest_run=latest_run,
         created_at=record.created_at,
         updated_at=record.updated_at,
     )
@@ -340,6 +358,8 @@ def _run_response(
     record: RunRecord,
     last_seq: int = 0,
     pending_input_request: RunInputRequestRecord | None = None,
+    *,
+    source_checkpoint_available: bool = False,
 ) -> RunResponse:
     return RunResponse(
         id=record.id,
@@ -349,6 +369,12 @@ def _run_response(
         repair_round=record.repair_round,
         last_seq=last_seq,
         base_version_id=record.base_version_id,
+        recovered_from_run_id=record.recovered_from_run_id,
+        recovered_from_goal_id=record.recovered_from_goal_id,
+        recovered_from_checkpoint_id=record.recovered_from_checkpoint_id,
+        recovery_mode=record.recovery_mode,
+        recovery_available=record.status in RECOVERABLE_TERMINAL_STATUSES,
+        source_checkpoint_available=source_checkpoint_available,
         cancel_requested_at=record.cancel_requested_at,
         error_code=record.error_code,
         preview_url=record.preview_url,
@@ -385,6 +411,24 @@ def _runtime_contract(record: RunRecord) -> RuntimeContract:
         run_max_tokens=record.runtime_run_max_tokens,
         inference_tpm_limit=record.runtime_inference_tpm_limit,
         max_spend_micros=record.runtime_max_spend_micros,
+    )
+
+
+def _project_latest_run_response(
+    record: RunRecord,
+    *,
+    source_checkpoint_available: bool,
+) -> ProjectLatestRunResponse:
+    return ProjectLatestRunResponse(
+        id=record.id,
+        status=RunStatus(record.status),
+        error_code=record.error_code,
+        agent_framework=AgentFramework(record.agent_framework),
+        profile_id=record.runtime_profile_id,
+        thinking=record.runtime_thinking,
+        recovery_available=record.status in RECOVERABLE_TERMINAL_STATUSES,
+        recovery_mode=record.recovery_mode,
+        source_checkpoint_available=source_checkpoint_available,
     )
 
 
@@ -629,7 +673,37 @@ class Repository:
             result = await session.scalars(
                 statement.where(ownership_filter).order_by(ProjectRecord.updated_at.desc())
             )
-            return [_project_response(record) for record in result]
+            projects = list(result)
+            if not projects:
+                return []
+            runs = list(
+                await session.scalars(
+                    select(RunRecord)
+                    .where(RunRecord.project_id.in_([record.id for record in projects]))
+                    .order_by(
+                        RunRecord.project_id.asc(),
+                        RunRecord.created_at.desc(),
+                        RunRecord.id.desc(),
+                    )
+                )
+            )
+            latest_by_project: dict[str, RunRecord] = {}
+            for run in runs:
+                latest_by_project.setdefault(run.project_id, run)
+            responses: list[ProjectResponse] = []
+            for project in projects:
+                latest = latest_by_project.get(project.id)
+                summary = None
+                if latest is not None:
+                    checkpoint_available = await self._source_checkpoint_available_in_session(
+                        session, latest
+                    )
+                    summary = _project_latest_run_response(
+                        latest,
+                        source_checkpoint_available=checkpoint_available,
+                    )
+                responses.append(_project_response(project, summary))
+            return responses
 
     async def require_project(
         self, project_id: str, owner_session_id: str | None = None
@@ -798,6 +872,182 @@ class Repository:
             await session.commit()
             return _message_response(message), await self._run_with_seq(session, run), True
 
+    async def create_recovery_message_and_run(
+        self,
+        source_run_id: str,
+        owner_session_id: str,
+        client_message_id: str,
+        content: str,
+        *,
+        agent_framework: AgentFramework | str | None = None,
+        runtime_contract: RuntimeContract | None = None,
+        enforce_runtime_match: bool = False,
+        enforce_agent_framework_match: bool = False,
+    ) -> tuple[MessageResponse, RunResponse, bool, RecoveryMode, bool]:
+        """Fork terminal history into a fresh queued run.
+
+        The source run, sandbox and Coding Agent session are never mutated or
+        resumed. An integrity-checked goal checkpoint takes priority over a
+        verified published source baseline; without either, the new run
+        explicitly restarts from the product base.
+        """
+
+        async with self.database.session_factory() as session:
+            source = await session.get(RunRecord, source_run_id, with_for_update=True)
+            if source is None:
+                raise NotFoundError("run not found")
+            project = await self._require_project_in_session(
+                session, source.project_id, owner_session_id
+            )
+            existing_message = await session.scalar(
+                select(MessageRecord).where(
+                    MessageRecord.project_id == project.id,
+                    MessageRecord.client_message_id == client_message_id,
+                )
+            )
+            if existing_message is not None:
+                if existing_message.run_id is None:
+                    raise RuntimeError("idempotent recovery message is missing its run")
+                existing_run = await session.get(RunRecord, existing_message.run_id)
+                if existing_run is None:
+                    raise RuntimeError("idempotent recovery message points to a missing run")
+                if (
+                    existing_message.content != content
+                    or existing_run.recovered_from_run_id != source.id
+                    or (
+                        enforce_runtime_match
+                        and runtime_contract is not None
+                        and _runtime_contract(existing_run) != runtime_contract
+                    )
+                    or (
+                        enforce_agent_framework_match
+                        and agent_framework is not None
+                        and existing_run.agent_framework
+                        != AgentFramework(agent_framework).value
+                    )
+                    or existing_run.recovery_mode is None
+                ):
+                    raise ConflictError(
+                        "Idempotency-Key was already used with a different request"
+                    )
+                return (
+                    _message_response(existing_message),
+                    await self._run_with_seq(session, existing_run),
+                    False,
+                    existing_run.recovery_mode,
+                    existing_run.recovered_from_checkpoint_id is not None,
+                )
+
+            if source.status not in RECOVERABLE_TERMINAL_STATUSES:
+                raise ConflictError("only a failed, interrupted, or cancelled run can recover")
+
+            try:
+                source_lineage = await self._run_prompt_lineage_in_session(
+                    session,
+                    source.id,
+                    expected_project_id=source.project_id,
+                )
+                self._assemble_run_prompt(
+                    [message.content for _run, message in source_lineage] + [content]
+                )
+            except ManifestIntegrityError as exc:
+                raise ConflictError(
+                    "recovery history is invalid or too large; start a new project"
+                ) from exc
+
+            try:
+                checkpoint = await self._recoverable_checkpoint_for_source_in_session(
+                    session, source
+                )
+            except ManifestIntegrityError as exc:
+                raise ConflictError(
+                    "the source recovery checkpoint failed integrity validation"
+                ) from exc
+            verified_version = await self._verified_base_version_in_session(
+                session, source
+            )
+            recovery_mode: RecoveryMode
+            if checkpoint is not None:
+                recovery_mode = "verified_checkpoint"
+            elif verified_version is not None:
+                recovery_mode = "verified_version"
+            else:
+                recovery_mode = "base_restart"
+
+            selected_framework = AgentFramework(
+                agent_framework if agent_framework is not None else source.agent_framework
+            ).value
+            selected_runtime = runtime_contract or _runtime_contract(source)
+            validate_agent_framework_runtime(
+                selected_framework,
+                selected_runtime.profile_id,
+                selected_runtime.thinking,
+            )
+            run_id = uuid7()
+            run = RunRecord(
+                id=run_id,
+                project_id=project.id,
+                base_version_id=(verified_version.id if verified_version is not None else None),
+                recovered_from_run_id=source.id,
+                recovered_from_goal_id=(checkpoint.goal_id if checkpoint is not None else None),
+                recovered_from_checkpoint_id=(checkpoint.id if checkpoint is not None else None),
+                recovery_mode=recovery_mode,
+                status=RunStatus.queued.value,
+                phase=RunPhase.queued.value,
+                # A recovery always starts a fresh framework session. Destroyed
+                # source sandboxes and session identifiers are never resumed.
+                pi_session_id=f"fomo-{run_id}",
+                agent_framework=selected_framework,
+                runtime_profile_id=selected_runtime.profile_id,
+                runtime_model_ref=selected_runtime.model_ref,
+                runtime_thinking=selected_runtime.thinking,
+                runtime_context_window=selected_runtime.context_window,
+                runtime_policy_version=selected_runtime.policy_version,
+                runtime_run_max_tokens=selected_runtime.run_max_tokens,
+                runtime_inference_tpm_limit=selected_runtime.inference_tpm_limit,
+                runtime_max_spend_micros=selected_runtime.max_spend_micros,
+            )
+            message = MessageRecord(
+                id=uuid7(),
+                project_id=project.id,
+                role="user",
+                content=content,
+                client_message_id=client_message_id,
+                run_id=run.id,
+            )
+            session.add_all((run, message))
+            if project.active_run_id is None:
+                project.active_run_id = run.id
+            project.status = "queued"
+            project.updated_at = utcnow()
+            await self._append_event_in_session(
+                session,
+                run,
+                "run.created",
+                payload={
+                    "messageId": message.id,
+                    "baseVersionId": run.base_version_id,
+                    "agentFramework": selected_framework,
+                    "profileId": selected_runtime.profile_id,
+                    "thinking": selected_runtime.thinking,
+                    "contextWindow": selected_runtime.context_window,
+                    "runtimePolicy": selected_runtime.policy_version,
+                    "recoveredFromRunId": source.id,
+                    "recoveredFromGoalId": run.recovered_from_goal_id,
+                    "recoveredFromCheckpointId": run.recovered_from_checkpoint_id,
+                    "recoveryMode": recovery_mode,
+                    "sourceCheckpointAvailable": checkpoint is not None,
+                },
+            )
+            await session.commit()
+            return (
+                _message_response(message),
+                await self._run_with_seq(session, run),
+                True,
+                recovery_mode,
+                checkpoint is not None,
+            )
+
     async def get_project_snapshot(self, project_id: str, owner_session_id: str) -> dict[str, Any]:
         async with self.database.session_factory() as session:
             project = await self._require_project_in_session(session, project_id, owner_session_id)
@@ -862,8 +1112,16 @@ class Repository:
                 if display_record is not None
                 else None
             )
+            latest_summary = None
+            if runs:
+                latest_summary = _project_latest_run_response(
+                    runs[0],
+                    source_checkpoint_available=(
+                        await self._source_checkpoint_available_in_session(session, runs[0])
+                    ),
+                )
             return {
-                "project": _project_response(project),
+                "project": _project_response(project, latest_summary),
                 "messages": [_message_response(item) for item in messages],
                 "runs": run_responses,
                 "active_run": active_run,
@@ -911,15 +1169,71 @@ class Repository:
 
     async def get_run_prompt(self, run_id: str) -> str:
         async with self.database.session_factory() as session:
+            run = await session.get(RunRecord, run_id)
+            if run is None:
+                raise NotFoundError("run not found")
+            lineage = await self._run_prompt_lineage_in_session(
+                session,
+                run.id,
+                expected_project_id=run.project_id,
+            )
+            return self._assemble_run_prompt(
+                [message.content for _current, message in lineage]
+            )
+
+    @staticmethod
+    async def _run_prompt_lineage_in_session(
+        session: AsyncSession,
+        run_id: str,
+        *,
+        expected_project_id: str,
+    ) -> list[tuple[RunRecord, MessageRecord]]:
+        lineage: list[tuple[RunRecord, MessageRecord]] = []
+        visited: set[str] = set()
+        current_id: str | None = run_id
+        while current_id is not None:
+            if current_id in visited:
+                raise ManifestIntegrityError("recovery run lineage contains a cycle")
+            if len(lineage) >= MAX_RECOVERY_LINEAGE_RUNS:
+                raise ManifestIntegrityError("recovery run lineage is too deep")
+            visited.add(current_id)
+            current = await session.get(RunRecord, current_id)
+            if current is None:
+                raise NotFoundError("run not found")
+            if current.project_id != expected_project_id:
+                raise ManifestIntegrityError("recovery run lineage crossed project scope")
             message = await session.scalar(
                 select(MessageRecord)
-                .where(MessageRecord.run_id == run_id, MessageRecord.role == "user")
+                .where(
+                    MessageRecord.run_id == current.id,
+                    MessageRecord.project_id == expected_project_id,
+                    MessageRecord.role == "user",
+                )
                 .order_by(MessageRecord.created_at.asc(), MessageRecord.id.asc())
                 .limit(1)
             )
             if message is None:
                 raise NotFoundError("run message not found")
-            return message.content
+            lineage.append((current, message))
+            current_id = current.recovered_from_run_id
+        lineage.reverse()
+        return lineage
+
+    @staticmethod
+    def _assemble_run_prompt(contents: list[str]) -> str:
+        if not contents or len(contents) > MAX_RECOVERY_LINEAGE_RUNS:
+            raise ManifestIntegrityError("recovery prompt lineage is invalid")
+        if len(contents) == 1:
+            prompt = contents[0]
+        else:
+            followups = "\n\n".join(
+                f"Recovery follow-up {index}:\n{content}"
+                for index, content in enumerate(contents[1:], start=1)
+            )
+            prompt = f"Original request:\n{contents[0]}\n\n{followups}"
+        if len(prompt) > MAX_RECOVERY_PROMPT_CHARACTERS:
+            raise ManifestIntegrityError("recovery prompt exceeds the runtime limit")
+        return prompt
 
     async def ensure_pi_session_id(
         self,
@@ -1767,21 +2081,27 @@ class Repository:
 
     async def get_latest_verified_checkpoint(self, run_id: str) -> VerifiedCheckpoint | None:
         async with self.database.session_factory() as session:
-            checkpoint = await session.scalar(
-                select(CheckpointRecord)
-                .where(CheckpointRecord.run_id == run_id)
-                .order_by(CheckpointRecord.ordinal.desc())
-                .limit(1)
-            )
-            if checkpoint is None:
-                return None
-            node = await session.get(GoalNodeRecord, checkpoint.goal_node_id)
-            if node is None or node.status != GoalStatus.VERIFIED.value:
-                raise ManifestIntegrityError("checkpoint no longer belongs to a verified goal")
-            return await self._checkpoint_projection_in_session(session, checkpoint, node.goal_key)
+            run = await session.get(RunRecord, run_id)
+            if run is None:
+                raise NotFoundError("run not found")
+            return await self._latest_verified_checkpoint_for_run_in_session(session, run)
 
     async def get_recent_verified_checkpoint(self, run_id: str) -> VerifiedCheckpoint | None:
         return await self.get_latest_verified_checkpoint(run_id)
+
+    async def get_recovery_checkpoint(self, run_id: str) -> VerifiedCheckpoint | None:
+        """Return the integrity-checked checkpoint selected for a recovery run.
+
+        This is deliberately a durable cross-run lookup. It never resumes the
+        source sandbox or Coding Agent session, and it fails closed if the
+        lineage no longer matches the source run and project.
+        """
+
+        async with self.database.session_factory() as session:
+            run = await session.get(RunRecord, run_id)
+            if run is None:
+                raise NotFoundError("run not found")
+            return await self._recovery_checkpoint_for_run_in_session(session, run)
 
     async def record_usage_entry(
         self,
@@ -4803,7 +5123,171 @@ class Repository:
             or 0
         )
         pending = await self._pending_input_request_in_session(session, run.id)
-        return _run_response(run, last_seq, pending)
+        checkpoint_available = await self._source_checkpoint_available_in_session(
+            session, run
+        )
+        return _run_response(
+            run,
+            last_seq,
+            pending,
+            source_checkpoint_available=checkpoint_available,
+        )
+
+    async def _latest_verified_checkpoint_for_run_in_session(
+        self,
+        session: AsyncSession,
+        run: RunRecord,
+    ) -> VerifiedCheckpoint | None:
+        checkpoint = await session.scalar(
+            select(CheckpointRecord)
+            .where(CheckpointRecord.run_id == run.id)
+            .order_by(CheckpointRecord.ordinal.desc())
+            .limit(1)
+        )
+        if checkpoint is None:
+            return None
+        if checkpoint.project_id != run.project_id:
+            raise ManifestIntegrityError("checkpoint project lineage is invalid")
+        node = await session.get(GoalNodeRecord, checkpoint.goal_node_id)
+        if (
+            node is None
+            or node.run_id != run.id
+            or node.project_id != run.project_id
+            or node.status != GoalStatus.VERIFIED.value
+        ):
+            raise ManifestIntegrityError("checkpoint no longer belongs to a verified goal")
+        projection = await self._checkpoint_projection_in_session(
+            session, checkpoint, node.goal_key
+        )
+        if not projection.evidence or any(
+            item.get("status") != "passed" for item in projection.evidence
+        ):
+            raise ManifestIntegrityError("checkpoint evidence is not fully verified")
+        return projection
+
+    async def _recoverable_checkpoint_for_source_in_session(
+        self,
+        session: AsyncSession,
+        source: RunRecord,
+    ) -> VerifiedCheckpoint | None:
+        """Select the newest state a fresh recovery may safely inherit.
+
+        A failed recovery run may not have produced a checkpoint of its own.
+        In that case its already verified inherited checkpoint remains the
+        newest trustworthy state and is revalidated before being selected.
+        """
+
+        checkpoint = await self._latest_verified_checkpoint_for_run_in_session(
+            session, source
+        )
+        if checkpoint is not None:
+            return checkpoint
+        return await self._recovery_checkpoint_for_run_in_session(session, source)
+
+    async def _recovery_checkpoint_for_run_in_session(
+        self,
+        session: AsyncSession,
+        run: RunRecord,
+    ) -> VerifiedCheckpoint | None:
+        if run.recovery_mode != "verified_checkpoint":
+            if (
+                run.recovered_from_checkpoint_id is not None
+                or run.recovered_from_goal_id is not None
+            ):
+                raise ManifestIntegrityError(
+                    "non-checkpoint recovery has checkpoint lineage"
+                )
+            return None
+        if (
+            run.recovered_from_run_id is None
+            or run.recovered_from_goal_id is None
+            or run.recovered_from_checkpoint_id is None
+        ):
+            raise ManifestIntegrityError("recovery checkpoint lineage is incomplete")
+        checkpoint = await session.get(
+            CheckpointRecord, run.recovered_from_checkpoint_id
+        )
+        if checkpoint is None or checkpoint.project_id != run.project_id:
+            raise ManifestIntegrityError("recovery checkpoint lineage is invalid")
+
+        # The run always points to its direct source, while an inherited
+        # checkpoint can belong to an older source run. Every intermediate
+        # recovery must attest the exact same checkpoint and goal until the
+        # checkpoint-owning run is reached.
+        ancestor_id: str | None = run.recovered_from_run_id
+        visited = {run.id}
+        for _ in range(MAX_RECOVERY_LINEAGE_RUNS):
+            if ancestor_id is None or ancestor_id in visited:
+                raise ManifestIntegrityError("recovery checkpoint lineage is invalid")
+            visited.add(ancestor_id)
+            ancestor = await session.get(RunRecord, ancestor_id)
+            if (
+                ancestor is None
+                or ancestor.project_id != run.project_id
+                or ancestor.status not in RECOVERABLE_TERMINAL_STATUSES
+            ):
+                raise ManifestIntegrityError("recovery checkpoint lineage is invalid")
+            if checkpoint.run_id == ancestor.id:
+                break
+            if (
+                ancestor.recovery_mode != "verified_checkpoint"
+                or ancestor.recovered_from_checkpoint_id != checkpoint.id
+                or ancestor.recovered_from_goal_id != run.recovered_from_goal_id
+            ):
+                raise ManifestIntegrityError("recovery checkpoint lineage is invalid")
+            ancestor_id = ancestor.recovered_from_run_id
+        else:
+            raise ManifestIntegrityError("recovery checkpoint lineage is too deep")
+
+        node = await session.get(GoalNodeRecord, checkpoint.goal_node_id)
+        if (
+            node is None
+            or node.run_id != checkpoint.run_id
+            or node.project_id != checkpoint.project_id
+            or node.goal_key != run.recovered_from_goal_id
+            or node.status != GoalStatus.VERIFIED.value
+        ):
+            raise ManifestIntegrityError("recovery checkpoint goal is invalid")
+        projection = await self._checkpoint_projection_in_session(
+            session, checkpoint, node.goal_key
+        )
+        if not projection.evidence or any(
+            item.get("status") != "passed" for item in projection.evidence
+        ):
+            raise ManifestIntegrityError("recovery checkpoint evidence is invalid")
+        return projection
+
+    async def _source_checkpoint_available_in_session(
+        self,
+        session: AsyncSession,
+        run: RunRecord,
+    ) -> bool:
+        if run.status not in RECOVERABLE_TERMINAL_STATUSES:
+            return False
+        try:
+            return (
+                await self._recoverable_checkpoint_for_source_in_session(session, run)
+            ) is not None
+        except ManifestIntegrityError:
+            # Availability is a safe projection. Corrupt recovery state is not
+            # advertised and the explicit recovery mutation still fails closed.
+            return False
+
+    @staticmethod
+    async def _verified_base_version_in_session(
+        session: AsyncSession,
+        source: RunRecord,
+    ) -> VersionRecord | None:
+        if source.base_version_id is None:
+            return None
+        version = await session.get(VersionRecord, source.base_version_id)
+        if (
+            version is None
+            or version.project_id != source.project_id
+            or version.qa_status != "passed"
+        ):
+            return None
+        return version
 
     @staticmethod
     async def _pending_input_request_in_session(

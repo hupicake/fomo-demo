@@ -79,18 +79,20 @@ def test_overall_expected_requires_a_real_passed_result() -> None:
     assert no_results is None
 
 
-def test_assertion_failure_requires_unexpected_overall_with_plain_failed_result() -> None:
+def test_unexpected_failure_or_test_timeout_is_a_product_failure() -> None:
     failed = parse_playwright_json(
         _report([_suite([_spec("broke", "unexpected", "failed")])])
     )
     assert failed is not None
     assert failed.status == "failed"
     assert failed.title == "broke"
-    # unexpected with a timedOut result is infrastructure, not an assertion.
+    # A completed reporter result proves that this individual product test ran
+    # and exhausted its own timeout. The caller separately classifies an outer
+    # runner/command timeout as infrastructure.
     timed_out = parse_playwright_json(
         _report([_suite([_spec("broke", "unexpected", "timedOut")])])
     )
-    assert timed_out is not None and timed_out.status == "did_not_run"
+    assert timed_out is not None and timed_out.status == "failed"
 
 
 def test_failed_assertion_projects_only_bounded_sanitized_details() -> None:

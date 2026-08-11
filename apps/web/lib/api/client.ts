@@ -15,6 +15,7 @@ import type {
   ProjectMessage,
   ProjectSnapshot,
   ProjectSummary,
+  RecoveryMode,
   RunRuntimeResponse,
   RunSnapshot,
   RuntimeOptionsResponse,
@@ -103,6 +104,14 @@ function boundedChoices(value: unknown): string[] | undefined {
 
 export function normalizeProject(value: unknown): ProjectSummary {
   const source = record(value);
+  const latestRunSource = record(source.latestRun || source.latest_run);
+  const latestRunId = text(latestRunSource.id);
+  const latestAgentFramework = normalizeAgentFrameworkId(
+    latestRunSource.agentFramework || latestRunSource.agent_framework,
+  );
+  const latestRecoveryMode = normalizeRecoveryMode(
+    latestRunSource.recoveryMode || latestRunSource.recovery_mode,
+  );
   return {
     id: text(source.id || source.projectId),
     name: text(source.name || source.title, "Untitled project"),
@@ -111,7 +120,32 @@ export function normalizeProject(value: unknown): ProjectSummary {
     createdAt: text(source.createdAt || source.created_at) || undefined,
     updatedAt: text(source.updatedAt || source.updated_at) || undefined,
     status: toProjectStatus(source.status),
+    ...(latestRunId && latestAgentFramework ? {
+      latestRun: {
+        id: latestRunId,
+        status: toRunStatus(latestRunSource.status),
+        errorCode: text(latestRunSource.errorCode || latestRunSource.error_code).slice(0, 80) || undefined,
+        agentFramework: latestAgentFramework,
+        profileId: text(latestRunSource.profileId || latestRunSource.profile_id),
+        thinking: text(latestRunSource.thinking),
+        recoveryAvailable: Boolean(
+          latestRunSource.recoveryAvailable ?? latestRunSource.recovery_available,
+        ),
+        ...(latestRecoveryMode ? { recoveryMode: latestRecoveryMode } : {}),
+        sourceCheckpointAvailable: Boolean(
+          latestRunSource.sourceCheckpointAvailable
+            ?? latestRunSource.source_checkpoint_available,
+        ),
+      },
+    } : {}),
   };
+}
+
+function normalizeRecoveryMode(value: unknown): RecoveryMode | undefined {
+  const mode = text(value);
+  return ["verified_checkpoint", "verified_version", "base_restart"].includes(mode)
+    ? mode as RecoveryMode
+    : undefined;
 }
 
 /** Explicitly selects the public clarification fields; never spread input. */
@@ -216,6 +250,9 @@ export function normalizeRun(value: unknown): RunSnapshot | undefined {
   const agentFramework = normalizeAgentFrameworkId(
     source.agentFramework || source.agent_framework,
   );
+  const recoveryMode = normalizeRecoveryMode(
+    source.recoveryMode || source.recovery_mode,
+  );
   return {
     id,
     projectId: text(source.projectId || source.project_id),
@@ -228,6 +265,16 @@ export function normalizeRun(value: unknown): RunSnapshot | undefined {
     ...(pendingInputRequest ? { pendingInputRequest } : {}),
     ...(agentFramework ? { agentFramework } : {}),
     ...(runtime ? { runtime } : {}),
+    recoveredFromRunId: text(source.recoveredFromRunId || source.recovered_from_run_id) || undefined,
+    recoveredFromGoalId: text(source.recoveredFromGoalId || source.recovered_from_goal_id) || undefined,
+    recoveredFromCheckpointId: text(
+      source.recoveredFromCheckpointId || source.recovered_from_checkpoint_id,
+    ) || undefined,
+    ...(recoveryMode ? { recoveryMode } : {}),
+    recoveryAvailable: Boolean(source.recoveryAvailable ?? source.recovery_available),
+    sourceCheckpointAvailable: Boolean(
+      source.sourceCheckpointAvailable ?? source.source_checkpoint_available,
+    ),
   };
 }
 
@@ -505,6 +552,57 @@ export const controlPlane = {
     );
     return {
       runId,
+      ...(agentFramework ? { agentFramework } : {}),
+      ...(runtime ? { runtime } : {}),
+    };
+  },
+
+  async recoverRun(
+    runId: string,
+    input: {
+      clientMessageId: string;
+      content: string;
+      agentFramework?: AgentFrameworkId;
+      profileId?: string;
+      thinking?: string;
+    },
+  ): Promise<{
+    runId: string;
+    recoveryMode?: RecoveryMode;
+    sourceCheckpointAvailable: boolean;
+    agentFramework?: AgentFrameworkId;
+    runtime?: RunRuntimeResponse;
+  }> {
+    const body: JsonRecord = { ...input, attachments: [] };
+    if (!input.profileId) delete body.profileId;
+    if (input.thinking === undefined) delete body.thinking;
+    const response = await request<unknown>(`/runs/${encodeURIComponent(runId)}/recover`, {
+      method: "POST",
+      headers: { "Idempotency-Key": input.clientMessageId },
+      body: JSON.stringify(body),
+    });
+    const source = record(response);
+    const recoveredRun = record(source.run);
+    const recoveredRunId = text(recoveredRun.id || source.runId || source.run_id);
+    if (!recoveredRunId) {
+      throw new ApiProblem({ status: 502, title: "Control plane did not return a recovery run ID" });
+    }
+    const runtime = normalizeRunRuntime(recoveredRun.runtime);
+    const agentFramework = normalizeAgentFrameworkId(
+      recoveredRun.agentFramework || recoveredRun.agent_framework,
+    );
+    const recoveryMode = normalizeRecoveryMode(
+      source.recoveryMode || source.recovery_mode || recoveredRun.recoveryMode || recoveredRun.recovery_mode,
+    );
+    return {
+      runId: recoveredRunId,
+      ...(recoveryMode ? { recoveryMode } : {}),
+      sourceCheckpointAvailable: Boolean(
+        source.sourceCheckpointAvailable
+          ?? source.source_checkpoint_available
+          ?? recoveredRun.sourceCheckpointAvailable
+          ?? recoveredRun.source_checkpoint_available,
+      ),
       ...(agentFramework ? { agentFramework } : {}),
       ...(runtime ? { runtime } : {}),
     };

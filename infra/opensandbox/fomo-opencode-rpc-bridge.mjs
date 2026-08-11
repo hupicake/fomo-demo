@@ -28,6 +28,54 @@ const SCHEMA_VERSION = 1;
 const PROVIDER_ID = "fomo-litellm";
 const STRUCTURED_OUTPUT_TOOL = "submit_structured_output";
 const DEFAULT_SDK_PATH = "/opt/fomo/pi/lib/node_modules/@opencode-ai/sdk/dist/v2/index.js";
+const SESSION_MAPPING_SCHEMA_VERSION = 2;
+const SESSION_POLICY_VERSION = 1;
+
+const SESSION_STAGE = Object.freeze({
+  planner: "planner",
+  workspace: "workspace",
+});
+
+const SESSION_PERMISSION_PROFILES = Object.freeze({
+  [SESSION_STAGE.planner]: Object.freeze([
+    permissionRule("read", "deny"),
+    permissionRule("edit", "deny"),
+    permissionRule("glob", "deny"),
+    permissionRule("grep", "deny"),
+    permissionRule("list", "deny"),
+    permissionRule("bash", "deny"),
+    permissionRule("todowrite", "deny"),
+    permissionRule("task", "deny"),
+    permissionRule("question", "deny"),
+    permissionRule("skill", "deny"),
+    permissionRule("webfetch", "deny"),
+    permissionRule("websearch", "deny"),
+    permissionRule("external_directory", "deny"),
+    permissionRule("doom_loop", "deny"),
+  ]),
+  [SESSION_STAGE.workspace]: Object.freeze([
+    permissionRule("read", "allow"),
+    // OpenCode resolves edit, write, and GPT's apply_patch through the
+    // semantic `edit` permission.
+    permissionRule("edit", "allow"),
+    permissionRule("glob", "allow"),
+    permissionRule("grep", "allow"),
+    permissionRule("list", "allow"),
+    permissionRule("bash", "allow"),
+    permissionRule("todowrite", "allow"),
+    permissionRule("task", "deny"),
+    permissionRule("question", "deny"),
+    permissionRule("skill", "deny"),
+    permissionRule("webfetch", "deny"),
+    permissionRule("websearch", "deny"),
+    permissionRule("external_directory", "deny"),
+    permissionRule("doom_loop", "deny"),
+  ]),
+});
+
+function permissionRule(permission, action) {
+  return Object.freeze({ permission, pattern: "*", action });
+}
 
 const MODEL_CONFIGS = Object.freeze({
   [`${PROVIDER_ID}/fomo-pi-flash`]: modelConfig(
@@ -97,6 +145,7 @@ const DEFAULTS = Object.freeze({
 const BRIDGE_FAILURE_MESSAGES = Object.freeze({
   opencode_model_failed: "OpenCode model request failed.",
   opencode_runtime_failed: "OpenCode runtime could not complete the request.",
+  opencode_capability_unavailable: "OpenCode runtime does not expose the capabilities required for this turn.",
   opencode_failed: "OpenCode failed unexpectedly.",
   bridge_error: "OpenCode bridge failed unexpectedly.",
   timeout: "OpenCode bridge exceeded its run time limit.",
@@ -126,6 +175,14 @@ class OpenCodeRuntimeFailure extends Error {
   constructor(cause) {
     super(BRIDGE_FAILURE_MESSAGES.opencode_runtime_failed);
     this.name = "OpenCodeRuntimeFailure";
+    this.cause = cause;
+  }
+}
+
+class OpenCodeCapabilityFailure extends Error {
+  constructor(cause) {
+    super(BRIDGE_FAILURE_MESSAGES.opencode_capability_unavailable);
+    this.name = "OpenCodeCapabilityFailure";
     this.cause = cause;
   }
 }
@@ -190,10 +247,12 @@ const completedTools = new Set();
 const startedTurns = new Set();
 const endedTurns = new Set();
 const startedTexts = new Set();
+const completedTexts = new Set();
 let sawPublicTextDelta = false;
 let sawTurn = false;
 let terminalError = null;
 let privateRuntimeDir = null;
+let workspaceInvocation = null;
 
 function bounded(value, limit) {
   const text = String(value ?? "");
@@ -443,9 +502,33 @@ function mappingPath() {
   return join(stateDir, "session-map", `${sessionId}.json`);
 }
 
+function invocationSessionStage() {
+  return structuredOutputSchema ? SESSION_STAGE.planner : SESSION_STAGE.workspace;
+}
+
+function emptySessionMapping() {
+  return {
+    schemaVersion: SESSION_MAPPING_SCHEMA_VERSION,
+    policyVersion: SESSION_POLICY_VERSION,
+    fomoSessionId: sessionId,
+    plannerSessionId: null,
+    workspaceSessionId: null,
+  };
+}
+
+function stageSessionKey(stage) {
+  if (stage === SESSION_STAGE.planner) return "plannerSessionId";
+  if (stage === SESSION_STAGE.workspace) return "workspaceSessionId";
+  throw new OpenCodeCapabilityFailure({ reason: "unknown_session_stage" });
+}
+
+function validMappedSessionId(value) {
+  return value === null || (typeof value === "string" && value.length > 0 && value.length <= 256);
+}
+
 function readSessionMapping() {
   const file = mappingPath();
-  if (!existsSync(file)) return null;
+  if (!existsSync(file)) return emptySessionMapping();
   const metadata = lstatSync(file);
   if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > 4096) {
     throw new Error("OpenCode session mapping is not a bounded regular file");
@@ -456,26 +539,34 @@ function readSessionMapping() {
   } catch {
     throw new Error("OpenCode session mapping is invalid");
   }
+  if (value?.schemaVersion === 1) {
+    // Schema v1 points planning and workspace turns at one session. Planning
+    // prompts in the old bridge persisted an all-deny tool override into that
+    // session, so its capability state cannot be trusted or safely resumed.
+    throw new OpenCodeCapabilityFailure({ reason: "legacy_session_mapping" });
+  }
   if (
-    !value || Array.isArray(value) || Object.keys(value).sort().join(",") !== "fomoSessionId,openCodeSessionId,schemaVersion" ||
-    value.schemaVersion !== 1 || value.fomoSessionId !== sessionId ||
-    typeof value.openCodeSessionId !== "string" || !value.openCodeSessionId || value.openCodeSessionId.length > 256
+    !value || Array.isArray(value) ||
+    Object.keys(value).sort().join(",") !==
+      "fomoSessionId,plannerSessionId,policyVersion,schemaVersion,workspaceSessionId" ||
+    value.schemaVersion !== SESSION_MAPPING_SCHEMA_VERSION ||
+    value.policyVersion !== SESSION_POLICY_VERSION ||
+    value.fomoSessionId !== sessionId ||
+    !validMappedSessionId(value.plannerSessionId) ||
+    !validMappedSessionId(value.workspaceSessionId) ||
+    (value.plannerSessionId && value.plannerSessionId === value.workspaceSessionId)
   ) {
     throw new Error("OpenCode session mapping does not match the invocation");
   }
-  return value.openCodeSessionId;
+  return value;
 }
 
-function writeSessionMapping(openCodeSessionId) {
+function writeSessionMapping(mapping) {
   const file = mappingPath();
   const directory = dirname(file);
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   const temporary = join(directory, `.${sessionId}.${randomUUID()}.tmp`);
-  writeFileSync(temporary, `${JSON.stringify({
-    schemaVersion: 1,
-    fomoSessionId: sessionId,
-    openCodeSessionId,
-  })}\n`, { mode: 0o600, flag: "wx" });
+  writeFileSync(temporary, `${JSON.stringify(mapping)}\n`, { mode: 0o600, flag: "wx" });
   renameSync(temporary, file);
 }
 
@@ -597,7 +688,8 @@ async function loadSdk() {
 }
 
 function isKnownOpenCodeFailure(error) {
-  return error instanceof OpenCodeModelFailure || error instanceof OpenCodeRuntimeFailure;
+  return error instanceof OpenCodeModelFailure || error instanceof OpenCodeRuntimeFailure ||
+    error instanceof OpenCodeCapabilityFailure;
 }
 
 function isModelResponseError(error) {
@@ -648,8 +740,102 @@ function safeError(error) {
   return bounded(redact(String(error ?? "unknown error")), 2048);
 }
 
+function sessionPolicyMetadata(stage) {
+  return {
+    fomoSessionStage: stage,
+    fomoSessionPolicyVersion: SESSION_POLICY_VERSION,
+  };
+}
+
+function permissionMatches(candidate, required) {
+  return candidate === required || candidate === "*";
+}
+
+function effectivePermission(permission, name) {
+  if (!Array.isArray(permission)) return null;
+  for (let index = permission.length - 1; index >= 0; index -= 1) {
+    const rule = permission[index];
+    if (
+      rule && typeof rule === "object" && rule.pattern === "*" &&
+      permissionMatches(rule.permission, name) && ["allow", "deny", "ask"].includes(rule.action)
+    ) {
+      return rule.action;
+    }
+  }
+  return null;
+}
+
+function assertSessionPolicy(session, stage) {
+  if (!session || typeof session !== "object" || typeof session.id !== "string" || !session.id) {
+    throw new OpenCodeCapabilityFailure({ reason: "invalid_stage_session" });
+  }
+  const metadata = session.metadata;
+  if (
+    !metadata || metadata.fomoSessionStage !== stage ||
+    metadata.fomoSessionPolicyVersion !== SESSION_POLICY_VERSION
+  ) {
+    throw new OpenCodeCapabilityFailure({ reason: "stage_session_identity_mismatch" });
+  }
+  const expected = SESSION_PERMISSION_PROFILES[stage];
+  if (
+    !Array.isArray(session.permission) || session.permission.length !== expected.length ||
+    expected.some((rule, index) => {
+      const actual = session.permission[index];
+      return !actual || actual.permission !== rule.permission ||
+        actual.pattern !== rule.pattern || actual.action !== rule.action;
+    })
+  ) {
+    throw new OpenCodeCapabilityFailure({ reason: "stage_session_permission_mismatch" });
+  }
+}
+
+async function inspectCapabilities(client, session, stage) {
+  assertSessionPolicy(session, stage);
+  if (!client.tool || typeof client.tool.list !== "function") {
+    throw new OpenCodeCapabilityFailure({ reason: "tool_registry_unavailable" });
+  }
+  let tools;
+  try {
+    tools = unwrap(
+      await client.tool.list({ directory: workspace, provider: PROVIDER_ID, model: model.id }),
+      "OpenCode tool registry query",
+    );
+  } catch {
+    throw new OpenCodeCapabilityFailure({ reason: "tool_registry_query_failed" });
+  }
+  if (
+    !Array.isArray(tools) || tools.some((tool) =>
+      !tool || typeof tool !== "object" || typeof tool.id !== "string" || !tool.id)
+  ) {
+    throw new OpenCodeCapabilityFailure({ reason: "invalid_tool_registry" });
+  }
+  const toolIds = new Set(tools.map((tool) => tool.id));
+  const capabilities = {
+    structuredOutput: stage === SESSION_STAGE.planner &&
+      structuredOutputSchema !== null && typeof client.session?.prompt === "function",
+    repoRead: effectivePermission(session.permission, "read") === "allow" && toolIds.has("read"),
+    repoMutate: effectivePermission(session.permission, "edit") === "allow" &&
+      ["apply_patch", "edit", "write", "patch"].some((tool) => toolIds.has(tool)),
+    commandExec: effectivePermission(session.permission, "bash") === "allow" && toolIds.has("bash"),
+    sessionResume: typeof client.session?.get === "function" && typeof client.session?.messages === "function" &&
+      (stage === SESSION_STAGE.planner ||
+        (typeof client.session?.promptAsync === "function" && typeof client.session?.status === "function")),
+    sessionCancel: typeof client.session?.abort === "function",
+  };
+  const required = stage === SESSION_STAGE.planner
+    ? ["structuredOutput", "sessionResume", "sessionCancel"]
+    : ["repoRead", "repoMutate", "commandExec", "sessionResume", "sessionCancel"];
+  if (required.some((capability) => capabilities[capability] !== true)) {
+    throw new OpenCodeCapabilityFailure({ reason: "required_capability_missing", stage });
+  }
+  return capabilities;
+}
+
 async function resolveSession(client) {
-  const mapped = runtimeValue(() => readSessionMapping());
+  const stage = invocationSessionStage();
+  const mapping = runtimeValue(() => readSessionMapping());
+  const sessionKey = stageSessionKey(stage);
+  const mapped = mapping[sessionKey];
   if (mapped) {
     try {
       const existing = unwrap(
@@ -657,7 +843,8 @@ async function resolveSession(client) {
         "OpenCode session lookup",
       );
       if (existing.id !== mapped) throw new OpenCodeRuntimeFailure({ reason: "session_mismatch" });
-      return { id: mapped, resumed: true };
+      assertSessionPolicy(existing, stage);
+      return { id: mapped, resumed: true, stage, session: existing };
     } catch (error) {
       throw runtimeFailure(error);
     }
@@ -669,23 +856,48 @@ async function resolveSession(client) {
       title: `FOMO ${correlationId}`,
       agent: "build",
       model: { providerID: PROVIDER_ID, id: model.id, ...(thinkingVariant() ? { variant: thinkingVariant() } : {}) },
+      metadata: sessionPolicyMetadata(stage),
+      permission: SESSION_PERMISSION_PROFILES[stage].map((rule) => ({ ...rule })),
     }),
     "OpenCode session creation",
   );
   if (!created || typeof created.id !== "string" || !created.id) {
     throw new OpenCodeRuntimeFailure({ reason: "invalid_session" });
   }
-  runtimeValue(() => writeSessionMapping(created.id));
-  return { id: created.id, resumed: false };
+  const otherSessionKey = stage === SESSION_STAGE.planner ? "workspaceSessionId" : "plannerSessionId";
+  if (mapping[otherSessionKey] === created.id) {
+    throw new OpenCodeCapabilityFailure({ reason: "stage_session_collision" });
+  }
+  const persisted = unwrap(
+    await client.session.get({ sessionID: created.id, directory: workspace }),
+    "OpenCode created session lookup",
+  );
+  if (persisted.id !== created.id) throw new OpenCodeRuntimeFailure({ reason: "session_mismatch" });
+  assertSessionPolicy(persisted, stage);
+  const nextMapping = { ...mapping, [sessionKey]: created.id };
+  runtimeValue(() => writeSessionMapping(nextMapping));
+  return { id: created.id, resumed: false, stage, session: persisted };
 }
 
 function thinkingVariant() {
   return ["off", "default"].includes(thinkingLevel) ? null : thinkingLevel;
 }
 
+function eventSessionId(event) {
+  const properties = event?.properties;
+  if (!properties || typeof properties !== "object") return null;
+  if (typeof properties.sessionID === "string") return properties.sessionID;
+  if (typeof properties.part?.sessionID === "string") return properties.part.sessionID;
+  if (typeof properties.info?.sessionID === "string") return properties.info.sessionID;
+  return null;
+}
+
 function eventBelongsToSession(event) {
-  if (event?.type === "session.error" && event?.properties?.sessionID === undefined) return true;
-  return event?.properties?.sessionID === sdkSessionId;
+  // OpenCode's legacy session.error schema permits an absent sessionID. The
+  // server can own more than one durable stage session, so an unscoped error
+  // must never be attributed to the active turn. A scoped assistant error is
+  // recovered from message history during the terminal reconciliation.
+  return eventSessionId(event) === sdkSessionId;
 }
 
 function touchActivity() {
@@ -752,7 +964,10 @@ function endTool(callId, isError) {
   if (!name) return;
   activeTools.delete(id);
   completedTools.add(id);
-  if (!isError && ["edit", "write", "patch"].includes(name) && firstEditOrWriteToolElapsedMs === null && runStartedAt) {
+  if (
+    !isError && ["edit", "write", "patch", "apply_patch"].includes(name) &&
+    firstEditOrWriteToolElapsedMs === null && runStartedAt
+  ) {
     firstEditOrWriteToolElapsedMs = Date.now() - runStartedAt;
   }
   emitPi("tool_end", {
@@ -771,6 +986,86 @@ function publicToolContent(content) {
     .join("\n");
 }
 
+function invocationAssistant(messageId) {
+  const id = String(messageId ?? "");
+  return Boolean(id && workspaceInvocation?.assistantIds.has(id));
+}
+
+function emitCompletedText(part) {
+  const id = String(part?.id ?? "");
+  const messageId = String(part?.messageID ?? "");
+  if (!id || !messageId || completedTexts.has(id) || !invocationAssistant(messageId)) return;
+  beginTurn(messageId);
+  if (!startedTexts.has(id)) {
+    startedTexts.add(id);
+    emitPi("message_delta", { deltaType: "text_start", contentIndex: 0 });
+    const text = bounded(redact(part?.text), LIMITS.publicTextCharacters);
+    if (text) {
+      sawPublicTextDelta = true;
+      emitPi("message_delta", { deltaType: "text_delta", contentIndex: 0, delta: text });
+    }
+  }
+  emitPi("message_delta", { deltaType: "text_end", contentIndex: 0 });
+  completedTexts.add(id);
+}
+
+function handleLegacyPart(part, delta = "") {
+  if (!part || typeof part !== "object" || !invocationAssistant(part.messageID)) return;
+  workspaceInvocation.sawActivity = true;
+  workspaceInvocation.parts.set(String(part.id ?? ""), part);
+  const messageId = String(part.messageID ?? "");
+
+  if (part.type === "step-start") {
+    beginTurn(messageId);
+    return;
+  }
+  if (part.type === "step-finish") {
+    endTurn(messageId, part.reason || "stop");
+    return;
+  }
+  if (part.type === "retry") {
+    emitPi("auto_retry_start", { attempt: Number(part.attempt ?? 0), maxAttempts: 0 });
+    return;
+  }
+  if (part.type === "compaction") {
+    emitPi("compaction_start", { reason: part.auto ? "auto" : "manual" });
+    return;
+  }
+  if (part.type === "text") {
+    const id = String(part.id ?? "");
+    if (delta && id && !completedTexts.has(id)) {
+      beginTurn(messageId);
+      if (!startedTexts.has(id)) {
+        startedTexts.add(id);
+        emitPi("message_delta", { deltaType: "text_start", contentIndex: 0 });
+      }
+      sawPublicTextDelta = true;
+      emitPi("message_delta", {
+        deltaType: "text_delta",
+        contentIndex: 0,
+        delta: bounded(redact(delta), LIMITS.publicDeltaCharacters),
+      });
+    }
+    if (part.time?.end) emitCompletedText(part);
+    return;
+  }
+  if (part.type !== "tool") return;
+
+  const callId = String(part.callID || part.id || "");
+  const state = part.state ?? {};
+  if (["running", "completed", "error"].includes(state.status)) {
+    beginTurn(messageId);
+    beginTool(callId, part.tool, state.input);
+  }
+  if (state.status === "completed") {
+    progressTool(callId, state.output);
+    endTool(callId, false);
+  } else if (state.status === "error") {
+    progressTool(callId, state.error);
+    endTool(callId, true);
+  }
+}
+
 function handleSdkEvent(event) {
   if (!event || typeof event !== "object" || typeof event.type !== "string") return;
   if (event.type === "server.connected") return;
@@ -783,6 +1078,7 @@ function handleSdkEvent(event) {
     terminalError = isModelResponseError(properties.error)
       ? modelFailure(properties.error)
       : new OpenCodeRuntimeFailure({ reason: "session_error" });
+    if (workspaceInvocation) workspaceInvocation.sawActivity = true;
     return;
   }
 
@@ -791,6 +1087,48 @@ function handleSdkEvent(event) {
   if (structuredOutputSchema) return;
 
   switch (event.type) {
+    case "message.updated": {
+      const info = properties.info;
+      if (!workspaceInvocation || !info || typeof info !== "object") break;
+      if (info.role === "user" && info.id === workspaceInvocation.messageId) {
+        workspaceInvocation.sawActivity = true;
+      }
+      if (info.role === "assistant" && info.parentID === workspaceInvocation.messageId) {
+        workspaceInvocation.sawActivity = true;
+        workspaceInvocation.assistantIds.add(String(info.id));
+        workspaceInvocation.assistants.set(String(info.id), info);
+        beginTurn(info.id);
+        if (info.error) {
+          terminalError = isModelResponseError(info.error)
+            ? modelFailure(info.error)
+            : new OpenCodeRuntimeFailure({ reason: "assistant_error" });
+        }
+      }
+      break;
+    }
+    case "message.part.updated":
+      handleLegacyPart(properties.part, properties.delta);
+      break;
+    case "message.part.delta": {
+      if (!workspaceInvocation || !invocationAssistant(properties.messageID)) break;
+      const prior = workspaceInvocation.parts.get(String(properties.partID ?? ""));
+      if (prior && properties.field === "text") handleLegacyPart(prior, properties.delta);
+      break;
+    }
+    case "session.status": {
+      if (!workspaceInvocation) break;
+      const status = String(properties.status?.type ?? "");
+      workspaceInvocation.status = status;
+      if (["busy", "retry"].includes(status)) {
+        workspaceInvocation.sawActivity = true;
+        workspaceInvocation.sawBusy = true;
+      }
+      if (status === "idle") workspaceInvocation.sawIdle = true;
+      break;
+    }
+    case "session.idle":
+      if (workspaceInvocation) workspaceInvocation.sawIdle = true;
+      break;
     case "session.next.step.started":
       beginTurn(properties.assistantMessageID);
       break;
@@ -899,12 +1237,133 @@ async function startEventStream(client) {
   return { task };
 }
 
-function disabledStructuredTools() {
-  return Object.fromEntries([
-    "bash", "edit", "write", "patch", "apply_patch", "execute", "plan_exit", "lsp", "read",
-    "glob", "grep", "list", "task", "question", "skill", "webfetch", "websearch", "todowrite",
-    "todoread",
-  ].map((name) => [name, false]));
+function assertAsyncPromptAccepted(result) {
+  if (result && typeof result === "object" && Object.hasOwn(result, "error") && result.error !== undefined) {
+    throw new OpenCodeRuntimeFailure({ operation: "OpenCode async prompt", reason: "sdk_error" });
+  }
+  const status = result?.response?.status;
+  if (status !== undefined && status !== 204) {
+    throw new OpenCodeRuntimeFailure({ operation: "OpenCode async prompt", reason: "unexpected_status" });
+  }
+}
+
+function inspectWorkspaceHistory(messages, messageId) {
+  const entries = Array.isArray(messages) ? messages : [];
+  const userPresent = entries.some((entry) => entry?.info?.role === "user" && entry.info.id === messageId);
+  const assistants = entries.filter((entry) =>
+    entry?.info?.role === "assistant" && entry.info.parentID === messageId);
+  const last = assistants.at(-1) ?? null;
+  const pendingTools = assistants.flatMap((entry) => Array.isArray(entry?.parts) ? entry.parts : [])
+    .filter((part) => part?.type === "tool" && ["pending", "running"].includes(part.state?.status));
+  return {
+    userPresent,
+    assistants,
+    last,
+    pendingTools,
+    completed: Boolean(last?.info?.time?.completed && !last.info.error && pendingTools.length === 0),
+  };
+}
+
+function emitReconciledTools(response) {
+  for (const part of Array.isArray(response?.parts) ? response.parts : []) {
+    if (part?.type !== "tool" || !["completed", "error"].includes(part.state?.status)) continue;
+    const callId = String(part.callID || part.id || "");
+    beginTurn(part.messageID);
+    beginTool(callId, part.tool, part.state?.input);
+    progressTool(callId, part.state?.status === "completed" ? part.state?.output : part.state?.error);
+    endTool(callId, part.state?.status === "error");
+  }
+}
+
+async function querySessionMessages(client, operation) {
+  const messages = unwrap(
+    await runtimeStep(() => client.session.messages({ sessionID: sdkSessionId, directory: workspace })),
+    operation,
+  );
+  if (!Array.isArray(messages)) throw new OpenCodeRuntimeFailure({ reason: "invalid_session_messages" });
+  return messages;
+}
+
+async function querySessionStatus(client) {
+  const statuses = unwrap(
+    await runtimeStep(() => client.session.status({ directory: workspace })),
+    "OpenCode session status query",
+  );
+  if (!statuses || typeof statuses !== "object" || Array.isArray(statuses)) {
+    throw new OpenCodeRuntimeFailure({ reason: "invalid_session_status" });
+  }
+  const status = statuses[sdkSessionId]?.type ?? "idle";
+  if (!["idle", "busy", "retry"].includes(status)) {
+    throw new OpenCodeRuntimeFailure({ reason: "unknown_session_status" });
+  }
+  return status;
+}
+
+async function runWorkspacePrompt(client) {
+  const messageId = `msg_fomo_${randomUUID().replaceAll("-", "")}`;
+  workspaceInvocation = {
+    messageId,
+    accepted: false,
+    sawActivity: false,
+    sawBusy: false,
+    sawIdle: false,
+    status: "submitting",
+    assistantIds: new Set(),
+    assistants: new Map(),
+    parts: new Map(),
+  };
+
+  const accepted = await runtimeStep(() => client.session.promptAsync({
+    sessionID: sdkSessionId,
+    directory: workspace,
+    messageID: messageId,
+    model: { providerID: PROVIDER_ID, modelID: model.id },
+    agent: "build",
+    ...(thinkingVariant() ? { variant: thinkingVariant() } : {}),
+    parts: [{ type: "text", text: prompt }],
+  }));
+  assertAsyncPromptAccepted(accepted);
+  workspaceInvocation.accepted = true;
+
+  let idleMisses = 0;
+  let admissionMisses = 0;
+  while (lifecycle === "running") {
+    const status = await querySessionStatus(client);
+    workspaceInvocation.status = status;
+    if (["busy", "retry"].includes(status)) {
+      workspaceInvocation.sawBusy = true;
+      workspaceInvocation.sawActivity = true;
+      idleMisses = 0;
+    } else {
+      const messages = await querySessionMessages(client, "OpenCode workspace reconciliation");
+      const result = inspectWorkspaceHistory(messages, messageId);
+      if (result.completed) {
+        emitReconciledTools(result.last);
+        return { response: result.last, finalMessages: messages };
+      }
+      if (result.last?.info?.error) throw modelFailure(result.last.info.error);
+      if (result.pendingTools.length || result.userPresent ||
+          workspaceInvocation.sawActivity || workspaceInvocation.sawBusy) {
+        idleMisses += 1;
+      } else {
+        admissionMisses += 1;
+      }
+      // Idle is authoritative, but its event can race the final durable
+      // message write. These retries only settle persistence; they do not cap
+      // model execution time.
+      if (idleMisses >= 4) {
+        if (terminalError) throw terminalError;
+        if (result.pendingTools.length) throw new OpenCodeRuntimeFailure({ reason: "unfinished_tool_calls" });
+        throw new OpenCodeRuntimeFailure({ reason: "missing_completed_assistant" });
+      }
+      if (admissionMisses >= 40) {
+        if (terminalError) throw terminalError;
+        throw new OpenCodeRuntimeFailure({ reason: "async_prompt_not_persisted" });
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new OpenCodeRuntimeFailure({ reason: "workspace_prompt_interrupted" });
 }
 
 function finalText(response) {
@@ -1035,6 +1494,7 @@ async function main() {
     sdkClient = runtimeValue(() => sdk.createOpencodeClient({ baseUrl: sdkServer.url, directory: workspace }));
     const resolved = await runtimeStep(() => resolveSession(sdkClient));
     sdkSessionId = resolved.id;
+    const capabilities = await inspectCapabilities(sdkClient, resolved.session, resolved.stage);
     let initialMessages;
     let initialHistoryAvailable = true;
     try {
@@ -1044,12 +1504,12 @@ async function main() {
       );
       if (!Array.isArray(initialMessages)) throw new OpenCodeRuntimeFailure({ reason: "invalid_initial_messages" });
     } catch (error) {
-      if (!resolved.resumed) throw error;
+      if (!resolved.resumed || resolved.stage !== "planner") throw error;
       // session.get() already established that the mapped durable session
-      // exists. Some OpenCode versions cannot project a structured-output
-      // turn through the history endpoint, although the session remains
-      // resumable by session.prompt(). Treat that read as telemetry only and
-      // let the authoritative resumed prompt validate the stored history.
+      // exists. The pinned OpenCode version may fail to project a structured
+      // planner turn through the history endpoint. This exception is never
+      // allowed for a workspace/build session: repair resume must prove its
+      // readable history before the model is called.
       initialHistoryAvailable = false;
       initialMessages = [];
       diagnostic("OpenCode resume history telemetry unavailable; deferring validation to resumed prompt");
@@ -1068,6 +1528,7 @@ async function main() {
       contextWindow,
       resumed: resolved.resumed && (!initialHistoryAvailable || initialMessages.length > 0),
       initialStats,
+      capabilities,
     });
     emitPi("agent_start");
     startHeartbeat();
@@ -1076,27 +1537,30 @@ async function main() {
     }
 
     const { task: eventTask } = await startEventStream(sdkClient);
-    const response = unwrap(
-      await runtimeStep(() => sdkClient.session.prompt({
-        sessionID: sdkSessionId,
-        directory: workspace,
-        model: { providerID: PROVIDER_ID, modelID: model.id },
-        agent: "build",
-        ...(thinkingVariant() ? { variant: thinkingVariant() } : {}),
-        ...(structuredOutputSchema ? {
+    let response;
+    let finalMessages;
+    if (structuredOutputSchema) {
+      response = unwrap(
+        await runtimeStep(() => sdkClient.session.prompt({
+          sessionID: sdkSessionId,
+          directory: workspace,
+          model: { providerID: PROVIDER_ID, modelID: model.id },
+          agent: "build",
+          ...(thinkingVariant() ? { variant: thinkingVariant() } : {}),
           format: { type: "json_schema", schema: structuredOutputSchema, retryCount: 2 },
-          tools: disabledStructuredTools(),
           system: "Return only the object required by the active structured-output schema. Do not modify files or emit prose.",
-        } : {}),
-        parts: [{ type: "text", text: prompt }],
-      })),
-      "OpenCode prompt",
-    );
+          parts: [{ type: "text", text: prompt }],
+        })),
+        "OpenCode structured prompt",
+      );
+    } else {
+      ({ response, finalMessages } = await runWorkspacePrompt(sdkClient));
+    }
     if (!response?.info || response.info.role !== "assistant") {
       throw new OpenCodeRuntimeFailure({ reason: "invalid_assistant_message" });
     }
     if (response.info.error) throw modelFailure(response.info.error);
-    if (terminalError) throw terminalError;
+    if (structuredOutputSchema && terminalError) throw terminalError;
     if (activeTools.size) throw new OpenCodeRuntimeFailure({ reason: "unfinished_tool_calls" });
 
     if (structuredOutputSchema) emitStructuredResult(response);
@@ -1111,23 +1575,20 @@ async function main() {
     if (sseAbortController) sseAbortController.abort();
     await Promise.race([eventTask, new Promise((resolve) => setTimeout(resolve, 100))]);
 
-    let finalMessages;
-    try {
-      finalMessages = unwrap(
-        await runtimeStep(() => sdkClient.session.messages({ sessionID: sdkSessionId, directory: workspace })),
-        "OpenCode final message query",
-      );
-      if (!Array.isArray(finalMessages)) throw new OpenCodeRuntimeFailure({ reason: "invalid_final_messages" });
-    } catch {
-      // The prompt response is the authoritative completed turn. A follow-up
-      // history read only improves cumulative telemetry and must not overturn
-      // a successful result (notably OpenCode structured-output turns).
-      diagnostic("OpenCode final message telemetry unavailable; using completed-turn fallback");
-      finalMessages = [
-        ...initialMessages,
-        { info: { role: "user" }, parts: [] },
-        response,
-      ];
+    if (!finalMessages) {
+      try {
+        finalMessages = await querySessionMessages(sdkClient, "OpenCode final message query");
+      } catch {
+        // The synchronous structured prompt response is authoritative. The
+        // async workspace path never takes this fallback because its success
+        // contract already requires durable message reconciliation.
+        diagnostic("OpenCode final message telemetry unavailable; using completed-turn fallback");
+        finalMessages = [
+          ...initialMessages,
+          { info: { role: "user" }, parts: [] },
+          response,
+        ];
+      }
     }
     const stats = summarizeMessages(finalMessages);
     const state = stateFromStats(stats);
@@ -1150,9 +1611,11 @@ async function main() {
   } catch (error) {
     const code = error instanceof OpenCodeModelFailure
       ? "opencode_model_failed"
-      : error instanceof OpenCodeRuntimeFailure
-        ? "opencode_runtime_failed"
-        : "opencode_failed";
+      : error instanceof OpenCodeCapabilityFailure
+        ? "opencode_capability_unavailable"
+        : error instanceof OpenCodeRuntimeFailure
+          ? "opencode_runtime_failed"
+          : "opencode_failed";
     await fail(code, 1);
   }
 }

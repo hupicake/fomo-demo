@@ -45,9 +45,16 @@ from .execution import (
 )
 from .failures import (
     CODING_AGENT_FAILED,
+    GOAL_VERIFICATION_INFRASTRUCTURE_FAILED,
+    AgentNoEffect,
     DirectPiOrchestrationError,
+    FailureCategory,
+    FailureOutcome,
+    FailureStage,
     PlanningContractError,
+    SafeRunDiagnostic,
     classify_direct_pi_failure,
+    safe_diagnostic_for_error,
 )
 from .goal_manager import (
     RegressionSuite,
@@ -85,6 +92,7 @@ from .session import (
     DirectPiSession,
     PiTransport,
 )
+from .settlement import TurnEffectPolicy, settle_workspace_turn
 from .verification import VerificationOutcome, Verifier
 from .workspace import (
     AuditedWorkspace,
@@ -295,6 +303,15 @@ class DirectPiOrchestrator:
             )
 
             latest_checkpoint = await self.repository.get_latest_verified_checkpoint(run_id)
+            # A recovery run never revives the dead Agent session or sandbox.
+            # It may, however, seed a fresh generation sandbox from the source
+            # run's integrity-checked verified checkpoint.
+            recovery_checkpoint = (
+                None
+                if latest_checkpoint is not None
+                else await self.repository.get_recovery_checkpoint(run_id)
+            )
+            workspace_checkpoint = latest_checkpoint or recovery_checkpoint
             await assert_run_active(self.repository, run_id, active_lease)
             if continuation is not None:
                 generation = SandboxRef(
@@ -311,9 +328,9 @@ class DirectPiOrchestrator:
                     continuation.context,
                     "baselineHashes",
                 )
-            elif latest_checkpoint is not None:
+            elif workspace_checkpoint is not None:
                 generation, baseline = await workspaces.create_generation_from_checkpoint(
-                    latest_checkpoint,
+                    workspace_checkpoint,
                     base_version_id=run.base_version_id,
                 )
             else:
@@ -404,7 +421,11 @@ class DirectPiOrchestrator:
 
             if projection is None:
                 await self._phase(run_id, RunPhase.planning, active_lease)
-                before_planning = baseline
+                # Recovery may have restored a verified checkpoint after the
+                # base snapshot was captured. Planning is read-only relative
+                # to the actual workspace it receives, while ``baseline``
+                # remains the publication/audit base for the candidate diff.
+                before_planning = await workspaces.snapshot_hashes(generation)
                 draft: GoalGraphDraft | None = None
                 starter_fingerprint = {
                     "starterId": starter.id,
@@ -595,6 +616,7 @@ class DirectPiOrchestrator:
                         baseline=baseline,
                     )
                 )
+                turn_start_hashes = await workspaces.snapshot_hashes(generation)
                 await assert_run_active(self.repository, run_id, active_lease)
 
                 turn_continuation_context = {
@@ -622,7 +644,7 @@ class DirectPiOrchestrator:
                     lease_token=active_lease,
                 )
                 if continuation is not None:
-                    handoff = await pi.invoke(
+                    await pi.invoke(
                         generation,
                         self._continuation_prompt(continuation),
                         stage=turn_stage,
@@ -633,7 +655,7 @@ class DirectPiOrchestrator:
                     )
                     continuation = None
                 else:
-                    handoff = await pi.invoke(
+                    await pi.invoke(
                         generation,
                         goal_build_prompt(
                             requirement=requirement,
@@ -648,11 +670,101 @@ class DirectPiOrchestrator:
                     )
                 await self.repository.append_event(
                     run_id,
+                    "runtime.turn.transport_finished",
+                    payload={
+                        "goalId": current_goal_id,
+                        "stage": turn_stage,
+                        "framework": agent_framework,
+                        "requestId": pi.last_turn_receipt.request_id,
+                    },
+                    lease_token=active_lease,
+                )
+                settlement_hashes = await workspaces.snapshot_hashes(generation)
+                settlement_paths = self._hash_delta_paths(
+                    turn_start_hashes,
+                    settlement_hashes,
+                )
+                try:
+                    settlement = settle_workspace_turn(
+                        pi.last_turn_receipt,
+                        changed_paths=settlement_paths,
+                        effect_policy=TurnEffectPolicy.MUST_CHANGE,
+                    )
+                except AgentNoEffect as first_no_effect:
+                    # One deterministic recovery turn is allowed. A second
+                    # unchanged manifest is no progress and terminates with a
+                    # precise runtime failure instead of verifying the starter.
+                    total_repair_round = await self.repository.increment_repair_round(
+                        run_id,
+                        phase=RunPhase.repairing,
+                        lease_token=active_lease,
+                    )
+                    await self.repository.append_event(
+                        run_id,
+                        "runtime.turn.repairing",
+                        payload={
+                            "goalId": current_goal_id,
+                            "diagnostic": first_no_effect.diagnostic.event_payload(),
+                        },
+                        lease_token=active_lease,
+                    )
+                    await pi.invoke(
+                        generation,
+                        goal_repair_prompt(
+                            execution_plan=execution_plan,
+                            diagnostic={
+                                "gate": "turn_settlement",
+                                "code": "agent_no_effect",
+                                "summary": (
+                                    "The previous build turn produced no server-observed "
+                                    "workspace change. Use the repository tools and implement "
+                                    "the active goal before handing off."
+                                ),
+                                "suggestedActions": [
+                                    "Inspect the current workspace with repository tools.",
+                                    "Implement the active goal and persist the code changes.",
+                                    "Run the focused self-check before handing off.",
+                                ],
+                            },
+                            round_number=total_repair_round,
+                            advisory_self_check_command=advisory_self_check_command,
+                        ),
+                        stage="repairing",
+                        goal_id=current_goal_id,
+                        continuation_key="goal_graph.settlement_repair",
+                        continuation_context=turn_continuation_context,
+                        require_existing_session=True,
+                    )
+                    await self.repository.append_event(
+                        run_id,
+                        "runtime.turn.transport_finished",
+                        payload={
+                            "goalId": current_goal_id,
+                            "stage": "repairing",
+                            "framework": agent_framework,
+                            "requestId": pi.last_turn_receipt.request_id,
+                        },
+                        lease_token=active_lease,
+                    )
+                    repaired_hashes = await workspaces.snapshot_hashes(generation)
+                    settlement_paths = self._hash_delta_paths(
+                        settlement_hashes,
+                        repaired_hashes,
+                    )
+                    settlement = settle_workspace_turn(
+                        pi.last_turn_receipt,
+                        changed_paths=settlement_paths,
+                        effect_policy=TurnEffectPolicy.MUST_CHANGE,
+                    )
+                await self.repository.append_event(
+                    run_id,
                     "build.turn.completed",
                     payload={
                         "goalId": current_goal_id,
                         "claimOnly": True,
-                        "handoff": handoff[:1000],
+                        "effectPolicy": settlement.effect_policy.value,
+                        "changedFileCount": len(settlement.changed_paths),
+                        "toolCalls": settlement.tool_calls,
                     },
                     lease_token=active_lease,
                 )
@@ -920,6 +1032,18 @@ class DirectPiOrchestrator:
                         lease_token=active_lease,
                     )
                     if outcome.has_infrastructure_failure:
+                        infrastructure_diagnostic = (
+                            self._verification_infrastructure_diagnostic(outcome)
+                        )
+                        await self.repository.append_event(
+                            run_id,
+                            "pi.failed",
+                            payload=GOAL_VERIFICATION_INFRASTRUCTURE_FAILED.event_payload(
+                                goal_id=current_goal_id,
+                                diagnostic=infrastructure_diagnostic,
+                            ),
+                            lease_token=active_lease,
+                        )
                         await self._discard_goal_workspace(workspaces, verification)
                         verification = None
                         await self.repository.set_preview_url(
@@ -1073,6 +1197,7 @@ class DirectPiOrchestrator:
         except Exception as exc:
             logger.error("GoalGraph Direct Pi run failed", extra={"run_id": run_id})
             public_failure = classify_direct_pi_failure(exc)
+            safe_diagnostic = safe_diagnostic_for_error(exc)
             try:
                 if current_goal_id is not None:
                     latest = await self.repository.get_goal_graph_for_run(run_id)
@@ -1105,7 +1230,10 @@ class DirectPiOrchestrator:
                 await self.repository.append_event(
                     run_id,
                     "pi.failed",
-                    payload=public_failure.event_payload(goal_id=current_goal_id),
+                    payload=public_failure.event_payload(
+                        goal_id=current_goal_id,
+                        diagnostic=safe_diagnostic,
+                    ),
                     lease_token=active_lease,
                 )
                 await self.repository.mark_terminal(
@@ -1824,6 +1952,85 @@ class DirectPiOrchestrator:
                 for path in prior.keys() | current.keys()
                 if prior.get(path) != current.get(path)
             )
+        )
+
+    @staticmethod
+    def _hash_delta_paths(
+        before: dict[str, str],
+        after: dict[str, str],
+    ) -> tuple[str, ...]:
+        """Compare the provider manifest without reading candidate contents.
+
+        Settlement must not pre-empt the workspace auditor: a model may have
+        produced a secret path, binary file, or other repairable violation.
+        Content validation remains the later authoritative audit gate.
+        """
+
+        return tuple(
+            sorted(
+                path
+                for path in before.keys() | after.keys()
+                if before.get(path) != after.get(path)
+            )
+        )
+
+    @staticmethod
+    def _verification_infrastructure_diagnostic(
+        outcome: VerificationOutcome,
+    ) -> SafeRunDiagnostic:
+        gate = next(
+            item
+            for item in outcome.gates
+            if (
+                item.scope == "project"
+                and item.gate in {"runner", "restore"}
+                and item.status.value == "failed"
+            )
+            or (
+                item.scope == "project"
+                and item.gate == "dependencies"
+                and item.status.value == "failed"
+                and item.timed_out
+            )
+            or (
+                item.scope == "acceptance"
+                and item.outcome == "infrastructure_failed"
+            )
+        )
+        if gate.scope == "acceptance":
+            reason_code = "playwright_report_untrusted"
+            frame = "Playwright did not produce one trustworthy acceptance result."
+            check = "playwright_report"
+        elif gate.gate == "dependencies":
+            reason_code = "verification_dependencies_timeout"
+            frame = "The fixed dependency preparation command timed out."
+            check = "dependencies"
+        elif gate.gate == "restore":
+            reason_code = "verification_restore_failed"
+            frame = "The immutable candidate could not be restored for verification."
+            check = "restore"
+        else:
+            reason_code = "verification_runner_unavailable"
+            frame = "The fixed verification runner could not start reliably."
+            check = "runner"
+        return SafeRunDiagnostic(
+            stage=FailureStage.VERIFYING,
+            component="verification_orchestrator",
+            check=check,
+            category=FailureCategory.INFRASTRUCTURE_FAILED,
+            reason_code=reason_code,
+            outcome=(
+                FailureOutcome.TIMED_OUT
+                if gate.timed_out
+                else FailureOutcome.UNAVAILABLE
+            ),
+            retryable=True,
+            frames=(
+                frame,
+                "A recovery run can continue only from the latest verified checkpoint.",
+            ),
+            exit_code=gate.exit_code,
+            timed_out=gate.timed_out,
         )
 
     @staticmethod

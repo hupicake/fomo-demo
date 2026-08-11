@@ -51,6 +51,10 @@ async def test_fresh_database_upgrades_to_head(tmp_path: Path) -> None:
             "runtime_inference_tpm_limit",
             "runtime_max_spend_micros",
             "agent_framework",
+            "recovered_from_run_id",
+            "recovered_from_goal_id",
+            "recovered_from_checkpoint_id",
+            "recovery_mode",
         } <= run_columns
         token_budget_column = next(
             row
@@ -59,6 +63,14 @@ async def test_fresh_database_upgrades_to_head(tmp_path: Path) -> None:
         )
         assert token_budget_column[3] == 0  # nullable: NULL means unlimited
         assert token_budget_column[4] is None
+        indexes = {
+            row[1] for row in connection.execute("PRAGMA index_list('runs')")
+        }
+        assert "ix_runs_recovered_from" in indexes
+        constraints_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'runs'"
+        ).fetchone()[0]
+        assert "ck_runs_recovery_lineage" in constraints_sql
 
 
 @pytest.mark.asyncio

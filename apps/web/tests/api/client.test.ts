@@ -47,6 +47,43 @@ describe("control plane client contract", () => {
     expect((fetchMock.mock.calls[0]?.[1] as RequestInit).credentials).toBe("include");
   });
 
+  it("normalizes the latest run summary used by task grouping and recovery", async () => {
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    installFetch(jsonResponse([{
+      id: "project-1",
+      title: "Library",
+      status: "idle",
+      latest_run: {
+        id: "run-failed",
+        status: "failed",
+        error_code: "agent_no_effect",
+        agent_framework: "opencode",
+        profile_id: "gpt-5.5",
+        thinking: "medium",
+        recovery_available: true,
+        recovery_mode: "verified_checkpoint",
+        source_checkpoint_available: true,
+      },
+    }]));
+
+    await expect(controlPlane.getProjects()).resolves.toEqual([
+      expect.objectContaining({
+        id: "project-1",
+        latestRun: {
+          id: "run-failed",
+          status: "failed",
+          errorCode: "agent_no_effect",
+          agentFramework: "opencode",
+          profileId: "gpt-5.5",
+          thinking: "medium",
+          recoveryAvailable: true,
+          recoveryMode: "verified_checkpoint",
+          sourceCheckpointAvailable: true,
+        },
+      }),
+    ]);
+  });
+
   it("creates a project once with the server's title payload", async () => {
     process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
     const fetchMock = installFetch(jsonResponse({ id: "project-1", title: "Library" }, 201));
@@ -458,6 +495,52 @@ describe("control plane client contract", () => {
       content: "Build a thing",
       profileId: "deepseek-flash",
       thinking: "high",
+      attachments: [],
+    });
+  });
+
+  it("creates a recovery run with a user follow-up and frozen runtime selection", async () => {
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    const fetchMock = installFetch(jsonResponse({
+      recovery_mode: "verified_checkpoint",
+      source_checkpoint_available: true,
+      run: {
+        id: "run-recovery",
+        agent_framework: "opencode",
+        runtime: {
+          profile_id: "gpt-5.5",
+          thinking: "medium",
+          context_window: 250_000,
+          policy_version: "direct-pi-runtime-v2",
+          run_token_budget: null,
+          run_token_budget_unlimited: true,
+          inference_tpm_limit: 1_000_000,
+        },
+      },
+    }, 202));
+
+    await expect(controlPlane.recoverRun("run failed", {
+      clientMessageId: "recover-1",
+      content: "Fix the missing interactions.",
+      agentFramework: "opencode",
+      profileId: "gpt-5.5",
+      thinking: "medium",
+    })).resolves.toEqual(expect.objectContaining({
+      runId: "run-recovery",
+      recoveryMode: "verified_checkpoint",
+      sourceCheckpointAvailable: true,
+      agentFramework: "opencode",
+    }));
+
+    expect(requestUrl(fetchMock).pathname).toBe("/v1/runs/run%20failed/recover");
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    expect(new Headers(init.headers).get("Idempotency-Key")).toBe("recover-1");
+    expect(JSON.parse(String(init.body))).toEqual({
+      clientMessageId: "recover-1",
+      content: "Fix the missing interactions.",
+      agentFramework: "opencode",
+      profileId: "gpt-5.5",
+      thinking: "medium",
       attachments: [],
     });
   });

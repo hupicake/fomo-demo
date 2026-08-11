@@ -57,6 +57,8 @@ from fomo.schemas import (
     ProjectPatch,
     ProjectResponse,
     ProjectSnapshotResponse,
+    RecoveryRunCreate,
+    RecoveryRunResponse,
     RunResponse,
     RuntimeOptionsResponse,
     RuntimeProfileOption,
@@ -606,6 +608,153 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
     @app.get("/v1/runs/{run_id}", response_model=RunResponse)
     async def get_run(run_id: str, owner_session_id: SessionId) -> RunResponse:
         return await _owned_run(run_id, owner_session_id)
+
+    @app.post("/v1/runs/{run_id}/recover", response_model=RecoveryRunResponse)
+    async def recover_run(
+        run_id: str,
+        payload: RecoveryRunCreate,
+        response: Response,
+        owner_session_id: SessionId,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> RecoveryRunResponse:
+        """Create a fresh run from safe terminal history; never resume a dead session."""
+
+        if idempotency_key and idempotency_key != payload.client_message_id:
+            raise HTTPException(
+                status_code=422, detail="Idempotency-Key must match clientMessageId"
+            )
+        source = await _owned_run(run_id, owner_session_id)
+        existing = await repository.get_message_run_by_client_id(
+            source.project_id,
+            owner_session_id,
+            payload.client_message_id,
+        )
+        if existing is not None:
+            existing_message, existing_run = existing
+            if (
+                existing_message.content != payload.content
+                or existing_run.recovered_from_run_id != source.id
+                or existing_run.recovery_mode is None
+                or (
+                    payload.profile_id is not None
+                    and payload.profile_id != existing_run.runtime.profile_id
+                )
+                or (
+                    payload.thinking is not None
+                    and payload.thinking != existing_run.runtime.thinking
+                )
+                or (
+                    payload.agent_framework is not None
+                    and payload.agent_framework != existing_run.agent_framework
+                )
+            ):
+                raise ConflictError(
+                    "Idempotency-Key was already used with a different request"
+                )
+            response.status_code = status.HTTP_200_OK
+            return RecoveryRunResponse(
+                message=existing_message,
+                run=existing_run,
+                recovery_mode=existing_run.recovery_mode,
+                source_checkpoint_available=(
+                    existing_run.recovered_from_checkpoint_id is not None
+                ),
+            )
+
+        if source.status.value not in {"failed", "needs_attention", "cancelled"}:
+            raise ConflictError("only a failed, interrupted, or cancelled run can recover")
+
+        selected_agent_framework = (
+            payload.agent_framework.value
+            if payload.agent_framework is not None
+            else source.agent_framework.value
+        )
+        if settings.agent_framework != "direct_pi":
+            if (
+                payload.agent_framework is not None
+                or payload.profile_id is not None
+                or payload.thinking is not None
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail="runtime selection requires the Direct Pi framework",
+                )
+            message, run, created, mode, checkpoint_available = (
+                await repository.create_recovery_message_and_run(
+                    source.id,
+                    owner_session_id,
+                    payload.client_message_id,
+                    payload.content,
+                    agent_framework=selected_agent_framework,
+                )
+            )
+            response.status_code = (
+                status.HTTP_202_ACCEPTED if created else status.HTTP_200_OK
+            )
+            return RecoveryRunResponse(
+                message=message,
+                run=run,
+                recovery_mode=mode,
+                source_checkpoint_available=checkpoint_available,
+            )
+
+        if selected_agent_framework not in settings.agent_enabled_frameworks:
+            raise HTTPException(status_code=422, detail="agent framework is not enabled")
+        selected_profile = payload.profile_id or source.runtime.profile_id
+        selected_thinking = payload.thinking
+        if selected_thinking is None and selected_profile == source.runtime.profile_id:
+            selected_thinking = source.runtime.thinking
+        try:
+            validate_agent_framework_profile(selected_agent_framework, selected_profile)
+        except RuntimeContractError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if selected_profile not in settings.runtime_enabled_profiles:
+            raise HTTPException(status_code=422, detail="runtime profile is not enabled")
+        available_profiles, discovery_succeeded = await runtime_availability()
+        if not discovery_succeeded:
+            raise HTTPException(
+                status_code=503,
+                detail="runtime model availability could not be verified",
+            )
+        if selected_profile not in available_profiles:
+            raise HTTPException(status_code=422, detail="runtime profile is unavailable")
+        try:
+            runtime_contract = resolve_runtime_contract(
+                selected_profile,
+                selected_thinking,
+                inference_tpm_limit=settings.run_inference_tpm_limit,
+                max_spend_micros=int(settings.run_max_spend * 1_000_000),
+            )
+            validate_agent_framework_runtime(
+                selected_agent_framework,
+                runtime_contract.profile_id,
+                runtime_contract.thinking,
+            )
+        except RuntimeContractError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        message, run, created, mode, checkpoint_available = (
+            await repository.create_recovery_message_and_run(
+                source.id,
+                owner_session_id,
+                payload.client_message_id,
+                payload.content,
+                agent_framework=selected_agent_framework,
+                runtime_contract=runtime_contract,
+                enforce_runtime_match=bool(
+                    {"profile_id", "thinking"}.intersection(payload.model_fields_set)
+                ),
+                enforce_agent_framework_match=(
+                    "agent_framework" in payload.model_fields_set
+                ),
+            )
+        )
+        response.status_code = status.HTTP_202_ACCEPTED if created else status.HTTP_200_OK
+        return RecoveryRunResponse(
+            message=message,
+            run=run,
+            recovery_mode=mode,
+            source_checkpoint_available=checkpoint_available,
+        )
 
     @app.get(
         "/v1/runs/{run_id}/artifacts/{artifact_id}",

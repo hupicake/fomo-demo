@@ -104,6 +104,7 @@ class RunRecord(Base):
     __tablename__ = "runs"
     __table_args__ = (
         Index("ix_runs_project_created", "project_id", "created_at"),
+        Index("ix_runs_recovered_from", "recovered_from_run_id", "created_at"),
         Index("ix_runs_claim", "status", "lease_expires_at", "created_at"),
         Index(
             "uq_runs_one_running_writer_per_project",
@@ -116,11 +117,46 @@ class RunRecord(Base):
             "agent_framework IN ('pi', 'opencode', 'codex')",
             name="ck_runs_agent_framework",
         ),
+        CheckConstraint(
+            "recovery_mode IS NULL OR recovery_mode IN "
+            "('verified_checkpoint', 'verified_version', 'base_restart')",
+            name="ck_runs_recovery_mode",
+        ),
+        CheckConstraint(
+            "(recovery_mode IS NULL AND recovered_from_run_id IS NULL "
+            "AND recovered_from_goal_id IS NULL "
+            "AND recovered_from_checkpoint_id IS NULL) "
+            "OR (recovery_mode = 'verified_checkpoint' "
+            "AND recovered_from_run_id IS NOT NULL "
+            "AND recovered_from_goal_id IS NOT NULL "
+            "AND recovered_from_checkpoint_id IS NOT NULL) "
+            "OR (recovery_mode = 'verified_version' "
+            "AND recovered_from_run_id IS NOT NULL "
+            "AND recovered_from_goal_id IS NULL "
+            "AND recovered_from_checkpoint_id IS NULL "
+            "AND base_version_id IS NOT NULL) "
+            "OR (recovery_mode = 'base_restart' "
+            "AND recovered_from_run_id IS NOT NULL "
+            "AND recovered_from_goal_id IS NULL "
+            "AND recovered_from_checkpoint_id IS NULL "
+            "AND base_version_id IS NULL)",
+            name="ck_runs_recovery_lineage",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False)
     base_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # Terminal history is immutable. A user continuation always creates a new
+    # run and records the exact source state selected by the control plane.
+    recovered_from_run_id: Mapped[str | None] = mapped_column(
+        ForeignKey("runs.id"), nullable=True
+    )
+    recovered_from_goal_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    recovered_from_checkpoint_id: Mapped[str | None] = mapped_column(
+        ForeignKey("checkpoints.id"), nullable=True
+    )
+    recovery_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
     phase: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
     repair_round: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

@@ -166,7 +166,17 @@ function formatProjectActivity(iso?: string): string {
 }
 
 function projectStatusText(status: string): string {
+  if (status === "completed") return "Success";
+  if (status === "failed") return "Failed";
+  if (status === "cancelled") return "Interrupted";
+  if (status === "needs_attention") return "Needs attention";
   return runStatusLabels[status] || status.replaceAll("_", " ");
+}
+
+function projectStatusTone(status: string): string {
+  if (status === "completed") return "text-emerald-700 dark:text-emerald-300";
+  if (["failed", "cancelled", "needs_attention"].includes(status)) return "text-destructive";
+  return "text-muted-foreground";
 }
 
 function errorNotice(prefix: string, failure: unknown): string {
@@ -177,12 +187,14 @@ function errorNotice(prefix: string, failure: unknown): string {
 
 function ProjectRail({ currentProjectId, currentProjectName, projects, run }: { currentProjectId: string; currentProjectName: string; projects: ProjectSummary[]; run: RunPresentation }) {
   const visibleProjects = projects.map((project) => {
-    const status = projectStatusLabel(project, project.id === currentProjectId && run.runId ? run.status : undefined);
+    const liveStatus = project.id === currentProjectId && run.runId ? run.status : undefined;
+    const status = liveStatus ?? project.latestRun?.status ?? projectStatusLabel(project);
     return {
       id: project.id,
       name: project.name,
       status,
       statusText: projectStatusText(status),
+      statusTone: projectStatusTone(status),
       activity: formatProjectActivity(project.updatedAt || project.createdAt),
       activityIso: project.updatedAt || project.createdAt,
     };
@@ -229,7 +241,7 @@ function ProjectRail({ currentProjectId, currentProjectName, projects, run }: { 
           >
             <span className="truncate text-sm font-medium text-foreground">{project.name}</span>
             <span className="flex min-w-0 items-center gap-1.5 text-[11px] leading-4 text-muted-foreground">
-              <span className="truncate">{project.statusText}</span>
+              <span className={cn("truncate font-medium", project.statusTone)}>{project.statusText}</span>
               <span aria-hidden="true" className="shrink-0 text-border">·</span>
               {project.activityIso ? (
                 <time className="shrink-0 tabular-nums" dateTime={project.activityIso}>{project.activity}</time>

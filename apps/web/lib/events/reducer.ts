@@ -76,6 +76,14 @@ const publicFailureContracts = {
     title: "Coding Agent 运行环境问题",
     message: "Coding Agent 运行环境暂时不可用，请重试；若问题持续发生，请检查所选 Agent 框架状态。",
   },
+  agent_capability_unavailable: {
+    title: "Coding Agent 工具不可用",
+    message: "当前 Coding Agent 未获得完成此阶段所需的仓库或命令工具，本轮没有进入代码验收。",
+  },
+  agent_no_effect: {
+    title: "Coding Agent 未产生代码变更",
+    message: "Coding Agent 已结束本轮开发，但工作区没有产生可验收的代码变更。",
+  },
   planning_contract_failed: {
     title: "模型运行问题：规划输出无效",
     message: "模型未能按要求返回有效的产品规划合约。请重试或切换模型。",
@@ -264,7 +272,39 @@ function publicFailureDetail(payload: Record<string, unknown>): string {
   // The server-provided message/summary is intentionally ignored. Only its
   // stable code can select browser text, so provider bodies and exception
   // strings remain private even if an upstream boundary regresses.
-  return publicFailureContract(payload).message;
+  const diagnostic = asRecord(payload.diagnostic);
+  const safeReasonCodes = new Set([
+    "repository_tools_unavailable",
+    "runtime_capability_attestation_invalid",
+    "runtime_capability_attestation_missing",
+    "agent_no_effect",
+    "protected_file_changed",
+    "protected_file_missing",
+    "rejected_secret_file",
+    "unsupported_source_type",
+    "invalid_source_encoding",
+    "workspace_contract_rejected",
+    "playwright_report_untrusted",
+    "verification_dependencies_timeout",
+    "verification_restore_failed",
+    "verification_runner_unavailable",
+  ]);
+  const safeStages = new Set(["initializing", "planning", "building", "repairing", "verifying", "publishing"]);
+  const safeCategories = new Set(["runtime_failed", "product_failed", "infrastructure_failed", "workspace_rejected"]);
+  const trustedDiagnostic = diagnostic.version === 1
+    && safeReasonCodes.has(asText(diagnostic.reasonCode))
+    && safeStages.has(asText(diagnostic.stage))
+    && safeCategories.has(asText(diagnostic.category));
+  const frames = trustedDiagnostic && Array.isArray(diagnostic.frames) && diagnostic.frames.length <= 4
+    ? diagnostic.frames.flatMap((value) => {
+        if (typeof value !== "string") return [];
+        const frame = boundedPublicText(value, 240).trim();
+        return frame ? [frame] : [];
+      })
+    : [];
+  return frames.length > 0
+    ? frames.join(" → ")
+    : publicFailureContract(payload).message;
 }
 
 const legacyFailureCodesByExactReason = {
@@ -1044,12 +1084,15 @@ function projectWorklogEvent(
 
   if (event.kind === "run.failed") {
     const failure = publicFailureContract(event.payload);
+    const causalDetail = [...state.worklog].reverse().find(
+      (item) => item.id === "system:pi:failure" && item.status === "failed" && item.detail,
+    )?.detail;
     add(worklogItem(event, {
       id: "system:run:failure",
       kind: "system",
       status: "failed",
       title: failure.title,
-      detail: failure.message,
+      detail: causalDetail || failure.message,
     }));
     return { worklog, activePublicMessageId: undefined };
   }
@@ -1160,7 +1203,9 @@ export function reduceDomainEvent(state: RunPresentation, event: DomainEvent): R
       ])) as Record<AgentStage, StageActivity>;
       next.problems = [...state.problems, {
         id: `failure:${event.eventId}`,
-        title: publicFailureDetail(event.payload),
+        title: [...state.worklog].reverse().find(
+          (item) => item.id === "system:pi:failure" && item.status === "failed" && item.detail,
+        )?.detail || publicFailureDetail(event.payload),
         severity: "error" as const,
       }].slice(-maxActivityItems);
       break;

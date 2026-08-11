@@ -53,6 +53,21 @@ export interface ProjectSummary {
   createdAt?: string;
   updatedAt?: string;
   status?: ProjectStatus;
+  latestRun?: ProjectLatestRun;
+}
+
+export type RecoveryMode = "verified_checkpoint" | "verified_version" | "base_restart";
+
+export interface ProjectLatestRun {
+  id: string;
+  status: RunStatus;
+  errorCode?: string;
+  agentFramework: AgentFrameworkId;
+  profileId: string;
+  thinking: string;
+  recoveryAvailable: boolean;
+  recoveryMode?: RecoveryMode;
+  sourceCheckpointAvailable: boolean;
 }
 
 export interface ProjectMessage {
@@ -168,6 +183,12 @@ export interface RunSnapshot {
   pendingInputRequest?: UserInputRequest;
   agentFramework?: AgentFrameworkId;
   runtime?: RunRuntimeResponse;
+  recoveredFromRunId?: string;
+  recoveredFromGoalId?: string;
+  recoveredFromCheckpointId?: string;
+  recoveryMode?: RecoveryMode;
+  recoveryAvailable?: boolean;
+  sourceCheckpointAvailable?: boolean;
 }
 
 export interface FileManifestEntry {

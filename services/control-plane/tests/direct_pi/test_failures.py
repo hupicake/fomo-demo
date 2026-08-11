@@ -5,6 +5,8 @@ import json
 import pytest
 
 from fomo.direct_pi.failures import (
+    AGENT_CAPABILITY_UNAVAILABLE,
+    AGENT_NO_EFFECT,
     CODING_AGENT_FAILED,
     CODING_AGENT_RUNTIME_FAILED,
     INFERENCE_GATEWAY_UNAVAILABLE,
@@ -17,8 +19,14 @@ from fomo.direct_pi.failures import (
     RUN_TOOL_BUDGET_EXCEEDED,
     RUN_WALL_TIME_BUDGET_EXCEEDED,
     WORKSPACE_CONTRACT_FAILED,
+    AgentCapabilityUnavailable,
+    AgentNoEffect,
     DirectPiOrchestrationError,
+    FailureCategory,
+    FailureOutcome,
+    FailureStage,
     PlanningContractError,
+    SafeRunDiagnostic,
     classify_direct_pi_failure,
     public_bridge_failure,
     public_failure_for_code,
@@ -157,3 +165,34 @@ def test_workspace_contract_and_terminal_code_lookup_are_closed() -> None:
     assert public_failure_for_code("workspace_contract_failed") == WORKSPACE_CONTRACT_FAILED
     assert public_failure_for_code(secret) == CODING_AGENT_FAILED
     assert secret not in json.dumps(WORKSPACE_CONTRACT_FAILED.event_payload(), ensure_ascii=False)
+
+
+def test_runtime_admission_and_settlement_failures_keep_safe_causal_diagnostics() -> None:
+    capability = SafeRunDiagnostic(
+        stage=FailureStage.BUILDING,
+        component="opencode_adapter",
+        check="runtime_capability_binding",
+        category=FailureCategory.RUNTIME_FAILED,
+        reason_code="repository_tools_unavailable",
+        outcome=FailureOutcome.UNAVAILABLE,
+        retryable=True,
+        frames=("OpenCode repository tools are unavailable.",),
+    )
+    no_effect = SafeRunDiagnostic(
+        stage=FailureStage.BUILDING,
+        component="settlement_engine",
+        check="candidate_manifest_delta",
+        category=FailureCategory.RUNTIME_FAILED,
+        reason_code="agent_no_effect",
+        outcome=FailureOutcome.REJECTED,
+        retryable=True,
+        frames=("Server-observed changed files: 0.",),
+    )
+
+    assert (
+        classify_direct_pi_failure(AgentCapabilityUnavailable(capability))
+        == AGENT_CAPABILITY_UNAVAILABLE
+    )
+    assert classify_direct_pi_failure(AgentNoEffect(no_effect)) == AGENT_NO_EFFECT
+    assert public_bridge_failure("opencode_capability_unavailable") == AGENT_CAPABILITY_UNAVAILABLE
+    assert capability.event_payload()["reasonCode"] == "repository_tools_unavailable"

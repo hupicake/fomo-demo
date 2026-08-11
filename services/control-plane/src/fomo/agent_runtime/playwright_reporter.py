@@ -4,7 +4,9 @@ Playwright 1.55.1's ``json`` reporter nests tests inside ``suites[].specs[]``:
 the unique test title lives on the spec, while ``spec.tests[]`` entries carry
 ``expectedStatus``, ``status`` (expected/unexpected/flaky/skipped/didNotRun/
 interrupted) and ``results[]`` whose per-result ``status`` is passed/failed/
-timedOut/skipped/interrupted. The SOP trusts only this projection; oversized,
+timedOut/skipped/interrupted. A completed, unexpected test-level timeout is a
+real product-test failure, not evidence that the reporter or runner failed.
+The SOP trusts only this projection; oversized,
 malformed, or structurally invalid output returns ``None`` and the caller
 treats that as an infrastructure failure — never a fabricated assertion.
 """
@@ -144,11 +146,13 @@ def parse_playwright_json(
     """Return ``None`` (fail closed) unless the report is structurally sound.
 
     A passed test requires the overall test status ``expected`` and a real
-    ``passed`` result; an assertion failure requires overall ``unexpected``
-    with a plain ``failed`` result. timedOut/interrupted/skipped results,
-    flaky/didNotRun/skipped overall statuses, zero or multiple tests,
-    top-level (startup/worker) errors, spec load errors and any structural
-    anomaly map to ``did_not_run`` or ``None`` — never to a fabricated pass.
+    ``passed`` result. A product-test failure requires overall ``unexpected``
+    with either a plain ``failed`` result or a test-level ``timedOut`` result;
+    the caller separately owns the outer command timeout and runner/report
+    checks. interrupted/skipped results, flaky/didNotRun/skipped overall
+    statuses, zero or multiple tests, top-level (startup/worker) errors, spec
+    load errors and any structural anomaly map to ``did_not_run`` or ``None``
+    — never to a fabricated pass.
     """
     if len(stdout.encode("utf-8")) > max_bytes:
         return None
@@ -222,7 +226,7 @@ def parse_playwright_json(
         title, overall, result_status, last_result = tests[0]
         if overall == "expected" and result_status == "passed":
             mapped: PlaywrightTestStatus = "passed"
-        elif overall == "unexpected" and result_status == "failed":
+        elif overall == "unexpected" and result_status in {"failed", "timedOut"}:
             mapped = "failed"
             assertion = _assertion_diagnostic(title, last_result)
         else:

@@ -1598,6 +1598,117 @@ async def test_goal_graph_runs_two_goals_with_scoped_full_regression_and_checkpo
 
 
 @pytest.mark.asyncio
+async def test_recovery_run_plans_against_the_restored_verified_checkpoint(
+    repository, settings
+) -> None:
+    owner = await create_user_session(repository)
+    project = await repository.create_project(owner.id, "Recovery library")
+    requirement = "Build a library with search and durable create."
+    _message, source, _created = await repository.create_message_and_run(
+        project.id,
+        owner.id,
+        "recovery-source",
+        requirement,
+    )
+    claimed_source = await repository.claim_next_run("recovery-source-worker", 60)
+    assert claimed_source is not None and claimed_source.lease_owner
+    source_lease = claimed_source.lease_owner
+    await repository.create_goal_graph(
+        project.id,
+        source.id,
+        parse_goal_graph_draft(_goal_graph_plan()),
+        lease_token=source_lease,
+    )
+    await repository.activate_goal(source.id, "G-1", lease_token=source_lease)
+    await repository.claim_goal(source.id, "G-1", lease_token=source_lease)
+    starter = resolve_starter_manifest(("crud", "local-persistence"))
+    checkpoint_files = [
+        {"path": item.path, "content": item.as_change().content}
+        for item in starter.files
+        if not item.path.startswith("tests/harness/")
+        and not item.path.startswith("tests/fomo-acceptance/")
+        and item.path != "next-env.d.ts"
+        and item.path != ".gitignore"
+    ]
+    checkpoint_files.append(
+        {
+            "path": "lib/domain/recovered.ts",
+            "content": "export const recoveredCheckpoint = true;\n",
+        }
+    )
+    await repository.record_verified_checkpoint(
+        source.id,
+        "G-1",
+        checkpoint_files,
+        [{"acceptanceKey": "G-1:AC-1", "kind": "playwright_smoke", "status": "passed"}],
+        lease_token=source_lease,
+        commit_sha="c" * 40,
+        capsule={
+            "verifiedEvidence": [{
+                "goalId": "G-1",
+                "passedAcceptanceIds": ["AC-1"],
+                "evidenceRefs": ["checkpoint:source-g1"],
+            }]
+        },
+    )
+    await repository.mark_terminal(
+        source.id,
+        RunStatus.needs_attention,
+        error_code="goal_verification_failed",
+        lease_token=source_lease,
+    )
+    _message, recovered, created, mode, checkpoint_available = (
+        await repository.create_recovery_message_and_run(
+            source.id,
+            owner.id,
+            "recovery-follow-up",
+            "Keep the verified work and finish the remaining interactions.",
+        )
+    )
+    assert created and mode == "verified_checkpoint" and checkpoint_available
+    claimed_recovery = await repository.claim_next_run("recovery-worker", 60)
+    assert claimed_recovery is not None and claimed_recovery.id == recovered.id
+    assert claimed_recovery.lease_owner
+
+    harness = _playwright_report("starter renders a stable application shell")
+    search = _playwright_report("searches books by title")
+    create = _playwright_report("creates and persists a book")
+    sandbox = GitAwareSandbox(
+        {
+            _playwright_command(_HARNESS_PATH): [
+                ExecResult(0, harness, ""),
+                ExecResult(0, harness, ""),
+            ],
+            _playwright_command(
+                "tests/fomo-acceptance/G-1/search-books.smoke.spec.ts"
+            ): [ExecResult(0, search, ""), ExecResult(0, search, "")],
+            _playwright_command(
+                "tests/fomo-acceptance/G-2/create-book.smoke.spec.ts"
+            ): ExecResult(0, create, ""),
+        }
+    )
+    orchestrator = DirectPiOrchestrator(
+        repository,
+        sandbox,
+        replace(
+            settings,
+            agent_framework="direct_pi",
+            direct_pi_goal_graph_enabled=True,
+        ),
+        _Gateway(),
+        _GoalGraphTransport(sandbox),
+    )
+
+    await orchestrator.run(recovered.id, lease_token=claimed_recovery.lease_owner)
+
+    final = await repository.get_run(recovered.id)
+    checkpoint = await repository.get_latest_verified_checkpoint(recovered.id)
+    assert final.status is RunStatus.succeeded
+    assert checkpoint is not None
+    assert "lib/domain/recovered.ts" in {item.path for item in checkpoint.files}
+
+
+@pytest.mark.asyncio
 async def test_goal_graph_repairs_workspace_audit_in_same_session(
     repository, settings
 ) -> None:
