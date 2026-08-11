@@ -18,6 +18,7 @@ import type {
   RecoveryMode,
   RunRuntimeResponse,
   RunSnapshot,
+  RunUsage,
   RuntimeOptionsResponse,
   RuntimeProfileOption,
   UserInputAnswerInput,
@@ -85,6 +86,12 @@ function nullableNumberValue(value: unknown): number | null {
   return value === null ? null : numberValue(value);
 }
 
+function nonnegativeSafeInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined;
+}
+
 function toArray(value: unknown): unknown[] {
   return Array.isArray(value) ? value : [];
 }
@@ -112,6 +119,7 @@ export function normalizeProject(value: unknown): ProjectSummary {
   const latestRecoveryMode = normalizeRecoveryMode(
     latestRunSource.recoveryMode || latestRunSource.recovery_mode,
   );
+  const latestUsage = normalizeRunUsage(latestRunSource.usage);
   return {
     id: text(source.id || source.projectId),
     name: text(source.name || source.title, "Untitled project"),
@@ -136,6 +144,7 @@ export function normalizeProject(value: unknown): ProjectSummary {
           latestRunSource.sourceCheckpointAvailable
             ?? latestRunSource.source_checkpoint_available,
         ),
+        ...(latestUsage ? { usage: latestUsage } : {}),
       },
     } : {}),
   };
@@ -207,6 +216,41 @@ export function normalizeRunRuntime(value: unknown): RunRuntimeResponse | undefi
   };
 }
 
+/** Rejects partial, negative or internally inconsistent usage projections. */
+export function normalizeRunUsage(value: unknown): RunUsage | undefined {
+  if (value === undefined || value === null) return undefined;
+  const source = record(value);
+  const inputTokens = nonnegativeSafeInteger(source.inputTokens ?? source.input_tokens);
+  const outputTokens = nonnegativeSafeInteger(source.outputTokens ?? source.output_tokens);
+  const cacheReadTokens = nonnegativeSafeInteger(
+    source.cacheReadTokens ?? source.cache_read_tokens,
+  );
+  const cacheWriteTokens = nonnegativeSafeInteger(
+    source.cacheWriteTokens ?? source.cache_write_tokens,
+  );
+  const totalTokens = nonnegativeSafeInteger(source.totalTokens ?? source.total_tokens);
+  const toolCalls = nonnegativeSafeInteger(source.toolCalls ?? source.tool_calls);
+  if (
+    inputTokens === undefined
+    || outputTokens === undefined
+    || cacheReadTokens === undefined
+    || cacheWriteTokens === undefined
+    || totalTokens === undefined
+    || toolCalls === undefined
+    || totalTokens !== inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens
+  ) {
+    return undefined;
+  }
+  return {
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+    totalTokens,
+    toolCalls,
+  };
+}
+
 /** Mirrors the public RuntimeProfileOption contract; drops nothing server-sent. */
 export function normalizeRuntimeProfile(value: unknown): RuntimeProfileOption | undefined {
   const source = record(value);
@@ -253,6 +297,7 @@ export function normalizeRun(value: unknown): RunSnapshot | undefined {
   const recoveryMode = normalizeRecoveryMode(
     source.recoveryMode || source.recovery_mode,
   );
+  const usage = normalizeRunUsage(source.usage);
   return {
     id,
     projectId: text(source.projectId || source.project_id),
@@ -275,6 +320,7 @@ export function normalizeRun(value: unknown): RunSnapshot | undefined {
     sourceCheckpointAvailable: Boolean(
       source.sourceCheckpointAvailable ?? source.source_checkpoint_available,
     ),
+    ...(usage ? { usage } : {}),
   };
 }
 

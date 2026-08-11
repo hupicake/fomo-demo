@@ -453,6 +453,7 @@ export function createRunPresentation(input: {
     contextUsage: undefined,
     agentFramework: input.run?.agentFramework,
     runtime: input.runtime ?? input.run?.runtime,
+    usage: input.run?.usage,
   };
 }
 

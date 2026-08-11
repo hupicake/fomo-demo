@@ -68,6 +68,7 @@ export interface ProjectLatestRun {
   recoveryAvailable: boolean;
   recoveryMode?: RecoveryMode;
   sourceCheckpointAvailable: boolean;
+  usage?: RunUsage;
 }
 
 export interface ProjectMessage {
@@ -170,6 +171,16 @@ export interface RunRuntimeResponse {
   inferenceTpmLimit: number;
 }
 
+/** Final, durable usage aggregated across every model turn in one terminal run. */
+export interface RunUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  totalTokens: number;
+  toolCalls: number;
+}
+
 export interface RunSnapshot {
   id: string;
   projectId: string;
@@ -189,6 +200,7 @@ export interface RunSnapshot {
   recoveryMode?: RecoveryMode;
   recoveryAvailable?: boolean;
   sourceCheckpointAvailable?: boolean;
+  usage?: RunUsage;
 }
 
 export interface FileManifestEntry {
@@ -425,6 +437,8 @@ export interface RunPresentation {
   /** Immutable actual configuration, shown read-only after the run is created. */
   agentFramework?: AgentFrameworkId;
   runtime?: RunRuntimeResponse;
+  /** Present only after the server has finalized the run ledger. */
+  usage?: RunUsage;
   disconnected?: boolean;
 }
 

@@ -54,6 +54,7 @@ from fomo.schemas import (
     RunResponse,
     RunRuntimeResponse,
     RunStatus,
+    RunUsageResponse,
     UserInputRequestDraft,
     UserInputRequestResponse,
     VersionResponse,
@@ -360,6 +361,7 @@ def _run_response(
     pending_input_request: RunInputRequestRecord | None = None,
     *,
     source_checkpoint_available: bool = False,
+    usage_totals: UsageTotals | None = None,
 ) -> RunResponse:
     return RunResponse(
         id=record.id,
@@ -396,6 +398,7 @@ def _run_response(
             run_token_budget_unlimited=record.runtime_run_max_tokens is None,
             inference_tpm_limit=record.runtime_inference_tpm_limit,
         ),
+        usage=_run_usage_response(record.status, usage_totals),
         created_at=record.created_at,
         updated_at=record.updated_at,
     )
@@ -418,6 +421,7 @@ def _project_latest_run_response(
     record: RunRecord,
     *,
     source_checkpoint_available: bool,
+    usage_totals: UsageTotals | None,
 ) -> ProjectLatestRunResponse:
     return ProjectLatestRunResponse(
         id=record.id,
@@ -429,6 +433,28 @@ def _project_latest_run_response(
         recovery_available=record.status in RECOVERABLE_TERMINAL_STATUSES,
         recovery_mode=record.recovery_mode,
         source_checkpoint_available=source_checkpoint_available,
+        usage=_run_usage_response(record.status, usage_totals),
+    )
+
+
+def _run_usage_response(
+    run_status: str,
+    totals: UsageTotals | None,
+) -> RunUsageResponse | None:
+    if run_status not in TERMINAL_STATUSES or totals is None:
+        return None
+    return RunUsageResponse(
+        input_tokens=totals.input_tokens,
+        output_tokens=totals.output_tokens,
+        cache_read_tokens=totals.cache_read_tokens,
+        cache_write_tokens=totals.cache_write_tokens,
+        total_tokens=(
+            totals.input_tokens
+            + totals.output_tokens
+            + totals.cache_read_tokens
+            + totals.cache_write_tokens
+        ),
+        tool_calls=totals.tool_calls,
     )
 
 
@@ -690,6 +716,10 @@ class Repository:
             latest_by_project: dict[str, RunRecord] = {}
             for run in runs:
                 latest_by_project.setdefault(run.project_id, run)
+            usage_by_run = await self._usage_totals_for_runs_in_session(
+                session,
+                [run.id for run in latest_by_project.values()],
+            )
             responses: list[ProjectResponse] = []
             for project in projects:
                 latest = latest_by_project.get(project.id)
@@ -701,6 +731,7 @@ class Repository:
                     summary = _project_latest_run_response(
                         latest,
                         source_checkpoint_available=checkpoint_available,
+                        usage_totals=usage_by_run.get(latest.id),
                     )
                 responses.append(_project_response(project, summary))
             return responses
@@ -1065,14 +1096,31 @@ class Repository:
                     .order_by(RunRecord.created_at.desc(), RunRecord.id.desc())
                 )
             )
-            run_responses = [await self._run_with_seq(session, item) for item in runs]
+            usage_by_run = await self._usage_totals_for_runs_in_session(
+                session,
+                [item.id for item in runs],
+            )
+            run_responses = [
+                await self._run_with_seq(
+                    session,
+                    item,
+                    usage_totals=usage_by_run.get(item.id),
+                    usage_totals_loaded=True,
+                )
+                for item in runs
+            ]
             active_record = (
                 await session.get(RunRecord, project.active_run_id)
                 if project.active_run_id is not None
                 else None
             )
             active_run = (
-                await self._run_with_seq(session, active_record)
+                await self._run_with_seq(
+                    session,
+                    active_record,
+                    usage_totals=usage_by_run.get(active_record.id),
+                    usage_totals_loaded=True,
+                )
                 if active_record is not None
                 else None
             )
@@ -1119,6 +1167,7 @@ class Repository:
                     source_checkpoint_available=(
                         await self._source_checkpoint_available_in_session(session, runs[0])
                     ),
+                    usage_totals=usage_by_run.get(runs[0].id),
                 )
             return {
                 "project": _project_response(project, latest_summary),
@@ -2195,26 +2244,57 @@ class Repository:
         async with self.database.session_factory() as session:
             if await session.get(RunRecord, run_id) is None:
                 raise NotFoundError("run not found")
-            row = (
-                await session.execute(
-                    select(
-                        func.coalesce(func.sum(UsageEntryRecord.input_tokens), 0),
-                        func.coalesce(func.sum(UsageEntryRecord.output_tokens), 0),
-                        func.coalesce(func.sum(UsageEntryRecord.cache_read_tokens), 0),
-                        func.coalesce(func.sum(UsageEntryRecord.cache_write_tokens), 0),
-                        func.coalesce(func.sum(UsageEntryRecord.tool_calls), 0),
-                        func.coalesce(func.sum(UsageEntryRecord.cost_micros), 0),
-                    ).where(UsageEntryRecord.run_id == run_id)
+            totals = await self._usage_totals_for_runs_in_session(session, [run_id])
+            return totals.get(run_id, UsageTotals())
+
+    @staticmethod
+    async def _usage_totals_for_runs_in_session(
+        session: AsyncSession,
+        run_ids: Iterable[str],
+    ) -> dict[str, UsageTotals]:
+        unique_run_ids = tuple(dict.fromkeys(run_ids))
+        if not unique_run_ids:
+            return {}
+        rows = (
+            await session.execute(
+                select(
+                    UsageEntryRecord.run_id,
+                    func.coalesce(func.sum(UsageEntryRecord.input_tokens), 0),
+                    func.coalesce(func.sum(UsageEntryRecord.output_tokens), 0),
+                    func.coalesce(func.sum(UsageEntryRecord.cache_read_tokens), 0),
+                    func.coalesce(func.sum(UsageEntryRecord.cache_write_tokens), 0),
+                    func.coalesce(func.sum(UsageEntryRecord.tool_calls), 0),
+                    func.coalesce(func.sum(UsageEntryRecord.cost_micros), 0),
                 )
-            ).one()
-            return UsageTotals(
-                input_tokens=int(row[0]),
-                output_tokens=int(row[1]),
-                cache_read_tokens=int(row[2]),
-                cache_write_tokens=int(row[3]),
-                tool_calls=int(row[4]),
-                cost_micros=int(row[5]),
+                .where(UsageEntryRecord.run_id.in_(unique_run_ids))
+                .group_by(UsageEntryRecord.run_id)
             )
+        ).all()
+        metadata_rows = (
+            await session.execute(
+                select(
+                    UsageEntryRecord.run_id,
+                    UsageEntryRecord.metadata_json,
+                ).where(UsageEntryRecord.run_id.in_(unique_run_ids))
+            )
+        ).all()
+        incomplete_run_ids = {
+            str(run_id)
+            for run_id, metadata in metadata_rows
+            if isinstance(metadata, dict) and metadata.get("_usageSettled") is False
+        }
+        return {
+            str(row[0]): UsageTotals(
+                input_tokens=int(row[1]),
+                output_tokens=int(row[2]),
+                cache_read_tokens=int(row[3]),
+                cache_write_tokens=int(row[4]),
+                tool_calls=int(row[5]),
+                cost_micros=int(row[6]),
+            )
+            for row in rows
+            if str(row[0]) not in incomplete_run_ids
+        }
 
     async def record_usage(self, run_id: str, request_id: str, **values: Any) -> UsageLedgerResult:
         return await self.record_usage_entry(run_id, request_id, **values)
@@ -5113,7 +5193,14 @@ class Repository:
             raise RunLeaseLost("run lease is no longer active")
         return await self._locked_run(session, run_id)
 
-    async def _run_with_seq(self, session: AsyncSession, run: RunRecord) -> RunResponse:
+    async def _run_with_seq(
+        self,
+        session: AsyncSession,
+        run: RunRecord,
+        *,
+        usage_totals: UsageTotals | None = None,
+        usage_totals_loaded: bool = False,
+    ) -> RunResponse:
         last_seq = int(
             await session.scalar(
                 select(func.coalesce(func.max(RunEventRecord.seq), 0)).where(
@@ -5126,11 +5213,15 @@ class Repository:
         checkpoint_available = await self._source_checkpoint_available_in_session(
             session, run
         )
+        if not usage_totals_loaded:
+            usage_by_run = await self._usage_totals_for_runs_in_session(session, [run.id])
+            usage_totals = usage_by_run.get(run.id)
         return _run_response(
             run,
             last_seq,
             pending,
             source_checkpoint_available=checkpoint_available,
+            usage_totals=usage_totals,
         )
 
     async def _latest_verified_checkpoint_for_run_in_session(

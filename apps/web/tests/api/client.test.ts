@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { controlPlane, normalizeApiBase, normalizeUserInputRequest } from "@/lib/api/client";
+import { controlPlane, normalizeApiBase, normalizeRunUsage, normalizeUserInputRequest } from "@/lib/api/client";
 
 const originalApiUrl = process.env.NEXT_PUBLIC_API_URL;
 const originalFetch = globalThis.fetch;
@@ -63,6 +63,14 @@ describe("control plane client contract", () => {
         recovery_available: true,
         recovery_mode: "verified_checkpoint",
         source_checkpoint_available: true,
+        usage: {
+          input_tokens: 120_000,
+          output_tokens: 8_000,
+          cache_read_tokens: 72_000,
+          cache_write_tokens: 0,
+          total_tokens: 200_000,
+          tool_calls: 14,
+        },
       },
     }]));
 
@@ -79,9 +87,52 @@ describe("control plane client contract", () => {
           recoveryAvailable: true,
           recoveryMode: "verified_checkpoint",
           sourceCheckpointAvailable: true,
+          usage: {
+            inputTokens: 120_000,
+            outputTokens: 8_000,
+            cacheReadTokens: 72_000,
+            cacheWriteTokens: 0,
+            totalTokens: 200_000,
+            toolCalls: 14,
+          },
         },
       }),
     ]);
+  });
+
+  it("rejects partial, negative, or inconsistent run usage", () => {
+    expect(normalizeRunUsage({
+      inputTokens: 10,
+      outputTokens: 5,
+      cacheReadTokens: 20,
+      cacheWriteTokens: 0,
+      totalTokens: 35,
+      toolCalls: 2,
+    })).toEqual({
+      inputTokens: 10,
+      outputTokens: 5,
+      cacheReadTokens: 20,
+      cacheWriteTokens: 0,
+      totalTokens: 35,
+      toolCalls: 2,
+    });
+    expect(normalizeRunUsage({ inputTokens: 10 })).toBeUndefined();
+    expect(normalizeRunUsage({
+      inputTokens: -1,
+      outputTokens: 5,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      totalTokens: 4,
+      toolCalls: 0,
+    })).toBeUndefined();
+    expect(normalizeRunUsage({
+      inputTokens: 10,
+      outputTokens: 5,
+      cacheReadTokens: 20,
+      cacheWriteTokens: 0,
+      totalTokens: 34,
+      toolCalls: 2,
+    })).toBeUndefined();
   });
 
   it("creates a project once with the server's title payload", async () => {

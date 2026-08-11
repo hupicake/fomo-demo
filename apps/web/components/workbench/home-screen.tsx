@@ -15,6 +15,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
 import { ThemeToggle } from "@/components/theme/theme-toggle";
 import { AccountEntry } from "@/components/workbench/account-entry";
+import { RunTokenUsage } from "@/components/workbench/run-token-usage";
 import { RuntimeSelector } from "@/components/workbench/runtime-selector";
 import { ApiProblem, controlPlane } from "@/lib/api/client";
 import type { AgentFrameworkId, ProjectSummary, RuntimeOptionsResponse } from "@/lib/contracts";
@@ -101,6 +102,7 @@ function ProjectLink({ project, onRecover }: { project: ProjectSummary; onRecove
             <Badge className={status.className} variant={status.variant}>{status.label}</Badge>
             {runtime ? <span className="text-xs text-muted-foreground">{frameworkLabel(runtime.agentFramework)} · {runtime.profileId} · {runtime.thinking}</span> : null}
           </span>
+          {runtime?.usage ? <RunTokenUsage className="mt-2" usage={runtime.usage} /> : null}
           {runtime?.errorCode ? (
             <span className="mt-2 block truncate text-xs text-destructive">
               {runtime.errorCode.replaceAll("_", " ")}

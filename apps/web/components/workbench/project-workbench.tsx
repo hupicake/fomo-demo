@@ -31,6 +31,7 @@ import { AgentActivityPanel } from "@/components/workbench/agent-activity-panel"
 import { AccountEntry } from "@/components/workbench/account-entry";
 import { TaskSummary } from "@/components/workbench/goal-graph-panel";
 import { RunMetrics } from "@/components/workbench/run-metrics";
+import { RunTokenUsage } from "@/components/workbench/run-token-usage";
 import { RunTimeline } from "@/components/workbench/role-timeline";
 import { RuntimeBadge, RuntimeSelector, findRuntimeProfile } from "@/components/workbench/runtime-selector";
 import { Workspace } from "@/components/workbench/workspace";
@@ -464,7 +465,8 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
     const inputRequestSignature = snapshot.pendingInputRequest
       ? JSON.stringify(snapshot.pendingInputRequest)
       : "none";
-    const signature = `${run?.id || initialRunId || "none"}:${snapshot.lastSeq}:${snapshot.messages.length}:${goalGraphSignature}:${inputRequestSignature}`;
+    const usageSignature = run?.usage ? JSON.stringify(run.usage) : "none";
+    const signature = `${run?.id || initialRunId || "none"}:${snapshot.lastSeq}:${snapshot.messages.length}:${goalGraphSignature}:${inputRequestSignature}:${usageSignature}`;
     if (hydratedSnapshotRef.current !== signature) {
       hydratedSnapshotRef.current = signature;
       setMessages(projectMessages(snapshot.messages, projectId));
@@ -492,6 +494,7 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
           versions: snapshot.versions && snapshot.versions.length > 0 ? snapshot.versions : next.versions,
           preview: snapshot.preview || next.preview,
           goalGraph: snapshot.goalGraph || next.goalGraph,
+          usage: run?.usage ?? next.usage,
         };
       });
     }
@@ -779,6 +782,7 @@ export function ProjectWorkbench({ initialRunId, projectId }: { initialRunId?: s
               <p className="truncate text-sm font-semibold lg:hidden">{currentProjectName}</p>
               <RunStatusBadge status={presentation.status} />
               {presentation.runtime ? <RuntimeBadge agentFramework={presentation.agentFramework} profileLabel={runtimeProfileLabel ?? presentation.runtime.profileId} runtime={presentation.runtime} /> : null}
+              {presentation.usage ? <RunTokenUsage usage={presentation.usage} /> : null}
             </div>
             <div className="hidden shrink-0 items-center gap-1 lg:flex">
               <ThemeToggle />

@@ -666,6 +666,29 @@ class RecoveryRunCreate(SchemaModel):
 RecoveryMode = Literal["verified_checkpoint", "verified_version", "base_restart"]
 
 
+class RunUsageResponse(SchemaModel):
+    """Final durable usage aggregated across every provider turn in one run."""
+
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    cache_read_tokens: int = Field(default=0, ge=0)
+    cache_write_tokens: int = Field(default=0, ge=0)
+    total_tokens: int = Field(default=0, ge=0)
+    tool_calls: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def _consistent_total(self) -> RunUsageResponse:
+        expected = (
+            self.input_tokens
+            + self.output_tokens
+            + self.cache_read_tokens
+            + self.cache_write_tokens
+        )
+        if self.total_tokens != expected:
+            raise ValueError("run usage total is inconsistent")
+        return self
+
+
 class ProjectLatestRunResponse(SchemaModel):
     id: str
     status: RunStatus
@@ -676,6 +699,7 @@ class ProjectLatestRunResponse(SchemaModel):
     recovery_available: bool = False
     recovery_mode: RecoveryMode | None = None
     source_checkpoint_available: bool = False
+    usage: RunUsageResponse | None = None
 
 
 class ProjectResponse(SchemaModel):
@@ -785,6 +809,7 @@ class RunResponse(SchemaModel):
     execution_started_at: datetime | None = None
     agent_framework: AgentFramework = AgentFramework.pi
     runtime: RunRuntimeResponse = Field(default_factory=_legacy_run_runtime_response)
+    usage: RunUsageResponse | None = None
     created_at: datetime
     updated_at: datetime
 
