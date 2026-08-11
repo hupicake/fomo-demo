@@ -195,7 +195,7 @@ def _routing_draft(
     )
     return parse_goal_graph_draft(
         {
-            "schemaVersion": 2,
+            "schemaVersion": 3,
             "productOutcome": "Users navigate a mission workspace.",
             "routes": [
                 {
@@ -273,6 +273,37 @@ def _three_goal_graph() -> GoalGraph:
                         "goalId": f"G-{index}",
                         "title": f"Goal {index}",
                         "productOutcome": f"Users can complete workflow {index}.",
+                        "userVisible": True,
+                        "dependsOn": [] if index == 1 else [f"G-{index - 1}"],
+                        "acceptance": _acceptance(index),
+                    }
+                    for index in range(1, 4)
+                ],
+            }
+        )
+    )
+
+
+def _three_route_graph() -> GoalGraph:
+    return materialize_goal_graph(
+        parse_goal_graph_draft(
+            {
+                "schemaVersion": 3,
+                "productOutcome": "Users complete three routed workflows.",
+                "routes": [
+                    {
+                        "path": path,
+                        "title": f"Route {index}",
+                        "owningGoalId": f"G-{index}",
+                        "deepLinkable": True,
+                    }
+                    for index, path in enumerate(("/", "/two", "/three"), start=1)
+                ],
+                "goals": [
+                    {
+                        "goalId": f"G-{index}",
+                        "title": f"Goal {index}",
+                        "productOutcome": f"Users complete workflow {index}.",
                         "userVisible": True,
                         "dependsOn": [] if index == 1 else [f"G-{index - 1}"],
                         "acceptance": _acceptance(index),
@@ -365,6 +396,46 @@ def test_final_goal_forces_full_suite_across_every_implemented_goal() -> None:
     assert suite.goal_ids == ("G-1", "G-2", "G-3")
 
 
+def test_v3_navigation_suite_tests_only_owned_route_then_final_complete_graph() -> None:
+    graph = materialize_goal_graph(_routing_draft())
+    first_claim = claim_active_goal(activate_next_goal(graph))
+
+    focused = build_regression_suite(first_claim)
+    assert focused.navigation_suite is not None
+    assert focused.navigation_suite.mode == "focused"
+    assert [route.path for route in focused.navigation_suite.routes] == ["/"]
+    focused_compiled = compile_acceptance_suite(
+        focused.contracts,
+        navigation_suite=focused.navigation_suite,
+    )
+    assert list(focused_compiled.navigation_test_name_by_id.values()) == [
+        "FOMO navigation direct load: Home"
+    ]
+
+    final_claim = claim_active_goal(
+        activate_next_goal(verify_claimed_goal(first_claim))
+    )
+    final = build_regression_suite(final_claim)
+    assert final.navigation_suite is not None
+    assert final.navigation_suite.mode == "final_full"
+    assert [route.path for route in final.navigation_suite.routes] == [
+        "/",
+        "/missions",
+    ]
+    final_compiled = compile_acceptance_suite(
+        final.contracts,
+        navigation_suite=final.navigation_suite,
+    )
+    final_names = set(final_compiled.navigation_test_name_by_id.values())
+    assert final_names == {
+        "FOMO navigation direct load: Home",
+        "FOMO navigation direct load: Missions",
+        "FOMO navigation: root links reach every route",
+        "FOMO navigation: 390px shared navigation reaches every route",
+        "FOMO navigation: browser back and forward preserve every route identity",
+    }
+
+
 @pytest.mark.parametrize(
     ("goal_paths", "prior_paths", "expected_reason"),
     [
@@ -399,6 +470,33 @@ def test_shared_change_escalates_middle_goal_to_full_suite(
     assert suite.mode is RuntimeValidationMode.FULL
     assert suite.reason is expected_reason
     assert suite.goal_ids == ("G-1", "G-2")
+
+
+def test_v3_early_full_navigation_uses_ready_subgraph_not_pending_route() -> None:
+    first = claim_active_goal(activate_next_goal(_three_route_graph()))
+    middle = claim_active_goal(activate_next_goal(verify_claimed_goal(first)))
+
+    suite = build_regression_suite(
+        middle,
+        full_reason=RuntimeValidationReason.PROJECT_CONFIG_CHANGED,
+    )
+
+    assert suite.navigation_suite is not None
+    assert suite.navigation_suite.mode == "ready_full"
+    assert [route.path for route in suite.navigation_suite.routes] == ["/", "/two"]
+    compiled = compile_acceptance_suite(
+        suite.contracts,
+        navigation_suite=suite.navigation_suite,
+    )
+    navigation_names = set(compiled.navigation_test_name_by_id.values())
+    assert "FOMO navigation direct load: Route 3" not in navigation_names
+    assert navigation_names == {
+        "FOMO navigation direct load: Route 1",
+        "FOMO navigation direct load: Route 2",
+        "FOMO navigation: root links reach every route",
+        "FOMO navigation: 390px shared navigation reaches every route",
+        "FOMO navigation: browser back and forward preserve every route identity",
+    }
 
 
 def test_legacy_checkpoint_unknown_paths_escalates_middle_goal_to_full() -> None:
@@ -521,7 +619,7 @@ def test_goal_prompts_bind_revision_and_exclude_raw_diagnostics() -> None:
     assert '"graphRevision":7' in build
     assert (
         '"navigationContract":{"schemaVersion":1,'
-        '"navigationMode":"single_surface","routes":[]}'
+        '"navigationSuiteVersion":null,"navigationMode":"single_surface","routes":[]}'
     ) in build
     assert '"navigationContract":{"schemaVersion":1' in repair
     assert '"goalId":"G-2"' in build
@@ -619,15 +717,14 @@ def test_goal_planner_promotes_explicit_multi_page_requests_to_route_contracts()
         starter={"routes": ["/"]},
     )
 
-    assert "authoritative routing contract v2" in multi_route
+    assert "authoritative routing contract v3" in multi_route
     assert "MULTI_ROUTE_REQUIRED" in multi_route
-    assert "schemaVersion: 2" in multi_route
+    assert "schemaVersion: 3" in multi_route
+    assert '"envelopeVersion":1' in multi_route
+    assert '"payloadJson"' in multi_route
     assert "complete `routes` manifest" in multi_route
-    assert "exact `url(path)` and exact visible role=`heading`" in multi_route
-    assert "role=`link` with accessible name exactly equal" in multi_route
-    assert "`history_roundtrip`" in multi_route
-    assert "`set_viewport` width <= 480" in multi_route
-    assert "State tabs, hashes, query panels" in multi_route
+    assert "Do not create criteria or tests merely to prove direct route loading" in multi_route
+    assert "FOMO deterministically derives and versions" in multi_route
 
     assert "ROUTE_SHAPE_PLANNER_SELECTED" in single_surface
     assert "MULTI_ROUTE_REQUIRED" not in single_surface
@@ -636,7 +733,7 @@ def test_goal_planner_promotes_explicit_multi_page_requests_to_route_contracts()
 def test_server_routing_validator_enforces_explicit_route_breadth() -> None:
     draft = parse_goal_graph_draft(
         {
-            "schemaVersion": 2,
+            "schemaVersion": 3,
             "productOutcome": "Users complete one focused workflow.",
             "routes": [
                 {
@@ -734,7 +831,7 @@ def test_route_intent_classifier_handles_counts_paths_and_negation() -> None:
     assert requires_multi_route("构建无需后端的高难成果展示")
 
 
-def test_route_intent_validator_closes_deep_mobile_and_history_evidence() -> None:
+def test_route_intent_validator_leaves_mechanical_navigation_to_server_suite() -> None:
     requirement = (
         "Build routes `/` and `/missions` with deep links, mobile navigation, "
         "and browser back and forward."
@@ -760,17 +857,18 @@ def test_route_intent_validator_closes_deep_mobile_and_history_evidence() -> Non
             requirement,
             _routing_draft(missions_deep_linkable=False),
         )
-    with pytest.raises(ValueError, match="set_viewport width<=480"):
+    assert (
         validate_goal_graph_routing(
             requirement,
             _routing_draft(viewport_widths=(390, 1024)),
-        )
+        ).schema_version
+        == 3
+    )
 
     without_history = valid.model_copy(deep=True)
     history_test = without_history.goals[1].acceptance.tests[-1]
     history_test.actions.pop()
-    with pytest.raises(ValueError, match="history_roundtrip"):
-        validate_goal_graph_routing(requirement, without_history)
+    assert validate_goal_graph_routing(requirement, without_history) is without_history
 
 
 def test_goal_repair_diagnostic_has_a_hard_json_cap() -> None:

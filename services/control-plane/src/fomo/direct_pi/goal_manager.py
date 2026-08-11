@@ -14,13 +14,19 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from .goalgraph import (
+    LEGACY_ROUTE_SCHEMA_VERSION,
+    LEGACY_SCHEMA_VERSION,
+    NAVIGATION_SUITE_VERSION,
+    SCHEMA_VERSION,
     Goal,
     GoalGraph,
     GoalStatus,
     GraphStatus,
     NavigationMode,
     NavigationRoute,
+    NavigationVerificationSuite,
     ScopedAcceptanceContract,
+    derive_navigation_verification_suite,
     scope_acceptance_contract,
     transition_goal_status,
     transition_graph_status,
@@ -96,6 +102,7 @@ class RegressionSuite:
     contracts: tuple[ScopedAcceptanceContract, ...]
     mode: RuntimeValidationMode
     reason: RuntimeValidationReason
+    navigation_suite: NavigationVerificationSuite | None = None
 
     def __post_init__(self) -> None:
         if not self.goal_ids or self.goal_ids[-1] != self.claimed_goal_id:
@@ -123,21 +130,34 @@ class GoalExecutionPlan:
     graph_schema_version: int
     navigation_mode: NavigationMode
     routes: tuple[NavigationRoute, ...]
+    navigation_suite_version: int | None
     active_goal: Goal
     verified_evidence: tuple[VerifiedGoalEvidence, ...]
 
     def __post_init__(self) -> None:
         if self.graph_revision < 1:
             raise ValueError("graph_revision must be positive")
-        if self.graph_schema_version not in {1, 2}:
+        if self.graph_schema_version not in {
+            LEGACY_SCHEMA_VERSION,
+            LEGACY_ROUTE_SCHEMA_VERSION,
+            SCHEMA_VERSION,
+        }:
             raise ValueError("graph_schema_version must be supported")
         expected_mode = (
             NavigationMode.MULTI_ROUTE
-            if self.graph_schema_version == 2 and len(self.routes) >= 2
+            if self.graph_schema_version in {LEGACY_ROUTE_SCHEMA_VERSION, SCHEMA_VERSION}
+            and len(self.routes) >= 2
             else NavigationMode.SINGLE_SURFACE
         )
         if self.navigation_mode is not expected_mode:
             raise ValueError("execution plan navigation contract is inconsistent")
+        expected_suite_version = (
+            NAVIGATION_SUITE_VERSION
+            if self.graph_schema_version == SCHEMA_VERSION
+            else None
+        )
+        if self.navigation_suite_version != expected_suite_version:
+            raise ValueError("execution plan navigation suite version is inconsistent")
         if self.active_goal.status is not GoalStatus.ACTIVE:
             raise ValueError("an execution plan requires exactly one active goal")
 
@@ -331,12 +351,24 @@ def build_regression_suite(
         if mode is RuntimeValidationMode.FULL
         else (current,)
     )
+    goal_ids = tuple(goal.goal_id for goal in selected)
     return RegressionSuite(
         claimed_goal_id=current.goal_id,
-        goal_ids=tuple(goal.goal_id for goal in selected),
+        goal_ids=goal_ids,
         contracts=tuple(scope_acceptance_contract(goal) for goal in selected),
         mode=mode,
         reason=reason,
+        navigation_suite=derive_navigation_verification_suite(
+            graph,
+            goal_ids=goal_ids,
+            mode=(
+                "final_full"
+                if is_final
+                else "ready_full"
+                if mode is RuntimeValidationMode.FULL
+                else "focused"
+            ),
+        ),
     )
 
 
@@ -425,6 +457,7 @@ def plan_goal_execution(
         graph_schema_version=activated.schema_version,
         navigation_mode=activated.navigation_mode,
         routes=tuple(activated.routes),
+        navigation_suite_version=activated.navigation_suite_version,
         active_goal=current,
         verified_evidence=ordered,
     )

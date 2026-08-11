@@ -17,9 +17,11 @@ from .contracts import (
     SelectAction,
 )
 from .goalgraph import (
+    NavigationVerificationSuite,
     ScopedAcceptanceContract,
     acceptance_persistence_key,
     acceptance_test_path,
+    navigation_test_ids,
     scope_acceptance_contract,
 )
 
@@ -46,6 +48,8 @@ class CompiledAcceptance:
     test_path_by_acceptance_id: dict[str, str]
     test_name_by_acceptance_id: dict[str, str]
     acceptance_key_by_id: dict[str, str] | None = None
+    navigation_test_path_by_id: dict[str, str] | None = None
+    navigation_test_name_by_id: dict[str, str] | None = None
 
 
 class AcceptanceCompilationError(ValueError):
@@ -181,6 +185,167 @@ def _test_source(
     )
 
 
+def _navigation_test_source(title: str, statements: Iterable[str]) -> str:
+    indented = "\n".join(
+        f"  {line}" for statement in statements for line in statement.splitlines()
+    )
+    return (
+        f'import {{ expect, test }} from "{FOMO_PLAYWRIGHT_TEST_MODULE}";\n\n'
+        f"{_PREVIEW_PATH_HELPERS}\n"
+        f"test({_quoted(title)}, async ({{ page }}) => {{\n{indented}\n}});\n"
+    )
+
+
+def _navigation_sources(
+    suite: NavigationVerificationSuite | None,
+) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+    """Compile FOMO-owned route mechanics, never planner-authored samples."""
+
+    if suite is None:
+        return {}, {}, {}
+    root = next((route for route in suite.routes if route.path == "/"), None)
+    sources: dict[str, str] = {}
+    paths: dict[str, str] = {}
+    names: dict[str, str] = {}
+
+    def register(test_id: str, title: str, statements: Iterable[str]) -> None:
+        path = f"{ACCEPTANCE_ROOT}/navigation-v{suite.version}/{test_id}.smoke.spec.ts"
+        sources[path] = _navigation_test_source(title, statements)
+        paths[test_id] = path
+        names[test_id] = title
+
+    direct_ids = navigation_test_ids(suite)[: len(suite.routes)]
+    for route, direct_id in zip(suite.routes, direct_ids, strict=True):
+        statements = [
+            f"await page.goto(fomoAppPath({_quoted(route.path)}));",
+            (
+                f"await expect(page.getByRole(\"heading\", "
+                f"{{ name: {_quoted(route.title)}, exact: true }})).toBeVisible();"
+            ),
+            f"await expect(page).toHaveURL(fomoAppUrl({_quoted(route.path)}));",
+        ]
+        if route.deep_linkable:
+            statements.extend(
+                (
+                    "await page.reload();",
+                    (
+                        f"await expect(page.getByRole(\"heading\", "
+                        f"{{ name: {_quoted(route.title)}, exact: true }})).toBeVisible();"
+                    ),
+                    f"await expect(page).toHaveURL(fomoAppUrl({_quoted(route.path)}));",
+                )
+            )
+        register(
+            direct_id,
+            f"FOMO navigation direct load: {route.title}",
+            statements,
+        )
+
+    non_root = tuple(route for route in suite.routes if route.path != "/")
+    if not suite.shared_navigation_gate or root is None or not non_root:
+        return sources, paths, names
+
+    shared_statements: list[str] = []
+    for route in non_root:
+        shared_statements.extend(
+            (
+                'await page.goto(fomoAppPath("/"));',
+                (
+                    "await page.getByRole(\"navigation\", "
+                    "{ name: \"Primary navigation\", exact: true }).filter({ visible: true })"
+                    f".getByRole(\"link\", {{ name: {_quoted(route.title)}, exact: true }}).click();"
+                ),
+                f"await expect(page).toHaveURL(fomoAppUrl({_quoted(route.path)}));",
+                (
+                    f"await expect(page.getByRole(\"heading\", "
+                    f"{{ name: {_quoted(route.title)}, exact: true }})).toBeVisible();"
+                ),
+            )
+        )
+    register(
+        "shared-navigation",
+        "FOMO navigation: root links reach every route",
+        shared_statements,
+    )
+
+    mobile_statements: list[str] = [
+        "await page.setViewportSize({ width: 390, height: 844 });"
+    ]
+    for index, route in enumerate(non_root):
+        variable = f"mobileLink{index}"
+        mobile_statements.extend(
+            (
+                'await page.goto(fomoAppPath("/"));',
+                (
+                    f"let {variable} = page.getByRole(\"navigation\", "
+                    "{ name: \"Primary navigation\", exact: true }).filter({ visible: true })"
+                    f".getByRole(\"link\", {{ name: {_quoted(route.title)}, exact: true }});"
+                ),
+            )
+        )
+        mobile_statements.extend(
+            (
+                f"if ((await {variable}.count()) === 0) {{",
+                "  await page.getByRole(\"button\", { name: \"Open navigation\", exact: true }).click();",
+                "}",
+                (
+                    f"{variable} = page.getByRole(\"navigation\", "
+                    "{ name: \"Primary navigation\", exact: true }).filter({ visible: true })"
+                    f".getByRole(\"link\", {{ name: {_quoted(route.title)}, exact: true }});"
+                ),
+                f"await expect({variable}).toHaveCount(1);",
+                f"await expect({variable}).toBeVisible();",
+                f"await {variable}.click();",
+                f"await expect(page).toHaveURL(fomoAppUrl({_quoted(route.path)}));",
+                (
+                    f"await expect(page.getByRole(\"heading\", "
+                    f"{{ name: {_quoted(route.title)}, exact: true }})).toBeVisible();"
+                ),
+            )
+        )
+    register(
+        "mobile-navigation-390",
+        "FOMO navigation: 390px shared navigation reaches every route",
+        mobile_statements,
+    )
+
+    history_statements: list[str] = []
+    for target in non_root:
+        history_statements.extend(
+            (
+                'await page.goto(fomoAppPath("/"));',
+                (
+                    "await page.getByRole(\"navigation\", "
+                    "{ name: \"Primary navigation\", exact: true }).filter({ visible: true })"
+                    f".getByRole(\"link\", {{ name: {_quoted(target.title)}, exact: true }}).click();"
+                ),
+                f"await expect(page).toHaveURL(fomoAppUrl({_quoted(target.path)}));",
+                (
+                    f"await expect(page.getByRole(\"heading\", "
+                    f"{{ name: {_quoted(target.title)}, exact: true }})).toBeVisible();"
+                ),
+                "await page.goBack();",
+                'await expect(page).toHaveURL(fomoAppUrl("/"));',
+                (
+                    f"await expect(page.getByRole(\"heading\", "
+                    f"{{ name: {_quoted(root.title)}, exact: true }})).toBeVisible();"
+                ),
+                "await page.goForward();",
+                f"await expect(page).toHaveURL(fomoAppUrl({_quoted(target.path)}));",
+                (
+                    f"await expect(page.getByRole(\"heading\", "
+                    f"{{ name: {_quoted(target.title)}, exact: true }})).toBeVisible();"
+                ),
+            )
+        )
+    register(
+        "history-roundtrip",
+        "FOMO navigation: browser back and forward preserve every route identity",
+        history_statements,
+    )
+    return sources, paths, names
+
+
 _CONFIG_SOURCE = (
     f'import {{ defineConfig, devices }} from "{FOMO_PLAYWRIGHT_TEST_MODULE}";\n\n'
     """export default defineConfig({
@@ -263,6 +428,7 @@ def _compile_sources(
     include_verification_assets: bool = True,
     playwright_test_module: str = FOMO_PLAYWRIGHT_TEST_MODULE,
     additional_sources: Mapping[str, str] | None = None,
+    navigation_suite: NavigationVerificationSuite | None = None,
 ) -> CompiledAcceptance:
     scoped_values = tuple(scoped_contracts)
     single_goal = len(scoped_values) == 1
@@ -270,6 +436,13 @@ def _compile_sources(
     for path, content in (additional_sources or {}).items():
         if path in sources:
             raise AcceptanceCompilationError(f"duplicate acceptance source path: {path}")
+        sources[path] = content
+    navigation_sources, navigation_paths, navigation_names = _navigation_sources(
+        navigation_suite
+    )
+    for path, content in navigation_sources.items():
+        if path in sources:
+            raise AcceptanceCompilationError(f"duplicate navigation source path: {path}")
         sources[path] = content
     test_paths: dict[str, str] = {}
     test_names: dict[str, str] = {}
@@ -324,6 +497,8 @@ def _compile_sources(
         test_path_by_acceptance_id=dict(sorted(test_paths.items())),
         test_name_by_acceptance_id=dict(sorted(test_names.items())),
         acceptance_key_by_id=dict(sorted(acceptance_keys.items())),
+        navigation_test_path_by_id=dict(sorted(navigation_paths.items())),
+        navigation_test_name_by_id=dict(sorted(navigation_names.items())),
     )
 
 
@@ -339,6 +514,8 @@ def compile_goal_acceptance(
 def compile_goal_advisory_acceptance(
     goal_id: str,
     contract: AcceptanceContract,
+    *,
+    navigation_suite: NavigationVerificationSuite | None = None,
 ) -> CompiledAcceptance:
     """Compile one current-goal suite for advisory execution in G.
 
@@ -355,6 +532,7 @@ def compile_goal_advisory_acceptance(
         additional_sources={
             ADVISORY_ACCEPTANCE_CONFIG_PATH: _ADVISORY_CONFIG_SOURCE,
         },
+        navigation_suite=navigation_suite,
     )
 
 
@@ -364,6 +542,8 @@ def compile_acceptance_suite(
         | Mapping[str, AcceptanceContract]
         | Iterable[tuple[str, AcceptanceContract]]
     ),
+    *,
+    navigation_suite: NavigationVerificationSuite | None = None,
 ) -> CompiledAcceptance:
     """Compile a stable multi-goal FOMO-owned suite, failing closed on conflicts."""
 
@@ -382,7 +562,7 @@ def compile_acceptance_suite(
                 goal_id, contract = item
                 normalized.append(scope_acceptance_contract(goal_id, contract))
         values = sorted(normalized, key=lambda item: item.goal_id)
-    return _compile_sources(values)
+    return _compile_sources(values, navigation_suite=navigation_suite)
 
 
 def compile_acceptance(

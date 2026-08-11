@@ -7,6 +7,9 @@ validation and clean-HEAD binding checks behave like a real workspace.
 
 from __future__ import annotations
 
+import json
+import re
+
 from fomo.persistence import Repository
 from fomo.persistence.models import RunRecord
 from fomo.sandbox.base import ExecResult
@@ -51,6 +54,44 @@ class GitAwareSandbox(FakeSandboxProvider):
             result = ExecResult(0, "", "")
         elif text.startswith("git init"):
             result = ExecResult(0, "", "")
+        elif (
+            "tests/fomo-acceptance/navigation-v" in text
+            and text not in self.command_results
+        ):
+            path_match = re.search(
+                r"(tests/fomo-acceptance/navigation-v\d+/[^\s]+\.smoke\.spec\.ts)",
+                text,
+            )
+            if path_match is not None:
+                source = self._sandbox(ref).files.get(path_match.group(1), b"").decode()
+                title_match = re.search(r"test\((\"(?:[^\"\\]|\\.)*\")", source)
+                if title_match is not None:
+                    title = json.loads(title_match.group(1))
+                    result = ExecResult(
+                        0,
+                        json.dumps(
+                            {
+                                "errors": [],
+                                "suites": [
+                                    {
+                                        "specs": [
+                                            {
+                                                "title": title,
+                                                "errors": [],
+                                                "tests": [
+                                                    {
+                                                        "status": "expected",
+                                                        "results": [{"status": "passed"}],
+                                                    }
+                                                ],
+                                            }
+                                        ]
+                                    }
+                                ],
+                            }
+                        ),
+                        "",
+                    )
         if result is None:
             return await super().exec(ref, command, sink)
         self._sandbox(ref).commands.append(text)

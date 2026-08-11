@@ -406,8 +406,9 @@ export interface GoalGraphProjection {
   graphId: string;
   runId: string;
   revision: number;
-  schemaVersion: 1 | 2;
+  schemaVersion: 1 | 2 | 3;
   navigationMode: GoalNavigationMode;
+  navigationSuiteVersion: 1 | null;
   routes: GoalRouteProjection[];
   status: GoalGraphStatus;
   productOutcome: string;

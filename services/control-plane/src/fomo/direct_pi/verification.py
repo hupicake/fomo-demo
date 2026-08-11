@@ -33,7 +33,12 @@ from .goal_manager import (
     RuntimeValidationMode,
     RuntimeValidationReason,
 )
-from .goalgraph import acceptance_persistence_key
+from .goalgraph import (
+    NavigationVerificationSuite,
+    acceptance_persistence_key,
+    navigation_evidence_key,
+    navigation_test_ids,
+)
 from .workspace import (
     FOMO_RUNNER_BIN,
     FOMO_RUNNER_NODE,
@@ -141,6 +146,10 @@ class VerificationOutcome:
                 gate.scope == "acceptance"
                 and gate.outcome == "infrastructure_failed"
             )
+            or (
+                gate.scope == "navigation"
+                and gate.outcome == "infrastructure_failed"
+            )
             for gate in self.gates
         )
 
@@ -154,11 +163,16 @@ class VerificationOutcome:
             "gates": [item.model_dump(mode="json", by_alias=True) for item in self.gates],
         }
 
-    def checkpoint_evidence(self, goal_id: str) -> tuple[dict[str, object], ...]:
+    def checkpoint_evidence(
+        self,
+        goal_id: str,
+        *,
+        navigation_suite: NavigationVerificationSuite | None = None,
+    ) -> tuple[dict[str, object], ...]:
         """Return bounded passed evidence for only the newly claimed goal."""
 
         prefix = f"{goal_id}:"
-        return tuple(
+        acceptance = tuple(
             {
                 "acceptanceKey": gate.acceptance_id,
                 "kind": "playwright_smoke",
@@ -177,6 +191,30 @@ class VerificationOutcome:
             and gate.acceptance_id is not None
             and gate.acceptance_id.startswith(prefix)
         )
+        navigation_by_id = {
+            gate.gate.removeprefix("navigation:"): gate
+            for gate in self.gates
+            if gate.scope == "navigation"
+            and gate.status == GateStatus.passed
+            and gate.gate.startswith("navigation:")
+        }
+        navigation = tuple(
+            {
+                "acceptanceKey": navigation_evidence_key(
+                    navigation_suite.version,
+                    test_id,
+                ),
+                "kind": f"fomo_navigation_v{navigation_suite.version}",
+                "status": "passed",
+                "artifactId": self.diagnostic_artifact_id,
+                "reference": f"navigation:v{navigation_suite.version}:{test_id}",
+                "summary": compiled_gate.summary,
+                "payload": {"testId": test_id, "suiteMode": navigation_suite.mode},
+            }
+            for test_id in navigation_test_ids(navigation_suite)
+            if (compiled_gate := navigation_by_id.get(test_id)) is not None
+        )
+        return (*acceptance, *navigation)
 
 
 class Verifier:
@@ -350,6 +388,20 @@ class Verifier:
                 await self._playwright_project_gate(ref, FOMO_HARNESS_PATH)
             )
 
+        navigation_paths = compiled.navigation_test_path_by_id or {}
+        navigation_names = compiled.navigation_test_name_by_id or {}
+        if all(item.status == GateStatus.passed for item in gates):
+            for navigation_id, test_path in navigation_paths.items():
+                gate = await self._navigation_gate(
+                    ref,
+                    navigation_id,
+                    test_path,
+                    navigation_names[navigation_id],
+                )
+                gates.append(gate)
+                if gate.status is not GateStatus.passed:
+                    break
+
         if all(item.status == GateStatus.passed for item in gates):
             for goal_id, contract in contracts:
                 for criterion in contract.criteria:
@@ -368,7 +420,7 @@ class Verifier:
                     )
 
         criterion_count = sum(len(contract.criteria) for _, contract in contracts)
-        project_gate_count = 8
+        project_gate_count = 8 + len(navigation_paths)
         passed = all(item.status == GateStatus.passed for item in gates) and len(gates) == (
             project_gate_count + criterion_count
         )
@@ -687,6 +739,99 @@ class Verifier:
             diagnostic=diagnostic,
         )
 
+    async def _navigation_gate(
+        self,
+        ref: SandboxRef,
+        navigation_id: str,
+        test_path: str,
+        test_name: str,
+    ) -> GateResult:
+        """Run one server-derived route check as a project-level hard gate."""
+
+        command = _PLAYWRIGHT.format(
+            path=shlex.quote(test_path), config=shlex.quote(ACCEPTANCE_CONFIG_PATH)
+        )
+        command = _with_preview_base_path(
+            command, self.settings.published_preview_base_path(ref.id)
+        )
+        result = await self.commands.run(
+            ref,
+            command,
+            label=f"navigation:{navigation_id}",
+            stage="verifying",
+        )
+        report = parse_playwright_json(result.stdout)
+        infrastructure_failed = (
+            result.timed_out
+            or report is None
+            or report.top_level_errors > 0
+            or report.load_errors > 0
+            or report.test_count != 1
+            or report.title != test_name
+            or report.status == "did_not_run"
+            or report.status == "passed"
+            and result.exit_code != 0
+            or report.status == "failed"
+            and result.exit_code == 0
+        )
+        if infrastructure_failed:
+            outcome = "infrastructure_failed"
+            summary = (
+                f"Navigation check {navigation_id} ({test_name}) did not produce one "
+                f"trustworthy Playwright result for {test_path}."
+            )
+        elif report.status == "passed":
+            outcome = "passed"
+            summary = f"Server-owned navigation check passed: {test_name}."
+        else:
+            outcome = "failed"
+            summary = (
+                f"Navigation check {navigation_id} ({test_name}) assertion failed "
+                f"in {test_path}."
+            )
+        diagnostic = (
+            GateDiagnostic(
+                message=report.assertion.message,
+                locator=report.assertion.locator,
+                test_name=report.assertion.test_name,
+                line=report.assertion.line,
+            )
+            if outcome == "failed"
+            and report is not None
+            and report.assertion is not None
+            else None
+        )
+        if diagnostic is not None:
+            assertion = report.assertion
+            detail = redact(assertion.message)[:320]
+            locator = (
+                f" locator={redact(assertion.locator)[:160]}"
+                if assertion.locator
+                else ""
+            )
+            line = f" line={assertion.line}" if assertion.line is not None else ""
+            summary = (
+                f"Navigation check {navigation_id} ({test_name}) failed in "
+                f"{test_path}: "
+                f"{detail}{locator}{line}"
+            )[:700]
+        gate = GateResult(
+            gate=f"navigation:{navigation_id}",
+            scope="navigation",
+            status=GateStatus.passed if outcome == "passed" else GateStatus.failed,
+            outcome=outcome,
+            summary=summary,
+            navigation_id=navigation_id,
+            test_path=test_path,
+            test_name=test_name,
+            exit_code=result.exit_code if outcome != "infrastructure_failed" else None,
+            evidence=[f"command:{command}"],
+            timed_out=result.timed_out,
+            diagnostic=diagnostic,
+        )
+        await self._record_project_gate(gate)
+        return gate
+
     async def _record_acceptance_evidence(
         self, gates: list[GateResult], artifact_id: str
     ) -> None:
@@ -735,6 +880,7 @@ class Verifier:
                 "status": gate.status.value,
                 "summary": gate.summary,
                 "affectedFiles": gate.affected_files,
+                **({"outcome": gate.outcome} if gate.outcome is not None else {}),
             },
             lease_token=self.lease_token,
         )

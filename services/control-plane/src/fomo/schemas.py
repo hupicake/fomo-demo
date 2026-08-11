@@ -372,8 +372,9 @@ class GateResult(SchemaModel):
     affected_files: list[str] = Field(default_factory=list)
     # Project gates (dependencies/typecheck/build/smoke/preview) are closed-set
     # project scope; acceptance gates bind one Playwright item to one AC.
-    scope: Literal["project", "acceptance"] = "project"
+    scope: Literal["project", "acceptance", "navigation"] = "project"
     acceptance_id: str | None = None
+    navigation_id: str | None = None
     test_path: str | None = None
     test_name: str | None = None
     # acceptance-only: assertion outcomes write AC evidence; an
@@ -395,6 +396,7 @@ class GateResult(SchemaModel):
     def _enforce_gate_scope_contract(self) -> GateResult:
         acceptance_fields = (
             self.acceptance_id,
+            self.navigation_id,
             self.test_path,
             self.test_name,
             self.outcome,
@@ -406,7 +408,37 @@ class GateResult(SchemaModel):
                     "project-scope gates must not carry acceptance fields or diagnostics"
                 )
             return self
-        if not self.acceptance_id or not self.outcome:
+        if self.scope == "navigation":
+            if self.acceptance_id is not None or not self.navigation_id:
+                raise ValueError(
+                    "navigation gates require navigationId and forbid acceptanceId"
+                )
+            if (
+                not self.outcome
+                or not self.test_path
+                or not self.test_name
+            ):
+                raise ValueError(
+                    "navigation gates require outcome, testPath and testName"
+                )
+            if self.outcome in {"passed", "failed"} and self.exit_code is None:
+                raise ValueError(
+                    "passed or failed navigation gates require an exit code"
+                )
+            if self.outcome == "infrastructure_failed" and self.exit_code is not None:
+                raise ValueError(
+                    "infrastructure-failed navigation gates must not expose exit code"
+                )
+            if self.diagnostic is not None and self.outcome != "failed":
+                raise ValueError("only failed navigation assertions may carry diagnostics")
+            for label, value, limit in (
+                ("testPath", self.test_path, 512),
+                ("testName", self.test_name, 300),
+            ):
+                if len(value) > limit or not value.strip():
+                    raise ValueError(f"{label} must be a bounded non-blank value")
+            return self
+        if self.navigation_id is not None or not self.acceptance_id or not self.outcome:
             raise ValueError(
                 "acceptance-scope gates require a nonempty acceptanceId and outcome"
             )
@@ -1017,8 +1049,9 @@ class GoalGraphReadProjection(SchemaModel):
     graph_id: str
     run_id: str
     revision: int
-    schema_version: Literal[1, 2]
+    schema_version: Literal[1, 2, 3]
     navigation_mode: Literal["single_surface", "multi_route"]
+    navigation_suite_version: Literal[1] | None = None
     routes: list[GoalRouteProjection] = Field(default_factory=list)
     status: Literal["active", "verified", "failed", "cancelled", "superseded"]
     product_outcome: str

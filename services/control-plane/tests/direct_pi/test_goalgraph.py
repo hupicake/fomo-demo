@@ -8,8 +8,10 @@ from pydantic import ValidationError
 
 from fomo.direct_pi.contracts import AcceptanceTest
 from fomo.direct_pi.goalgraph import (
+    NAVIGATION_SUITE_VERSION,
     SERVER_QUALITY_BAR,
     GoalGraphDraft,
+    GoalGraphPlanningEnvelope,
     GoalStatus,
     GraphStatus,
     InvalidStatusTransition,
@@ -19,10 +21,13 @@ from fomo.direct_pi.goalgraph import (
     acceptance_test_paths,
     assert_goal_graph_executable,
     can_transition_goal_status,
+    derive_navigation_verification_suite,
     materialize_goal_graph,
     parse_goal_graph,
     parse_goal_graph_draft,
+    parse_goal_graph_planning_envelope,
     parse_legacy_goal_graph_draft,
+    parse_legacy_route_goal_graph_draft,
     scope_acceptance_contract,
     serialize_goal_graph,
     serialize_goal_graph_draft,
@@ -165,16 +170,9 @@ def _route_acceptance(
 
 def _multi_route_graph() -> dict[str, object]:
     first = _goal(1)
-    first["acceptance"] = _route_acceptance(1, "/", "Mission Control")
     second = _goal(2, depends_on=["G-1"])
-    second["acceptance"] = _route_acceptance(
-        2,
-        "/missions",
-        "Missions",
-        link_from="/",
-    )
     return {
-        "schemaVersion": 2,
+        "schemaVersion": 3,
         "productOutcome": "Users navigate a durable multi-route mission workspace.",
         "routes": [
             {
@@ -194,6 +192,18 @@ def _multi_route_graph() -> dict[str, object]:
     }
 
 
+def _legacy_v2_graph() -> dict[str, object]:
+    value = _multi_route_graph()
+    value["schemaVersion"] = 2
+    value["goals"][0]["acceptance"] = _route_acceptance(  # type: ignore[index]
+        1, "/", "Mission Control"
+    )
+    value["goals"][1]["acceptance"] = _route_acceptance(  # type: ignore[index]
+        2, "/missions", "Missions", link_from="/"
+    )
+    return value
+
+
 def test_graph_accepts_topological_goals_and_has_server_quality_bar() -> None:
     graph = materialize_goal_graph(parse_legacy_goal_graph_draft(_graph()))
 
@@ -204,11 +214,14 @@ def test_graph_accepts_topological_goals_and_has_server_quality_bar() -> None:
     assert all(goal.status is GoalStatus.PENDING for goal in graph.goals)
 
 
-def test_current_planner_schema_is_v2_only_while_legacy_remains_readable() -> None:
+def test_current_planner_transport_is_shallow_and_domain_is_v3_only() -> None:
     schema = GoalGraphDraft.model_json_schema(by_alias=True)
+    envelope = GoalGraphPlanningEnvelope.model_json_schema(by_alias=True)
 
-    assert schema["properties"]["schemaVersion"]["const"] == 2
+    assert schema["properties"]["schemaVersion"]["const"] == 3
     assert "routes" in schema["required"]
+    assert envelope["required"] == ["envelopeVersion", "payloadJson"]
+    assert set(envelope["properties"]) == {"envelopeVersion", "payloadJson"}
     route_path = schema["$defs"]["NavigationRoute"]["properties"]["path"]
     assert route_path["maxLength"] == 200
     assert route_path["pattern"].startswith("^/$")
@@ -219,11 +232,41 @@ def test_current_planner_schema_is_v2_only_while_legacy_remains_readable() -> No
     assert legacy.schema_version == 1
 
 
+def test_planning_envelope_is_required_bounded_and_strictly_json() -> None:
+    payload_json = json.dumps(
+        _multi_route_graph(),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    envelope = parse_goal_graph_planning_envelope(
+        json.dumps(
+            {"envelopeVersion": 1, "payloadJson": payload_json},
+            ensure_ascii=False,
+        )
+    )
+    assert envelope.payload_json == payload_json
+
+    invalid_payloads = (
+        json.dumps({"payloadJson": payload_json}),
+        json.dumps({"envelopeVersion": 1, "payloadJson": {}}),
+        json.dumps(
+            {"envelopeVersion": 1, "payloadJson": payload_json, "extra": True}
+        ),
+        '{"envelopeVersion":1,"envelopeVersion":1,"payloadJson":"{}"}',
+        '{"envelopeVersion":NaN,"payloadJson":"{}"}',
+        f"```json\n{json.dumps({'envelopeVersion': 1, 'payloadJson': payload_json})}\n```",
+        json.dumps({"envelopeVersion": 1, "payloadJson": "界" * 32_001}),
+    )
+    for invalid in invalid_payloads:
+        with pytest.raises((ValidationError, ValueError)):
+            parse_goal_graph_planning_envelope(invalid)
+
+
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
         (
-            lambda value: value.update(schemaVersion=3),
+            lambda value: value.update(schemaVersion=2),
             "schemaVersion",
         ),
         (
@@ -276,11 +319,12 @@ def test_materialize_injects_fixed_initial_policy_and_status() -> None:
     assert {goal.status for goal in graph.goals} == {GoalStatus.PENDING}
 
 
-def test_v2_materializes_a_server_owned_multi_route_contract() -> None:
+def test_v3_materializes_a_versioned_server_owned_multi_route_contract() -> None:
     draft = parse_goal_graph_draft(_multi_route_graph())
     graph = materialize_goal_graph(draft)
 
     assert graph.navigation_mode is NavigationMode.MULTI_ROUTE
+    assert graph.navigation_suite_version == NAVIGATION_SUITE_VERSION
     assert [route.path for route in graph.routes] == ["/", "/missions"]
     assert graph.routes[1].owning_goal_id == "G-2"
     assert graph.routes[1].deep_linkable is True
@@ -323,9 +367,14 @@ def test_legacy_v1_preserves_old_path_hash_but_blocks_protocol_relative_executio
         assert_goal_graph_executable(unsafe)
 
 
-def test_v2_rejects_planner_owned_navigation_mode_and_invalid_route_manifests() -> None:
+def test_v3_rejects_planner_owned_navigation_policy_and_invalid_route_manifests() -> None:
     value = _multi_route_graph()
     value["navigationMode"] = "multi_route"
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        parse_goal_graph_draft(value)
+
+    value = _multi_route_graph()
+    value["navigationSuiteVersion"] = 1
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         parse_goal_graph_draft(value)
 
@@ -360,48 +409,58 @@ def test_v2_rejects_planner_owned_navigation_mode_and_invalid_route_manifests() 
         parse_goal_graph_draft(value)
 
 
-def test_multi_route_contract_requires_direct_reload_and_link_navigation_evidence() -> None:
-    value = _multi_route_graph()
-    value["goals"][1]["acceptance"]["tests"][0]["assertions"] = [  # type: ignore[index]
-        {
-            "kind": "visible",
-            "target": {"by": "role", "value": "heading", "name": "Missions"},
-        }
+def test_v3_does_not_require_planner_navigation_samples_but_v2_keeps_old_meaning() -> None:
+    assert parse_goal_graph_draft(_multi_route_graph()).schema_version == 3
+
+    legacy = _legacy_v2_graph()
+    legacy["goals"][1]["acceptance"]["tests"] = [  # type: ignore[index]
+        legacy["goals"][1]["acceptance"]["tests"][0]  # type: ignore[index]
     ]
-    with pytest.raises(ValidationError, match="independent direct test"):
-        parse_goal_graph_draft(value)
-
-    value = _multi_route_graph()
-    actions = value["goals"][1]["acceptance"]["tests"][0]["actions"]  # type: ignore[index]
-    actions.pop(1)  # type: ignore[union-attr]
-    with pytest.raises(ValidationError, match="independent direct test"):
-        parse_goal_graph_draft(value)
-
-    value = _multi_route_graph()
-    link = value["goals"][1]["acceptance"]["tests"][1]["actions"][-1]  # type: ignore[index]
-    link["target"] = {"by": "role", "value": "tab", "name": "Missions"}  # type: ignore[index]
+    legacy["goals"][1]["acceptance"]["criteria"] = [  # type: ignore[index]
+        legacy["goals"][1]["acceptance"]["criteria"][0]  # type: ignore[index]
+    ]
     with pytest.raises(ValidationError, match="separate link test"):
-        parse_goal_graph_draft(value)
+        parse_legacy_route_goal_graph_draft(legacy)
 
-    value = _multi_route_graph()
-    actions = value["goals"][1]["acceptance"]["tests"][1]["actions"]  # type: ignore[index]
-    actions.insert(1, {"kind": "back", "target": None})  # type: ignore[union-attr]
-    with pytest.raises(ValidationError, match="separate link test"):
-        parse_goal_graph_draft(value)
 
+def test_v3_focused_navigation_allows_a_business_goal_without_an_owned_route() -> None:
     value = _multi_route_graph()
-    actions = value["goals"][1]["acceptance"]["tests"][1]["actions"]  # type: ignore[index]
-    actions.append({"kind": "goto", "path": "/missions"})  # type: ignore[union-attr]
-    with pytest.raises(ValidationError, match="separate link test"):
-        parse_goal_graph_draft(value)
+    missions = value["goals"][1]  # type: ignore[index]
+    missions["goalId"] = "G-3"  # type: ignore[index]
+    missions["dependsOn"] = ["G-2"]  # type: ignore[index]
+    value["routes"][1]["owningGoalId"] = "G-3"  # type: ignore[index]
+    value["goals"].insert(  # type: ignore[union-attr]
+        1,
+        {
+            "goalId": "G-2",
+            "title": "Shared business rules",
+            "productOutcome": "Users retain shared mission preferences.",
+            "userVisible": True,
+            "dependsOn": ["G-1"],
+            "acceptance": _acceptance(9),
+        },
+    )
+    graph = materialize_goal_graph(parse_goal_graph_draft(value))
+
+    assert (
+        derive_navigation_verification_suite(
+            graph,
+            goal_ids=("G-2",),
+            mode="focused",
+        )
+        is None
+    )
 
 
 def test_route_semantic_errors_are_aggregated_for_one_correction_turn() -> None:
     value = _multi_route_graph()
     value["routes"][0]["path"] = "/home"  # type: ignore[index]
     value["routes"][1]["title"] = "mission control"  # type: ignore[index]
+    value["goals"][1]["acceptance"]["tests"][0]["actions"] = [  # type: ignore[index]
+        {"kind": "goto", "path": "/future"}
+    ]
     value["goals"][1]["acceptance"]["tests"][0]["assertions"] = [  # type: ignore[index]
-        {"kind": "url", "path": "/missions"}
+        {"kind": "url", "path": "/future"}
     ]
 
     with pytest.raises(ValidationError) as captured:
@@ -410,14 +469,19 @@ def test_route_semantic_errors_are_aggregated_for_one_correction_turn() -> None:
     message = str(captured.value)
     assert "must include root path" in message
     assert "titles must be unique ignoring case" in message
-    assert "independent direct test" in message
+    assert "references undeclared route /future" in message
 
-def test_persisted_v2_graph_rejects_a_forged_navigation_mode() -> None:
+def test_persisted_v3_graph_rejects_forged_server_navigation_policy() -> None:
     graph = materialize_goal_graph(parse_goal_graph_draft(_multi_route_graph()))
     payload = graph.model_dump(mode="json", by_alias=True)
     payload["navigationMode"] = "single_surface"
 
     with pytest.raises(ValidationError, match="derived and fixed by the server"):
+        parse_goal_graph(payload)
+
+    payload = graph.model_dump(mode="json", by_alias=True)
+    payload["navigationSuiteVersion"] = None
+    with pytest.raises(ValidationError, match="fixed by the server"):
         parse_goal_graph(payload)
 
 

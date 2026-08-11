@@ -8,8 +8,10 @@ size; the schema does not impose arbitrary goal or acceptance-count ceilings.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Annotated, Any, Literal
@@ -21,6 +23,7 @@ from pydantic import (
     StringConstraints,
     TypeAdapter,
     ValidationError,
+    field_validator,
     model_validator,
 )
 
@@ -43,7 +46,9 @@ from .contracts import (
 )
 
 LEGACY_SCHEMA_VERSION = 1
-SCHEMA_VERSION = 2
+LEGACY_ROUTE_SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+NAVIGATION_SUITE_VERSION = 1
 ACCEPTANCE_ROOT = "tests/fomo-acceptance"
 
 ProductOutcome = Annotated[
@@ -57,6 +62,10 @@ GoalProductOutcome = Annotated[
 GoalTitle = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=200),
+]
+PlanningPayload = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=2, max_length=96_000),
 ]
 
 
@@ -80,6 +89,27 @@ class GoalStatus(StrEnum):
 class NavigationMode(StrEnum):
     SINGLE_SURFACE = "single_surface"
     MULTI_ROUTE = "multi_route"
+
+
+@dataclass(frozen=True, slots=True)
+class NavigationVerificationSuite:
+    """One deterministic slice of FOMO's versioned navigation policy."""
+
+    version: int
+    routes: tuple[NavigationRoute, ...]
+    mode: Literal["focused", "ready_full", "final_full"]
+
+    def __post_init__(self) -> None:
+        if self.version != NAVIGATION_SUITE_VERSION:
+            raise ValueError("navigation verification suite version is unsupported")
+        if not self.routes:
+            raise ValueError("navigation verification suite requires routes")
+        if len({route.path for route in self.routes}) != len(self.routes):
+            raise ValueError("navigation verification suite routes must be unique")
+
+    @property
+    def shared_navigation_gate(self) -> bool:
+        return self.mode in {"ready_full", "final_full"}
 
 
 QualityGate = Literal[
@@ -238,7 +268,7 @@ def _validate_goal_topology(goals: Sequence[GoalDraft]) -> None:
         seen.add(goal.goal_id)
 
 
-def _validate_routing_contract(
+def _validate_route_manifest(
     *,
     schema_version: int,
     routes: Sequence[NavigationRoute],
@@ -251,7 +281,9 @@ def _validate_routing_contract(
 
     violations: list[str] = []
     if not routes:
-        raise ValueError("route contract violations: v2 requires a route manifest")
+        raise ValueError(
+            "route contract violations: routed GoalGraph requires a route manifest"
+        )
     paths = [route.path for route in routes]
     if "/" not in paths:
         violations.append("the route manifest must include root path /")
@@ -275,6 +307,88 @@ def _validate_routing_contract(
             + ", ".join(unknown_owners)
         )
 
+    if schema_version == SCHEMA_VERSION:
+        root = next((route for route in routes if route.path == "/"), None)
+        routes_by_path = {route.path: route for route in routes}
+        for route in routes:
+            owner = goals_by_id.get(route.owning_goal_id)
+            if owner is None:
+                continue
+            if not owner.user_visible:
+                violations.append(
+                    f"route {route.path} owner {owner.goal_id} must be user-visible"
+                )
+            if root is not None and route.path != "/":
+                allowed = {
+                    owner.goal_id,
+                    *_transitive_dependencies(owner.goal_id, goals_by_id),
+                }
+                if root.owning_goal_id not in allowed:
+                    violations.append(
+                        f"route {route.path} owner {owner.goal_id} must depend on root "
+                        f"owner {root.owning_goal_id}"
+                    )
+
+        for goal in goals:
+            allowed_route_owners = {
+                goal.goal_id,
+                *_transitive_dependencies(goal.goal_id, goals_by_id),
+            }
+            for test in goal.acceptance.tests:
+                referenced_paths = {
+                    action.path
+                    for action in test.actions
+                    if action.kind == "goto"
+                }
+                referenced_paths.update(
+                    path
+                    for action in test.actions
+                    if action.kind == "history_roundtrip"
+                    for path in (action.back_path, action.forward_path)
+                )
+                referenced_paths.update(
+                    assertion.path
+                    for assertion in test.assertions
+                    if assertion.kind == "url"
+                )
+                for path in sorted(referenced_paths):
+                    referenced = routes_by_path.get(path)
+                    if referenced is None:
+                        violations.append(
+                            f"goal {goal.goal_id} test {test.id} references undeclared "
+                            f"route {path}"
+                        )
+                    elif referenced.owning_goal_id not in allowed_route_owners:
+                        violations.append(
+                            f"goal {goal.goal_id} test {test.id} references future route "
+                            f"{path}"
+                        )
+
+    if violations:
+        raise ValueError(
+            "route manifest violations:\n- " + "\n- ".join(violations)
+        )
+
+
+def _validate_legacy_v2_routing_contract(
+    *,
+    routes: Sequence[NavigationRoute],
+    goals: Sequence[GoalDraft],
+) -> None:
+    """Validate the exact v2 planner-owned navigation evidence contract.
+
+    New planning never enters this path. It exists solely so persisted v2
+    revisions keep their original hash and meaning instead of being silently
+    reinterpreted under the server-derived v3 navigation suite.
+    """
+
+    _validate_route_manifest(
+        schema_version=LEGACY_ROUTE_SCHEMA_VERSION,
+        routes=routes,
+        goals=goals,
+    )
+    violations: list[str] = []
+    goals_by_id = {goal.goal_id: goal for goal in goals}
     for route in routes:
         if route.owning_goal_id not in goals_by_id:
             continue
@@ -299,9 +413,7 @@ def _validate_routing_contract(
             )
 
     if violations:
-        raise ValueError(
-            "route contract violations:\n- " + "\n- ".join(violations)
-        )
+        raise ValueError("route contract violations:\n- " + "\n- ".join(violations))
 
 
 class LegacyGoalGraphDraft(SchemaModel):
@@ -317,8 +429,29 @@ class LegacyGoalGraphDraft(SchemaModel):
         return self
 
 
+class LegacyRouteGoalGraphDraft(SchemaModel):
+    """Read-only v2 graph whose planner supplied mechanical navigation tests."""
+
+    schema_version: Literal[LEGACY_ROUTE_SCHEMA_VERSION] = LEGACY_ROUTE_SCHEMA_VERSION
+    product_outcome: ProductOutcome
+    routes: list[NavigationRoute] = Field(min_length=1)
+    goals: list[GoalDraft] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def valid_legacy_route_graph(self) -> LegacyRouteGoalGraphDraft:
+        _validate_goal_topology(self.goals)
+        _validate_legacy_v2_routing_contract(routes=self.routes, goals=self.goals)
+        return self
+
+
 class GoalGraphDraft(SchemaModel):
-    """Current planner payload; new planning is fail-closed to schema v2."""
+    """Current planner payload: business acceptance plus a route manifest.
+
+    Mechanical direct-load, shared-navigation, mobile and history checks are
+    deliberately absent. FOMO derives those from the frozen manifest after
+    admission, so the provider cannot weaken them and large products do not
+    spend most of their planning budget repeating server policy.
+    """
 
     schema_version: Literal[SCHEMA_VERSION] = SCHEMA_VERSION
     product_outcome: ProductOutcome
@@ -328,7 +461,7 @@ class GoalGraphDraft(SchemaModel):
     @model_validator(mode="after")
     def valid_graph_contract(self) -> GoalGraphDraft:
         _validate_goal_topology(self.goals)
-        _validate_routing_contract(
+        _validate_route_manifest(
             schema_version=self.schema_version,
             routes=self.routes,
             goals=self.goals,
@@ -336,32 +469,71 @@ class GoalGraphDraft(SchemaModel):
         return self
 
 
-GoalGraphDraftLike = GoalGraphDraft | LegacyGoalGraphDraft
+class GoalGraphPlanningEnvelope(SchemaModel):
+    """Shallow provider transport, intentionally decoupled from the domain.
+
+    Provider adapters only need to submit one bounded JSON string. The server
+    remains the single parser for Pydantic shape, topology and semantic route
+    validation across Pi, OpenCode and Codex.
+    """
+
+    envelope_version: Literal[1]
+    payload_json: PlanningPayload
+
+    @field_validator("payload_json")
+    @classmethod
+    def bounded_utf8_payload(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > 96_000:
+            raise ValueError("payloadJson exceeds the UTF-8 byte limit")
+        return value
+
+
+GoalGraphDraftLike = (
+    GoalGraphDraft | LegacyRouteGoalGraphDraft | LegacyGoalGraphDraft
+)
 
 
 class GoalGraph(SchemaModel):
     """Trusted persisted graph projection with server-owned policy and state."""
 
-    schema_version: Literal[LEGACY_SCHEMA_VERSION, SCHEMA_VERSION] = SCHEMA_VERSION
+    schema_version: Literal[
+        LEGACY_SCHEMA_VERSION,
+        LEGACY_ROUTE_SCHEMA_VERSION,
+        SCHEMA_VERSION,
+    ] = SCHEMA_VERSION
     product_outcome: ProductOutcome
     routes: list[NavigationRoute] = Field(default_factory=list)
     quality_bar: GoalGraphQualityBar
     navigation_mode: NavigationMode = NavigationMode.SINGLE_SURFACE
+    navigation_suite_version: Literal[NAVIGATION_SUITE_VERSION] | None = None
     goals: list[Goal | LegacyGoal] = Field(min_length=1)
     status: GraphStatus
 
     @model_validator(mode="after")
     def fixed_server_contract(self) -> GoalGraph:
-        if self.schema_version == SCHEMA_VERSION and any(
+        if self.schema_version != LEGACY_SCHEMA_VERSION and any(
             isinstance(goal, LegacyGoal) for goal in self.goals
         ):
-            raise ValueError("v2 GoalGraph cannot contain legacy acceptance paths")
+            raise ValueError("routed GoalGraph cannot contain legacy acceptance paths")
         _validate_goal_topology(self.goals)
-        _validate_routing_contract(
-            schema_version=self.schema_version,
-            routes=self.routes,
-            goals=self.goals,
-        )
+        if self.schema_version == LEGACY_ROUTE_SCHEMA_VERSION:
+            _validate_legacy_v2_routing_contract(
+                routes=self.routes,
+                goals=self.goals,
+            )
+        else:
+            _validate_route_manifest(
+                schema_version=self.schema_version,
+                routes=self.routes,
+                goals=self.goals,
+            )
+        if self.schema_version == SCHEMA_VERSION:
+            if self.navigation_suite_version != NAVIGATION_SUITE_VERSION:
+                raise ValueError("navigationSuiteVersion is fixed by the server")
+        elif self.navigation_suite_version is not None:
+            raise ValueError(
+                "historical GoalGraph cannot declare a navigation suite version"
+            )
         if self.quality_bar != SERVER_QUALITY_BAR:
             raise ValueError("qualityBar is fixed by the server and cannot be overridden")
         expected_navigation = _navigation_mode(self.schema_version, self.routes)
@@ -532,6 +704,64 @@ def _navigation_mode(
     if schema_version == LEGACY_SCHEMA_VERSION or len(routes) < 2:
         return NavigationMode.SINGLE_SURFACE
     return NavigationMode.MULTI_ROUTE
+
+
+def derive_navigation_verification_suite(
+    graph: GoalGraph,
+    *,
+    goal_ids: Sequence[str],
+    mode: Literal["focused", "ready_full", "final_full"],
+) -> NavigationVerificationSuite | None:
+    """Derive a current-schema suite without reinterpreting v1/v2 history."""
+
+    if graph.schema_version != SCHEMA_VERSION:
+        return None
+    selected = frozenset(goal_ids)
+    known = {goal.goal_id for goal in graph.goals}
+    if not selected or not selected.issubset(known):
+        raise ValueError("navigation suite goal scope is invalid")
+    routes = tuple(
+        route for route in graph.routes if route.owning_goal_id in selected
+    )
+    if not routes:
+        return None
+    if mode == "final_full" and (
+        selected != known or len(routes) != len(graph.routes)
+    ):
+        raise ValueError("final navigation gate requires the complete GoalGraph")
+    if mode == "ready_full" and "/" not in {route.path for route in routes}:
+        raise ValueError("full ready navigation suite requires the root route")
+    return NavigationVerificationSuite(
+        version=graph.navigation_suite_version or 0,
+        routes=routes,
+        mode=mode,
+    )
+
+
+def navigation_test_ids(
+    suite: NavigationVerificationSuite | None,
+) -> tuple[str, ...]:
+    """Return stable internal IDs shared by compilation and checkpoints."""
+
+    if suite is None:
+        return ()
+    values = [
+        f"direct-{hashlib.sha256(route.path.encode()).hexdigest()[:12]}"
+        for route in suite.routes
+    ]
+    non_root = [route for route in suite.routes if route.path != "/"]
+    if suite.shared_navigation_gate and non_root:
+        values.extend(
+            ("shared-navigation", "mobile-navigation-390", "history-roundtrip")
+        )
+    return tuple(values)
+
+
+def navigation_evidence_key(version: int, test_id: str) -> str:
+    if version != NAVIGATION_SUITE_VERSION:
+        raise ValueError("navigation evidence suite version is unsupported")
+    safe_id = _identifier(test_id, "navigation test id")
+    return f"__fomo_navigation_v{version}:{safe_id}"
 
 
 class ScopedAcceptanceContract(SchemaModel):
@@ -705,9 +935,19 @@ def _parse_json_object(
 def parse_goal_graph_draft(
     payload: str | bytes | bytearray | Mapping[str, Any],
 ) -> GoalGraphDraft:
-    """Parse new planner output; only current schema v2 is accepted."""
+    """Parse new planner output; only current schema v3 is accepted."""
 
     return GoalGraphDraft.model_validate(_parse_json_object(payload, label="GoalGraphDraft"))
+
+
+def parse_goal_graph_planning_envelope(
+    payload: str | bytes | bytearray | Mapping[str, Any],
+) -> GoalGraphPlanningEnvelope:
+    """Parse the provider envelope with duplicate/non-finite rejection."""
+
+    return GoalGraphPlanningEnvelope.model_validate(
+        _parse_json_object(payload, label="GoalGraphPlanningEnvelope")
+    )
 
 
 def parse_legacy_goal_graph_draft(
@@ -720,22 +960,42 @@ def parse_legacy_goal_graph_draft(
     )
 
 
+def parse_legacy_route_goal_graph_draft(
+    payload: str | bytes | bytearray | Mapping[str, Any],
+) -> LegacyRouteGoalGraphDraft:
+    """Parse a historical v2 draft without applying the v3 suite policy."""
+
+    return LegacyRouteGoalGraphDraft.model_validate(
+        _parse_json_object(payload, label="LegacyRouteGoalGraphDraft")
+    )
+
+
 def parse_persisted_goal_graph_draft(
     payload: str | bytes | bytearray | Mapping[str, Any],
 ) -> GoalGraphDraftLike:
     """Parse a stored draft using its explicit schema-version discriminator."""
 
     value = _parse_json_object(payload, label="PersistedGoalGraphDraft")
-    schema_version = value.get("schemaVersion", value.get("schema_version", SCHEMA_VERSION))
+    schema_version = value.get("schemaVersion", value.get("schema_version"))
+    if schema_version is None:
+        raise ValueError("persisted GoalGraph draft requires schemaVersion")
     if schema_version == LEGACY_SCHEMA_VERSION:
         return LegacyGoalGraphDraft.model_validate(value)
-    return GoalGraphDraft.model_validate(value)
+    if schema_version == LEGACY_ROUTE_SCHEMA_VERSION:
+        return LegacyRouteGoalGraphDraft.model_validate(value)
+    if schema_version == SCHEMA_VERSION:
+        return GoalGraphDraft.model_validate(value)
+    raise ValueError("persisted GoalGraph schemaVersion is unsupported")
 
 
 def materialize_goal_graph(draft: GoalGraphDraftLike) -> GoalGraph:
     """Create the initial trusted projection with server-owned policy/state."""
 
-    routes = draft.routes if isinstance(draft, GoalGraphDraft) else []
+    routes = (
+        draft.routes
+        if isinstance(draft, (GoalGraphDraft, LegacyRouteGoalGraphDraft))
+        else []
+    )
     goal_type = LegacyGoal if isinstance(draft, LegacyGoalGraphDraft) else Goal
     return GoalGraph(
         schema_version=draft.schema_version,
@@ -743,6 +1003,11 @@ def materialize_goal_graph(draft: GoalGraphDraftLike) -> GoalGraph:
         routes=routes,
         quality_bar=SERVER_QUALITY_BAR,
         navigation_mode=_navigation_mode(draft.schema_version, routes),
+        navigation_suite_version=(
+            NAVIGATION_SUITE_VERSION
+            if isinstance(draft, GoalGraphDraft)
+            else None
+        ),
         goals=[
             goal_type.model_validate({**goal.model_dump(), "status": GoalStatus.PENDING})
             for goal in draft.goals
@@ -756,7 +1021,10 @@ def parse_persisted_goal_graph(
 ) -> GoalGraph:
     """Parse a trusted persisted projection, never untrusted planner output."""
 
-    return GoalGraph.model_validate(_parse_json_object(payload, label="GoalGraph"))
+    value = _parse_json_object(payload, label="GoalGraph")
+    if "schemaVersion" not in value and "schema_version" not in value:
+        raise ValueError("persisted GoalGraph requires schemaVersion")
+    return GoalGraph.model_validate(value)
 
 
 def parse_goal_graph(payload: str | bytes | bytearray | Mapping[str, Any]) -> GoalGraph:
@@ -783,7 +1051,10 @@ def serialize_goal_graph_draft(
 
     validated = (
         draft
-        if isinstance(draft, (GoalGraphDraft, LegacyGoalGraphDraft))
+        if isinstance(
+            draft,
+            (GoalGraphDraft, LegacyRouteGoalGraphDraft, LegacyGoalGraphDraft),
+        )
         else parse_persisted_goal_graph_draft(draft)
     )
     return _serialize_model(validated)
@@ -793,6 +1064,11 @@ def _serialize_model(graph: GoalGraph | GoalGraphDraftLike) -> str:
     payload = graph.model_dump(mode="json", by_alias=True)
     # Schema v1 predates the routing contract. Omitting the new default fields
     # preserves historical revision hashes and canonical persisted payloads.
+    if graph.schema_version in {
+        LEGACY_SCHEMA_VERSION,
+        LEGACY_ROUTE_SCHEMA_VERSION,
+    }:
+        payload.pop("navigationSuiteVersion", None)
     if graph.schema_version == LEGACY_SCHEMA_VERSION:
         payload.pop("routes", None)
         payload.pop("navigationMode", None)
@@ -817,6 +1093,8 @@ __all__ = [
     "GRAPH_STATUS_TRANSITIONS",
     "QUALITY_GATES",
     "LEGACY_SCHEMA_VERSION",
+    "LEGACY_ROUTE_SCHEMA_VERSION",
+    "NAVIGATION_SUITE_VERSION",
     "SCHEMA_VERSION",
     "SERVER_QUALITY_BAR",
     "Goal",
@@ -824,6 +1102,7 @@ __all__ = [
     "GoalGraph",
     "GoalGraphDraft",
     "GoalGraphDraftLike",
+    "GoalGraphPlanningEnvelope",
     "GoalGraphQualityBar",
     "GoalNode",
     "GoalStatus",
@@ -832,8 +1111,10 @@ __all__ = [
     "LegacyGoal",
     "LegacyGoalDraft",
     "LegacyGoalGraphDraft",
+    "LegacyRouteGoalGraphDraft",
     "NavigationMode",
     "NavigationRoute",
+    "NavigationVerificationSuite",
     "ScopedAcceptanceContract",
     "acceptance_persistence_key",
     "acceptance_test_path",
@@ -841,10 +1122,15 @@ __all__ = [
     "can_transition_goal_status",
     "can_transition_graph_status",
     "assert_goal_graph_executable",
+    "derive_navigation_verification_suite",
     "materialize_goal_graph",
+    "navigation_evidence_key",
+    "navigation_test_ids",
     "parse_goal_graph",
     "parse_goal_graph_draft",
+    "parse_goal_graph_planning_envelope",
     "parse_legacy_goal_graph_draft",
+    "parse_legacy_route_goal_graph_draft",
     "parse_persisted_goal_graph",
     "parse_persisted_goal_graph_draft",
     "route_link_evidence_tests",

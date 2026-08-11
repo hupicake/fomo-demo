@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
@@ -78,6 +79,55 @@ class SafeRunDiagnostic:
 
 
 @dataclass(frozen=True, slots=True)
+class PlanningViolationDiagnostic:
+    """Bounded planning failure identity with no provider-authored body."""
+
+    violation_code: str
+    route_ids: tuple[str, ...] = ()
+    goal_ids: tuple[str, ...] = ()
+    test_ids: tuple[str, ...] = ()
+    fingerprint: str = ""
+    repeated_from: str | None = None
+
+    def event_payload(self) -> dict[str, Any]:
+        safe_code = re.compile(r"^[a-z][a-z0-9_]{2,63}$")
+        safe_identifier = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+        safe_route = re.compile(r"^/$|^/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*$")
+        safe_fingerprint = re.compile(r"^[a-f0-9]{64}$")
+        if not safe_code.fullmatch(self.violation_code):
+            raise ValueError("planning violation code is invalid")
+        if len(self.route_ids) > 8 or any(
+            len(item) > 200 or not safe_route.fullmatch(item) for item in self.route_ids
+        ):
+            raise ValueError("planning route ids are invalid")
+        if len(self.goal_ids) > 8 or any(
+            not safe_identifier.fullmatch(item) for item in self.goal_ids
+        ):
+            raise ValueError("planning goal ids are invalid")
+        if len(self.test_ids) > 8 or any(
+            not safe_identifier.fullmatch(item) for item in self.test_ids
+        ):
+            raise ValueError("planning test ids are invalid")
+        if not safe_fingerprint.fullmatch(self.fingerprint):
+            raise ValueError("planning fingerprint is invalid")
+        if self.repeated_from is not None and not safe_fingerprint.fullmatch(
+            self.repeated_from
+        ):
+            raise ValueError("planning repeatedFrom is invalid")
+        payload: dict[str, Any] = {
+            "version": 1,
+            "violationCode": self.violation_code,
+            "routeIds": list(self.route_ids),
+            "goalIds": list(self.goal_ids),
+            "testIds": list(self.test_ids),
+            "fingerprint": self.fingerprint,
+        }
+        if self.repeated_from is not None:
+            payload["repeatedFrom"] = self.repeated_from
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
 class PublicRunFailure:
     """A stable failure result that is safe to persist and send to browsers."""
 
@@ -108,6 +158,17 @@ class DirectPiOrchestrationError(RuntimeError):
 
 class PlanningContractError(DirectPiOrchestrationError):
     """The model did not return the server-owned planning contract."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        violation_code: str = "planning_contract_invalid",
+        planning_diagnostic: PlanningViolationDiagnostic | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.violation_code = violation_code
+        self.planning_diagnostic = planning_diagnostic
 
 
 class AgentCapabilityUnavailable(DirectPiOrchestrationError):

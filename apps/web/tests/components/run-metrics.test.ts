@@ -15,6 +15,7 @@ function graphFixture(): GoalGraphProjection {
     revision: 1,
     schemaVersion: 1,
     navigationMode: "single_surface",
+    navigationSuiteVersion: null,
     routes: [],
     status: "active",
     productOutcome: "Ship the requested page.",

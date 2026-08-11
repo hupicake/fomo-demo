@@ -110,7 +110,11 @@ export function normalizeGoalGraph(value: unknown): GoalGraphProjection | null {
   const status = text(source.status) as GoalGraphStatus;
   if (!graphId || !runId || !productOutcome || !graphStatuses.has(status)) return null;
   const rawSchemaVersion = numberValue(source.schemaVersion ?? source.schema_version, 1);
-  const schemaVersion = rawSchemaVersion === 2 ? 2 : 1;
+  const schemaVersion = rawSchemaVersion === 3 ? 3 : rawSchemaVersion === 2 ? 2 : 1;
+  const rawNavigationSuiteVersion = numberValue(
+    source.navigationSuiteVersion ?? source.navigation_suite_version,
+  );
+  const navigationSuiteVersion = rawNavigationSuiteVersion === 1 ? 1 : null;
   const rawNavigationMode = text(
     source.navigationMode || source.navigation_mode,
     "single_surface",
@@ -124,6 +128,7 @@ export function normalizeGoalGraph(value: unknown): GoalGraphProjection | null {
     revision: Math.max(0, Math.floor(numberValue(source.revision))),
     schemaVersion,
     navigationMode,
+    navigationSuiteVersion,
     routes: array(source.routes).flatMap((item) => {
       const normalized = normalizeRoute(item);
       return normalized ? [normalized] : [];

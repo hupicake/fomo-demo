@@ -24,8 +24,13 @@ from fomo.direct_pi.goal_manager import (
     RuntimeValidationMode,
     RuntimeValidationReason,
 )
-from fomo.direct_pi.goalgraph import scope_acceptance_contract
-from fomo.direct_pi.verification import Verifier
+from fomo.direct_pi.goalgraph import (
+    NavigationRoute,
+    NavigationVerificationSuite,
+    navigation_test_ids,
+    scope_acceptance_contract,
+)
+from fomo.direct_pi.verification import VerificationOutcome, Verifier
 from fomo.direct_pi.workspace import (
     FOMO_RUNNER_BIN,
     FOMO_RUNNER_NODE,
@@ -552,6 +557,86 @@ async def test_acceptance_timeout_classification_replays_trusted_runner_results(
     else:
         assert acceptance_gate.diagnostic is None
         assert acceptance_gate.exit_code is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("result_factory", "expected_outcome", "expected_infrastructure"),
+    [
+        (
+            lambda title: ExecResult(1, _playwright_timeout_report(title), ""),
+            "failed",
+            False,
+        ),
+        (
+            lambda _title: ExecResult(1, "not-json", ""),
+            "infrastructure_failed",
+            True,
+        ),
+    ],
+    ids=("locator-timeout-is-repairable", "malformed-report-is-infrastructure"),
+)
+async def test_navigation_gate_preserves_assertion_vs_infrastructure_failure_domain(
+    repository,
+    settings,
+    result_factory,
+    expected_outcome: str,
+    expected_infrastructure: bool,
+) -> None:
+    project, run, lease = await _run_context(
+        repository,
+        f"navigation-classification-{expected_outcome}",
+    )
+    suite = NavigationVerificationSuite(
+        version=1,
+        routes=(
+            NavigationRoute(
+                path="/",
+                title="Home",
+                owningGoalId="G-1",
+                deepLinkable=True,
+            ),
+        ),
+        mode="focused",
+    )
+    navigation_id = navigation_test_ids(suite)[0]
+    test_path = (
+        f"tests/fomo-acceptance/navigation-v1/{navigation_id}.smoke.spec.ts"
+    )
+    test_name = "FOMO navigation direct load: Home"
+    command = _playwright_command(test_path)
+    sandbox = FakeSandboxProvider(
+        {command: result_factory(test_name)}
+    )
+    ref = await sandbox.create(project.id)
+
+    gate = await _verifier(
+        repository,
+        sandbox,
+        settings,
+        run.id,
+        lease,
+    )._navigation_gate(ref, navigation_id, test_path, test_name)
+    outcome = VerificationOutcome(
+        passed=False,
+        gates=(gate,),
+        diagnostic_artifact_id="diagnostic-artifact",
+        preview_url=None,
+    )
+
+    assert gate.scope == "navigation"
+    assert gate.navigation_id == navigation_id
+    assert gate.outcome == expected_outcome
+    assert outcome.has_infrastructure_failure is expected_infrastructure
+    if expected_outcome == "failed":
+        assert gate.diagnostic is not None
+        assert gate.diagnostic.locator == (
+            "getByRole('button', { name: 'Increment' })"
+        )
+        assert "timeout-diagnostic-secret" not in gate.summary
+    else:
+        assert gate.diagnostic is None
+        assert gate.exit_code is None
 
 
 @pytest.mark.asyncio

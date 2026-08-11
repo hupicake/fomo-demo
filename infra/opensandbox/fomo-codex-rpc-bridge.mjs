@@ -790,6 +790,12 @@ function completedStats() {
 function finalizeSuccess() {
   if (terminal) return;
   const publicAssistantText = redact(assistantText);
+  // Structured output is a machine contract, not public assistant prose. The
+  // synthetic tool lifecycle below must retain the complete object so the
+  // control plane can extract it, while the public message lifecycle remains
+  // intentionally empty. This matches the Pi/OpenCode adapters and prevents a
+  // planning payload from being duplicated into SSE and durable text events.
+  const publicLifecycleText = structuredMode ? "" : publicAssistantText;
   let structuredValue = null;
   if (structuredMode) {
     try { structuredValue = JSON.parse(publicAssistantText); } catch {
@@ -815,12 +821,12 @@ function finalizeSuccess() {
   // itself is valid so the next resume can expose an exact settlement baseline.
   storeThreadMapping(threadId, childUsage);
   emitPi("message_start", { role: "assistant", elapsedMs: elapsedMs() });
-  for (let offset = 0; offset < publicAssistantText.length; offset += 8_000) {
+  for (let offset = 0; offset < publicLifecycleText.length; offset += 8_000) {
     emitPi("message_delta", {
       role: "assistant",
       deltaType: "text_delta",
       contentIndex: 0,
-      delta: publicAssistantText.slice(offset, offset + 8_000),
+      delta: publicLifecycleText.slice(offset, offset + 8_000),
       elapsedMs: elapsedMs(),
     });
   }
@@ -831,7 +837,7 @@ function finalizeSuccess() {
   });
   emitPi("turn_end", {
     role: "assistant",
-    text: bounded(publicAssistantText),
+    text: bounded(publicLifecycleText),
     stopReason: "stop",
     elapsedMs: elapsedMs(),
   });

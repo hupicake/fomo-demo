@@ -352,8 +352,9 @@ describe("control plane client contract", () => {
           graph_id: "graph-1",
           run_id: "run-1",
           revision: 2,
-          schema_version: 2,
+          schema_version: 3,
           navigation_mode: "multi_route",
+          navigation_suite_version: 1,
           routes: [
             { path: "/", title: "Library", owning_goal_id: "G-1", deep_linkable: true },
             { path: "/borrow", title: "Borrow", owning_goal_id: "G-2", deep_linkable: true },
@@ -383,8 +384,9 @@ describe("control plane client contract", () => {
     expect(current.goalGraph).toEqual(expect.objectContaining({
       graphId: "graph-1",
       activeGoalId: "G-2",
-      schemaVersion: 2,
+      schemaVersion: 3,
       navigationMode: "multi_route",
+      navigationSuiteVersion: 1,
       routes: [
         { path: "/", title: "Library", owningGoalId: "G-1", deepLinkable: true },
         { path: "/borrow", title: "Borrow", owningGoalId: "G-2", deepLinkable: true },

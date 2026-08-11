@@ -22,9 +22,9 @@ from .architecture_profile import (
 )
 from .contracts import LOCAL_PATH_PATTERN
 from .goal_manager import GoalExecutionPlan
-from .goalgraph import GoalGraphDraft, route_link_evidence_tests
+from .goalgraph import GoalGraphDraft
 
-GOAL_GRAPH_PLANNING_POLICY = "frontend-ui-v6"
+GOAL_GRAPH_PLANNING_POLICY = "frontend-ui-v7"
 PRODUCT_REQUIREMENTS_POLICY = "frontend-product-v3"
 PRODUCT_DESIGN_POLICY = "frontend-design-v4"
 _MAX_REPAIR_DIAGNOSTIC_JSON_CHARACTERS = 12_000
@@ -232,96 +232,11 @@ def required_route_count(requirement: str) -> int:
     return 2 if requires_multi_route(requirement) else 1
 
 
-def _asserts_route_identity(test: object, *, path: str, title: str) -> bool:
-    assertions = getattr(test, "assertions", ())
-    return any(
-        item.kind == "url" and item.path == path for item in assertions
-    ) and any(
-        item.kind == "visible"
-        and item.target.by == "role"
-        and item.target.value == "heading"
-        and item.target.name == title
-        for item in assertions
-    )
-
-
-def _has_observable_history_roundtrip(draft: GoalGraphDraft) -> bool:
-    routes_by_path = {route.path: route for route in draft.routes}
-    for goal in draft.goals:
-        for test in goal.acceptance.tests:
-            for index, action in enumerate(test.actions):
-                if action.kind != "history_roundtrip" or index != len(test.actions) - 1:
-                    continue
-                back_route = routes_by_path.get(action.back_path)
-                forward_route = routes_by_path.get(action.forward_path)
-                if (
-                    back_route is None
-                    or forward_route is None
-                    or not _asserts_route_identity(
-                        test,
-                        path=forward_route.path,
-                        title=forward_route.title,
-                    )
-                ):
-                    continue
-                setup = test.actions[:index]
-                navigation_setup = [
-                    item
-                    for item in setup
-                    if item.kind in {"goto", "back", "forward", "history_roundtrip"}
-                    or (
-                        item.kind == "click"
-                        and item.target.by == "role"
-                        and item.target.value == "link"
-                    )
-                ]
-                if (
-                    len(navigation_setup) >= 2
-                    and navigation_setup[-2].kind == "goto"
-                    and navigation_setup[-2].path == back_route.path
-                    and navigation_setup[-1].kind == "goto"
-                    and navigation_setup[-1].path == forward_route.path
-                ):
-                    return True
-                if len(navigation_setup) < 2:
-                    continue
-                source = navigation_setup[-2]
-                link = navigation_setup[-1]
-                if (
-                    source.kind == "goto"
-                    and source.path == back_route.path
-                    and link.kind == "click"
-                    and link.target.by == "role"
-                    and link.target.value == "link"
-                    and link.target.name == forward_route.title
-                ):
-                    return True
-    return False
-
-
-def _has_mobile_link_evidence(draft: GoalGraphDraft) -> bool:
-    for route in draft.routes:
-        if route.path == "/":
-            continue
-        for test in route_link_evidence_tests(draft, route.path):
-            last_viewport = next(
-                (
-                    action
-                    for action in reversed(test.actions[:-1])
-                    if action.kind == "set_viewport"
-                ),
-                None,
-            )
-            if last_viewport is not None and last_viewport.width <= 480:
-                return True
-    return False
-
-
 def validate_goal_graph_routing(
     requirement: str,
     draft: GoalGraphDraft,
 ) -> GoalGraphDraft:
-    """Reject a valid v2 graph that still weakens explicit route requirements."""
+    """Reject a valid v3 manifest that weakens explicit source requirements."""
 
     violations: list[str] = []
     minimum = required_route_count(requirement)
@@ -342,16 +257,6 @@ def validate_goal_graph_routing(
                 "explicit deep-link support requires deepLinkable=true for: "
                 + ", ".join(not_deep)
             )
-    if _MOBILE_NAVIGATION_INTENT.search(positive):
-        if not _has_mobile_link_evidence(draft):
-            violations.append(
-                "mobile navigation requires a non-root link test with set_viewport width<=480"
-            )
-    if _HISTORY_INTENT.search(positive) and not _has_observable_history_roundtrip(draft):
-        violations.append(
-            "browser back/forward requires a terminal history_roundtrip with exact "
-            "back and forward URL observations"
-        )
     if violations:
         raise ValueError(
             "GoalGraph route intent violations:\n- " + "\n- ".join(violations)
@@ -376,13 +281,12 @@ def _routing_planning_brief(requirement: str) -> str:
         if listed_paths
         else ""
     )
-    return f"""FOMO authoritative routing contract v2:
-- Output `schemaVersion: 2` and a complete `routes` manifest. FOMO derives `navigationMode`; never submit that server-owned field.
+    return f"""FOMO authoritative routing contract v3:
+- Inside the envelope payload, output `schemaVersion: 3` and a complete `routes` manifest. FOMO derives `navigationMode` and `navigationSuiteVersion`; never submit those server-owned fields.
 - {classification}{listed}
 - The manifest must include `/`. Every path is one canonical same-origin local path with no `//`, query, hash, dynamic bracket, or trailing-slash alias. Titles must be unique ignoring case. Each route declares `path`, `title`, `owningGoalId`, and `deepLinkable`; explicit deep-link requirements make every applicable route deep-linkable.
-- Every route owner needs an independent direct test asserting exact `url(path)` and exact visible role=`heading` name=`route.title`. A normal route's final action is `goto(path)`; a deep-linkable route's final two actions are exactly `goto(path)`, `reload`, with nothing after them.
-- With multiple routes, every non-root route needs a separate link test in its owner. Its final action is role=`link` with accessible name exactly equal to the target route title; it asserts the target's exact URL and exact heading. The last preceding goto is another declared source whose owner is either the same goal or a transitive dependency of the target owner.
-- Mobile navigation evidence puts `set_viewport` width <= 480 before a qualifying non-root link. Browser back/forward evidence uses a separate terminal `history_roundtrip` action with distinct declared `backPath`/`forwardPath`; FOMO asserts both URLs inside that action. State tabs, hashes, query panels, raw `back`/`forward`, or a later goto never prove routing.
+- Every route owner is user-visible. The root owner must be the same goal as, or a transitive dependency of, every non-root owner. A goal's business tests may reference only routes owned by itself or its dependencies, never a future goal.
+- Do not create criteria or tests merely to prove direct route loading, route-title headings, shared navigation links, mobile navigation, reload, or browser history. FOMO deterministically derives and versions that mechanical navigation suite from the frozen manifest.
 - Cross-route persistence must be proven through a visible mutation, real route navigation, reload, and visible resulting state rather than an implementation-only assertion."""
 
 
@@ -390,7 +294,8 @@ _ROUTING_DELIVERY_BRIEF = """FOMO route-delivery policy:
 - The embedded `navigationContract` is complete, frozen, server-owned, and read-only. Implement it exactly; never rename, add, remove, or collapse its routes in the active Goal.
 - Treat route paths and their acceptance journeys as frozen product behavior. Implement each top-level destination as a real Next.js App Router page reachable at its exact path.
 - Render one exact accessible heading matching each route title and use accessible links with those exact route-title names for cross-route movement. Route-level destinations must not be implemented as state tabs, hashes, or query-only panels; tabs are allowed only for subordinate content that remains within one route.
-- Preserve direct loading, reload, browser history and narrow-screen navigation whenever the active acceptance contract exercises them. Shared browser state must remain consistent across real route transitions and reloads."""
+- FOMO always derives exact direct-load/heading checks for ready routes. At the final graph gate it clicks every non-root exact-title link from `/`, exercises navigation at 390px (opening a button named `Open navigation` when links are hidden), and observes browser back/forward for every non-root route plus deep-link reload. Implement these mechanics even though the model-authored acceptance omits their repetitive tests.
+- Expose the shared navigation as an accessible `navigation` named `Primary navigation`. Shared browser state must remain consistent across real route transitions and reloads."""
 
 
 _PRODUCT_MANAGER_BRIEF = f"""FOMO product-requirements policy {PRODUCT_REQUIREMENTS_POLICY}:
@@ -473,6 +378,7 @@ def _goal_execution_context(plan: GoalExecutionPlan) -> dict[str, object]:
         "graphRevision": plan.graph_revision,
         "navigationContract": {
             "schemaVersion": plan.graph_schema_version,
+            "navigationSuiteVersion": plan.navigation_suite_version,
             "navigationMode": plan.navigation_mode.value,
             "routes": [
                 route.model_dump(mode="json", by_alias=True) for route in plan.routes
@@ -614,6 +520,8 @@ Planning policy {GOAL_GRAPH_PLANNING_POLICY}: derive the number and granularity 
 
 The GoalGraph structures delivery order, not product ambition. Preserve every explicit user outcome and describe enough observable behavior that the coding turn cannot satisfy the graph with a hollow shell. Where the requirement leaves presentation details open, exercise product and design judgment without inventing unrelated major capabilities.
 
+Provider transport envelope (the form is intentionally shallow): submit exactly `{{"envelopeVersion":1,"payloadJson":"<one JSON-encoded GoalGraphDraft>"}}`. `payloadJson` is a string, not a nested object or Markdown. Its decoded object has exactly `schemaVersion`, `productOutcome`, `routes`, and `goals`. A route has `path`, `title`, `owningGoalId`, `deepLinkable`. A goal has `goalId`, `title`, `productOutcome`, `userVisible`, `dependsOn`, and `acceptance`. Acceptance has equal one-to-one `criteria` and `tests`; a criterion has `id`, `title`, `priority`, `given`, `when`, `then`; a test has `id`, `acceptanceId`, `title`, nonempty `actions`, nonempty `assertions`. Actions are `goto(path)`, `click(target)`, `fill(target,value)`, `select(target,value)`, `reload`, `back`, `forward`, `set_viewport(width,height)`, or `history_roundtrip(backPath,forwardPath)`. Assertions are `visible(target)`, `not_visible(target)`, `value(target,expected)`, or `url(path)`. A target is exact `role(value,name)`, `label(value)`, or `text(value)`. Use these tests for business workflows only; FOMO owns mechanical navigation tests.
+
 {_PRODUCT_MANAGER_BRIEF}
 
 {_FRONTEND_ONLY_BRIEF}
@@ -639,7 +547,7 @@ def goal_graph_planning_correction_prompt(*, validation_error: str) -> str:
 
 Fill the submit_structured_output form until that virtual tool succeeds exactly once. If it returns a form or schema validation error, use the feedback to correct the fields and resubmit until it succeeds. Stop immediately after the successful submission. It is the only allowed tool. Do not change files, emit prose or JSON as assistant text, add lifecycle status/quality policy/revision/evidence, or choose an active goal. Preserve the complete intended product outcome and acceptance behavior while enforcing planning policy {GOAL_GRAPH_PLANNING_POLICY}: let requirement complexity and coherent user outcomes determine goal granularity and coverage. Revise goals, dependencies, or criteria as needed to satisfy the structured contract without shrinking the source request. The form enforces the JSON shape; FOMO will revalidate all semantic constraints.
 
-Keep `schemaVersion: 2` and repair the complete route manifest plus all reported route violations in one submission; do not add server-owned `navigationMode`. Include `/`, canonical same-origin paths, and case-insensitively unique titles. Every route needs its own exact URL + exact route-title heading direct test, ending in `goto(path)` or `goto(path), reload` when deep-linkable. Every non-root route in a multi-route graph needs a separate owner-local test ending in its exact route-title role=`link`, sourced from the same owner or a transitive dependency and asserting the target URL + heading. Mobile evidence needs `set_viewport` width <= 480 before such a link; browser history needs a terminal observable `history_roundtrip`. Never use state tabs, hashes, query panels, raw history actions, or a later goto as route evidence.
+Submit the same exact `{{"envelopeVersion":1,"payloadJson":"..."}}` envelope and keep inner `schemaVersion: 3`. Repair the complete route manifest and reported business-contract violations in one submission; do not add server-owned `navigationMode` or `navigationSuiteVersion`. Include `/`, canonical same-origin paths, case-insensitively unique titles, user-visible owners, and root-owner dependency reachability. Business tests may reference only routes owned by their goal or dependencies. Do not add repetitive direct/link/mobile/history criteria: FOMO owns and derives them from the manifest.
 
 {_FRONTEND_ONLY_BRIEF}
 

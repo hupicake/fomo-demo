@@ -13,8 +13,12 @@ from fomo.direct_pi.goalgraph import (
     GoalStatus,
     GraphStatus,
     NavigationMode,
+    derive_navigation_verification_suite,
+    navigation_evidence_key,
+    navigation_test_ids,
     parse_goal_graph_draft,
     parse_legacy_goal_graph_draft,
+    parse_legacy_route_goal_graph_draft,
 )
 from fomo.ids import utcnow
 from fomo.persistence import ConflictError, ManifestIntegrityError, RunLeaseLost
@@ -176,7 +180,7 @@ def _v2_draft():
             },
         ],
     }
-    return parse_goal_graph_draft(
+    return parse_legacy_route_goal_graph_draft(
         {
             "schemaVersion": 2,
             "productOutcome": "A durable routed mission product",
@@ -210,6 +214,51 @@ def _v2_draft():
                     "userVisible": True,
                     "dependsOn": ["G-1"],
                     "acceptance": second_acceptance,
+                },
+            ],
+        }
+    )
+
+
+def _v3_draft(*, final_owns_route: bool = True):
+    routes = [
+        {
+            "path": "/",
+            "title": "Home",
+            "owningGoalId": "G-1",
+            "deepLinkable": True,
+        }
+    ]
+    if final_owns_route:
+        routes.append(
+            {
+                "path": "/missions",
+                "title": "Missions",
+                "owningGoalId": "G-2",
+                "deepLinkable": True,
+            }
+        )
+    return parse_goal_graph_draft(
+        {
+            "schemaVersion": 3,
+            "productOutcome": "A durable routed mission product",
+            "routes": routes,
+            "goals": [
+                {
+                    "goalId": "G-1",
+                    "title": "Home route",
+                    "productOutcome": "Users open mission control.",
+                    "userVisible": True,
+                    "dependsOn": [],
+                    "acceptance": _acceptance("AC-1"),
+                },
+                {
+                    "goalId": "G-2",
+                    "title": "Mission route",
+                    "productOutcome": "Users manage missions.",
+                    "userVisible": True,
+                    "dependsOn": ["G-1"],
+                    "acceptance": _acceptance("AC-2"),
                 },
             ],
         }
@@ -253,7 +302,7 @@ async def test_legacy_write_requires_private_admission_and_preserves_safe_old_pa
 ) -> None:
     project, run, lease = await _running_context(repository, "legacy-admission")
     draft = _draft()
-    with pytest.raises(ValueError, match="only accepts current schema v2"):
+    with pytest.raises(ValueError, match="only accepts current schema v3"):
         await repository.create_goal_graph(project.id, run.id, draft, lease_token=lease)
 
     payload = draft.model_dump(mode="json", by_alias=True)
@@ -279,14 +328,14 @@ async def test_v2_route_manifest_round_trips_and_is_integrity_checked(repository
         goal_count=2,
         shared_state_across_routes=True,
     )
-    with pytest.raises(ValueError, match="requires an architecture profile"):
+    with pytest.raises(ValueError, match="only accepts current schema v3"):
         await repository.create_goal_graph(
             project.id,
             run.id,
             _v2_draft(),
             lease_token=lease,
         )
-    created = await repository.create_goal_graph(
+    created = await repository._create_legacy_route_goal_graph(
         project.id,
         run.id,
         _v2_draft(),
@@ -304,6 +353,11 @@ async def test_v2_route_manifest_round_trips_and_is_integrity_checked(repository
 
     assert created.graph.navigation_mode is NavigationMode.MULTI_ROUTE
     assert created.architecture_profile == profile
+    # Frozen v2 canonical draft + architecture-profile hash from the pre-v3
+    # implementation. V3 policy changes must never rewrite historical IDs.
+    assert created.content_hash == (
+        "b2fd1345dd332befd7f52b5f7d244ea92fa69f098e156004501299eeace5c9f1"
+    )
     assert [route.path for route in created.graph.routes] == ["/", "/missions"]
     created_event = next(
         event
@@ -356,7 +410,7 @@ async def test_v2_route_manifest_round_trips_and_is_integrity_checked(repository
 async def test_v2_architecture_profile_provenance_rejects_tampering(repository) -> None:
     project, run, lease = await _running_context(repository, "architecture-profile")
     profile = derive_architecture_profile(route_count=2, goal_count=2)
-    created = await repository.create_goal_graph(
+    created = await repository._create_legacy_route_goal_graph(
         project.id,
         run.id,
         _v2_draft(),
@@ -383,6 +437,248 @@ async def test_v2_architecture_profile_provenance_rejects_tampering(repository) 
 
     with pytest.raises(ManifestIntegrityError, match="content hash mismatch"):
         await repository.get_goal_graph(run.id)
+
+
+@pytest.mark.asyncio
+async def test_v3_checkpoint_binds_server_navigation_suite_and_detects_tampering(
+    repository,
+) -> None:
+    project, run, lease = await _running_context(repository, "v3-navigation-evidence")
+    profile = derive_architecture_profile(route_count=2, goal_count=2)
+    created = await repository.create_goal_graph(
+        project.id,
+        run.id,
+        _v3_draft(),
+        architecture_profile=profile,
+        lease_token=lease,
+    )
+    await repository.activate_goal(run.id, "G-1", lease_token=lease)
+    await repository.claim_goal(run.id, "G-1", lease_token=lease)
+    claimed = await repository.get_goal_graph(run.id)
+    assert claimed is not None
+    suite = derive_navigation_verification_suite(
+        claimed.graph,
+        goal_ids=("G-1",),
+        mode="focused",
+    )
+    assert suite is not None
+    business_evidence = {
+        "acceptanceKey": "G-1:AC-1",
+        "kind": "playwright_smoke",
+        "status": "passed",
+    }
+    navigation_evidence = [
+        {
+            "acceptanceKey": navigation_evidence_key(suite.version, test_id),
+            "kind": f"fomo_navigation_v{suite.version}",
+            "status": "passed",
+        }
+        for test_id in navigation_test_ids(suite)
+    ]
+
+    with pytest.raises(ValueError, match="missing goal navigation evidence"):
+        await repository.record_verified_checkpoint(
+            run.id,
+            "G-1",
+            [{"path": "app/page.tsx", "content": "export default () => null\n"}],
+            [business_evidence],
+            lease_token=lease,
+        )
+
+    checkpoint = await repository.record_verified_checkpoint(
+        run.id,
+        "G-1",
+        [{"path": "app/page.tsx", "content": "export default () => null\n"}],
+        [business_evidence, *navigation_evidence],
+        lease_token=lease,
+        navigation_suite=suite,
+        capsule={"_fomoNavigationEvidence": {"suiteVersion": 999}},
+    )
+    expected_test_ids = list(navigation_test_ids(suite))
+    assert checkpoint.capsule["_fomoNavigationEvidence"] == {
+        "suiteVersion": suite.version,
+        "mode": "focused",
+        "testIds": expected_test_ids,
+        "evidenceKeys": sorted(
+            navigation_evidence_key(suite.version, test_id)
+            for test_id in expected_test_ids
+        ),
+    }
+    assert await repository.get_latest_verified_checkpoint(run.id) == checkpoint
+    assert created.graph.navigation_suite_version == suite.version
+
+    async with repository.database.session_factory() as session:
+        record = await session.get(CheckpointRecord, checkpoint.id)
+        assert record is not None
+        capsule = dict(record.capsule)
+        navigation = dict(capsule["_fomoNavigationEvidence"])
+        navigation["testIds"] = ["forged-navigation-id"]
+        capsule["_fomoNavigationEvidence"] = navigation
+        record.capsule = capsule
+        await session.commit()
+
+    with pytest.raises(
+        ManifestIntegrityError,
+        match="navigation evidence suite mismatch",
+    ):
+        await repository.get_latest_verified_checkpoint(run.id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "final_owns_route",
+    (True, False),
+    ids=("final-goal-owns-route", "final-goal-has-no-route"),
+)
+async def test_v3_final_checkpoint_cannot_downgrade_complete_navigation_suite(
+    repository,
+    final_owns_route: bool,
+) -> None:
+    project, run, lease = await _running_context(
+        repository,
+        f"v3-final-navigation-{final_owns_route}",
+    )
+    route_count = 2 if final_owns_route else 1
+    await repository.create_goal_graph(
+        project.id,
+        run.id,
+        _v3_draft(final_owns_route=final_owns_route),
+        architecture_profile=derive_architecture_profile(
+            route_count=route_count,
+            goal_count=2,
+        ),
+        lease_token=lease,
+    )
+    await repository.activate_goal(run.id, "G-1", lease_token=lease)
+    await repository.claim_goal(run.id, "G-1", lease_token=lease)
+    first = await repository.get_goal_graph(run.id)
+    assert first is not None
+    first_suite = derive_navigation_verification_suite(
+        first.graph,
+        goal_ids=("G-1",),
+        mode="focused",
+    )
+    assert first_suite is not None
+    await repository.record_verified_checkpoint(
+        run.id,
+        "G-1",
+        [{"path": "app/page.tsx", "content": "export default () => null\n"}],
+        [
+            {
+                "acceptanceKey": "G-1:AC-1",
+                "kind": "playwright_smoke",
+                "status": "passed",
+            },
+            *[
+                {
+                    "acceptanceKey": navigation_evidence_key(
+                        first_suite.version,
+                        test_id,
+                    ),
+                    "kind": f"fomo_navigation_v{first_suite.version}",
+                    "status": "passed",
+                }
+                for test_id in navigation_test_ids(first_suite)
+            ],
+        ],
+        lease_token=lease,
+        navigation_suite=first_suite,
+    )
+
+    await repository.claim_goal(run.id, "G-2", lease_token=lease)
+    final = await repository.get_goal_graph(run.id)
+    assert final is not None
+    downgraded = derive_navigation_verification_suite(
+        final.graph,
+        goal_ids=("G-2",),
+        mode="focused",
+    )
+    downgraded_evidence = [
+        {
+            "acceptanceKey": navigation_evidence_key(
+                downgraded.version,
+                test_id,
+            ),
+            "kind": f"fomo_navigation_v{downgraded.version}",
+            "status": "passed",
+        }
+        for test_id in navigation_test_ids(downgraded)
+    ]
+
+    with pytest.raises(
+        ValueError,
+        match="final checkpoint requires the complete navigation suite",
+    ):
+        await repository.record_verified_checkpoint(
+            run.id,
+            "G-2",
+            [
+                {"path": "app/page.tsx", "content": "export default () => null\n"},
+                {"path": "app/final.ts", "content": "export const final = true\n"},
+            ],
+            [
+                {
+                    "acceptanceKey": "G-2:AC-2",
+                    "kind": "playwright_smoke",
+                    "status": "passed",
+                },
+                *downgraded_evidence,
+            ],
+            lease_token=lease,
+            navigation_suite=downgraded,
+        )
+
+    complete = derive_navigation_verification_suite(
+        final.graph,
+        goal_ids=("G-1", "G-2"),
+        mode="final_full",
+    )
+    assert complete is not None
+    checkpoint = await repository.record_verified_checkpoint(
+        run.id,
+        "G-2",
+        [
+            {"path": "app/page.tsx", "content": "export default () => null\n"},
+            {"path": "app/final.ts", "content": "export const final = true\n"},
+        ],
+        [
+            {
+                "acceptanceKey": "G-2:AC-2",
+                "kind": "playwright_smoke",
+                "status": "passed",
+            },
+            *[
+                {
+                    "acceptanceKey": navigation_evidence_key(
+                        complete.version,
+                        test_id,
+                    ),
+                    "kind": f"fomo_navigation_v{complete.version}",
+                    "status": "passed",
+                }
+                for test_id in navigation_test_ids(complete)
+            ],
+        ],
+        lease_token=lease,
+        navigation_suite=complete,
+    )
+    assert checkpoint.capsule["_fomoNavigationEvidence"]["mode"] == "final_full"
+
+    async with repository.database.session_factory() as session:
+        record = await session.get(CheckpointRecord, checkpoint.id)
+        assert record is not None
+        capsule = dict(record.capsule)
+        navigation = dict(capsule["_fomoNavigationEvidence"])
+        navigation["mode"] = "focused"
+        capsule["_fomoNavigationEvidence"] = navigation
+        record.capsule = capsule
+        await session.commit()
+
+    with pytest.raises(
+        ManifestIntegrityError,
+        match="navigation evidence suite mismatch",
+    ):
+        await repository.get_latest_verified_checkpoint(run.id)
 
 
 @pytest.mark.asyncio

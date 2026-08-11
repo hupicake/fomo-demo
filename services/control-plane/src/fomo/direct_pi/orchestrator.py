@@ -59,6 +59,7 @@ from .failures import (
     FailureOutcome,
     FailureStage,
     PlanningContractError,
+    PlanningViolationDiagnostic,
     SafeRunDiagnostic,
     classify_direct_pi_failure,
     safe_diagnostic_for_error,
@@ -75,9 +76,12 @@ from .goal_manager import (
 )
 from .goalgraph import (
     GoalGraphDraft,
+    GoalGraphPlanningEnvelope,
     GoalStatus,
     GraphStatus,
+    derive_navigation_verification_suite,
     parse_goal_graph_draft,
+    parse_goal_graph_planning_envelope,
     scope_acceptance_contract,
 )
 from .prompts import (
@@ -131,6 +135,85 @@ def _planning_failure_fingerprint(plan_text: str, error: Exception) -> str:
     return hashlib.sha256(
         f"{normalized_plan}\n{normalized_error}".encode()
     ).hexdigest()
+
+
+def _planning_entity_ids(plan_text: str) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Extract only bounded domain identifiers; never return planner content."""
+
+    try:
+        value = json.loads(plan_text)
+        if isinstance(value, dict) and isinstance(value.get("payloadJson"), str):
+            value = json.loads(value["payloadJson"])
+    except (json.JSONDecodeError, RecursionError, TypeError, ValueError):
+        return (), (), ()
+    if not isinstance(value, dict):
+        return (), (), ()
+    routes = value.get("routes")
+    goals = value.get("goals")
+    route_ids: list[str] = []
+    goal_ids: list[str] = []
+    test_ids: list[str] = []
+    if isinstance(routes, list):
+        for route in routes[:32]:
+            path = route.get("path") if isinstance(route, dict) else None
+            if (
+                isinstance(path, str)
+                and len(path) <= 200
+                and re.fullmatch(r"^/$|^/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*$", path)
+                and path not in route_ids
+                and len(route_ids) < 8
+            ):
+                route_ids.append(path)
+    if isinstance(goals, list):
+        for goal in goals[:32]:
+            if not isinstance(goal, dict):
+                continue
+            goal_id = goal.get("goalId")
+            if (
+                isinstance(goal_id, str)
+                and re.fullmatch(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$", goal_id)
+                and goal_id not in goal_ids
+                and len(goal_ids) < 8
+            ):
+                goal_ids.append(goal_id)
+            acceptance = goal.get("acceptance")
+            tests = acceptance.get("tests") if isinstance(acceptance, dict) else None
+            if not isinstance(tests, list):
+                continue
+            for test in tests[:16]:
+                test_id = test.get("id") if isinstance(test, dict) else None
+                if (
+                    isinstance(test_id, str)
+                    and re.fullmatch(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$", test_id)
+                    and test_id not in test_ids
+                    and len(test_ids) < 8
+                ):
+                    test_ids.append(test_id)
+    return tuple(route_ids), tuple(goal_ids), tuple(test_ids)
+
+
+def _planning_violation_diagnostic(
+    plan_text: str,
+    error: Exception,
+    *,
+    fingerprint: str,
+    repeated_from: str | None = None,
+    violation_code: str | None = None,
+) -> PlanningViolationDiagnostic:
+    routes, goals, tests = _planning_entity_ids(plan_text)
+    code = violation_code or (
+        error.violation_code
+        if isinstance(error, PlanningContractError)
+        else "planning_contract_invalid"
+    )
+    return PlanningViolationDiagnostic(
+        violation_code=code,
+        route_ids=routes,
+        goal_ids=goals,
+        test_ids=tests,
+        fingerprint=fingerprint,
+        repeated_from=repeated_from,
+    )
 
 
 class RunKeyGateway(Protocol):
@@ -459,6 +542,7 @@ class DirectPiOrchestrator:
                 # remains the publication/audit base for the candidate diff.
                 before_planning = await workspaces.snapshot_hashes(generation)
                 draft: GoalGraphDraft | None = None
+                plan_text: str | None = None
                 starter_fingerprint = {
                     "starterId": starter.id,
                     "starterVersion": starter.version,
@@ -481,7 +565,7 @@ class DirectPiOrchestrator:
                         generation,
                         self._continuation_prompt(continuation),
                         stage="planning",
-                        structured_output_schema=GoalGraphDraft.model_json_schema(
+                        structured_output_schema=GoalGraphPlanningEnvelope.model_json_schema(
                             by_alias=True
                         ),
                         continuation_key=continuation.continuation_key,
@@ -490,10 +574,6 @@ class DirectPiOrchestrator:
                     )
                     await workspaces.assert_unchanged(generation, before_planning)
                     await assert_run_active(self.repository, run_id, active_lease)
-                    draft = self._parse_goal_graph_draft(
-                        plan_text,
-                        requirement=requirement,
-                    )
                     continuation = None
                 else:
                     candidates = await self.repository.list_goal_graph_cache_candidates(
@@ -512,6 +592,7 @@ class DirectPiOrchestrator:
                             draft = self._parse_goal_graph_draft(
                                 candidate_text,
                                 requirement=requirement,
+                                allow_raw_domain=True,
                             )
                         except (DirectPiOrchestrationError, KeyError, TypeError):
                             continue
@@ -527,21 +608,31 @@ class DirectPiOrchestrator:
                         break
 
                 if draft is None:
-                    plan_text = await pi.invoke(
-                        generation,
-                        goal_graph_planning_prompt(
-                            requirement=requirement,
-                            starter=starter.as_build_context(),
-                        ),
-                        stage="planning",
-                        structured_output_schema=GoalGraphDraft.model_json_schema(
-                            by_alias=True
-                        ),
-                        continuation_key="goal_graph.planning",
-                        continuation_context=continuation_context,
-                    )
-                    await workspaces.assert_unchanged(generation, before_planning)
-                    await assert_run_active(self.repository, run_id, active_lease)
+                    if plan_text is None:
+                        plan_text = await pi.invoke(
+                            generation,
+                            goal_graph_planning_prompt(
+                                requirement=requirement,
+                                starter=starter.as_build_context(),
+                            ),
+                            stage="planning",
+                            structured_output_schema=(
+                                GoalGraphPlanningEnvelope.model_json_schema(
+                                    by_alias=True
+                                )
+                            ),
+                            continuation_key="goal_graph.planning",
+                            continuation_context=continuation_context,
+                        )
+                        await workspaces.assert_unchanged(
+                            generation,
+                            before_planning,
+                        )
+                        await assert_run_active(
+                            self.repository,
+                            run_id,
+                            active_lease,
+                        )
                     correction_attempts = 0
                     invalid_submission_fingerprints: set[str] = set()
                     while True:
@@ -556,16 +647,36 @@ class DirectPiOrchestrator:
                                 plan_text,
                                 exc,
                             )
+                            diagnostic = _planning_violation_diagnostic(
+                                plan_text,
+                                exc,
+                                fingerprint=failure_fingerprint,
+                            )
                             if failure_fingerprint in invalid_submission_fingerprints:
                                 raise PlanningContractError(
                                     "GoalGraph planning repeated the same invalid semantic "
-                                    "submission without progress"
+                                    "submission without progress",
+                                    violation_code="planning_no_progress",
+                                    planning_diagnostic=_planning_violation_diagnostic(
+                                        plan_text,
+                                        exc,
+                                        fingerprint=failure_fingerprint,
+                                        repeated_from=failure_fingerprint,
+                                        violation_code="planning_no_progress",
+                                    ),
                                 ) from exc
                             invalid_submission_fingerprints.add(failure_fingerprint)
                             if correction_attempts >= _MAX_GOAL_GRAPH_CORRECTIONS:
                                 raise PlanningContractError(
                                     "GoalGraph planning did not converge within the "
-                                    f"server correction budget ({_MAX_GOAL_GRAPH_CORRECTIONS})"
+                                    f"server correction budget ({_MAX_GOAL_GRAPH_CORRECTIONS})",
+                                    violation_code="planning_budget_exhausted",
+                                    planning_diagnostic=_planning_violation_diagnostic(
+                                        plan_text,
+                                        exc,
+                                        fingerprint=failure_fingerprint,
+                                        violation_code="planning_budget_exhausted",
+                                    ),
                                 ) from exc
                             correction_attempts += 1
                             await self.repository.append_event(
@@ -577,6 +688,7 @@ class DirectPiOrchestrator:
                                     "attempt": correction_attempts,
                                     "maxAttempts": _MAX_GOAL_GRAPH_CORRECTIONS,
                                     "thinkingLevel": runtime_contract.thinking,
+                                    "diagnostic": diagnostic.event_payload(),
                                 },
                                 lease_token=active_lease,
                             )
@@ -586,7 +698,7 @@ class DirectPiOrchestrator:
                                     validation_error=str(exc)
                                 ),
                                 stage="planning",
-                                structured_output_schema=GoalGraphDraft.model_json_schema(
+                                structured_output_schema=GoalGraphPlanningEnvelope.model_json_schema(
                                     by_alias=True
                                 ),
                                 continuation_key="goal_graph.planning_correction",
@@ -775,6 +887,11 @@ class DirectPiOrchestrator:
                 advisory = compile_goal_advisory_acceptance(
                     current_goal_id,
                     execution_plan.active_goal.acceptance,
+                    navigation_suite=derive_navigation_verification_suite(
+                        projection.graph,
+                        goal_ids=(current_goal_id,),
+                        mode="focused",
+                    ),
                 )
                 baseline, advisory_self_check_command = (
                     await workspaces.reconcile_generation_advisory(
@@ -1227,7 +1344,10 @@ class DirectPiOrchestrator:
                         projection.graph,
                         full_reason=full_reason,
                     )
-                    compiled = compile_acceptance_suite(suite.contracts)
+                    compiled = compile_acceptance_suite(
+                        suite.contracts,
+                        navigation_suite=suite.navigation_suite,
+                    )
                     await self._phase(run_id, RunPhase.verifying, active_lease)
                     await assert_run_active(self.repository, run_id, active_lease)
                     snapshot = await workspaces.create_verification(
@@ -1303,13 +1423,17 @@ class DirectPiOrchestrator:
                             run_id,
                             current_goal_id,
                             candidate_checkpoint.files,
-                            outcome.checkpoint_evidence(current_goal_id),
+                            outcome.checkpoint_evidence(
+                                current_goal_id,
+                                navigation_suite=suite.navigation_suite,
+                            ),
                             lease_token=active_lease,
                             commit_sha=snapshot.commit_sha,
                             capsule=self._checkpoint_capsule(
                                 evidence_summaries,
                                 goal_changed_paths_by_id,
                             ),
+                            navigation_suite=suite.navigation_suite,
                         )
                         await assert_run_active(self.repository, run_id, active_lease)
                         projection = await self.repository.get_goal_graph_for_run(run_id)
@@ -1592,10 +1716,20 @@ class DirectPiOrchestrator:
                 await self.repository.append_event(
                     run_id,
                     "pi.failed",
-                    payload=public_failure.event_payload(
-                        goal_id=current_goal_id,
-                        diagnostic=safe_diagnostic,
-                    ),
+                    payload={
+                        **public_failure.event_payload(
+                            goal_id=current_goal_id,
+                            diagnostic=safe_diagnostic,
+                        ),
+                        **(
+                            {
+                                "planningDiagnostic": exc.planning_diagnostic.event_payload()
+                            }
+                            if isinstance(exc, PlanningContractError)
+                            and exc.planning_diagnostic is not None
+                            else {}
+                        ),
+                    },
                     lease_token=active_lease,
                 )
                 await self.repository.mark_terminal(
@@ -2582,11 +2716,18 @@ class DirectPiOrchestrator:
                 and item.timed_out
             )
             or (
-                item.scope == "acceptance"
+                item.scope in {"acceptance", "navigation"}
                 and item.outcome == "infrastructure_failed"
             )
         )
-        if gate.scope == "acceptance":
+        if gate.scope == "navigation":
+            reason_code = "navigation_playwright_report_untrusted"
+            frame = (
+                f"Navigation test {gate.navigation_id} ({gate.test_name}) did not "
+                "produce one trustworthy Playwright result."
+            )[:240]
+            check = "navigation_playwright_report"
+        elif gate.scope == "acceptance":
             reason_code = "playwright_report_untrusted"
             frame = "Playwright did not produce one trustworthy acceptance result."
             check = "playwright_report"
@@ -2727,8 +2868,16 @@ class DirectPiOrchestrator:
             contracts=tuple(scope_acceptance_contract(goal) for goal in goals),
             mode=RuntimeValidationMode.FULL,
             reason=RuntimeValidationReason.VERIFIED_GRAPH_RECOVERY,
+            navigation_suite=derive_navigation_verification_suite(
+                projection.graph,
+                goal_ids=tuple(goal.goal_id for goal in goals),
+                mode="final_full",
+            ),
         )
-        compiled = compile_acceptance_suite(suite.contracts)
+        compiled = compile_acceptance_suite(
+            suite.contracts,
+            navigation_suite=suite.navigation_suite,
+        )
         await assert_run_active(
             self.repository, projection.run_id, lease_token
         )
@@ -3062,31 +3211,65 @@ class DirectPiOrchestrator:
         text: str,
         *,
         requirement: str,
+        allow_raw_domain: bool = False,
     ) -> GoalGraphDraft:
         value = text.strip()
-        if value.startswith("```json") and value.endswith("```"):
-            value = value[7:-3].strip()
-        elif value.startswith("```") and value.endswith("```"):
-            value = value[3:-3].strip()
+
+        def validation_details(exc: ValidationError) -> str:
+            details: list[str] = []
+            for item in exc.errors(include_input=False)[:5]:
+                pointer = "/" + "/".join(str(part) for part in item["loc"])
+                details.append(f"{pointer}: {str(item['msg'])[:500]}")
+            return "; ".join(details)[:2_500]
+
         try:
-            decoder = json.JSONDecoder()
-            payload, end = decoder.raw_decode(value)
-            if value[end:].strip():
-                raise ValueError("GoalGraphDraft has trailing content")
+            envelope = parse_goal_graph_planning_envelope(value)
+        except ValidationError as exc:
+            if not allow_raw_domain:
+                raise PlanningContractError(
+                    "Direct Pi returned an invalid planning envelope: "
+                    + validation_details(exc),
+                    violation_code="planning_envelope_invalid",
+                ) from exc
+            payload: object = value
+        except (RecursionError, TypeError, ValueError) as exc:
+            if not allow_raw_domain:
+                raise PlanningContractError(
+                    "Direct Pi returned malformed planning-envelope JSON.",
+                    violation_code="planning_envelope_json_invalid",
+                ) from exc
+            payload = value
+        else:
+            payload = envelope.payload_json
+
+        try:
+            draft = parse_goal_graph_draft(payload)
+        except ValidationError as exc:
+            locations = [item["loc"] for item in exc.errors(include_input=False)[:20]]
+            violation_code = "goal_graph_domain_invalid"
+            if any(location and location[0] == "routes" for location in locations):
+                violation_code = "route_manifest_invalid"
+            elif any(location and location[0] == "goals" for location in locations):
+                violation_code = "goal_contract_invalid"
+            raise PlanningContractError(
+                "Direct Pi returned an invalid GoalGraphDraft: "
+                + validation_details(exc),
+                violation_code=violation_code,
+            ) from exc
+        except (RecursionError, TypeError, ValueError) as exc:
+            raise PlanningContractError(
+                "Direct Pi returned malformed payloadJson; expected one strict JSON object.",
+                violation_code="planning_payload_json_invalid",
+            ) from exc
+
+        try:
             return validate_goal_graph_routing(
                 requirement,
-                parse_goal_graph_draft(payload),
+                draft,
             )
-        except (json.JSONDecodeError, ValidationError, ValueError, TypeError) as exc:
-            if isinstance(exc, ValidationError):
-                details = "; ".join(
-                    f"{'.'.join(str(part) for part in item['loc'])}: {item['msg']}"
-                    for item in exc.errors()[:5]
-                )
-            elif isinstance(exc, json.JSONDecodeError):
-                details = f"JSON syntax error at character {exc.pos}"
-            else:
-                details = str(exc) or type(exc).__name__
+        except ValueError as exc:
             raise PlanningContractError(
-                f"Direct Pi returned an invalid GoalGraphDraft: {details}"
+                "Direct Pi returned a GoalGraphDraft that conflicts with the request: "
+                + str(exc)[:2_500],
+                violation_code="route_intent_invalid",
             ) from exc

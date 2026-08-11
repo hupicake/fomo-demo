@@ -8,6 +8,7 @@ import test from "node:test";
 const BRIDGE = new URL("./fomo-codex-rpc-bridge.mjs", import.meta.url);
 const MODEL_CATALOG = new URL("./fomo-codex-models.json", import.meta.url);
 const THREAD_ID = "019fe958-a12e-7632-9817-efca95bf47e4";
+const STRUCTURED_SECRET_MARKER = "structured-payload-must-not-become-public-text";
 
 const FAKE_CODEX = String.raw`#!/usr/bin/env node
 import { appendFileSync, readFileSync } from "node:fs";
@@ -54,7 +55,7 @@ process.stdin.on("end", () => {
     send({ type: "item.completed", item: { id: "cmd-reused", type: "command_execution", status: "failed", exit_code: 1, aggregated_output: "expected failure" } });
     return;
   }
-  const text = mode === "structured" ? '{"answer":{"label":"ok","priority":"must"}}'
+  const text = mode === "structured" ? '{"answer":{"label":"${STRUCTURED_SECRET_MARKER}","priority":"must"}}'
     : mode === "structured-invalid" ? "{" : "done";
   if (mode === "success") {
     send({ type: "item.completed", item: { id: "reason-1", type: "reasoning", text: "private reasoning" } });
@@ -306,7 +307,39 @@ test("Codex bridge classifies structured, model, and protocol terminal failures"
   assert.equal(structured.code, 0, structured.stderr);
   const structuredEvents = records(structured.stdout);
   const submit = structuredEvents.find((event) => event.payload.toolName === "submit_structured_output");
-  assert.deepEqual(submit.payload.args, { answer: { label: "ok", priority: "must" } });
+  assert.deepEqual(submit.payload.args, {
+    answer: { label: STRUCTURED_SECRET_MARKER, priority: "must" },
+  });
+  const publicStructuredEvents = structuredEvents.filter(
+    (event) => !(
+      event.type === "pi.event" &&
+      event.payload.kind === "tool_start" &&
+      event.payload.toolName === "submit_structured_output"
+    ),
+  );
+  assert.doesNotMatch(JSON.stringify(publicStructuredEvents), new RegExp(STRUCTURED_SECRET_MARKER));
+  assert.equal(
+    structuredEvents.filter(
+      (event) => event.type === "pi.event" && event.payload.kind === "message_delta",
+    ).length,
+    0,
+  );
+  assert.equal(
+    structuredEvents.filter(
+      (event) => event.type === "pi.event" && event.payload.kind === "message_start",
+    ).length,
+    1,
+  );
+  assert.equal(
+    structuredEvents.filter(
+      (event) => event.type === "pi.event" && event.payload.kind === "message_end",
+    ).length,
+    1,
+  );
+  const structuredTurnEnd = structuredEvents.find(
+    (event) => event.type === "pi.event" && event.payload.kind === "turn_end",
+  );
+  assert.equal(structuredTurnEnd.payload.text, "");
   const normalized = JSON.parse((await invocations(structuredPaths.log))[0].schema);
   assert.equal(normalized.title, schema.title);
   assert.equal(normalized.description, schema.description);

@@ -498,7 +498,12 @@ class WorkspaceManager:
         expected_hashes = dict(compiled.sha256_by_path)
         expected_paths = set(expected_hashes)
         change_paths = {change.path for change in compiled.changes}
-        test_paths = sorted(set(compiled.test_path_by_acceptance_id.values()))
+        test_paths = sorted(
+            {
+                *compiled.test_path_by_acceptance_id.values(),
+                *(compiled.navigation_test_path_by_id or {}).values(),
+            }
+        )
         allowed_paths = {ADVISORY_ACCEPTANCE_CONFIG_PATH, *test_paths}
         if (
             not expected_paths

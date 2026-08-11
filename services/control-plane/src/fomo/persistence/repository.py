@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Any, Literal
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from sqlalchemy import and_, case, func, or_, select, update
@@ -23,6 +23,9 @@ from fomo.auth import hash_password, new_session_id, normalize_email, verify_pas
 from fomo.direct_pi.architecture_profile import ArchitectureProfile
 from fomo.direct_pi.failures import public_failure_for_code
 from fomo.direct_pi.goalgraph import (
+    LEGACY_ROUTE_SCHEMA_VERSION,
+    NAVIGATION_SUITE_VERSION,
+    SCHEMA_VERSION,
     Goal,
     GoalGraph,
     GoalGraphDraft,
@@ -31,11 +34,17 @@ from fomo.direct_pi.goalgraph import (
     GraphStatus,
     LegacyGoal,
     LegacyGoalGraphDraft,
+    LegacyRouteGoalGraphDraft,
+    NavigationVerificationSuite,
     acceptance_persistence_key,
     assert_goal_graph_executable,
+    derive_navigation_verification_suite,
     materialize_goal_graph,
+    navigation_evidence_key,
+    navigation_test_ids,
     parse_goal_graph_draft,
     parse_legacy_goal_graph_draft,
+    parse_legacy_route_goal_graph_draft,
     serialize_goal_graph_draft,
     transition_goal_status,
     transition_graph_status,
@@ -174,7 +183,7 @@ def _goal_graph_revision_hash(
     """Hash the executable graph and its frozen architecture policy together."""
 
     canonical = serialize_goal_graph_draft(draft).encode()
-    if isinstance(draft, GoalGraphDraft):
+    if isinstance(draft, (GoalGraphDraft, LegacyRouteGoalGraphDraft)):
         if architecture_profile is None:
             raise ValueError("current GoalGraph requires an architecture profile")
         if (
@@ -185,6 +194,8 @@ def _goal_graph_revision_hash(
                 "architecture profile graph signals do not match the GoalGraph"
             )
         canonical += b"\0architecture-profile:" + architecture_profile.fingerprint().encode()
+    if isinstance(draft, GoalGraphDraft):
+        canonical += f"\0navigation-suite:{NAVIGATION_SUITE_VERSION}".encode()
     return hashlib.sha256(canonical).hexdigest()
 
 
@@ -1639,9 +1650,9 @@ class Repository:
         reason: str | None = None,
         lease_token: str | None = None,
     ) -> GoalGraphProjection:
-        """Persist one current v2 graph; historical writes use the private helper."""
-        if isinstance(draft, LegacyGoalGraphDraft):
-            raise ValueError("create_goal_graph only accepts current schema v2")
+        """Persist one current v3 graph; historical writes use private helpers."""
+        if isinstance(draft, (LegacyGoalGraphDraft, LegacyRouteGoalGraphDraft)):
+            raise ValueError("create_goal_graph only accepts current schema v3")
         if architecture_profile is None:
             raise ValueError("current GoalGraph requires an architecture profile")
         validated = (
@@ -1685,6 +1696,34 @@ class Repository:
             lease_token=lease_token,
         )
 
+    async def _create_legacy_route_goal_graph(
+        self,
+        project_id: str,
+        run_id: str,
+        draft: LegacyRouteGoalGraphDraft | Mapping[str, Any] | str | bytes,
+        *,
+        architecture_profile: ArchitectureProfile,
+        provenance: Mapping[str, Any] | None = None,
+        reason: str | None = None,
+        lease_token: str | None = None,
+    ) -> GoalGraphProjection:
+        """Private migration/test writer preserving historical v2 semantics."""
+
+        validated = (
+            draft
+            if isinstance(draft, LegacyRouteGoalGraphDraft)
+            else parse_legacy_route_goal_graph_draft(draft)
+        )
+        return await self._persist_goal_graph(
+            project_id,
+            run_id,
+            validated,
+            architecture_profile=architecture_profile,
+            provenance=provenance,
+            reason=reason,
+            lease_token=lease_token,
+        )
+
     async def _persist_goal_graph(
         self,
         project_id: str,
@@ -1703,7 +1742,7 @@ class Repository:
         revision_provenance = dict(provenance or {"createdBy": f"run:{run_id}"})
         revision_provenance.pop(_GOAL_GRAPH_ROUTING_PROVENANCE_KEY, None)
         revision_provenance.pop(_GOAL_GRAPH_ARCHITECTURE_PROVENANCE_KEY, None)
-        if isinstance(validated, GoalGraphDraft):
+        if isinstance(validated, (GoalGraphDraft, LegacyRouteGoalGraphDraft)):
             revision_provenance[_GOAL_GRAPH_ROUTING_PROVENANCE_KEY] = {
                 "schemaVersion": validated.schema_version,
                 "navigationMode": graph.navigation_mode.value,
@@ -1712,6 +1751,10 @@ class Repository:
                     for route in validated.routes
                 ],
             }
+            if isinstance(validated, GoalGraphDraft):
+                revision_provenance[_GOAL_GRAPH_ROUTING_PROVENANCE_KEY][
+                    "navigationSuiteVersion"
+                ] = NAVIGATION_SUITE_VERSION
             if architecture_profile is not None:
                 revision_provenance[_GOAL_GRAPH_ARCHITECTURE_PROVENANCE_KEY] = (
                     architecture_profile.as_prompt_context()
@@ -2014,6 +2057,7 @@ class Repository:
         commit_sha: str | None = None,
         snapshot_id: str | None = None,
         capsule: Mapping[str, Any] | None = None,
+        navigation_suite: NavigationVerificationSuite | None = None,
     ) -> VerifiedCheckpoint:
         """Atomically fence, checkpoint files/evidence, and advance the graph."""
         normalized_files, manifest_hash = self._normalize_checkpoint_files(files)
@@ -2028,10 +2072,55 @@ class Repository:
                 session, run_id, goal_id
             )
             transition_goal_status(GoalStatus(target.status), GoalStatus.VERIFIED)
-            required_keys = {
+            required_acceptance_keys = {
                 acceptance_persistence_key(goal_id, item["id"])
                 for item in target.acceptance.get("criteria", [])
             }
+            projected = self._goal_graph_projection(
+                graph,
+                revision,
+                nodes,
+            ).graph
+            trusted_navigation_suite: NavigationVerificationSuite | None = None
+            if projected.schema_version == SCHEMA_VERSION:
+                ready_goal_ids = tuple(
+                    node.goal_key
+                    for node in sorted(nodes, key=lambda item: item.position)
+                    if node.status == GoalStatus.VERIFIED.value
+                    or node.goal_key == goal_id
+                )
+                final_checkpoint = len(ready_goal_ids) == len(nodes)
+                required_mode: Literal["focused", "ready_full", "final_full"] = (
+                    "final_full"
+                    if final_checkpoint
+                    else navigation_suite.mode
+                    if navigation_suite is not None
+                    else "focused"
+                )
+                selected_goal_ids = (
+                    (goal_id,) if required_mode == "focused" else ready_goal_ids
+                )
+                trusted_navigation_suite = derive_navigation_verification_suite(
+                    projected,
+                    goal_ids=selected_goal_ids,
+                    mode=required_mode,
+                )
+                if trusted_navigation_suite != navigation_suite:
+                    message = (
+                        "final checkpoint requires the complete navigation suite"
+                        if final_checkpoint
+                        else "checkpoint is missing goal navigation evidence"
+                        if navigation_suite is None
+                        else "checkpoint navigation suite does not match the GoalGraph"
+                    )
+                    raise ValueError(message)
+            elif navigation_suite is not None:
+                raise ValueError("historical checkpoint cannot use derived navigation evidence")
+            required_navigation_keys = {
+                navigation_evidence_key(trusted_navigation_suite.version, test_id)
+                for test_id in navigation_test_ids(trusted_navigation_suite)
+            }
+            required_keys = required_acceptance_keys | required_navigation_keys
             supplied_keys: set[str] = set()
             evidence_keys: set[tuple[str, str]] = set()
             for item in normalized_evidence:
@@ -2043,6 +2132,11 @@ class Repository:
                     raise ValueError("evidence requires acceptanceKey and kind")
                 if acceptance_key not in required_keys:
                     raise ValueError("evidence acceptanceKey is outside the goal scope")
+                if acceptance_key in required_navigation_keys:
+                    if kind != f"fomo_navigation_v{NAVIGATION_SUITE_VERSION}":
+                        raise ValueError("navigation evidence kind is invalid")
+                elif kind.startswith("fomo_navigation_"):
+                    raise ValueError("business evidence cannot use navigation evidence kind")
                 if (acceptance_key, kind) in evidence_keys:
                     raise ValueError("duplicate checkpoint evidence")
                 evidence_keys.add((acceptance_key, kind))
@@ -2062,6 +2156,18 @@ class Repository:
                 + 1
             )
             capsule_payload = dict(capsule or {})
+            capsule_payload.pop("_fomoNavigationEvidence", None)
+            if projected.schema_version == SCHEMA_VERSION:
+                capsule_payload["_fomoNavigationEvidence"] = {
+                    "suiteVersion": NAVIGATION_SUITE_VERSION,
+                    "mode": (
+                        trusted_navigation_suite.mode
+                        if trusted_navigation_suite is not None
+                        else None
+                    ),
+                    "testIds": list(navigation_test_ids(trusted_navigation_suite)),
+                    "evidenceKeys": sorted(required_navigation_keys),
+                }
             checkpoint = CheckpointRecord(
                 id=uuid7(),
                 graph_id=graph.id,
@@ -2130,7 +2236,7 @@ class Repository:
                     and _is_business_implementation_path(path)
                 }
             )
-            acceptance_keys = sorted(required_keys)
+            acceptance_keys = sorted(required_acceptance_keys)
             existing_pairs = (
                 {
                     (source_ref, target_ref)
@@ -4807,11 +4913,14 @@ class Repository:
         routing_payload: Mapping[str, Any] | None = None
         if graph_record.schema_version == 1:
             draft = parse_legacy_goal_graph_draft(draft_payload)
-        else:
+        elif graph_record.schema_version in {
+            LEGACY_ROUTE_SCHEMA_VERSION,
+            SCHEMA_VERSION,
+        }:
             raw_routing = revision.provenance.get(_GOAL_GRAPH_ROUTING_PROVENANCE_KEY)
             if not isinstance(raw_routing, Mapping):
                 raise ManifestIntegrityError(
-                    "GoalGraph v2 revision is missing its routing manifest"
+                    "routed GoalGraph revision is missing its routing manifest"
                 )
             routing_payload = raw_routing
             if raw_routing.get("schemaVersion") != graph_record.schema_version:
@@ -4823,17 +4932,34 @@ class Repository:
                 raise ManifestIntegrityError("GoalGraph routing manifest is invalid")
             draft_payload["routes"] = raw_routes
             try:
-                draft = parse_goal_graph_draft(draft_payload)
+                draft = (
+                    parse_legacy_route_goal_graph_draft(draft_payload)
+                    if graph_record.schema_version == LEGACY_ROUTE_SCHEMA_VERSION
+                    else parse_goal_graph_draft(draft_payload)
+                )
             except (TypeError, ValueError) as exc:
                 raise ManifestIntegrityError(
                     "GoalGraph routing manifest is invalid"
                 ) from exc
+        else:
+            raise ManifestIntegrityError("GoalGraph schema version is unsupported")
         trusted = materialize_goal_graph(draft)
         if (
             routing_payload is not None
             and routing_payload.get("navigationMode") != trusted.navigation_mode.value
         ):
             raise ManifestIntegrityError("GoalGraph routing mode integrity mismatch")
+        if routing_payload is not None:
+            raw_suite_version = routing_payload.get("navigationSuiteVersion")
+            if graph_record.schema_version == SCHEMA_VERSION:
+                if raw_suite_version != NAVIGATION_SUITE_VERSION:
+                    raise ManifestIntegrityError(
+                        "GoalGraph navigation suite version integrity mismatch"
+                    )
+            elif "navigationSuiteVersion" in routing_payload:
+                raise ManifestIntegrityError(
+                    "historical GoalGraph cannot declare a navigation suite version"
+                )
         goal_by_key = {goal.goal_id: goal for goal in trusted.goals}
         projected_goals = [
             (LegacyGoal if isinstance(goal_by_key[node.goal_key], LegacyGoal) else Goal).model_validate(
@@ -4854,6 +4980,7 @@ class Repository:
                 ],
                 "qualityBar": dict(revision.quality_bar),
                 "navigationMode": trusted.navigation_mode.value,
+                "navigationSuiteVersion": trusted.navigation_suite_version,
                 "goals": [item.model_dump(mode="json", by_alias=True) for item in projected_goals],
                 "status": graph_record.status,
             }
@@ -4867,9 +4994,12 @@ class Repository:
         raw_architecture = revision.provenance.get(
             _GOAL_GRAPH_ARCHITECTURE_PROVENANCE_KEY
         )
-        if graph_record.schema_version == 2 and raw_architecture is None:
+        if graph_record.schema_version in {
+            LEGACY_ROUTE_SCHEMA_VERSION,
+            SCHEMA_VERSION,
+        } and raw_architecture is None:
             raise ManifestIntegrityError(
-                "GoalGraph v2 revision is missing its architecture profile"
+                "routed GoalGraph revision is missing its architecture profile"
             )
         if raw_architecture is not None:
             if not isinstance(raw_architecture, Mapping):
@@ -5039,6 +5169,7 @@ class Repository:
             "revision": revision.revision,
             "schemaVersion": trusted_graph.schema_version,
             "navigationMode": trusted_graph.navigation_mode.value,
+            "navigationSuiteVersion": trusted_graph.navigation_suite_version,
             "routes": [
                 route.model_dump(mode="json", by_alias=True)
                 for route in trusted_graph.routes
@@ -5239,6 +5370,119 @@ class Repository:
                 .order_by(GoalEvidenceRecord.acceptance_key, GoalEvidenceRecord.kind)
             )
         )
+        graph = await session.get(GoalGraphRecord, checkpoint.graph_id)
+        if graph is None:
+            raise ManifestIntegrityError("checkpoint GoalGraph is missing")
+        navigation_capsule = checkpoint.capsule.get("_fomoNavigationEvidence")
+        if graph.schema_version == SCHEMA_VERSION:
+            if not isinstance(navigation_capsule, Mapping):
+                raise ManifestIntegrityError(
+                    "v3 checkpoint is missing navigation evidence provenance"
+                )
+            suite_version = navigation_capsule.get("suiteVersion")
+            mode = navigation_capsule.get("mode")
+            test_ids = navigation_capsule.get("testIds")
+            evidence_keys = navigation_capsule.get("evidenceKeys")
+            if (
+                suite_version != NAVIGATION_SUITE_VERSION
+                or mode not in {None, "focused", "ready_full", "final_full"}
+                or not isinstance(test_ids, list)
+                or not isinstance(evidence_keys, list)
+                or any(not isinstance(item, str) for item in test_ids)
+                or any(not isinstance(item, str) for item in evidence_keys)
+                or len(test_ids) != len(set(test_ids))
+                or len(evidence_keys) != len(set(evidence_keys))
+            ):
+                raise ManifestIntegrityError(
+                    "checkpoint navigation evidence provenance is invalid"
+                )
+            revision = await session.get(
+                GoalGraphRevisionRecord,
+                checkpoint.revision_id,
+            )
+            nodes = list(
+                await session.scalars(
+                    select(GoalNodeRecord)
+                    .where(GoalNodeRecord.revision_id == checkpoint.revision_id)
+                    .order_by(GoalNodeRecord.position)
+                )
+            )
+            if revision is None or not nodes:
+                raise ManifestIntegrityError(
+                    "checkpoint GoalGraph revision is missing"
+                )
+            trusted_graph = self._goal_graph_projection(
+                graph,
+                revision,
+                nodes,
+            ).graph
+            completed_node_ids = set(
+                await session.scalars(
+                    select(CheckpointRecord.goal_node_id).where(
+                        CheckpointRecord.graph_id == checkpoint.graph_id,
+                        CheckpointRecord.ordinal <= checkpoint.ordinal,
+                    )
+                )
+            )
+            completed_goal_ids = tuple(
+                node.goal_key for node in nodes if node.id in completed_node_ids
+            )
+            final_checkpoint = len(completed_goal_ids) == len(nodes)
+            if final_checkpoint:
+                required_mode: Literal["focused", "ready_full", "final_full"] = (
+                    "final_full"
+                )
+            elif mode in {"focused", "ready_full"}:
+                required_mode = mode
+            elif mode is None:
+                required_mode = "focused"
+            else:
+                raise ManifestIntegrityError(
+                    "checkpoint navigation evidence scope is invalid"
+                )
+            selected_goal_ids = (
+                (goal_id,)
+                if required_mode == "focused"
+                else completed_goal_ids
+            )
+            try:
+                expected_suite = derive_navigation_verification_suite(
+                    trusted_graph,
+                    goal_ids=selected_goal_ids,
+                    mode=required_mode,
+                )
+            except ValueError as exc:
+                raise ManifestIntegrityError(
+                    "checkpoint navigation evidence scope is invalid"
+                ) from exc
+            expected_test_ids = list(navigation_test_ids(expected_suite))
+            expected_capsule_mode = (
+                expected_suite.mode if expected_suite is not None else None
+            )
+            if (
+                mode != expected_capsule_mode
+                or test_ids != expected_test_ids
+            ):
+                raise ManifestIntegrityError(
+                    "checkpoint navigation evidence suite mismatch"
+                )
+            expected_keys = sorted(
+                navigation_evidence_key(NAVIGATION_SUITE_VERSION, item)
+                for item in expected_test_ids
+            )
+            actual_keys = sorted(
+                item.acceptance_key
+                for item in evidence_records
+                if item.kind == f"fomo_navigation_v{NAVIGATION_SUITE_VERSION}"
+            )
+            if expected_keys != sorted(evidence_keys) or actual_keys != expected_keys:
+                raise ManifestIntegrityError(
+                    "checkpoint navigation evidence integrity mismatch"
+                )
+        elif navigation_capsule is not None:
+            raise ManifestIntegrityError(
+                "historical checkpoint has unexpected navigation provenance"
+            )
         return VerifiedCheckpoint(
             id=checkpoint.id,
             graph_id=checkpoint.graph_id,

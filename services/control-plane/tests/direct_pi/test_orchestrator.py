@@ -19,7 +19,13 @@ from fomo.direct_pi.architecture_profile import (
 )
 from fomo.direct_pi.contracts import PlanningBundle
 from fomo.direct_pi.failures import AgentNoEffect, PlanningContractError
-from fomo.direct_pi.goalgraph import parse_goal_graph_draft
+from fomo.direct_pi.goalgraph import (
+    GoalStatus,
+    derive_navigation_verification_suite,
+    navigation_evidence_key,
+    navigation_test_ids,
+    parse_goal_graph_draft,
+)
 from fomo.direct_pi.orchestrator import DirectPiOrchestrationError
 from fomo.direct_pi.prompts import (
     GOAL_GRAPH_PLANNING_POLICY,
@@ -58,7 +64,7 @@ from fomo.fomo_pi_ds import (
 from fomo.persistence.models import RunRecord, TraceLinkRecord
 from fomo.runtime_contract import resolve_runtime_contract
 from fomo.sandbox.base import ExecResult, FileChange, SandboxRef
-from fomo.schemas import RunStatus
+from fomo.schemas import GateResult, GateStatus, RunStatus
 from fomo.starter import resolve_starter_manifest
 from tests.helpers import create_user_session
 
@@ -418,7 +424,7 @@ def _goal_graph_plan() -> dict[str, object]:
         },
     ]
     return {
-        "schemaVersion": 2,
+        "schemaVersion": 3,
         "productOutcome": "Users can search and maintain a durable library.",
         "routes": [
             {
@@ -474,7 +480,7 @@ def _two_route_goal_graph_plan() -> dict[str, object]:
         ]
 
     return {
-        "schemaVersion": 2,
+        "schemaVersion": 3,
         "productOutcome": "Users navigate a two-route local library.",
         "routes": [
             {
@@ -548,6 +554,44 @@ def _two_route_goal_graph_plan() -> dict[str, object]:
     }
 
 
+async def _navigation_checkpoint_fixture(
+    repository,
+    run_id: str,
+    goal_id: str,
+    *,
+    mode: str = "focused",
+):
+    projection = await repository.get_goal_graph_for_run(run_id)
+    assert projection is not None
+    selected = (
+        (goal_id,)
+        if mode == "focused"
+        else tuple(
+            goal.goal_id
+            for goal in projection.graph.goals
+            if goal.status is GoalStatus.VERIFIED or goal.goal_id == goal_id
+        )
+    )
+    suite = derive_navigation_verification_suite(
+        projection.graph,
+        goal_ids=selected,
+        mode=mode,
+    )
+    evidence = (
+        [
+            {
+                "acceptanceKey": navigation_evidence_key(suite.version, test_id),
+                "kind": f"fomo_navigation_v{suite.version}",
+                "status": "passed",
+            }
+            for test_id in navigation_test_ids(suite)
+        ]
+        if suite is not None
+        else []
+    )
+    return suite, evidence
+
+
 def test_goal_graph_planning_prompts_use_complexity_driven_product_scope() -> None:
     prompt = goal_graph_planning_prompt(
         requirement="Build one responsive landing page.",
@@ -555,7 +599,7 @@ def test_goal_graph_planning_prompts_use_complexity_driven_product_scope() -> No
     )
     correction = goal_graph_planning_correction_prompt(validation_error="invalid graph")
 
-    assert GOAL_GRAPH_PLANNING_POLICY == "frontend-ui-v6"
+    assert GOAL_GRAPH_PLANNING_POLICY == "frontend-ui-v7"
     assert "derive the number and granularity" in prompt
     assert "actual requirement complexity" in prompt
     assert "Use enough goals to express the complete product" in prompt
@@ -644,6 +688,7 @@ class _GoalGraphTransport:
         noop_calls: set[int] | None = None,
         protected_only_calls: set[int] | None = None,
         question_calls: set[int] | None = None,
+        structured_question_calls: set[int] | None = None,
     ) -> None:
         self.sandbox = sandbox
         self.calls = 0
@@ -654,6 +699,7 @@ class _GoalGraphTransport:
         self.noop_calls = noop_calls or set()
         self.protected_only_calls = protected_only_calls or set()
         self.question_calls = question_calls or set()
+        self.structured_question_calls = structured_question_calls or set()
 
     async def run(self, ref, invocation, *, on_event=None, **_kwargs):
         self.calls += 1
@@ -661,8 +707,21 @@ class _GoalGraphTransport:
         self.require_resumes.append(invocation.request.require_resume)
         structured = invocation.request.structured_output_schema is not None
         input_request: dict[str, object] | None = None
-        if structured:
-            text = json.dumps(self.plan, separators=(",", ":"))
+        if structured and self.calls in self.structured_question_calls:
+            assert invocation.request.user_input_enabled
+            input_request = {
+                "requestId": f"input-planning-{self.calls}",
+                "question": "Should the library use a focused route?",
+                "choices": ["Yes", "No"],
+                "allowFreeform": False,
+            }
+            text = "Waiting for the route decision before submitting GoalGraph."
+        elif structured:
+            envelope = {
+                "envelopeVersion": 1,
+                "payloadJson": json.dumps(self.plan, separators=(",", ":")),
+            }
+            text = json.dumps(envelope, separators=(",", ":"))
         elif self.calls in self.question_calls:
             assert invocation.request.user_input_enabled
             input_request = {
@@ -738,7 +797,7 @@ class _GoalGraphTransport:
             "toolCalls": self.calls,
             "cost": self.calls * 0.01,
         }
-        if structured:
+        if structured and input_request is None:
             events = (
                 PiBridgeEnvelope(
                     seq=1,
@@ -752,7 +811,7 @@ class _GoalGraphTransport:
                         "kind": "tool_start",
                         "toolCallId": "structured-1",
                         "toolName": "submit_structured_output",
-                        "args": self.plan,
+                        "args": envelope,
                     },
                 ),
                 PiBridgeEnvelope(
@@ -971,6 +1030,10 @@ class _PlanningThenQuestionTransport:
         completed: dict[str, object] = {"stats": final}
         if self.calls == 1:
             plan = _one_goal_graph_plan()
+            envelope = {
+                "envelopeVersion": 1,
+                "payloadJson": json.dumps(plan, separators=(",", ":")),
+            }
             events = (
                 PiBridgeEnvelope(
                     seq=1,
@@ -979,7 +1042,7 @@ class _PlanningThenQuestionTransport:
                         "kind": "tool_start",
                         "toolCallId": "structured-plan",
                         "toolName": "submit_structured_output",
-                        "args": plan,
+                        "args": envelope,
                     },
                 ),
                 PiBridgeEnvelope(
@@ -1775,6 +1838,84 @@ def test_planning_parser_rejects_arbitrary_trailing_content() -> None:
         )
 
 
+def test_goal_graph_provider_parser_requires_envelope_but_cache_can_read_raw_v3() -> None:
+    plan = _one_goal_graph_plan()
+    raw = json.dumps(plan, separators=(",", ":"))
+    requirement = "Build one focused library workflow."
+
+    with pytest.raises(PlanningContractError, match="invalid planning envelope"):
+        DirectPiOrchestrator._parse_goal_graph_draft(
+            raw,
+            requirement=requirement,
+        )
+
+    malformed_cases = (
+        ("{not-json", "planning_envelope_json_invalid"),
+        (
+            json.dumps({"envelopeVersion": 1, "payloadJson": "{not-json"}),
+            "planning_payload_json_invalid",
+        ),
+        (
+            json.dumps({"envelopeVersion": 1, "payloadJson": {}}),
+            "planning_envelope_invalid",
+        ),
+    )
+    for malformed, expected_code in malformed_cases:
+        with pytest.raises(PlanningContractError) as captured:
+            DirectPiOrchestrator._parse_goal_graph_draft(
+                malformed,
+                requirement=requirement,
+            )
+        assert captured.value.violation_code == expected_code
+
+    cached = DirectPiOrchestrator._parse_goal_graph_draft(
+        raw,
+        requirement=requirement,
+        allow_raw_domain=True,
+    )
+    provider = DirectPiOrchestrator._parse_goal_graph_draft(
+        json.dumps(
+            {"envelopeVersion": 1, "payloadJson": raw},
+            separators=(",", ":"),
+        ),
+        requirement=requirement,
+    )
+    assert cached == provider
+
+
+def test_navigation_report_infrastructure_diagnostic_names_the_server_owned_check() -> None:
+    outcome = VerificationOutcome(
+        passed=False,
+        gates=(
+            GateResult(
+                gate="navigation:history-roundtrip",
+                scope="navigation",
+                status=GateStatus.failed,
+                outcome="infrastructure_failed",
+                summary="Playwright report was missing.",
+                navigationId="history-roundtrip",
+                testPath=(
+                    "tests/fomo-acceptance/navigation-v1/"
+                    "history-roundtrip.smoke.spec.ts"
+                ),
+                testName=(
+                    "FOMO navigation: browser back and forward preserve every "
+                    "route identity"
+                ),
+            ),
+        ),
+        diagnostic_artifact_id="diagnostic-artifact",
+        preview_url=None,
+    )
+
+    diagnostic = DirectPiOrchestrator._verification_infrastructure_diagnostic(outcome)
+
+    assert diagnostic.reason_code == "navigation_playwright_report_untrusted"
+    assert diagnostic.check == "navigation_playwright_report"
+    assert "history-roundtrip" in diagnostic.frames[0]
+    assert "browser back and forward" in diagnostic.frames[0]
+
+
 async def _new_project_run(repository, requirement: str, message_id: str):
     session = await create_user_session(repository)
     project = await repository.create_project(session.id, "Library")
@@ -1932,6 +2073,7 @@ async def test_goal_graph_repeated_invalid_planning_stops_after_one_correction(
     )
     sandbox = GitAwareSandbox()
     invalid = _goal_graph_plan()
+    invalid["productOutcome"] = "PRIVATE-PLANNING-DRAFT-MARKER"
     transport = _GoalGraphPlanningSequenceTransport(sandbox, [invalid, invalid])
 
     with pytest.raises(
@@ -1951,6 +2093,21 @@ async def test_goal_graph_repeated_invalid_planning_stops_after_one_correction(
     retries = [event for event in events if event.kind == "pi.retrying"]
     assert len(retries) == 1
     assert retries[0].payload["reason"] == "goal_graph_contract_validation"
+    retry_diagnostic = retries[0].payload["diagnostic"]
+    assert retry_diagnostic["violationCode"] == "route_intent_invalid"
+    assert retry_diagnostic["routeIds"] == ["/"]
+    assert retry_diagnostic["goalIds"] == ["G-1", "G-2"]
+    assert retry_diagnostic["testIds"]
+    failed = next(event for event in reversed(events) if event.kind == "pi.failed")
+    failure_diagnostic = failed.payload["planningDiagnostic"]
+    assert failure_diagnostic["violationCode"] == "planning_no_progress"
+    assert failure_diagnostic["fingerprint"] == retry_diagnostic["fingerprint"]
+    assert failure_diagnostic["repeatedFrom"] == retry_diagnostic["fingerprint"]
+    serialized_events = json.dumps(
+        [event.payload for event in events],
+        ensure_ascii=False,
+    )
+    assert "PRIVATE-PLANNING-DRAFT-MARKER" not in serialized_events
 
 
 @pytest.mark.asyncio
@@ -1998,6 +2155,87 @@ async def test_goal_graph_changed_planning_correction_can_converge(
     assert projection is not None
     assert [route.path for route in projection.graph.routes] == ["/", "/books"]
     assert transport.structured_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_answered_planning_continuation_uses_same_semantic_correction_loop(
+    repository,
+    settings,
+) -> None:
+    owner = await create_user_session(repository)
+    project = await repository.create_project(owner.id, "Planning continuation")
+    _message, run, _created = await repository.create_message_and_run(
+        project.id,
+        owner.id,
+        "planning-continuation-correction",
+        "Build one focused searchable library workflow.",
+    )
+    claimed = await repository.claim_next_run("planning-question-worker", 120)
+    assert claimed is not None and claimed.lease_owner
+    sandbox = GitAwareSandbox(
+        {
+            _playwright_command(_HARNESS_PATH): ExecResult(
+                0,
+                _playwright_report("starter renders a stable application shell"),
+                "",
+            ),
+            _playwright_command(
+                "tests/fomo-acceptance/G-1/search-books.smoke.spec.ts"
+            ): ExecResult(0, _playwright_report("searches books by title"), ""),
+        }
+    )
+    question_transport = _GoalGraphTransport(
+        sandbox,
+        plan=_one_goal_graph_plan(),
+        structured_question_calls={1},
+    )
+    await _goal_graph_orchestrator(
+        repository,
+        settings,
+        sandbox,
+        question_transport,
+    ).run(run.id, lease_token=claimed.lease_owner)
+
+    waiting = await repository.get_run(run.id)
+    assert waiting.status is RunStatus.waiting_for_user
+    assert waiting.pending_input_request is not None
+    _message, _request, queued, _created = await repository.answer_user_input(
+        run.id,
+        waiting.pending_input_request.id,
+        owner.id,
+        "planning-continuation-answer",
+        "Yes",
+    )
+    assert queued.status is RunStatus.queued
+    resumed = await repository.claim_next_run("planning-answer-worker", 120)
+    assert resumed is not None and resumed.lease_owner
+
+    invalid = _one_goal_graph_plan()
+    invalid["routes"][0]["path"] = "/home"  # type: ignore[index]
+    answer_transport = _GoalGraphPlanningSequenceTransport(
+        sandbox,
+        [invalid, _one_goal_graph_plan()],
+    )
+    await _goal_graph_orchestrator(
+        repository,
+        settings,
+        sandbox,
+        answer_transport,
+    ).run(run.id, lease_token=resumed.lease_owner)
+
+    final = await repository.get_run(run.id)
+    assert final.status is RunStatus.succeeded
+    assert answer_transport.structured_calls == 2
+    assert answer_transport.require_resumes[0] is True
+    retries = [
+        event
+        for event in await repository.list_events(run.id)
+        if event.kind == "pi.retrying"
+    ]
+    assert len(retries) == 1
+    assert retries[0].payload["diagnostic"]["violationCode"] == (
+        "goal_graph_domain_invalid"
+    )
 
 
 @pytest.mark.asyncio
@@ -2515,20 +2753,49 @@ async def test_recovery_run_plans_against_the_restored_verified_checkpoint(
             "content": "export const recoveredCheckpoint = true;\n",
         }
     )
+    claimed_projection = await repository.get_goal_graph_for_run(source.id)
+    assert claimed_projection is not None
+    navigation_suite = derive_navigation_verification_suite(
+        claimed_projection.graph,
+        goal_ids=("G-1",),
+        mode="focused",
+    )
+    assert navigation_suite is not None
+    navigation_evidence = [
+        {
+            "acceptanceKey": navigation_evidence_key(
+                navigation_suite.version,
+                test_id,
+            ),
+            "kind": f"fomo_navigation_v{navigation_suite.version}",
+            "status": "passed",
+        }
+        for test_id in navigation_test_ids(navigation_suite)
+    ]
     await repository.record_verified_checkpoint(
         source.id,
         "G-1",
         checkpoint_files,
-        [{"acceptanceKey": "G-1:AC-1", "kind": "playwright_smoke", "status": "passed"}],
+        [
+            {
+                "acceptanceKey": "G-1:AC-1",
+                "kind": "playwright_smoke",
+                "status": "passed",
+            },
+            *navigation_evidence,
+        ],
         lease_token=source_lease,
         commit_sha="c" * 40,
         capsule={
-            "verifiedEvidence": [{
-                "goalId": "G-1",
-                "passedAcceptanceIds": ["AC-1"],
-                "evidenceRefs": ["checkpoint:source-g1"],
-            }]
+            "verifiedEvidence": [
+                {
+                    "goalId": "G-1",
+                    "passedAcceptanceIds": ["AC-1"],
+                    "evidenceRefs": ["checkpoint:source-g1"],
+                }
+            ]
         },
+        navigation_suite=navigation_suite,
     )
     await repository.mark_terminal(
         source.id,
@@ -2750,7 +3017,10 @@ async def test_goal_graph_wait_retains_generation_and_answer_resumes_same_sessio
     await orchestrator.run(run.id, lease_token=claimed.lease_owner)
 
     assert answer_transport.calls == 1
-    assert (await repository.get_run(run.id)).status is RunStatus.succeeded
+    completed = await repository.get_run(run.id)
+    assert (completed.status, completed.error_code) == (RunStatus.succeeded, None), (
+        sandbox.sandboxes[answer_transport.expected_sandbox_id].commands
+    )
     assert await repository.get_run_continuation(run.id) is None
     events = await repository.list_events(run.id)
     assert any(event.kind == "run.resumed" for event in events)
@@ -3086,6 +3356,11 @@ async def test_goal_graph_recovers_from_verified_checkpoint_with_durable_session
         and item.path != "next-env.d.ts"
         and item.path != ".gitignore"
     ]
+    navigation_suite, navigation_evidence = await _navigation_checkpoint_fixture(
+        repository,
+        run.id,
+        "G-1",
+    )
     await repository.record_verified_checkpoint(
         run.id,
         "G-1",
@@ -3095,7 +3370,8 @@ async def test_goal_graph_recovers_from_verified_checkpoint_with_durable_session
                 "acceptanceKey": "G-1:AC-1",
                 "kind": "playwright_smoke",
                 "status": "passed",
-            }
+            },
+            *navigation_evidence,
         ],
         lease_token=lease,
         commit_sha="b" * 40,
@@ -3108,6 +3384,7 @@ async def test_goal_graph_recovers_from_verified_checkpoint_with_durable_session
                 }
             ]
         },
+        navigation_suite=navigation_suite,
     )
     await repository.record_usage_entry(
         run.id,
@@ -3196,11 +3473,21 @@ async def test_verified_graph_publish_recovery_rebuilds_and_reverifies_without_p
     ]
     await repository.activate_goal(run.id, "G-1", lease_token=lease)
     await repository.claim_goal(run.id, "G-1", lease_token=lease)
+    first_navigation, first_navigation_evidence = (
+        await _navigation_checkpoint_fixture(repository, run.id, "G-1")
+    )
     await repository.record_verified_checkpoint(
         run.id,
         "G-1",
         files,
-        [{"acceptanceKey": "G-1:AC-1", "kind": "playwright_smoke", "status": "passed"}],
+        [
+            {
+                "acceptanceKey": "G-1:AC-1",
+                "kind": "playwright_smoke",
+                "status": "passed",
+            },
+            *first_navigation_evidence,
+        ],
         lease_token=lease,
         capsule={
             "verifiedEvidence": [
@@ -3211,13 +3498,29 @@ async def test_verified_graph_publish_recovery_rebuilds_and_reverifies_without_p
                 }
             ]
         },
+        navigation_suite=first_navigation,
     )
     await repository.claim_goal(run.id, "G-2", lease_token=lease)
+    final_navigation, final_navigation_evidence = (
+        await _navigation_checkpoint_fixture(
+            repository,
+            run.id,
+            "G-2",
+            mode="final_full",
+        )
+    )
     await repository.record_verified_checkpoint(
         run.id,
         "G-2",
         files,
-        [{"acceptanceKey": "G-2:AC-2", "kind": "playwright_smoke", "status": "passed"}],
+        [
+            {
+                "acceptanceKey": "G-2:AC-2",
+                "kind": "playwright_smoke",
+                "status": "passed",
+            },
+            *final_navigation_evidence,
+        ],
         lease_token=lease,
         capsule={
             "verifiedEvidence": [
@@ -3233,6 +3536,7 @@ async def test_verified_graph_publish_recovery_rebuilds_and_reverifies_without_p
                 },
             ]
         },
+        navigation_suite=final_navigation,
     )
 
     harness = _playwright_report("starter renders a stable application shell")
