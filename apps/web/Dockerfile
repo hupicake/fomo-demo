@@ -12,6 +12,10 @@ FROM deps AS builder
 
 COPY . .
 
+# Bound the production build on small self-hosted deployment machines. Runtime
+# memory remains governed independently by the final image/container.
+ENV NODE_OPTIONS=--max-old-space-size=1536
+
 # NEXT_PUBLIC_* values are compiled into the browser bundle. Compose supplies
 # the host-reachable API origin, never a private Docker-only hostname.
 ARG NEXT_PUBLIC_API_URL=http://localhost:8000
