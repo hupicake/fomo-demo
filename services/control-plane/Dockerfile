@@ -11,6 +11,12 @@ RUN pip install --no-cache-dir "uv==0.8.15"
 WORKDIR /app
 
 COPY pyproject.toml uv.lock README.md ./
+
+# Keep the third-party dependency closure reusable when ordinary application
+# source changes. The second sync below only installs the local project and its
+# entry points into the already-populated environment.
+RUN uv sync --locked --no-dev --no-install-project
+
 COPY alembic.ini ./
 COPY migrations ./migrations
 COPY src ./src

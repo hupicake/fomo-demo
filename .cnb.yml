@@ -1,0 +1,134 @@
+"**":
+  api_trigger_fomo_build:
+    - name: fomo-images-full-16c
+      runner:
+        tags: cnb:arch:amd64
+        cpus: 16
+      git:
+        submodules: false
+        lfs: false
+      services:
+        - name: docker
+          options:
+            rootlessBuildkitd:
+              enabled: true
+      env:
+        FOMO_BAKE_FILES: docker/docker-bake.hcl:docker/docker-bake.cnb.hcl
+        FOMO_BUILD_SEQUENTIAL: "false"
+        FOMO_PUSH_IMAGES: "true"
+        BUILDKIT_PROGRESS: plain
+      stages:
+        - name: Validate CNB build contract
+          script:
+            - docker info
+            - docker buildx version
+            - git diff --check
+            - sh -n scripts/ci/build-images.sh
+            - sh -n scripts/ci/cnb-build.sh
+            - sh -n scripts/ci/cnb-release.sh
+            - sh -n scripts/ci/cnb-sync.sh
+            - sh -n scripts/ci/detect-images.sh
+            - sh -n scripts/ci/verify-image.sh
+            - sh scripts/ci/test-detect-images.sh
+            - sh scripts/ci/test-cnb-build.sh
+            - sh scripts/ci/test-cnb-release.sh
+            - sh scripts/ci/test-cnb-sync.sh
+            - docker buildx bake --file docker/docker-bake.hcl --file docker/docker-bake.cnb.hcl --print all >/dev/null
+        - name: Build and publish selected images
+          script: sh scripts/ci/cnb-build.sh build
+        - name: Release full-build dependency
+          type: cnb:resolve
+          options:
+            key: fomo-images-full
+      endStages:
+        - name: Report CNB full-build result
+          script: printf 'fomo CNB full-build status=%s build=%s\n' "$CNB_PIPELINE_STATUS" "$CNB_BUILD_WEB_URL"
+
+    - name: fomo-images-full-verify-4c
+      runner:
+        tags: cnb:arch:amd64
+        cpus: 4
+      git:
+        submodules: false
+        lfs: false
+      services:
+        - name: docker
+      env:
+        FOMO_VERIFY_PARALLELISM: "3"
+      stages:
+        - name: Await full image publication
+          type: cnb:await
+          options:
+            key: fomo-images-full
+        - name: Pull and verify image contracts
+          script: sh scripts/ci/cnb-build.sh verify
+      endStages:
+        - name: Report CNB full-verification result
+          script: printf 'fomo CNB full-verification status=%s build=%s\n' "$CNB_PIPELINE_STATUS" "$CNB_BUILD_WEB_URL"
+
+  api_trigger_fomo_build_small:
+    - name: fomo-images-small-8c
+      runner:
+        tags: cnb:arch:amd64
+        cpus: 8
+      git:
+        submodules: false
+        lfs: false
+      services:
+        - name: docker
+          options:
+            rootlessBuildkitd:
+              enabled: true
+      env:
+        FOMO_BAKE_FILES: docker/docker-bake.hcl:docker/docker-bake.cnb.hcl
+        FOMO_BUILD_SEQUENTIAL: "false"
+        FOMO_PUSH_IMAGES: "true"
+        BUILDKIT_PROGRESS: plain
+      stages:
+        - name: Validate CNB build contract
+          script:
+            - docker info
+            - docker buildx version
+            - git diff --check
+            - sh -n scripts/ci/build-images.sh
+            - sh -n scripts/ci/cnb-build.sh
+            - sh -n scripts/ci/cnb-release.sh
+            - sh -n scripts/ci/cnb-sync.sh
+            - sh -n scripts/ci/detect-images.sh
+            - sh -n scripts/ci/verify-image.sh
+            - sh scripts/ci/test-detect-images.sh
+            - sh scripts/ci/test-cnb-build.sh
+            - sh scripts/ci/test-cnb-release.sh
+            - sh scripts/ci/test-cnb-sync.sh
+            - docker buildx bake --file docker/docker-bake.hcl --file docker/docker-bake.cnb.hcl --print all >/dev/null
+        - name: Build and publish selected images
+          script: sh scripts/ci/cnb-build.sh build
+        - name: Release small-build dependency
+          type: cnb:resolve
+          options:
+            key: fomo-images-small
+      endStages:
+        - name: Report CNB small-build result
+          script: printf 'fomo CNB small-build status=%s build=%s\n' "$CNB_PIPELINE_STATUS" "$CNB_BUILD_WEB_URL"
+
+    - name: fomo-images-small-verify-4c
+      runner:
+        tags: cnb:arch:amd64
+        cpus: 4
+      git:
+        submodules: false
+        lfs: false
+      services:
+        - name: docker
+      env:
+        FOMO_VERIFY_PARALLELISM: "3"
+      stages:
+        - name: Await small image publication
+          type: cnb:await
+          options:
+            key: fomo-images-small
+        - name: Pull and verify image contracts
+          script: sh scripts/ci/cnb-build.sh verify
+      endStages:
+        - name: Report CNB small-verification result
+          script: printf 'fomo CNB small-verification status=%s build=%s\n' "$CNB_PIPELINE_STATUS" "$CNB_BUILD_WEB_URL"
